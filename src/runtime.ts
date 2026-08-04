@@ -187,7 +187,7 @@ export interface SpeculativeActionRuntimeAdapter<
 	}) => MaybePromise<unknown>;
 	readonly isResourceExpired?: (input: {
 		readonly stateData: StateData;
-		readonly consumeInput: ConsumeInput;
+		readonly consumeInput?: ConsumeInput;
 		readonly action: ActionKey;
 		readonly candidate: SpeculativeCandidate;
 	}) => MaybePromise<boolean>;
@@ -371,6 +371,35 @@ export function makeSpeculativeActionRuntime<
 		}
 	};
 
+	const expireCandidate = (
+		state: TurnState<SessionID, Output, StateData>,
+		candidate: RuntimeCandidate<Output>,
+	): void => {
+		candidate.consumed = true;
+		state.candidates.delete(candidate.key.key);
+		if (candidate.lifetime === "resource") resourceCandidates.delete(resourceKey(state.sessionID, candidate.key));
+		candidate.controller.abort();
+	};
+
+	const findReusableDraftCandidate = async (
+		state: TurnState<SessionID, Output, StateData>,
+		action: ActionKey,
+	): Promise<RuntimeCandidate<Output> | undefined> => {
+		for (const candidate of availableCandidates(state).values()) {
+			if (candidate.consumed && candidate.lifetime === "turn") continue;
+			const matches =
+				candidate.key.key === action.key ||
+				(adapter.projectOutput !== undefined && actionKeyMatches(candidate.key, action));
+			if (!matches) continue;
+			if (await isExpired(adapter, state, undefined, action, candidate)) {
+				expireCandidate(state, candidate);
+				continue;
+			}
+			return candidate;
+		}
+		return undefined;
+	};
+
 	const runPrediction = async (
 		input: StartInput,
 		settings: SpeculativeActionSettings,
@@ -379,6 +408,8 @@ export function makeSpeculativeActionRuntime<
 		state: TurnState<SessionID, Output, StateData>,
 	): Promise<void> => {
 		let accepted = 0;
+		let started = 0;
+		const candidateLimit = clampMaxCandidates(settings.maxCandidates);
 		const predictionStarted = Date.now();
 		try {
 			const prediction = await withTimeout(
@@ -393,7 +424,7 @@ export function makeSpeculativeActionRuntime<
 			tokenTotals.set(input.sessionID, totalDraftTokens);
 
 			for (const [index, draft] of prediction.candidates.entries()) {
-				if (state.finished || accepted >= clampMaxCandidates(settings.maxCandidates)) break;
+				if (state.finished || started >= candidateLimit) break;
 				const concrete = asConcreteInput(draft.input);
 				const draftCandidate = draftCandidateDiagnostic(draft);
 				if (!concrete) {
@@ -427,8 +458,10 @@ export function makeSpeculativeActionRuntime<
 						callID,
 						index,
 					}) ?? actionLifetime(action.tool);
-				if (state.candidates.has(action.key)) continue;
-				if (lifetime === "resource" && resourceCandidates.has(resourceKey(input.sessionID, action))) continue;
+				if (await findReusableDraftCandidate(state, action)) {
+					accepted++;
+					continue;
+				}
 				const execution = draft.execution ?? inferredExecution(draft.tool);
 				if (execution !== action.execution) {
 					await publishMiss(state, "execution_mismatch", action, undefined, { draftCandidate, predictedAction });
@@ -491,6 +524,7 @@ export function makeSpeculativeActionRuntime<
 				state.candidates.set(action.key, candidate);
 				if (lifetime === "resource") resourceCandidates.set(resourceKey(input.sessionID, action), candidate);
 				accepted++;
+				started++;
 				await emit({
 					type: "started",
 					sessionID: state.sessionID,
@@ -842,7 +876,7 @@ async function isExpired<
 >(
 	adapter: SpeculativeActionRuntimeAdapter<SessionID, Output, StartInput, ConsumeInput, StateData>,
 	state: TurnState<SessionID, Output, StateData>,
-	consumeInput: ConsumeInput,
+	consumeInput: ConsumeInput | undefined,
 	action: ActionKey,
 	candidate: RuntimeCandidate<Output>,
 ): Promise<boolean> {
@@ -850,7 +884,7 @@ async function isExpired<
 	try {
 		return await adapter.isResourceExpired({
 			stateData: state.data,
-			consumeInput,
+			...(consumeInput === undefined ? {} : { consumeInput }),
 			action,
 			candidate,
 		});

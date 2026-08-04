@@ -4,6 +4,7 @@ import { buildPiActionKey } from "../src/common.ts";
 import type {
 	SpeculativeActionEvent,
 	SpeculativeActionSettings,
+	SpeculativeCandidate,
 	SpeculativeDraftCandidate,
 	SpeculativePrediction,
 } from "../src/runtime.ts";
@@ -25,7 +26,10 @@ interface HarnessOptions {
 	readonly execute?: (candidate: SpeculativeDraftCandidate, signal: AbortSignal) => Promise<string> | string;
 	readonly lifetime?: CandidateLifetime;
 	readonly captureResourceVersion?: () => Promise<unknown> | unknown;
-	readonly isResourceExpired?: () => Promise<boolean> | boolean;
+	readonly isResourceExpired?: (input: {
+		readonly consumeInput?: ConsumeInput;
+		readonly candidate: SpeculativeCandidate;
+	}) => Promise<boolean> | boolean;
 	readonly projectOutput?: (output: string) => Promise<string | undefined> | string | undefined;
 }
 
@@ -66,7 +70,9 @@ function createHarness(options: HarnessOptions) {
 		},
 		...(options.lifetime ? { candidateLifetime: () => options.lifetime as CandidateLifetime } : {}),
 		...(options.captureResourceVersion ? { captureResourceVersion: () => options.captureResourceVersion?.() } : {}),
-		...(options.isResourceExpired ? { isResourceExpired: () => options.isResourceExpired?.() ?? false } : {}),
+		...(options.isResourceExpired
+			? { isResourceExpired: (input) => options.isResourceExpired?.(input) ?? false }
+			: {}),
 		...(options.projectOutput ? { projectOutput: ({ output }) => options.projectOutput?.(output) } : {}),
 		onEvent: (event) => {
 			events.push(event);
@@ -156,6 +162,122 @@ describe("speculative action runtime", () => {
 		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-3" });
 		expect(await harness.runtime.consume(consume("turn-3"))).toBeUndefined();
 		expect(harness.events.some((event) => event.type === "miss" && event.reason === "resource_expired")).toBe(true);
+	});
+
+	it("lets the drafter reuse an exact resource candidate without reporting no candidate", async () => {
+		const harness = createHarness({ predict: () => prediction(readCandidate()) });
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-1" });
+		await waitFor(() => harness.executions() === 1);
+		await harness.runtime.finishTurn(consume("turn-1", {}));
+
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-2" });
+		await waitFor(() => harness.runtime.inspect().pendingPredictions === 0);
+
+		expect(await harness.runtime.consume(consume("turn-2"))).toBe("prefetched");
+		expect(harness.executions()).toBe(1);
+		expect(harness.events.filter((event) => event.type === "started")).toHaveLength(1);
+		expect(harness.events.some((event) => event.type === "miss" && event.reason === "no_candidate")).toBe(false);
+	});
+
+	it("deduplicates exact draft candidates after one cache miss", async () => {
+		const harness = createHarness({ predict: () => prediction(readCandidate(), readCandidate()) });
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-1" });
+		await waitFor(() => harness.runtime.inspect().pendingPredictions === 0);
+
+		expect(await harness.runtime.consume(consume("turn-1"))).toBe("prefetched");
+		expect(harness.executions()).toBe(1);
+		expect(harness.events.filter((event) => event.type === "started")).toHaveLength(1);
+	});
+
+	it("reuses a containing read candidate from the same draft batch", async () => {
+		const harness = createHarness({
+			predict: () => prediction(readCandidate("README.md", 1, 100), readCandidate("README.md", 1, 60)),
+			execute: () => "lines-1-100",
+			projectOutput: (output) => `projected:${output}`,
+		});
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-1" });
+		await waitFor(() => harness.runtime.inspect().pendingPredictions === 0);
+
+		expect(await harness.runtime.consume(consume("turn-1", { path: "README.md", offset: 1, limit: 60 }))).toBe(
+			"projected:lines-1-100",
+		);
+		expect(harness.executions()).toBe(1);
+		expect(harness.events.filter((event) => event.type === "started")).toHaveLength(1);
+	});
+
+	it("keeps containing reads separate when no safe projector is installed", async () => {
+		const harness = createHarness({
+			predict: () => prediction(readCandidate("README.md", 1, 100), readCandidate("README.md", 1, 60)),
+		});
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-1" });
+		await waitFor(() => harness.runtime.inspect().pendingPredictions === 0);
+
+		expect(await harness.runtime.consume(consume("turn-1", { path: "README.md", offset: 1, limit: 60 }))).toBe(
+			"prefetched",
+		);
+		expect(harness.executions()).toBe(2);
+		expect(harness.events.filter((event) => event.type === "started")).toHaveLength(2);
+	});
+
+	it("shares an in-flight resource job between the next drafter and actor", async () => {
+		const execution = deferred<string>();
+		const harness = createHarness({
+			predict: () => prediction(readCandidate()),
+			execute: () => execution.promise,
+		});
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-1" });
+		await waitFor(() => harness.executions() === 1);
+		await harness.runtime.finishTurn(consume("turn-1", {}));
+
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-2" });
+		const result = harness.runtime.consume(consume("turn-2"));
+		await waitFor(() => harness.runtime.inspect().pendingPredictions === 0);
+		execution.resolve("shared-prefetch");
+
+		expect(await result).toBe("shared-prefetch");
+		expect(harness.executions()).toBe(1);
+		expect(harness.events.some((event) => event.type === "miss" && event.reason === "no_candidate")).toBe(false);
+	});
+
+	it("expires a stale drafter cache entry before starting one replacement", async () => {
+		let version = "v1";
+		const harness = createHarness({
+			predict: () => prediction(readCandidate()),
+			execute: () => `prefetched-${version}`,
+			captureResourceVersion: () => version,
+			isResourceExpired: ({ candidate }) => candidate.resourceVersion !== version,
+		});
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-1" });
+		await waitFor(() => harness.executions() === 1);
+		await harness.runtime.finishTurn(consume("turn-1", {}));
+
+		version = "v2";
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-2" });
+		await waitFor(() => harness.executions() === 2);
+
+		expect(await harness.runtime.consume(consume("turn-2"))).toBe("prefetched-v2");
+		expect(harness.executions()).toBe(2);
+		expect(harness.events.filter((event) => event.type === "started")).toHaveLength(2);
+	});
+
+	it("does not charge reused candidates against the execution limit", async () => {
+		const harness = createHarness({
+			settings: { ...enabledSettings, maxCandidates: 1 },
+			predict: (input) =>
+				input.turnID === "turn-1"
+					? prediction(readCandidate("README.md"))
+					: prediction(readCandidate("README.md"), readCandidate("CHANGELOG.md")),
+		});
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-1" });
+		await waitFor(() => harness.executions() === 1);
+		await harness.runtime.finishTurn(consume("turn-1", {}));
+
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-2" });
+		await waitFor(() => harness.runtime.inspect().pendingPredictions === 0);
+
+		expect(await harness.runtime.consume(consume("turn-2", { path: "CHANGELOG.md" }))).toBe("prefetched");
+		expect(harness.executions()).toBe(2);
+		expect(harness.events.filter((event) => event.type === "started")).toHaveLength(2);
 	});
 
 	it("projects a containing speculative read and rejects uncovered reads", async () => {

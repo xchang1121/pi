@@ -36,4 +36,10 @@ await installed.uninstall();
 - Misses, hits, starts, cancellation, timing, and draft-token usage are observable as typed events.
 - Prediction failures, invalid inputs, resource changes, and candidate failures fall back to normal tool execution.
 
+## M2 behavior
+
+- Drafter candidates consult the same session cache used for actor adoption before starting work.
+- Exact actions and containing `read` ranges share ready or in-flight jobs; stale resource entries are discarded first.
+- Reused candidates do not consume the per-prediction execution limit, so later cache misses can still start work.
+
 If the drafter uses a different provider from the actor, provide `getDraftOptions` so the drafter receives the correct credentials. The generic Pi stream interface does not promise a provider-independent “required tool choice”; the system prompt enforces tool-call-only output and non-tool output is treated as no candidate.
