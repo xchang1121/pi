@@ -1,0 +1,52 @@
+{
+	"name": "@earendil-works/pi-speculative-action",
+	"version": "0.84.1",
+	"description": "Speculative tool pre-execution runtime and Pi Agent integration",
+	"type": "module",
+	"main": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./dist/index.js"
+		},
+		"./package.json": "./package.json"
+	},
+	"files": [
+		"dist",
+		"README.md",
+		"CHANGELOG.md"
+	],
+	"scripts": {
+		"clean": "shx rm -rf dist",
+		"build": "tsgo -p tsconfig.build.json",
+		"test": "vitest --run",
+		"prepublishOnly": "npm run clean && npm run build"
+	},
+	"dependencies": {
+		"@earendil-works/pi-agent-core": "^0.84.1",
+		"@earendil-works/pi-ai": "^0.84.1"
+	},
+	"devDependencies": {
+		"@types/node": "24.12.4",
+		"shx": "0.4.0",
+		"typescript": "5.9.3",
+		"vitest": "4.1.9"
+	},
+	"keywords": [
+		"ai",
+		"agent",
+		"speculative-execution",
+		"tool-use"
+	],
+	"author": "Earendil Works",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/earendil-works/pi.git",
+		"directory": "packages/speculative-action"
+	},
+	"engines": {
+		"node": ">=22.19.0"
+	}
+}
