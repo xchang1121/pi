@@ -7,6 +7,7 @@
 - Added a single-step speculative tool runtime with Pi Agent integration, conservative action keys, resource validation, lifecycle events, and running or ready result reuse.
 - Added canonical sandbox keys, an explicit sandbox host boundary, temporary `write`/`edit` execution, verified adoption, and opt-in bash process execution.
 - Added private Git worktree snapshots, multi-file bash change capture, transactional adoption with rollback, and normalized cache/actual telemetry.
+- Added a source-built Rust sandbox backend for Linux, macOS, and Windows, plus a versioned TypeScript broker, hash-verified packaged asset discovery, and fail-closed native process execution.
 
 ### Changed
 

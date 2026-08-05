@@ -146,7 +146,10 @@ describe("M4 workspace sandbox", () => {
 			await writeFile(path.join(root, "input.txt"), "hello", "utf8");
 			await writeFile(path.join(root, "delete.txt"), "remove me", "utf8");
 			const sandbox = createWorkspaceSandbox({
-				processRunner: async ({ command, cwd, signal }) => {
+				processRunner: async ({ command, cwd, processRoot, sourceRoot, signal }) => {
+					expect(path.dirname(cwd)).toBe(processRoot);
+					expect(sourceRoot).toBe(root);
+					expect(processRoot).not.toBe(root);
 					await runNodeScript(command, cwd, signal);
 					return {
 						result: { content: [{ type: "text", text: `sandbox cwd: ${cwd}` }], details: undefined },

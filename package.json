@@ -14,12 +14,16 @@
 	},
 	"files": [
 		"dist",
+		"native/sandbox",
 		"README.md",
 		"CHANGELOG.md"
 	],
 	"scripts": {
 		"clean": "shx rm -rf dist",
 		"build": "tsgo -p tsconfig.build.json",
+		"build:native": "node ./native/sandbox/build.mjs",
+		"generate:native-manifest": "node ./native/sandbox/generate-manifest.mjs",
+		"smoke:native": "node ./native/sandbox/smoke.mjs",
 		"test": "vitest --run",
 		"prepublishOnly": "npm run clean && npm run build"
 	},

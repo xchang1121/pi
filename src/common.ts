@@ -36,7 +36,7 @@ export const DEFAULTS = {
 	predictionTimeoutMs: 300_000,
 	tools: {
 		resourceCached: ["read", "grep", "find"] as readonly string[],
-		sandbox: ["write", "edit"] as readonly string[],
+		sandbox: ["bash", "write", "edit"] as readonly string[],
 	},
 };
 

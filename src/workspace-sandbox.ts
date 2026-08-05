@@ -42,6 +42,8 @@ export interface SpeculativeAgentSandbox {
 export interface SandboxProcessRunnerInput {
 	readonly command: string;
 	readonly cwd: string;
+	/** Private parent mounted by native isolation; cwd must remain inside it. */
+	readonly processRoot: string;
 	readonly sourceRoot: string;
 	readonly timeout?: number;
 	readonly signal: AbortSignal;
@@ -61,10 +63,10 @@ export interface WorkspaceSandboxOptions {
 export interface SandboxWorkspaceContext {
 	readonly sourceRoot: string;
 	readonly sandboxRoot: string;
+	readonly processRoot: string;
 }
 
 interface PrivateGitWorkspace extends SandboxWorkspaceContext {
-	readonly parent: string;
 	readonly repository: string;
 	readonly gitBinary: string;
 }
@@ -186,6 +188,7 @@ async function executeBash(
 		const output = await runner({
 			command,
 			cwd: workspace.sandboxRoot,
+			processRoot: workspace.processRoot,
 			sourceRoot,
 			...(typeof args.timeout === "number" ? { timeout: args.timeout } : {}),
 			signal: context.signal,
@@ -235,7 +238,7 @@ async function createPrivateGitWorkspace(cwd: string, gitBinary: string): Promis
 			.trim();
 		await git(gitBinary, ["--git-dir", repository, "update-ref", "refs/heads/baseline", commit], parent);
 		await git(gitBinary, ["--git-dir", repository, "worktree", "add", "--detach", sandboxRoot, commit], parent);
-		return { sourceRoot, sandboxRoot, parent, repository, gitBinary };
+		return { sourceRoot, sandboxRoot, processRoot: parent, repository, gitBinary };
 	} catch (error) {
 		await rm(parent, { recursive: true, force: true });
 		throw error;
@@ -260,12 +263,12 @@ async function cleanupPrivateGitWorkspace(workspace: PrivateGitWorkspace): Promi
 		await git(
 			workspace.gitBinary,
 			["--git-dir", workspace.repository, "worktree", "remove", "--force", workspace.sandboxRoot],
-			workspace.parent,
+			workspace.processRoot,
 		);
 	} catch {
 		// The private parent removal below is the final cleanup boundary.
 	}
-	await rm(workspace.parent, { recursive: true, force: true });
+	await rm(workspace.processRoot, { recursive: true, force: true });
 }
 
 async function collectSandboxChanges(workspace: PrivateGitWorkspace): Promise<readonly SandboxFileChange[]> {

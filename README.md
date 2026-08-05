@@ -7,6 +7,7 @@ The feature is disabled by default. Enabling it requires a non-interactive `pref
 ```ts
 import { Agent } from "@earendil-works/pi-agent-core";
 import {
+	createNativeSandboxProcessRunner,
 	createWorkspaceSandbox,
 	installSpeculativeAction,
 } from "@earendil-works/pi-speculative-action";
@@ -18,10 +19,10 @@ const installed = installSpeculativeAction(agent, {
 		maxCandidates: 4,
 		resourceCacheMaxEntries: 256,
 		predictionTimeoutMs: 1_000,
-		tools: { resourceCached: ["read", "grep", "find"], sandbox: ["write", "edit"] },
+		tools: { resourceCached: ["read", "grep", "find"], sandbox: ["bash", "write", "edit"] },
 	}),
 	preflight: () => true,
-	sandbox: createWorkspaceSandbox(),
+	sandbox: createWorkspaceSandbox({ processRunner: createNativeSandboxProcessRunner() }),
 	onEvent: (event) => console.debug(event),
 });
 
@@ -64,6 +65,12 @@ await installed.uninstall();
 - Workspace escapes and symlink paths fail closed, and private repositories and worktrees are removed after success, failure, or cancellation.
 - Every lifecycle event carries a cache snapshot. Candidate completion emits a cache refresh even without an actor hit, while real fallback execution emits an `actual` event with its duration.
 
-Native process isolation remains a later migration milestone. Until then, `bash` requires an explicit process provider that enforces the host security boundary; the Git worktree alone is filesystem staging, not process isolation.
+## M5 behavior
+
+- `bash` can use the package's versioned native broker through `createNativeSandboxProcessRunner()`.
+- Linux uses namespaces, a read-only host mount, seccomp, dropped capabilities, and process-tree supervision; macOS uses Seatbelt; Windows uses a zero-capability AppContainer, restricted token, private desktop, ACL cleanup, and Jobs.
+- Packaged assets are selected by platform, architecture, and Linux libc, verified against `native/sandbox/prebuilds/manifest.json`, and materialized as a private executable.
+- Set `PI_SPECULATIVE_SANDBOX_NATIVE_BIN` only for an explicitly trusted development build. Missing, corrupt, incompatible, aborted, or failed brokers reject speculative execution so the actor follows Pi's normal tool path; there is no implicit direct-execution fallback.
+- Build a host asset from the included Rust source with `npm run build:native --workspace @earendil-works/pi-speculative-action`.
 
 If the drafter uses a different provider from the actor, provide `getDraftOptions` so the drafter receives the correct credentials. The generic Pi stream interface does not promise a provider-independent “required tool choice”; the system prompt enforces tool-call-only output and non-tool output is treated as no candidate.

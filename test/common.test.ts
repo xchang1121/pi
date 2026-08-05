@@ -5,6 +5,7 @@ import {
 	buildDrafterToolCallPrompt,
 	buildPiActionKey,
 	clampMaxCandidates,
+	DEFAULTS,
 	inferredExecution,
 } from "../src/common.ts";
 import { candidateToolNames } from "../src/runtime.ts";
@@ -85,6 +86,7 @@ describe("speculative action common", () => {
 	});
 
 	it("selects configured readonly and sandbox candidates independently", () => {
+		expect(DEFAULTS.tools.sandbox).toEqual(["bash", "write", "edit"]);
 		expect(
 			candidateToolNames({
 				enabled: true,

@@ -1,0 +1,11 @@
+Pi native speculative-action sandbox
+
+This product includes and modifies the OpenCode native speculative-action
+sandbox, Copyright (c) 2025 opencode, distributed under the MIT License.
+
+That work includes and modifies portions of Anthropic's experimental
+sandbox-runtime project, Copyright 2025 Anthropic, licensed under the Apache
+License, Version 2.0.
+
+The Pi protocol broker, package asset manifest, Node build integration, and Pi
+workspace integration are Pi modifications.
