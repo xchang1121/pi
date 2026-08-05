@@ -5,6 +5,7 @@ export interface SpeculativeActionSettings {
 	readonly enabled: boolean;
 	readonly mode: "predict_action_single_step";
 	readonly maxCandidates: number;
+	readonly resourceCacheMaxEntries: number;
 	readonly predictionTimeoutMs: number;
 	readonly tools: {
 		readonly liveReadonly: readonly string[];
@@ -198,6 +199,13 @@ export interface SpeculativeActionRuntimeAdapter<
 		readonly candidate: SpeculativeCandidate;
 		readonly output: Output;
 	}) => MaybePromise<Output | undefined>;
+	readonly adoptCandidate?: (input: {
+		readonly stateData: StateData;
+		readonly consumeInput: ConsumeInput;
+		readonly action: ActionKey;
+		readonly candidate: SpeculativeCandidate;
+		readonly output: Output;
+	}) => MaybePromise<Output | undefined>;
 	readonly onEvent?: (event: SpeculativeActionEvent<SessionID>) => MaybePromise<void>;
 }
 
@@ -269,6 +277,26 @@ export function makeSpeculativeActionRuntime<
 	const turnKey = (input: TurnInput<SessionID>): string => `${String(input.sessionID)}:${input.turnID}`;
 	const resourceKey = (sessionID: SessionID, key: ActionKey): string => `${String(sessionID)}:${key.key}`;
 	const sessionPrefix = (sessionID: SessionID): string => `${String(sessionID)}:`;
+	const resourceCacheLimit = (settings: SpeculativeActionSettings): number =>
+		Number.isFinite(settings.resourceCacheMaxEntries) ? Math.max(1, Math.floor(settings.resourceCacheMaxEntries)) : 1;
+	const touchResourceCandidate = (
+		state: TurnState<SessionID, Output, StateData>,
+		candidate: RuntimeCandidate<Output>,
+	): void => {
+		if (candidate.lifetime !== "resource") return;
+		const key = resourceKey(state.sessionID, candidate.key);
+		if (!resourceCandidates.has(key)) return;
+		resourceCandidates.delete(key);
+		resourceCandidates.set(key, candidate);
+	};
+	const trimResourceCandidates = (settings: SpeculativeActionSettings): void => {
+		const limit = resourceCacheLimit(settings);
+		while (resourceCandidates.size > limit) {
+			const oldest = resourceCandidates.keys().next().value;
+			if (oldest === undefined) return;
+			resourceCandidates.delete(oldest);
+		}
+	};
 
 	const emit = async (event: SpeculativeActionEvent<SessionID>): Promise<void> => {
 		try {
@@ -337,11 +365,17 @@ export function makeSpeculativeActionRuntime<
 		actual: ActionKey,
 	): RuntimeCandidate<Output> | undefined => {
 		const exact = state.candidates.get(actual.key) ?? resourceCandidates.get(resourceKey(state.sessionID, actual));
-		if (exact) return exact;
+		if (exact) {
+			touchResourceCandidate(state, exact);
+			return exact;
+		}
 		if (!adapter.projectOutput) return undefined;
 		for (const candidate of availableCandidates(state).values()) {
 			if (candidate.consumed && candidate.lifetime === "turn") continue;
-			if (actionKeyMatches(candidate.key, actual)) return candidate;
+			if (actionKeyMatches(candidate.key, actual)) {
+				touchResourceCandidate(state, candidate);
+				return candidate;
+			}
 		}
 		return undefined;
 	};
@@ -395,6 +429,7 @@ export function makeSpeculativeActionRuntime<
 				expireCandidate(state, candidate);
 				continue;
 			}
+			touchResourceCandidate(state, candidate);
 			return candidate;
 		}
 		return undefined;
@@ -522,7 +557,12 @@ export function makeSpeculativeActionRuntime<
 					controller: candidateController,
 				};
 				state.candidates.set(action.key, candidate);
-				if (lifetime === "resource") resourceCandidates.set(resourceKey(input.sessionID, action), candidate);
+				if (lifetime === "resource") {
+					const key = resourceKey(input.sessionID, action);
+					resourceCandidates.delete(key);
+					resourceCandidates.set(key, candidate);
+					trimResourceCandidates(settings);
+				}
 				accepted++;
 				started++;
 				await emit({
@@ -695,8 +735,8 @@ export function makeSpeculativeActionRuntime<
 		const execution = await waitForCandidate(candidate.execution.promise, signal);
 		if (!execution || signal?.aborted) return undefined;
 		if (!execution.ok) {
-			await cancelCandidate(state, candidate, "candidate_error", errorDetail(execution.error));
-			await publishMiss(state, "candidate_error", actual, errorDetail(execution.error), {
+			await cancelCandidate(state, candidate, "candidate_execution_failed", errorDetail(execution.error));
+			await publishMiss(state, "candidate_execution_failed", actual, errorDetail(execution.error), {
 				actualAction,
 				draftCandidate: candidate.draftCandidate,
 				predictedAction: candidate.predictedAction,
@@ -716,6 +756,24 @@ export function makeSpeculativeActionRuntime<
 		candidate.consumed = true;
 		if (candidate.lifetime === "turn") state.candidates.delete(candidate.key.key);
 		let output = execution.output;
+		if (adapter.adoptCandidate) {
+			const adopted = await adapter.adoptCandidate({
+				stateData: state.data,
+				consumeInput: input,
+				action: actual,
+				candidate,
+				output,
+			});
+			if (adopted === undefined) {
+				await publishMiss(state, "adoption_failed", actual, undefined, {
+					actualAction,
+					draftCandidate: candidate.draftCandidate,
+					predictedAction: candidate.predictedAction,
+				});
+				return undefined;
+			}
+			output = adopted;
+		}
 		if (candidate.key.key !== actual.key) {
 			const projected = await adapter.projectOutput?.({
 				stateData: state.data,
@@ -823,8 +881,11 @@ export function makeSpeculativeActionRuntime<
 }
 
 export function candidateToolNames(settings: SpeculativeActionSettings): readonly string[] {
-	const allowed = new Set(settings.tools.liveReadonly);
-	return KEYABLE_TOOLS.filter((tool) => allowed.has(tool));
+	const liveReadonly = new Set(settings.tools.liveReadonly);
+	const sandbox = new Set(settings.tools.sandbox);
+	return KEYABLE_TOOLS.filter((tool) =>
+		inferredExecution(tool) === "sandbox" ? sandbox.has(tool) : liveReadonly.has(tool),
+	);
 }
 
 export function diagnosticAction(tool: string, input: unknown, key?: ActionKey): string {

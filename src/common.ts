@@ -24,17 +24,19 @@ export interface DrafterToolDefinition {
 	readonly inputSchema?: unknown;
 }
 
-export const KEYABLE_TOOLS = ["read", "grep", "find"] as const;
-export const IDEMPOTENT_ACTION_TOOLS = KEYABLE_TOOLS;
+export const IDEMPOTENT_ACTION_TOOLS = ["read", "grep", "find"] as const;
+export const SANDBOX_ACTION_TOOLS = ["bash", "write", "edit"] as const;
+export const KEYABLE_TOOLS = [...IDEMPOTENT_ACTION_TOOLS, ...SANDBOX_ACTION_TOOLS] as const;
 
 export const DEFAULTS = {
 	enabled: false,
 	mode: "predict_action_single_step" as const,
 	maxCandidates: 8,
+	resourceCacheMaxEntries: 512,
 	predictionTimeoutMs: 300_000,
 	tools: {
 		liveReadonly: ["read", "grep", "find"] as readonly string[],
-		sandbox: [] as readonly string[],
+		sandbox: ["write", "edit"] as readonly string[],
 	},
 };
 
@@ -139,6 +141,53 @@ export function buildPiActionKey(tool: string, input: unknown, cwd: string): Act
 		});
 	}
 
+	if (tool === "bash") {
+		if (typeof record.command !== "string") return undefined;
+		const normalizedCwd = slash(path.resolve(cwd));
+		return buildActionKey({
+			tool,
+			execution: "sandbox",
+			resources: [normalizedCwd],
+			input: {
+				command: record.command,
+				cwd: normalizedCwd,
+				timeout: finiteOrUndefined(record.timeout),
+			},
+		});
+	}
+
+	if (tool === "write") {
+		if (typeof record.path !== "string" || typeof record.content !== "string") return undefined;
+		const resource = normalizeWorkspacePath(record.path, cwd);
+		if (resource === undefined || resource === ".") return undefined;
+		return buildActionKey({
+			tool,
+			execution: "sandbox",
+			resources: [resource],
+			input: { path: resource, content: record.content },
+		});
+	}
+
+	if (tool === "edit") {
+		if (typeof record.path !== "string" || !Array.isArray(record.edits) || record.edits.length === 0) {
+			return undefined;
+		}
+		const edits: Array<{ readonly oldText: string; readonly newText: string }> = [];
+		for (const value of record.edits) {
+			const edit = asRecord(value);
+			if (!edit || typeof edit.oldText !== "string" || typeof edit.newText !== "string") return undefined;
+			edits.push({ oldText: edit.oldText, newText: edit.newText });
+		}
+		const resource = normalizeWorkspacePath(record.path, cwd);
+		if (resource === undefined || resource === ".") return undefined;
+		return buildActionKey({
+			tool,
+			execution: "sandbox",
+			resources: [resource],
+			input: { path: resource, edits },
+		});
+	}
+
 	return undefined;
 }
 
@@ -175,11 +224,21 @@ export function normalizeRelativeRoot(value: unknown, cwd: string): string | und
 }
 
 export function inferredExecution(tool: string): SpeculativeExecution | undefined {
-	return (KEYABLE_TOOLS as readonly string[]).includes(tool) ? "live_readonly" : undefined;
+	if ((IDEMPOTENT_ACTION_TOOLS as readonly string[]).includes(tool)) return "live_readonly";
+	if ((SANDBOX_ACTION_TOOLS as readonly string[]).includes(tool)) return "sandbox";
+	return undefined;
 }
 
 export function isIdempotentAction(tool: string): boolean {
 	return (IDEMPOTENT_ACTION_TOOLS as readonly string[]).includes(tool);
+}
+
+export function isAdoptableSandboxAction(tool: string): boolean {
+	return tool === "write" || tool === "edit";
+}
+
+export function isObservableSandboxAction(tool: string): boolean {
+	return tool === "bash";
 }
 
 export function actionLifetime(tool: string): CandidateLifetime {

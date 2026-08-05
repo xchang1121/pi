@@ -1,3 +1,6 @@
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Agent } from "@earendil-works/pi-agent-core";
 import type {
@@ -11,8 +14,9 @@ import type {
 import { EventStream } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
-import { installSpeculativeAction } from "../src/agent-integration.ts";
+import { installSpeculativeAction, type SpeculativeAgentSettingsInput } from "../src/agent-integration.ts";
 import type { SpeculativeActionEvent } from "../src/runtime.ts";
+import { createWorkspaceSandbox } from "../src/workspace-sandbox.ts";
 
 const readSchema = Type.Object({
 	path: Type.String(),
@@ -21,6 +25,9 @@ const readSchema = Type.Object({
 });
 
 type ReadTool = AgentTool<typeof readSchema, { source: string }>;
+
+const writeSchema = Type.Object({ path: Type.String(), content: Type.String() });
+type WriteTool = AgentTool<typeof writeSchema, { target: string }>;
 
 class MockAssistantStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
 	constructor() {
@@ -73,7 +80,15 @@ function assistantMessage(
 	};
 }
 
-function createStreamHarness(options: { readonly draftMode?: "tool" | "text" | "error" } = {}) {
+function createStreamHarness(
+	options: {
+		readonly draftMode?: "tool" | "text" | "error";
+		readonly draftOnlyFirst?: boolean;
+		readonly toolName?: string;
+		readonly toolArgs?: Record<string, unknown>;
+		readonly draftToolArgs?: Record<string, unknown>;
+	} = {},
+) {
 	let actorRequests = 0;
 	let draftRequests = 0;
 	const draftModels: string[] = [];
@@ -88,6 +103,11 @@ function createStreamHarness(options: { readonly draftMode?: "tool" | "text" | "
 		}
 		queueMicrotask(() => {
 			if (isDraft) {
+				if (options.draftOnlyFirst && draftRequests > 1) {
+					const message = assistantMessage([{ type: "text", text: "No second candidate" }], "stop");
+					response.push({ type: "done", reason: "stop", message });
+					return;
+				}
 				if (options.draftMode === "text") {
 					const message = assistantMessage([{ type: "text", text: "No tool call" }], "stop");
 					response.push({ type: "done", reason: "stop", message });
@@ -102,7 +122,14 @@ function createStreamHarness(options: { readonly draftMode?: "tool" | "text" | "
 					return;
 				}
 				const message = assistantMessage(
-					[{ type: "toolCall", id: `draft-${draftRequests}`, name: "read", arguments: { path: "README.md" } }],
+					[
+						{
+							type: "toolCall",
+							id: `draft-${draftRequests}`,
+							name: options.toolName ?? "read",
+							arguments: options.draftToolArgs ?? options.toolArgs ?? { path: "README.md" },
+						},
+					],
 					"toolUse",
 				);
 				response.push({ type: "done", reason: "toolUse", message });
@@ -113,7 +140,14 @@ function createStreamHarness(options: { readonly draftMode?: "tool" | "text" | "
 			const message =
 				actorRequests === 1
 					? assistantMessage(
-							[{ type: "toolCall", id: "actor-1", name: "read", arguments: { path: "README.md" } }],
+							[
+								{
+									type: "toolCall",
+									id: "actor-1",
+									name: options.toolName ?? "read",
+									arguments: options.toolArgs ?? { path: "README.md" },
+								},
+							],
 							"toolUse",
 						)
 					: assistantMessage([{ type: "text", text: "done" }], "stop");
@@ -347,6 +381,204 @@ describe("Pi Agent speculative integration", () => {
 		expect(toolExecutions).toBe(1);
 		expect(events.some((event) => event.type === "miss" && event.reason === "drafter_error")).toBe(true);
 		expect(events.some((event) => event.type === "hit")).toBe(false);
+		await installed.uninstall();
+	});
+
+	it("adopts a staged write through the Agent settlement path without executing against the real path first", async () => {
+		const root = await mkdtemp(path.join(os.tmpdir(), "pi-agent-spec-write-"));
+		try {
+			let executions = 0;
+			const tool: WriteTool = {
+				name: "write",
+				label: "Write",
+				description: "Write a file",
+				parameters: writeSchema,
+				async execute(_callID, args) {
+					executions++;
+					await mkdir(path.dirname(path.resolve(root, args.path)), { recursive: true });
+					await writeFile(path.resolve(root, args.path), args.content, "utf8");
+					return {
+						content: [{ type: "text", text: `wrote ${args.path}` }],
+						details: { target: args.path },
+					};
+				},
+			};
+			const args = { path: "created.txt", content: "from speculation\n" };
+			const streams = createStreamHarness({ toolName: "write", toolArgs: args, draftOnlyFirst: true });
+			const agent = new Agent({ initialState: { model: createModel(), tools: [tool] }, streamFn: streams.stream });
+			const installed = installSpeculativeAction(agent, {
+				cwd: root,
+				getSettings: () => ({ enabled: true, tools: { liveReadonly: [], sandbox: ["write"] } }),
+				preflight: () => true,
+				sandbox: createWorkspaceSandbox(),
+			});
+
+			await agent.prompt("Create the file");
+
+			expect(executions).toBe(1);
+			expect(await readFile(path.join(root, "created.txt"), "utf8")).toBe("from speculation\n");
+			const result = agent.state.messages.find((message) => message.role === "toolResult");
+			expect(result?.role === "toolResult" ? result.content : undefined).toEqual([
+				{ type: "text", text: "wrote created.txt" },
+			]);
+			await installed.uninstall();
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("falls back to the real write when sandbox adoption detects a base conflict", async () => {
+		const root = await mkdtemp(path.join(os.tmpdir(), "pi-agent-spec-conflict-"));
+		try {
+			const staged = deferred<void>();
+			let executions = 0;
+			const tool: WriteTool = {
+				name: "write",
+				label: "Write",
+				description: "Write a file",
+				parameters: writeSchema,
+				async execute(_callID, args) {
+					executions++;
+					if (path.isAbsolute(args.path)) await staged.promise;
+					await mkdir(path.dirname(path.resolve(root, args.path)), { recursive: true });
+					await writeFile(path.resolve(root, args.path), args.content, "utf8");
+					return { content: [{ type: "text", text: `wrote ${args.path}` }], details: { target: args.path } };
+				},
+			};
+			const args = { path: "conflict.txt", content: "actor result\n" };
+			const streams = createStreamHarness({ toolName: "write", toolArgs: args, draftOnlyFirst: true });
+			const events: SpeculativeActionEvent<string>[] = [];
+			const agent = new Agent({ initialState: { model: createModel(), tools: [tool] }, streamFn: streams.stream });
+			const installed = installSpeculativeAction(agent, {
+				cwd: root,
+				getSettings: () => ({ enabled: true, tools: { liveReadonly: [], sandbox: ["write"] } }),
+				preflight: () => true,
+				sandbox: createWorkspaceSandbox(),
+				onEvent: (event) => {
+					events.push(event);
+				},
+			});
+
+			const prompt = agent.prompt("Create the file");
+			await waitFor(() => executions === 1);
+			await writeFile(path.join(root, "conflict.txt"), "concurrent change\n", "utf8");
+			staged.resolve();
+			await prompt;
+
+			expect(executions).toBe(2);
+			expect(await readFile(path.join(root, "conflict.txt"), "utf8")).toBe("actor result\n");
+			expect(events.some((event) => event.type === "miss" && event.reason === "adoption_failed")).toBe(true);
+			await installed.uninstall();
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("fails closed for configured sandbox tools when the host capability is absent", async () => {
+		const root = await mkdtemp(path.join(os.tmpdir(), "pi-agent-spec-no-sandbox-"));
+		try {
+			let executions = 0;
+			const events: SpeculativeActionEvent<string>[] = [];
+			const tool: WriteTool = {
+				name: "write",
+				label: "Write",
+				description: "Write a file",
+				parameters: writeSchema,
+				async execute(_callID, args) {
+					executions++;
+					await writeFile(path.join(root, args.path), args.content, "utf8");
+					return { content: [{ type: "text", text: "normal write" }], details: { target: args.path } };
+				},
+			};
+			const args = { path: "normal.txt", content: "normal\n" };
+			const streams = createStreamHarness({ toolName: "write", toolArgs: args, draftOnlyFirst: true });
+			const agent = new Agent({ initialState: { model: createModel(), tools: [tool] }, streamFn: streams.stream });
+			const installed = installSpeculativeAction(agent, {
+				cwd: root,
+				getSettings: () => ({ enabled: true, tools: { liveReadonly: [], sandbox: ["write"] } }),
+				preflight: () => true,
+				onEvent: (event) => {
+					events.push(event);
+				},
+			});
+
+			await agent.prompt("Write normally");
+
+			expect(executions).toBe(1);
+			expect(events.some((event) => event.type === "miss" && event.reason === "sandbox_unavailable")).toBe(true);
+			expect(events.some((event) => event.type === "hit")).toBe(false);
+			await installed.uninstall();
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("fails closed before preflight when the drafter emits schema-invalid arguments", async () => {
+		const executedCallIDs: string[] = [];
+		let preflightCalls = 0;
+		const events: SpeculativeActionEvent<string>[] = [];
+		const tool: ReadTool = {
+			name: "read",
+			label: "Read",
+			description: "Read a file",
+			parameters: readSchema,
+			async execute(callID) {
+				executedCallIDs.push(callID);
+				return { content: [{ type: "text", text: "normal README" }], details: { source: "tool" } };
+			},
+		};
+		const streams = createStreamHarness({
+			toolArgs: { path: "README.md" },
+			draftToolArgs: {},
+			draftOnlyFirst: true,
+		});
+		const agent = new Agent({ initialState: { model: createModel(), tools: [tool] }, streamFn: streams.stream });
+		const installed = installSpeculativeAction(agent, {
+			cwd: "/workspace",
+			getSettings: () => ({ enabled: true, tools: { liveReadonly: ["read"] } }),
+			preflight: () => {
+				preflightCalls++;
+				return true;
+			},
+			onEvent: (event) => {
+				events.push(event);
+			},
+		});
+
+		await agent.prompt("Read README.md");
+
+		expect(executedCallIDs).toEqual(["actor-1"]);
+		expect(preflightCalls).toBe(0);
+		expect(events.some((event) => event.type === "miss" && event.reason === "unsupported_tool_or_input")).toBe(true);
+		expect(events.some((event) => event.type === "hit")).toBe(false);
+		await installed.uninstall();
+	});
+
+	it("treats an invalid enabled setting as disabled", async () => {
+		let executions = 0;
+		const tool: ReadTool = {
+			name: "read",
+			label: "Read",
+			description: "Read a file",
+			parameters: readSchema,
+			async execute() {
+				executions++;
+				return { content: [{ type: "text", text: "normal README" }], details: { source: "tool" } };
+			},
+		};
+		const streams = createStreamHarness();
+		const agent = new Agent({ initialState: { model: createModel(), tools: [tool] }, streamFn: streams.stream });
+		const invalidSettings = { enabled: "true" } as unknown as SpeculativeAgentSettingsInput;
+		const installed = installSpeculativeAction(agent, {
+			cwd: "/workspace",
+			getSettings: () => invalidSettings,
+			preflight: () => true,
+		});
+
+		await agent.prompt("Read README.md");
+
+		expect(executions).toBe(1);
+		expect(streams.draftRequests()).toBe(0);
 		await installed.uninstall();
 	});
 });

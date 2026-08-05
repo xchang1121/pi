@@ -31,12 +31,15 @@ interface HarnessOptions {
 		readonly candidate: SpeculativeCandidate;
 	}) => Promise<boolean> | boolean;
 	readonly projectOutput?: (output: string) => Promise<string | undefined> | string | undefined;
+	readonly adopt?: (output: string) => Promise<string | undefined> | string | undefined;
+	readonly observerThrows?: boolean;
 }
 
 const enabledSettings: SpeculativeActionSettings = {
 	enabled: true,
 	mode: "predict_action_single_step",
 	maxCandidates: 4,
+	resourceCacheMaxEntries: 512,
 	predictionTimeoutMs: 250,
 	tools: { liveReadonly: ["read", "grep", "find"], sandbox: [] },
 };
@@ -74,8 +77,10 @@ function createHarness(options: HarnessOptions) {
 			? { isResourceExpired: (input) => options.isResourceExpired?.(input) ?? false }
 			: {}),
 		...(options.projectOutput ? { projectOutput: ({ output }) => options.projectOutput?.(output) } : {}),
+		...(options.adopt ? { adoptCandidate: ({ output }) => options.adopt?.(output) } : {}),
 		onEvent: (event) => {
 			events.push(event);
+			if (options.observerThrows) throw new Error("observer failed");
 		},
 	});
 	return { runtime, events, executions: () => executions };
@@ -369,7 +374,79 @@ describe("speculative action runtime", () => {
 		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-1" });
 
 		expect(await harness.runtime.consume(consume("turn-1"))).toBeUndefined();
-		expect(harness.events.some((event) => event.type === "miss" && event.reason === "candidate_error")).toBe(true);
+		expect(
+			harness.events.some((event) => event.type === "miss" && event.reason === "candidate_execution_failed"),
+		).toBe(true);
+	});
+
+	it("updates LRU order on access and evicts the oldest resource candidate", async () => {
+		const paths: Record<string, string | undefined> = {
+			"turn-a": "a.txt",
+			"turn-b": "b.txt",
+			"turn-c": "c.txt",
+		};
+		const harness = createHarness({
+			settings: { ...enabledSettings, resourceCacheMaxEntries: 2 },
+			predict: (input) => {
+				const path = paths[input.turnID];
+				return path ? prediction(readCandidate(path)) : prediction();
+			},
+			execute: (candidate) => String((candidate.input as { path: string }).path),
+		});
+		for (const turnID of ["turn-a", "turn-b"]) {
+			await harness.runtime.startTurn({ sessionID: "session", turnID });
+			await waitFor(() => harness.runtime.inspect().pendingPredictions === 0);
+			await harness.runtime.finishTurn({ sessionID: "session", turnID, tool: "read", input: {} });
+		}
+
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-touch" });
+		await waitFor(() => harness.runtime.inspect().pendingPredictions === 0);
+		expect(await harness.runtime.consume(consume("turn-touch", { path: "a.txt" }))).toBe("a.txt");
+		await harness.runtime.finishTurn(consume("turn-touch", {}));
+
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-c" });
+		await waitFor(() => harness.runtime.inspect().pendingPredictions === 0);
+		await harness.runtime.finishTurn({ sessionID: "session", turnID: "turn-c", tool: "read", input: {} });
+		expect(harness.runtime.inspect("session").resourceCandidates).toBe(2);
+
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-check-b" });
+		await waitFor(() => harness.runtime.inspect().pendingPredictions === 0);
+		expect(await harness.runtime.consume(consume("turn-check-b", { path: "b.txt" }))).toBeUndefined();
+		await harness.runtime.finishTurn(consume("turn-check-b", {}));
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-check-a" });
+		await waitFor(() => harness.runtime.inspect().pendingPredictions === 0);
+		expect(await harness.runtime.consume(consume("turn-check-a", { path: "a.txt" }))).toBe("a.txt");
+	});
+
+	it("reports adoption failure and leaves the actor on the normal execution path", async () => {
+		const harness = createHarness({
+			settings: { ...enabledSettings, tools: { liveReadonly: [], sandbox: ["write"] } },
+			predict: () => prediction({ type: "tool_call", tool: "write", input: { path: "out.txt", content: "draft" } }),
+			execute: () => "staged",
+			adopt: () => undefined,
+		});
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-write" });
+
+		expect(
+			await harness.runtime.consume({
+				sessionID: "session",
+				turnID: "turn-write",
+				tool: "write",
+				input: { path: "out.txt", content: "draft" },
+			}),
+		).toBeUndefined();
+		expect(harness.events.some((event) => event.type === "miss" && event.reason === "adoption_failed")).toBe(true);
+	});
+
+	it("isolates observer failures from candidate settlement", async () => {
+		const harness = createHarness({
+			predict: () => prediction(readCandidate()),
+			observerThrows: true,
+		});
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-observer" });
+
+		expect(await harness.runtime.consume(consume("turn-observer"))).toBe("prefetched");
+		expect(harness.events.some((event) => event.type === "hit")).toBe(true);
 	});
 
 	it("publishes complete redacted lifecycle payloads with cumulative draft tokens", async () => {

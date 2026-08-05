@@ -27,10 +27,12 @@ import type {
 	SpeculativeDraftCandidate,
 } from "./runtime.ts";
 import { makeSpeculativeActionRuntime } from "./runtime.ts";
+import type { SpeculativeAgentSandbox, SpeculativeSandboxExecution } from "./workspace-sandbox.ts";
 
 export interface SpeculativeAgentSettingsInput {
 	readonly enabled?: boolean;
 	readonly maxCandidates?: number;
+	readonly resourceCacheMaxEntries?: number;
 	readonly predictionTimeoutMs?: number;
 	readonly tools?: {
 		readonly liveReadonly?: readonly string[];
@@ -79,6 +81,8 @@ export interface InstallSpeculativeActionOptions {
 	readonly projectOutput?: (
 		context: SpeculativeAgentProjectionContext,
 	) => SettleToolCallResult | undefined | Promise<SettleToolCallResult | undefined>;
+	/** Required capability for every tool configured under tools.sandbox. */
+	readonly sandbox?: SpeculativeAgentSandbox;
 	readonly onEvent?: (event: SpeculativeActionEvent<string>) => void | Promise<void>;
 }
 
@@ -127,16 +131,21 @@ export function installSpeculativeAction(
 	const sessionID = agent.sessionId ?? `pi_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
 	const baseStream = agent.streamFunction;
 	const previousSettlement = agent.settleToolCall;
+	const sandboxExecutions = new WeakMap<SettleToolCallResult, SpeculativeSandboxExecution>();
 	const resolveSettings = async (): Promise<SpeculativeActionSettings> => {
 		const settings = (await options.getSettings?.()) ?? {};
 		return {
-			enabled: settings.enabled ?? DEFAULTS.enabled,
+			enabled: typeof settings.enabled === "boolean" ? settings.enabled : DEFAULTS.enabled,
 			mode: "predict_action_single_step",
 			maxCandidates: clampMaxCandidates(settings.maxCandidates ?? DEFAULTS.maxCandidates),
+			resourceCacheMaxEntries: normalizePositiveInteger(
+				settings.resourceCacheMaxEntries,
+				DEFAULTS.resourceCacheMaxEntries,
+			),
 			predictionTimeoutMs: normalizeTimeout(settings.predictionTimeoutMs),
 			tools: {
-				liveReadonly: settings.tools?.liveReadonly ?? DEFAULTS.tools.liveReadonly,
-				sandbox: settings.tools?.sandbox ?? DEFAULTS.tools.sandbox,
+				liveReadonly: normalizeStringArray(settings.tools?.liveReadonly, DEFAULTS.tools.liveReadonly),
+				sandbox: normalizeStringArray(settings.tools?.sandbox, DEFAULTS.tools.sandbox),
 			},
 		};
 	};
@@ -233,6 +242,9 @@ export function installSpeculativeAction(
 			if (!tool || !options.preflight) return { ok: false, reason: "permission_or_policy" };
 			const args = validateCandidateArguments(tool, toolName, concrete, callID);
 			if (args === undefined) return { ok: false, reason: "invalid_tool_call_input" };
+			if (action.execution === "sandbox" && !options.sandbox?.supports(toolName)) {
+				return { ok: false, reason: "sandbox_unavailable" };
+			}
 			const result = await options.preflight({ tool, toolName, args, action, signal });
 			return typeof result === "boolean"
 				? result
@@ -240,11 +252,25 @@ export function installSpeculativeAction(
 					: { ok: false, reason: "permission_or_policy" }
 				: result;
 		},
-		executeCandidate: async ({ data, tool: toolName, concrete, callID, signal }) => {
+		executeCandidate: async ({ data, tool: toolName, concrete, action, callID, signal }) => {
 			const tool = data.tools.get(toolName);
 			if (!tool) return errorSettlement(`Tool ${toolName} not found`);
 			const args = validateCandidateArguments(tool, toolName, concrete, callID);
 			if (args === undefined) return errorSettlement(`Invalid arguments for tool ${toolName}`);
+			if (action.execution === "sandbox") {
+				if (!options.sandbox?.supports(toolName)) throw new Error(`Sandbox unavailable for tool ${toolName}`);
+				const execution = await options.sandbox.execute({
+					cwd: options.cwd,
+					tool,
+					toolName,
+					args,
+					action,
+					callID,
+					signal,
+				});
+				sandboxExecutions.set(execution.output, execution);
+				return execution.output;
+			}
 			try {
 				return { result: await tool.execute(callID, args as never, signal), isError: false };
 			} catch (error) {
@@ -261,6 +287,16 @@ export function installSpeculativeAction(
 					projectOutput: ({ action, candidate, output }) => projection({ action, candidate, output }),
 				}
 			: {}),
+		adoptCandidate: async ({ action, output }) => {
+			if (action.execution !== "sandbox") return output;
+			const execution = sandboxExecutions.get(output);
+			if (!execution || !options.sandbox) return undefined;
+			try {
+				return await options.sandbox.adopt(execution);
+			} catch {
+				return undefined;
+			}
+		},
 		onEvent: options.onEvent,
 	});
 
@@ -358,4 +394,12 @@ function normalizeTimeout(value: unknown): number {
 	return typeof value === "number" && Number.isFinite(value) && value >= 0
 		? Math.floor(value)
 		: DEFAULTS.predictionTimeoutMs;
+}
+
+function normalizePositiveInteger(value: unknown, fallback: number): number {
+	return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
+}
+
+function normalizeStringArray(value: unknown, fallback: readonly string[]): readonly string[] {
+	return Array.isArray(value) && value.every((item): item is string => typeof item === "string") ? value : fallback;
 }
