@@ -15,6 +15,7 @@ import { EventStream } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
 import { installSpeculativeAction, type SpeculativeAgentSettingsInput } from "../src/agent-integration.ts";
+import { PATTERN_AWARE_DEFAULTS, type PatternAwareEventInput, PatternAwareStore } from "../src/pattern-aware.ts";
 import type { SpeculativeActionEvent } from "../src/runtime.ts";
 import { createWorkspaceSandbox } from "../src/workspace-sandbox.ts";
 
@@ -28,6 +29,9 @@ type ReadTool = AgentTool<typeof readSchema, { source: string }>;
 
 const writeSchema = Type.Object({ path: Type.String(), content: Type.String() });
 type WriteTool = AgentTool<typeof writeSchema, { target: string }>;
+
+const findSchema = Type.Object({ pattern: Type.String() });
+type FindTool = AgentTool<typeof findSchema, undefined>;
 
 class MockAssistantStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
 	constructor() {
@@ -87,6 +91,7 @@ function createStreamHarness(
 		readonly toolName?: string;
 		readonly toolArgs?: Record<string, unknown>;
 		readonly draftToolArgs?: Record<string, unknown>;
+		readonly actorDelayMs?: number;
 	} = {},
 ) {
 	let actorRequests = 0;
@@ -101,7 +106,7 @@ function createStreamHarness(
 			draftModels.push(model.id);
 			draftOptions.push(streamOptions);
 		}
-		queueMicrotask(() => {
+		const publish = () => {
 			if (isDraft) {
 				if (options.draftOnlyFirst && draftRequests > 1) {
 					const message = assistantMessage([{ type: "text", text: "No second candidate" }], "stop");
@@ -152,7 +157,9 @@ function createStreamHarness(
 						)
 					: assistantMessage([{ type: "text", text: "done" }], "stop");
 			response.push({ type: "done", reason: message.stopReason === "toolUse" ? "toolUse" : "stop", message });
-		});
+		};
+		if (!isDraft && options.actorDelayMs) setTimeout(publish, options.actorDelayMs);
+		else queueMicrotask(publish);
 		return response;
 	};
 	return {
@@ -180,14 +187,19 @@ describe("Pi Agent speculative integration", () => {
 				return { content: [{ type: "text", text: "prefetched README" }], details: { source: "tool" } };
 			},
 		};
-		const streams = createStreamHarness();
+		const streams = createStreamHarness({ actorDelayMs: 100 });
 		const agent = new Agent({
 			initialState: { model: createModel(), systemPrompt: "Act as a coding agent", tools: [tool] },
 			streamFn: streams.stream,
 		});
 		const installed = installSpeculativeAction(agent, {
 			cwd: "/workspace",
-			getSettings: () => ({ enabled: true, predictionTimeoutMs: 1000, tools: { liveReadonly: ["read"] } }),
+			getSettings: () => ({
+				enabled: true,
+				predictionTimeoutMs: 1000,
+				patternAware: { enabled: false },
+				tools: { liveReadonly: ["read"] },
+			}),
 			preflight: () => true,
 			onEvent: (event) => {
 				events.push(event);
@@ -417,11 +429,20 @@ describe("Pi Agent speculative integration", () => {
 				},
 			};
 			const args = { path: "created.txt", content: "from speculation\n" };
-			const streams = createStreamHarness({ toolName: "write", toolArgs: args, draftOnlyFirst: true });
+			const streams = createStreamHarness({
+				toolName: "write",
+				toolArgs: args,
+				draftOnlyFirst: true,
+				actorDelayMs: 100,
+			});
 			const agent = new Agent({ initialState: { model: createModel(), tools: [tool] }, streamFn: streams.stream });
 			const installed = installSpeculativeAction(agent, {
 				cwd: root,
-				getSettings: () => ({ enabled: true, tools: { resourceCached: [], sandbox: ["write"] } }),
+				getSettings: () => ({
+					enabled: true,
+					patternAware: { enabled: false },
+					tools: { resourceCached: [], sandbox: ["write"] },
+				}),
 				preflight: () => true,
 				sandbox: createWorkspaceSandbox(),
 			});
@@ -459,12 +480,21 @@ describe("Pi Agent speculative integration", () => {
 				},
 			};
 			const args = { path: "conflict.txt", content: "actor result\n" };
-			const streams = createStreamHarness({ toolName: "write", toolArgs: args, draftOnlyFirst: true });
+			const streams = createStreamHarness({
+				toolName: "write",
+				toolArgs: args,
+				draftOnlyFirst: true,
+				actorDelayMs: 100,
+			});
 			const events: SpeculativeActionEvent<string>[] = [];
 			const agent = new Agent({ initialState: { model: createModel(), tools: [tool] }, streamFn: streams.stream });
 			const installed = installSpeculativeAction(agent, {
 				cwd: root,
-				getSettings: () => ({ enabled: true, tools: { resourceCached: [], sandbox: ["write"] } }),
+				getSettings: () => ({
+					enabled: true,
+					patternAware: { enabled: false },
+					tools: { resourceCached: [], sandbox: ["write"] },
+				}),
 				preflight: () => true,
 				sandbox: createWorkspaceSandbox(),
 				onEvent: (event) => {
@@ -594,7 +624,117 @@ describe("Pi Agent speculative integration", () => {
 		expect(streams.draftRequests()).toBe(0);
 		await installed.uninstall();
 	});
+
+	it("records authoritative output paths and schema metadata in the PatternAware store", async () => {
+		class RecordingStore extends PatternAwareStore {
+			readonly observed: PatternAwareEventInput[] = [];
+
+			override observe(input: PatternAwareEventInput) {
+				this.observed.push(input);
+				return super.observe(input);
+			}
+		}
+		const store = new RecordingStore(PATTERN_AWARE_DEFAULTS);
+		const tool: FindTool = {
+			name: "find",
+			label: "Find",
+			description: "Find files",
+			parameters: findSchema,
+			async execute() {
+				return {
+					content: [{ type: "text", text: "src/a.ts\nsrc/b.ts" }],
+					details: undefined,
+				};
+			},
+		};
+		const streams = createStreamHarness({
+			draftMode: "text",
+			toolName: "find",
+			toolArgs: { pattern: "src/*.ts" },
+		});
+		const agent = new Agent({ initialState: { model: createModel(), tools: [tool] }, streamFn: streams.stream });
+		const installed = installSpeculativeAction(agent, {
+			cwd: "/workspace",
+			patternStore: store,
+			getSettings: () => ({ enabled: true, tools: { resourceCached: ["find"] } }),
+			preflight: () => true,
+		});
+
+		await agent.prompt("Find TypeScript files");
+
+		const event = store.observed.find((item) => item.tool === "find");
+		expect(event).toMatchObject({
+			tool: "find",
+			input: { pattern: "src/*.ts" },
+			outcome: "success",
+			outputPaths: ["src/a.ts", "src/b.ts"],
+			learnTarget: true,
+		});
+		expect(event?.schemaHash).toMatch(/^[a-f0-9]{32}$/);
+		await installed.uninstall();
+	});
+
+	it("uses a learned PatternAware candidate without a drafter tool call", async () => {
+		const store = new PatternAwareStore(PATTERN_AWARE_DEFAULTS);
+		trainPattern(store, "one", "README.md");
+		trainPattern(store, "two", "README.md");
+		let executions = 0;
+		const events: SpeculativeActionEvent<string>[] = [];
+		const tool: ReadTool = {
+			name: "read",
+			label: "Read",
+			description: "Read a file",
+			parameters: readSchema,
+			async execute() {
+				executions++;
+				return { content: [{ type: "text", text: "README" }], details: { source: "tool" } };
+			},
+		};
+		const streams = createStreamHarness({ draftMode: "text", actorDelayMs: 100 });
+		const agent = new Agent({ initialState: { model: createModel(), tools: [tool] }, streamFn: streams.stream });
+		const installed = installSpeculativeAction(agent, {
+			cwd: "/workspace",
+			patternStore: store,
+			getSettings: () => ({ enabled: true, tools: { resourceCached: ["read"] } }),
+			preflight: () => true,
+			onEvent: (event) => {
+				events.push(event);
+			},
+		});
+		store.observe(patternInput(installed.sessionID, "grep", { pattern: "README" }, ["README.md"]));
+
+		await agent.prompt("Read README.md");
+
+		expect(executions).toBe(1);
+		expect(streams.draftRequests()).toBeGreaterThan(0);
+		expect(events).toContainEqual(expect.objectContaining({ type: "hit", source: "pattern_aware" }));
+		await installed.uninstall();
+	});
 });
+
+function trainPattern(store: PatternAwareStore, sessionID: string, path: string): void {
+	store.observe(patternInput(sessionID, "grep", { pattern: "README" }, [path]));
+	store.observeTurn({ sessionID, turnID: `${sessionID}:turn`, phase: "start", model: "openai/mock" });
+	store.observe(patternInput(sessionID, "read", { path }));
+}
+
+function patternInput(
+	sessionID: string,
+	tool: string,
+	input: Record<string, unknown>,
+	outputPaths?: readonly string[],
+): PatternAwareEventInput {
+	return {
+		sessionID,
+		turnID: `${sessionID}:turn`,
+		tool,
+		input,
+		actionKey: JSON.stringify({ tool, input }),
+		outcome: "success",
+		durationMs: 10,
+		...(outputPaths ? { outputPaths } : {}),
+	};
+}
 
 function deferred<T>(): { readonly promise: Promise<T>; readonly resolve: (value: T) => void } {
 	let resolvePromise: (value: T) => void = () => {};

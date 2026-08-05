@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { CandidateLifetime } from "../src/common.ts";
 import { buildPiActionKey } from "../src/common.ts";
 import type {
+	CandidatePreflight,
 	SpeculativeActionEvent,
 	SpeculativeActionSettings,
 	SpeculativeCandidate,
@@ -24,6 +25,10 @@ interface HarnessOptions {
 	readonly settings?: SpeculativeActionSettings;
 	readonly predict: (input: StartInput, signal: AbortSignal) => Promise<SpeculativePrediction> | SpeculativePrediction;
 	readonly execute?: (candidate: SpeculativeDraftCandidate, signal: AbortSignal) => Promise<string> | string;
+	readonly preflight?: (
+		candidate: SpeculativeDraftCandidate,
+		signal: AbortSignal,
+	) => Promise<CandidatePreflight> | CandidatePreflight;
 	readonly lifetime?: CandidateLifetime;
 	readonly captureResourceVersion?: () => Promise<unknown> | unknown;
 	readonly isResourceExpired?: (input: {
@@ -66,7 +71,7 @@ function createHarness(options: HarnessOptions) {
 		predict: (input, _settings, _definitions, _candidateNames, signal) => options.predict(input, signal),
 		actionKey: (tool, input) => buildPiActionKey(tool, input, "/workspace"),
 		actual: (input) => ({ tool: input.tool, input: input.input }),
-		preflightCandidate: () => ({ ok: true }),
+		preflightCandidate: ({ candidate, signal }) => options.preflight?.(candidate, signal) ?? { ok: true },
 		executeCandidate: ({ candidate, signal }) => {
 			executions++;
 			return options.execute?.(candidate, signal) ?? "prefetched";
@@ -106,8 +111,8 @@ describe("speculative action runtime", () => {
 			execute: () => execution.promise,
 		});
 		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-1" });
-		const result = harness.runtime.consume(consume("turn-1"));
 		await waitFor(() => harness.executions() === 1);
+		const result = harness.runtime.consume(consume("turn-1"));
 		execution.resolve("running-prefetch");
 
 		expect(await result).toBe("running-prefetch");
@@ -194,15 +199,40 @@ describe("speculative action runtime", () => {
 		});
 	});
 
-	it("waits for a drafter candidate that arrives after the actor call", async () => {
+	it("never blocks the actor or starts a late drafter candidate after the actor call", async () => {
 		const draft = deferred<SpeculativePrediction>();
 		const harness = createHarness({ predict: () => draft.promise });
 		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-1" });
-		const result = harness.runtime.consume(consume("turn-1"));
-		draft.resolve(prediction(readCandidate()));
+		const startedAt = Date.now();
+		const result = await harness.runtime.consume(consume("turn-1"));
 
-		expect(await result).toBe("prefetched");
-		expect(harness.events.some((event) => event.type === "hit")).toBe(true);
+		expect(result).toBeUndefined();
+		expect(Date.now() - startedAt).toBeLessThan(50);
+		draft.resolve(prediction(readCandidate()));
+		await waitFor(() => harness.runtime.inspect().pendingPredictions === 0);
+		expect(harness.executions()).toBe(0);
+		expect(harness.events.some((event) => event.type === "hit")).toBe(false);
+	});
+
+	it("does not start a drafter candidate after the actor wins during asynchronous preflight", async () => {
+		const preflight = deferred<CandidatePreflight>();
+		let preflightStarted = false;
+		const harness = createHarness({
+			predict: () => prediction(readCandidate()),
+			preflight: () => {
+				preflightStarted = true;
+				return preflight.promise;
+			},
+		});
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-preflight-race" });
+		await waitFor(() => preflightStarted);
+
+		expect(await harness.runtime.consume(consume("turn-preflight-race"))).toBeUndefined();
+		preflight.resolve({ ok: true });
+		await waitFor(() => harness.runtime.inspect().pendingPredictions === 0);
+
+		expect(harness.executions()).toBe(0);
+		expect(harness.events.some((event) => event.type === "started")).toBe(false);
 	});
 
 	it("times out and falls back when the drafter never produces a candidate", async () => {
@@ -214,6 +244,9 @@ describe("speculative action runtime", () => {
 		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-1" });
 
 		expect(await harness.runtime.consume(consume("turn-1"))).toBeUndefined();
+		await waitFor(() =>
+			harness.events.some((event) => event.type === "miss" && event.reason === "prediction_timeout"),
+		);
 		expect(harness.events.some((event) => event.type === "miss" && event.reason === "prediction_timeout")).toBe(true);
 		expect(harness.executions()).toBe(0);
 	});
@@ -362,6 +395,7 @@ describe("speculative action runtime", () => {
 			projectOutput: (output) => `projected:${output}`,
 		});
 		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-1" });
+		await waitFor(() => harness.runtime.inspect().pendingPredictions === 0);
 		expect(await harness.runtime.consume(consume("turn-1", { path: "README.md", offset: 20, limit: 10 }))).toBe(
 			"projected:lines-1-100",
 		);
@@ -383,6 +417,7 @@ describe("speculative action runtime", () => {
 			predict: () => prediction({ type: "tool_call", tool: "task", input: { prompt: "inspect" } }, readCandidate()),
 		});
 		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-1" });
+		await waitFor(() => harness.runtime.inspect().pendingPredictions === 0);
 
 		expect(await harness.runtime.consume(consume("turn-1"))).toBe("prefetched");
 		expect(harness.executions()).toBe(1);
@@ -442,6 +477,7 @@ describe("speculative action runtime", () => {
 			},
 		});
 		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-1" });
+		await waitFor(() => harness.runtime.inspect().pendingPredictions === 0);
 
 		expect(await harness.runtime.consume(consume("turn-1"))).toBeUndefined();
 		expect(
@@ -496,6 +532,7 @@ describe("speculative action runtime", () => {
 			adopt: () => undefined,
 		});
 		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-write" });
+		await waitFor(() => harness.runtime.inspect().pendingPredictions === 0);
 
 		expect(
 			await harness.runtime.consume({
@@ -514,6 +551,7 @@ describe("speculative action runtime", () => {
 			observerThrows: true,
 		});
 		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-observer" });
+		await waitFor(() => harness.runtime.inspect().pendingPredictions === 0);
 
 		expect(await harness.runtime.consume(consume("turn-observer"))).toBe("prefetched");
 		expect(harness.events.some((event) => event.type === "hit")).toBe(true);

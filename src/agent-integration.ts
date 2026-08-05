@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type {
 	ActualToolCallContext,
 	Agent,
@@ -16,8 +17,16 @@ import {
 	buildPiActionKey,
 	clampMaxCandidates,
 	DEFAULTS,
+	inferredExecution,
 	usageTokenCount,
 } from "./common.ts";
+import {
+	openPatternAwareStore,
+	PATTERN_AWARE_DEFAULTS,
+	type PatternAwareSettings,
+	type PatternAwareStore,
+	patternAwareSettings,
+} from "./pattern-aware.ts";
 import { fingerprintActionResources } from "./resource-version.ts";
 import type {
 	CandidatePreflight,
@@ -27,7 +36,7 @@ import type {
 	SpeculativeCandidate,
 	SpeculativeDraftCandidate,
 } from "./runtime.ts";
-import { makeSpeculativeActionRuntime } from "./runtime.ts";
+import { candidateToolNames, makeSpeculativeActionRuntime } from "./runtime.ts";
 import type { SpeculativeAgentSandbox, SpeculativeSandboxExecution } from "./workspace-sandbox.ts";
 
 export interface SpeculativeAgentSettingsInput {
@@ -35,6 +44,7 @@ export interface SpeculativeAgentSettingsInput {
 	readonly maxCandidates?: number;
 	readonly resourceCacheMaxEntries?: number;
 	readonly predictionTimeoutMs?: number;
+	readonly patternAware?: Partial<PatternAwareSettings>;
 	readonly tools?: {
 		readonly resourceCached?: readonly string[];
 		/** @deprecated Use resourceCached. */
@@ -86,6 +96,10 @@ export interface InstallSpeculativeActionOptions {
 	) => SettleToolCallResult | undefined | Promise<SettleToolCallResult | undefined>;
 	/** Required capability for every tool configured under tools.sandbox. */
 	readonly sandbox?: SpeculativeAgentSandbox;
+	/** Optional persistence root for workspace-hashed PatternAware state. */
+	readonly patternStateDirectory?: string;
+	/** Optional injected store, primarily for embedding and deterministic tests. */
+	readonly patternStore?: PatternAwareStore | Promise<PatternAwareStore>;
 	readonly onEvent?: (event: SpeculativeActionEvent<string>) => void | Promise<void>;
 }
 
@@ -103,6 +117,7 @@ interface AgentConsumeInput {
 	readonly turnID: string;
 	readonly tool: string;
 	readonly args: unknown;
+	readonly terminal?: boolean;
 }
 
 interface AgentStateData {
@@ -136,6 +151,7 @@ export function installSpeculativeAction(
 	const previousSettlement = agent.settleToolCall;
 	const previousActual = agent.actualToolCall;
 	const sandboxExecutions = new WeakMap<SettleToolCallResult, SpeculativeSandboxExecution>();
+	let openedPatternStore: Promise<PatternAwareStore> | undefined;
 	const resolveSettings = async (): Promise<SpeculativeActionSettings> => {
 		const settings = (await options.getSettings?.()) ?? {};
 		return {
@@ -147,6 +163,7 @@ export function installSpeculativeAction(
 				DEFAULTS.resourceCacheMaxEntries,
 			),
 			predictionTimeoutMs: normalizeTimeout(settings.predictionTimeoutMs),
+			patternAware: patternAwareSettings(settings.patternAware ?? PATTERN_AWARE_DEFAULTS),
 			tools: {
 				resourceCached: normalizeStringArray(
 					settings.tools?.resourceCached ?? settings.tools?.liveReadonly,
@@ -155,6 +172,31 @@ export function installSpeculativeAction(
 				sandbox: normalizeStringArray(settings.tools?.sandbox, DEFAULTS.tools.sandbox),
 			},
 		};
+	};
+	const resolvePatternStore = async (settings: SpeculativeActionSettings): Promise<PatternAwareStore> => {
+		if (options.patternStore) {
+			const store = await options.patternStore;
+			store.configure(settings.patternAware ?? PATTERN_AWARE_DEFAULTS);
+			return store;
+		}
+		openedPatternStore ??= openPatternAwareStore(
+			options.cwd,
+			settings.patternAware ?? PATTERN_AWARE_DEFAULTS,
+			options.patternStateDirectory,
+		);
+		const store = await openedPatternStore;
+		store.configure(settings.patternAware ?? PATTERN_AWARE_DEFAULTS);
+		return store;
+	};
+	const finishPatternSession = async (): Promise<void> => {
+		const store = options.patternStore
+			? await options.patternStore
+			: openedPatternStore
+				? await openedPatternStore
+				: undefined;
+		if (!store) return;
+		store.finishSession(sessionID);
+		await store.flush();
 	};
 
 	const projection = options.projectOutput
@@ -236,6 +278,16 @@ export function installSpeculativeAction(
 				draftTokens: usageTokenCount(message.usage),
 			};
 		},
+		predictPatternAware: async (input, settings, definitions) => {
+			if (!settings.patternAware?.enabled) return { candidates: [], draftTokens: 0 };
+			const store = await resolvePatternStore(settings);
+			return {
+				candidates: store
+					.predict(input.sessionID, definitionSchemaHashes(definitions))
+					.map((candidate) => ({ ...candidate, patternContext: store })),
+				draftTokens: 0,
+			};
+		},
 		actionKey: (toolName, input, context) => {
 			if (context.type === "consume") return buildPiActionKey(toolName, input, options.cwd);
 			const tool = context.data.tools.get(toolName);
@@ -304,6 +356,74 @@ export function installSpeculativeAction(
 				return undefined;
 			}
 		},
+		recordAuthoritative: async ({
+			startInput,
+			settings,
+			consumeInput,
+			action,
+			tool,
+			concrete,
+			output,
+			durationMs,
+		}) => {
+			if (!settings.patternAware?.enabled) return undefined;
+			const store = await resolvePatternStore(settings);
+			const definition = startInput.tools.find((item) => item.name === tool);
+			const candidates = store.observe({
+				sessionID: consumeInput.sessionID,
+				turnID: consumeInput.turnID,
+				tool,
+				input: concrete,
+				actionKey: action?.key ?? stableHash({ tool, input: concrete }),
+				outcome: output?.isError ? "failure" : "success",
+				output: output?.result,
+				outputPaths: extractOutputPaths(tool, output?.result),
+				durationMs,
+				...(typeof concrete.operation === "string" ? { operation: concrete.operation } : {}),
+				...(definition ? { schemaHash: stableHash(definition.parameters) } : {}),
+				learnTarget: candidateToolNames(settings).includes(tool),
+			});
+			return {
+				candidates: candidates.map((candidate) => ({ ...candidate, patternContext: store })),
+				draftTokens: 0,
+			};
+		},
+		prepareCandidate: async ({ candidate }) => {
+			if (candidate.execution !== "sandbox" && inferredExecution(candidate.tool) !== "sandbox") return;
+			if (!options.sandbox?.supports(candidate.tool)) throw new Error(`Sandbox unavailable for ${candidate.tool}`);
+		},
+		onPatternLaunched: (patternID, context) => {
+			if (isPatternStore(context)) context.launched(patternID);
+		},
+		onPatternResolved: (patternID, outcome, context) => {
+			if (isPatternStore(context)) context.resolved(patternID, outcome);
+		},
+		flushPatternStore: async () => {
+			if (openedPatternStore) await (await openedPatternStore).flush();
+			if (options.patternStore) await (await options.patternStore).flush();
+		},
+		onTurnStarted: async ({ startInput, settings }) => {
+			if (!settings.patternAware?.enabled) return;
+			const store = await resolvePatternStore(settings);
+			store.observeTurn({
+				sessionID: startInput.sessionID,
+				turnID: startInput.turnID,
+				phase: "start",
+				model: `${startInput.actorModel.provider}/${startInput.actorModel.id}`,
+			});
+		},
+		onTurnFinished: async ({ startInput, settings, terminal, durationMs }) => {
+			if (!settings.patternAware?.enabled) return;
+			const store = await resolvePatternStore(settings);
+			store.observeTurn({
+				sessionID: startInput.sessionID,
+				turnID: startInput.turnID,
+				phase: "finish",
+				terminal,
+				durationMs,
+			});
+			if (terminal) store.finishSession(startInput.sessionID);
+		},
 		onEvent: options.onEvent,
 	});
 
@@ -362,6 +482,7 @@ export function installSpeculativeAction(
 				tool: context.toolCall.name,
 				args: context.args,
 				durationMs: context.durationMs,
+				output: { result: context.result, isError: context.isError },
 			});
 		} catch {
 			// Speculative telemetry must never alter real tool execution.
@@ -371,11 +492,29 @@ export function installSpeculativeAction(
 	agent.streamFunction = wrappedStream;
 	agent.settleToolCall = installedSettlement;
 	agent.actualToolCall = installedActual;
+	let lastTurnID: string | undefined;
 	const unsubscribe = agent.subscribe(async (event) => {
-		if ((event.type !== "turn_end" && event.type !== "agent_end") || !currentTurnID) return;
-		const finishedTurnID = currentTurnID;
+		if (event.type === "turn_end" && currentTurnID) {
+			const finishedTurnID = currentTurnID;
+			currentTurnID = undefined;
+			lastTurnID = finishedTurnID;
+			await runtime.finishTurn({ sessionID, turnID: finishedTurnID, tool: "", args: {} });
+			return;
+		}
+		if (event.type !== "agent_end") return;
+		const terminalTurnID = currentTurnID ?? lastTurnID;
 		currentTurnID = undefined;
-		await runtime.finishTurn({ sessionID, turnID: finishedTurnID, tool: "", args: {} });
+		lastTurnID = undefined;
+		if (terminalTurnID) {
+			await runtime.finishTurn({
+				sessionID,
+				turnID: terminalTurnID,
+				tool: "",
+				args: {},
+				terminal: true,
+			});
+		}
+		await finishPatternSession();
 	});
 
 	return {
@@ -387,6 +526,7 @@ export function installSpeculativeAction(
 			if (agent.settleToolCall === installedSettlement) agent.settleToolCall = previousSettlement;
 			if (agent.actualToolCall === installedActual) agent.actualToolCall = previousActual;
 			await runtime.disposeSession(sessionID);
+			await finishPatternSession();
 		},
 	};
 }
@@ -417,6 +557,60 @@ function errorSettlement(message: string): SettleToolCallResult {
 		details: {},
 	};
 	return { result, isError: true };
+}
+
+function definitionSchemaHashes(
+	definitions: readonly { readonly name: string; readonly inputSchema?: unknown }[],
+): Readonly<Record<string, string>> {
+	return Object.fromEntries(
+		definitions.map((definition) => [definition.name, stableHash(definition.inputSchema ?? null)]),
+	);
+}
+
+function stableHash(value: unknown): string {
+	return createHash("sha256")
+		.update(JSON.stringify(stableValue(value)))
+		.digest("hex")
+		.slice(0, 32);
+}
+
+function stableValue(value: unknown): unknown {
+	if (Array.isArray(value)) return value.map(stableValue);
+	if (!value || typeof value !== "object") return value;
+	return Object.fromEntries(
+		Object.entries(value as Record<string, unknown>)
+			.sort(([left], [right]) => left.localeCompare(right))
+			.map(([key, item]) => [key, stableValue(item)]),
+	);
+}
+
+function extractOutputPaths(tool: string, result: AgentToolResult<unknown> | undefined): readonly string[] | undefined {
+	if ((tool !== "find" && tool !== "grep") || !result) return undefined;
+	const text = result.content
+		.filter((item): item is Extract<(typeof result.content)[number], { type: "text" }> => item.type === "text")
+		.map((item) => item.text)
+		.join("\n");
+	const paths = text
+		.split(/\r?\n/)
+		.map((line) => {
+			const trimmed = line.trim();
+			if (!trimmed || trimmed.startsWith("[") || /^No files found\b/.test(trimmed)) return undefined;
+			if (tool === "find") return trimmed;
+			return /^(.*?):\d+(?::\d+)?:/.exec(trimmed)?.[1];
+		})
+		.filter((item): item is string => typeof item === "string" && item.length > 0);
+	return paths.length ? [...new Set(paths)] : undefined;
+}
+
+function isPatternStore(value: unknown): value is PatternAwareStore {
+	return (
+		typeof value === "object" &&
+		value !== null &&
+		"launched" in value &&
+		typeof value.launched === "function" &&
+		"resolved" in value &&
+		typeof value.resolved === "function"
+	);
 }
 
 function normalizeTimeout(value: unknown): number {
