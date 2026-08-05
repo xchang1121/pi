@@ -8,7 +8,7 @@ export interface SpeculativeActionSettings {
 	readonly resourceCacheMaxEntries: number;
 	readonly predictionTimeoutMs: number;
 	readonly tools: {
-		readonly liveReadonly: readonly string[];
+		readonly resourceCached: readonly string[];
 		readonly sandbox: readonly string[];
 	};
 }
@@ -59,50 +59,75 @@ interface SpeculativeEventBase<SessionID> {
 	readonly timestamp: number;
 }
 
-export type SpeculativeActionEvent<SessionID> =
-	| (SpeculativeEventBase<SessionID> & {
-			type: "started";
-			tool: string;
-			actionKeyHash: string;
-			execution: SpeculativeExecution;
-			predictionLatencyMs: number;
-			draftTokens: number;
-			totalDraftTokens: number;
-			draftCandidate: string;
-			predictedAction: string;
-	  })
-	| (SpeculativeEventBase<SessionID> & {
-			type: "hit";
-			tool: string;
-			actionKeyHash: string;
-			savedMs: number;
-			waitedMs: number;
-			predictionLatencyMs: number;
-			draftTokens: number;
-			totalDraftTokens: number;
-			draftCandidate: string;
-			predictedAction: string;
-			actualAction: string;
-	  })
-	| (SpeculativeEventBase<SessionID> & {
-			type: "miss";
-			reason: string;
-			tool?: string;
-			actionKeyHash?: string;
-			detail?: string;
-			draftCandidate?: string;
-			predictedAction?: string;
-			actualAction?: string;
-	  })
-	| (SpeculativeEventBase<SessionID> & {
-			type: "cancelled";
-			reason: string;
-			tool: string;
-			actionKeyHash: string;
-			detail?: string;
-			draftCandidate: string;
-			predictedAction: string;
-	  });
+export interface SpeculativeCacheSnapshot {
+	readonly cacheEntries: number;
+	readonly cacheCapacity: number;
+	readonly cacheRunning: number;
+	readonly cacheCompleted: number;
+	readonly activeCandidates: number;
+	readonly turnCandidates: number;
+	readonly resourceCandidates: number;
+	readonly cacheTools: readonly string[];
+	readonly cacheExecutions: readonly SpeculativeExecution[];
+}
+
+export type SpeculativeActionEvent<SessionID> = SpeculativeCacheSnapshot &
+	(
+		| (SpeculativeEventBase<SessionID> & {
+				type: "started";
+				tool: string;
+				actionKeyHash: string;
+				execution: SpeculativeExecution;
+				predictionLatencyMs: number;
+				draftTokens: number;
+				totalDraftTokens: number;
+				draftCandidate: string;
+				predictedAction: string;
+		  })
+		| (SpeculativeEventBase<SessionID> & {
+				type: "cache";
+		  })
+		| (SpeculativeEventBase<SessionID> & {
+				type: "actual";
+				tool: string;
+				actionKeyHash?: string;
+				execution?: SpeculativeExecution;
+				actualAction: string;
+				actualDurationMs: number;
+		  })
+		| (SpeculativeEventBase<SessionID> & {
+				type: "hit";
+				tool: string;
+				actionKeyHash: string;
+				savedMs: number;
+				waitedMs: number;
+				predictionLatencyMs: number;
+				draftTokens: number;
+				totalDraftTokens: number;
+				draftCandidate: string;
+				predictedAction: string;
+				actualAction: string;
+		  })
+		| (SpeculativeEventBase<SessionID> & {
+				type: "miss";
+				reason: string;
+				tool?: string;
+				actionKeyHash?: string;
+				detail?: string;
+				draftCandidate?: string;
+				predictedAction?: string;
+				actualAction?: string;
+		  })
+		| (SpeculativeEventBase<SessionID> & {
+				type: "cancelled";
+				reason: string;
+				tool: string;
+				actionKeyHash: string;
+				detail?: string;
+				draftCandidate: string;
+				predictedAction: string;
+		  })
+	);
 
 interface TurnInput<SessionID> {
 	readonly sessionID: SessionID;
@@ -219,6 +244,7 @@ export interface SpeculativeRuntimeInspection {
 export interface SpeculativeActionRuntime<SessionID, Output, StartInput, ConsumeInput, FinishInput> {
 	readonly startTurn: (input: StartInput, signal?: AbortSignal) => Promise<void>;
 	readonly consume: (input: ConsumeInput, signal?: AbortSignal) => Promise<Output | undefined>;
+	readonly actual: (input: ConsumeInput & { readonly durationMs: number }) => Promise<void>;
 	readonly finishTurn: (input: FinishInput) => Promise<void>;
 	readonly disposeSession: (sessionID: SessionID) => Promise<void>;
 	readonly dispose: () => Promise<void>;
@@ -246,6 +272,7 @@ interface TurnState<SessionID, Output, StateData> {
 	readonly ready: DeferredState<void>;
 	readonly candidates: Map<string, RuntimeCandidate<Output>>;
 	readonly data: StateData;
+	readonly settings: SpeculativeActionSettings;
 	readonly predictionController: AbortController;
 	finished: boolean;
 	noCandidateReported: boolean;
@@ -306,6 +333,42 @@ export function makeSpeculativeActionRuntime<
 		}
 	};
 
+	const cachedCandidates = (state: TurnState<SessionID, Output, StateData>): RuntimeCandidate<Output>[] => {
+		const candidates = new Map<string, RuntimeCandidate<Output>>();
+		for (const candidate of sessionResourceCandidates(state.sessionID)) candidates.set(candidate.key.key, candidate);
+		for (const candidate of state.candidates.values()) {
+			if (candidate.consumed && candidate.lifetime === "turn") continue;
+			candidates.set(candidate.key.key, candidate);
+		}
+		return [...candidates.values()];
+	};
+
+	const cacheSnapshot = (state: TurnState<SessionID, Output, StateData>): SpeculativeCacheSnapshot => {
+		const candidates = cachedCandidates(state);
+		const running = candidates.filter((candidate) => candidate.completedAt === undefined).length;
+		return {
+			cacheEntries: candidates.length,
+			cacheCapacity: state.settings.resourceCacheMaxEntries,
+			cacheRunning: running,
+			cacheCompleted: candidates.length - running,
+			activeCandidates: running,
+			turnCandidates: candidates.filter((candidate) => candidate.lifetime === "turn").length,
+			resourceCandidates: candidates.filter((candidate) => candidate.lifetime === "resource").length,
+			cacheTools: [...new Set(candidates.map((candidate) => candidate.key.tool))].sort(),
+			cacheExecutions: [...new Set(candidates.map((candidate) => candidate.key.execution))].sort(),
+		};
+	};
+
+	const publishCache = async (state: TurnState<SessionID, Output, StateData>): Promise<void> => {
+		await emit({
+			type: "cache",
+			sessionID: state.sessionID,
+			turnID: state.turnID,
+			timestamp: Date.now(),
+			...cacheSnapshot(state),
+		});
+	};
+
 	const publishMiss = async (
 		state: TurnState<SessionID, Output, StateData>,
 		reason: string,
@@ -322,6 +385,7 @@ export function makeSpeculativeActionRuntime<
 			...(key ? { tool: key.tool, actionKeyHash: key.hash } : {}),
 			...(detail ? { detail } : {}),
 			...diagnostics,
+			...cacheSnapshot(state),
 		});
 	};
 
@@ -342,6 +406,7 @@ export function makeSpeculativeActionRuntime<
 			draftCandidate: candidate.draftCandidate,
 			predictedAction: candidate.predictedAction,
 			...(detail ? { detail } : {}),
+			...cacheSnapshot(state),
 		});
 	};
 
@@ -578,6 +643,7 @@ export function makeSpeculativeActionRuntime<
 					totalDraftTokens,
 					draftCandidate,
 					predictedAction,
+					...cacheSnapshot(state),
 				});
 				const executionStarted = Date.now();
 				void Promise.resolve()
@@ -595,14 +661,16 @@ export function makeSpeculativeActionRuntime<
 						}),
 					)
 					.then(
-						(output) => {
+						async (output) => {
 							candidate.completedAt = Date.now();
 							candidate.executionMs = Math.max(0, candidate.completedAt - executionStarted);
+							await publishCache(state);
 							executionState.resolve({ ok: true, output });
 						},
-						(error: unknown) => {
+						async (error: unknown) => {
 							candidate.completedAt = Date.now();
 							candidate.executionMs = Math.max(0, candidate.completedAt - executionStarted);
+							await publishCache(state);
 							executionState.resolve({ ok: false, error });
 						},
 					);
@@ -649,6 +717,7 @@ export function makeSpeculativeActionRuntime<
 			ready: deferred<void>(),
 			candidates: new Map(),
 			data: await adapter.stateData(input),
+			settings,
 			predictionController: new AbortController(),
 			finished: false,
 			noCandidateReported: false,
@@ -810,8 +879,30 @@ export function makeSpeculativeActionRuntime<
 			draftCandidate: candidate.draftCandidate,
 			predictedAction: candidate.predictedAction,
 			actualAction,
+			...cacheSnapshot(state),
 		});
 		return output;
+	};
+
+	const actual = async (input: ConsumeInput & { readonly durationMs: number }): Promise<void> => {
+		const state = turns.get(turnKey(input));
+		if (!state) return;
+		const actualCall = adapter.actual(input);
+		const key = await adapter.actionKey(actualCall.tool, actualCall.input, {
+			type: "consume",
+			consumeInput: input,
+		});
+		await emit({
+			type: "actual",
+			sessionID: state.sessionID,
+			turnID: state.turnID,
+			timestamp: Date.now(),
+			tool: actualCall.tool,
+			...(key ? { actionKeyHash: key.hash, execution: key.execution } : {}),
+			actualAction: diagnosticAction(actualCall.tool, actualCall.input, key),
+			actualDurationMs: Number.isFinite(input.durationMs) ? Math.max(0, input.durationMs) : 0,
+			...cacheSnapshot(state),
+		});
 	};
 
 	const finishState = async (state: TurnState<SessionID, Output, StateData>): Promise<void> => {
@@ -845,7 +936,7 @@ export function makeSpeculativeActionRuntime<
 		for (const state of [...turns.values()].filter((item) => item.sessionID === sessionID)) {
 			await abortState(state, "session_disposed");
 		}
-		const stateForEvents = createDisposalState<SessionID, Output, StateData>(sessionID);
+		const stateForEvents = createDisposalState<SessionID, Output, StateData>(sessionID, await adapter.settings());
 		for (const candidate of sessionResourceCandidates(sessionID)) {
 			await cancelCandidate(stateForEvents, candidate, "session_disposed");
 		}
@@ -877,14 +968,14 @@ export function makeSpeculativeActionRuntime<
 		};
 	};
 
-	return { startTurn, consume, finishTurn, disposeSession, dispose, inspect };
+	return { startTurn, consume, actual, finishTurn, disposeSession, dispose, inspect };
 }
 
 export function candidateToolNames(settings: SpeculativeActionSettings): readonly string[] {
-	const liveReadonly = new Set(settings.tools.liveReadonly);
+	const resourceCached = new Set(settings.tools.resourceCached);
 	const sandbox = new Set(settings.tools.sandbox);
 	return KEYABLE_TOOLS.filter((tool) =>
-		inferredExecution(tool) === "sandbox" ? sandbox.has(tool) : liveReadonly.has(tool),
+		inferredExecution(tool) === "sandbox" ? sandbox.has(tool) : resourceCached.has(tool),
 	);
 }
 
@@ -956,6 +1047,7 @@ async function isExpired<
 
 function createDisposalState<SessionID, Output, StateData>(
 	sessionID: SessionID,
+	settings: SpeculativeActionSettings,
 ): TurnState<SessionID, Output, StateData> {
 	return {
 		sessionID,
@@ -963,6 +1055,7 @@ function createDisposalState<SessionID, Output, StateData>(
 		ready: deferred<void>(),
 		candidates: new Map(),
 		data: undefined as StateData,
+		settings,
 		predictionController: new AbortController(),
 		finished: true,
 		noCandidateReported: false,

@@ -1,12 +1,16 @@
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { AgentTool, SettleToolCallResult } from "@earendil-works/pi-agent-core";
 import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
 import { buildPiActionKey } from "../src/common.ts";
-import { createWorkspaceSandbox } from "../src/workspace-sandbox.ts";
+import {
+	commitSandboxExecution,
+	createWorkspaceSandbox,
+	type SpeculativeSandboxExecution,
+} from "../src/workspace-sandbox.ts";
 
 const writeParameters = Type.Object({ path: Type.String(), content: Type.String() });
 const editParameters = Type.Object({
@@ -53,7 +57,7 @@ const bashTool: AgentTool<typeof bashParameters> = {
 	},
 };
 
-describe("M3 workspace sandbox", () => {
+describe("M4 workspace sandbox", () => {
 	it("stages write output without touching the workspace and adopts after base validation", async () => {
 		const root = await mkdtemp(path.join(os.tmpdir(), "pi-spec-write-test-"));
 		try {
@@ -109,10 +113,38 @@ describe("M3 workspace sandbox", () => {
 		}
 	});
 
+	it("uses a private repository without changing an existing workspace Git index or branch", async () => {
+		const root = await mkdtemp(path.join(os.tmpdir(), "pi-spec-git-test-"));
+		try {
+			await runGit(["init", "-b", "actor-branch"], root);
+			await writeFile(path.join(root, "dirty.txt"), "dirty working tree", "utf8");
+			const beforeStatus = await runGit(["status", "--short"], root);
+			const beforeBranch = await runGit(["branch", "--show-current"], root);
+			const args = { path: "created.txt", content: "staged" };
+			const execution = await createWorkspaceSandbox().execute({
+				cwd: root,
+				tool: writeTool,
+				toolName: "write",
+				args,
+				action: requiredAction("write", args, root),
+				callID: "spec-private-git",
+				signal: new AbortController().signal,
+			});
+
+			expect(execution.sandbox).toBe("git_worktree");
+			expect(await runGit(["status", "--short"], root)).toBe(beforeStatus);
+			expect(await runGit(["branch", "--show-current"], root)).toBe(beforeBranch);
+			await expect(stat(path.join(root, "created.txt"))).rejects.toThrow();
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
 	it("runs bash through an explicit provider in a copied cwd without workspace pollution", async () => {
 		const root = await mkdtemp(path.join(os.tmpdir(), "pi-spec-bash-test-"));
 		try {
 			await writeFile(path.join(root, "input.txt"), "hello", "utf8");
+			await writeFile(path.join(root, "delete.txt"), "remove me", "utf8");
 			const sandbox = createWorkspaceSandbox({
 				processRunner: async ({ command, cwd, signal }) => {
 					await runNodeScript(command, cwd, signal);
@@ -125,6 +157,8 @@ describe("M3 workspace sandbox", () => {
 			const script = [
 				"const fs = require('node:fs')",
 				"fs.writeFileSync('sandbox-created.txt', fs.readFileSync('input.txt', 'utf8'))",
+				"fs.writeFileSync('input.txt', 'changed')",
+				"fs.unlinkSync('delete.txt')",
 				"console.log(process.cwd())",
 			].join(";");
 			const args = { command: script, timeout: 5 };
@@ -139,13 +173,203 @@ describe("M3 workspace sandbox", () => {
 			});
 
 			expect(sandbox.supports("bash")).toBe(true);
-			expect(execution.output.result.content[0]).toMatchObject({
-				type: "text",
-				text: expect.stringContaining("workspace"),
-			});
+			expect(execution.output.result.content[0]).toEqual({ type: "text", text: `sandbox cwd: ${root}` });
 			await expect(stat(path.join(root, "sandbox-created.txt"))).rejects.toThrow();
+			expect(await readFile(path.join(root, "input.txt"), "utf8")).toBe("hello");
+			expect(await readFile(path.join(root, "delete.txt"), "utf8")).toBe("remove me");
+			expect(execution.changes.map((change) => change.resource)).toEqual([
+				"delete.txt",
+				"input.txt",
+				"sandbox-created.txt",
+			]);
 			expect(await sandbox.adopt(execution)).toBe(execution.output);
+			expect(await readFile(path.join(root, "sandbox-created.txt"), "utf8")).toBe("hello");
+			expect(await readFile(path.join(root, "input.txt"), "utf8")).toBe("changed");
+			await expect(stat(path.join(root, "delete.txt"))).rejects.toThrow();
 			expect(createWorkspaceSandbox().supports("bash")).toBe(false);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("validates every base before applying any multi-file change", async () => {
+		const root = await mkdtemp(path.join(os.tmpdir(), "pi-spec-conflict-test-"));
+		try {
+			await writeFile(path.join(root, "a.txt"), "a0", "utf8");
+			await writeFile(path.join(root, "b.txt"), "b0", "utf8");
+			const sandbox = createWorkspaceSandbox({
+				processRunner: async ({ cwd }) => {
+					await writeFile(path.join(cwd, "a.txt"), "a1", "utf8");
+					await writeFile(path.join(cwd, "b.txt"), "b1", "utf8");
+					return settlement("changed two files");
+				},
+			});
+			const args = { command: "unused" };
+			const execution = await sandbox.execute({
+				cwd: root,
+				tool: bashTool,
+				toolName: "bash",
+				args,
+				action: requiredAction("bash", args, root),
+				callID: "spec-conflict",
+				signal: new AbortController().signal,
+			});
+			await writeFile(path.join(root, "b.txt"), "actor", "utf8");
+
+			await expect(sandbox.adopt(execution)).rejects.toThrow("resource changed before adoption: b.txt");
+			expect(await readFile(path.join(root, "a.txt"), "utf8")).toBe("a0");
+			expect(await readFile(path.join(root, "b.txt"), "utf8")).toBe("actor");
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("rolls back already applied paths when a later adoption write fails", async () => {
+		const root = await mkdtemp(path.join(os.tmpdir(), "pi-spec-rollback-test-"));
+		try {
+			const first = path.join(root, "a.txt");
+			const second = path.join(root, "b.txt");
+			await writeFile(first, "a0", "utf8");
+			await writeFile(second, "b0", "utf8");
+			const execution: SpeculativeSandboxExecution = {
+				output: settlement("staged"),
+				sandbox: "git_worktree",
+				changes: [
+					{
+						root,
+						target: first,
+						resource: "a.txt",
+						before: Buffer.from("a0"),
+						after: Buffer.from("a1"),
+					},
+					{
+						root,
+						target: second,
+						resource: "b.txt",
+						before: Buffer.from("b0"),
+						after: null as unknown as Uint8Array,
+					},
+				],
+			};
+
+			await expect(commitSandboxExecution(execution)).rejects.toThrow();
+			expect(await readFile(first, "utf8")).toBe("a0");
+			expect(await readFile(second, "utf8")).toBe("b0");
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("fails closed on source symlinks before invoking a mutation tool", async () => {
+		const root = await mkdtemp(path.join(os.tmpdir(), "pi-spec-symlink-test-"));
+		const outside = await mkdtemp(path.join(os.tmpdir(), "pi-spec-symlink-outside-"));
+		try {
+			await symlink(outside, path.join(root, "linked"), "dir");
+			const args = { path: "linked/out.txt", content: "no" };
+			await expect(
+				createWorkspaceSandbox().execute({
+					cwd: root,
+					tool: writeTool,
+					toolName: "write",
+					args,
+					action: requiredAction("write", args, root),
+					callID: "spec-symlink",
+					signal: new AbortController().signal,
+				}),
+			).rejects.toThrow("contains symlink");
+			await expect(stat(path.join(outside, "out.txt"))).rejects.toThrow();
+		} finally {
+			await rm(root, { recursive: true, force: true });
+			await rm(outside, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects a symlink created inside the staged workspace", async () => {
+		const root = await mkdtemp(path.join(os.tmpdir(), "pi-spec-created-symlink-test-"));
+		try {
+			const sandbox = createWorkspaceSandbox({
+				processRunner: async ({ cwd }) => {
+					await symlink("missing-target", path.join(cwd, "created-link"));
+					return settlement("created symlink");
+				},
+			});
+			const args = { command: "unused" };
+			await expect(
+				sandbox.execute({
+					cwd: root,
+					tool: bashTool,
+					toolName: "bash",
+					args,
+					action: requiredAction("bash", args, root),
+					callID: "spec-created-symlink",
+					signal: new AbortController().signal,
+				}),
+			).rejects.toThrow("contains symlink");
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("cleans the private worktree after process execution fails", async () => {
+		const root = await mkdtemp(path.join(os.tmpdir(), "pi-spec-cleanup-test-"));
+		let stagedRoot = "";
+		try {
+			const sandbox = createWorkspaceSandbox({
+				processRunner: async ({ cwd }) => {
+					stagedRoot = cwd;
+					throw new Error("runner failed");
+				},
+			});
+			const args = { command: "unused" };
+			await expect(
+				sandbox.execute({
+					cwd: root,
+					tool: bashTool,
+					toolName: "bash",
+					args,
+					action: requiredAction("bash", args, root),
+					callID: "spec-cleanup",
+					signal: new AbortController().signal,
+				}),
+			).rejects.toThrow("runner failed");
+			expect(stagedRoot).not.toBe("");
+			await expect(stat(stagedRoot)).rejects.toThrow();
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("cleans the private worktree after process execution is aborted", async () => {
+		const root = await mkdtemp(path.join(os.tmpdir(), "pi-spec-abort-test-"));
+		const controller = new AbortController();
+		let stagedRoot = "";
+		let markStarted: (() => void) | undefined;
+		const started = new Promise<void>((resolve) => {
+			markStarted = resolve;
+		});
+		try {
+			const sandbox = createWorkspaceSandbox({
+				processRunner: ({ cwd, signal }) =>
+					new Promise((_resolve, reject) => {
+						stagedRoot = cwd;
+						signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+						markStarted?.();
+					}),
+			});
+			const args = { command: "unused" };
+			const execution = sandbox.execute({
+				cwd: root,
+				tool: bashTool,
+				toolName: "bash",
+				args,
+				action: requiredAction("bash", args, root),
+				callID: "spec-abort",
+				signal: controller.signal,
+			});
+			await started;
+			controller.abort();
+			await expect(execution).rejects.toThrow("aborted");
+			await expect(stat(stagedRoot)).rejects.toThrow();
 		} finally {
 			await rm(root, { recursive: true, force: true });
 		}
@@ -185,6 +409,13 @@ function requiredAction(tool: string, args: unknown, cwd: string) {
 	return action;
 }
 
+function settlement(text: string): SettleToolCallResult {
+	return {
+		result: { content: [{ type: "text", text }], details: undefined },
+		isError: false,
+	};
+}
+
 function runNodeScript(command: string, cwd: string, signal: AbortSignal): Promise<SettleToolCallResult> {
 	return new Promise((resolve, reject) => {
 		execFile(process.execPath, ["-e", command], { cwd, signal }, (error, stdout, stderr) => {
@@ -196,6 +427,18 @@ function runNodeScript(command: string, cwd: string, signal: AbortSignal): Promi
 				result: { content: [{ type: "text", text: `${stdout}${stderr}`.trim() }], details: undefined },
 				isError: false,
 			});
+		});
+	});
+}
+
+function runGit(args: string[], cwd: string): Promise<string> {
+	return new Promise((resolve, reject) => {
+		execFile("git", args, { cwd }, (error, stdout, stderr) => {
+			if (error) {
+				reject(new Error(stderr));
+				return;
+			}
+			resolve(stdout);
 		});
 	});
 }

@@ -203,6 +203,7 @@ describe("Pi Agent speculative integration", () => {
 		expect(streams.actorRequests()).toBe(2);
 		expect(streams.draftRequests()).toBe(2);
 		expect(events.some((event) => event.type === "hit" && event.tool === "read")).toBe(true);
+		expect(events.some((event) => event.type === "actual")).toBe(false);
 		const result = agent.state.messages.find((message) => message.role === "toolResult");
 		expect(result?.role === "toolResult" ? result.content : undefined).toEqual([
 			{ type: "text", text: "prefetched README" },
@@ -248,6 +249,7 @@ describe("Pi Agent speculative integration", () => {
 
 	it("fails closed without speculative preflight and uses the normal tool path", async () => {
 		let toolExecutions = 0;
+		let previousActualCalls = 0;
 		const events: SpeculativeActionEvent<string>[] = [];
 		const tool: ReadTool = {
 			name: "read",
@@ -263,10 +265,13 @@ describe("Pi Agent speculative integration", () => {
 		const agent = new Agent({
 			initialState: { model: createModel(), tools: [tool] },
 			streamFn: streams.stream,
+			actualToolCall: async () => {
+				previousActualCalls++;
+			},
 		});
 		const installed = installSpeculativeAction(agent, {
 			cwd: "/workspace",
-			getSettings: () => ({ enabled: true, predictionTimeoutMs: 100, tools: { liveReadonly: ["read"] } }),
+			getSettings: () => ({ enabled: true, predictionTimeoutMs: 100, tools: { resourceCached: ["read"] } }),
 			onEvent: (event) => {
 				events.push(event);
 			},
@@ -276,8 +281,16 @@ describe("Pi Agent speculative integration", () => {
 
 		expect(toolExecutions).toBe(1);
 		expect(streams.draftRequests()).toBe(2);
+		expect(previousActualCalls).toBe(1);
 		expect(events.some((event) => event.type === "miss" && event.reason === "permission_or_policy")).toBe(true);
 		expect(events.some((event) => event.type === "hit")).toBe(false);
+		expect(events.find((event) => event.type === "actual")).toMatchObject({
+			type: "actual",
+			tool: "read",
+			execution: "resource_cached",
+			actualDurationMs: expect.any(Number),
+			actualAction: expect.any(String),
+		});
 		await installed.uninstall();
 	});
 
@@ -300,7 +313,7 @@ describe("Pi Agent speculative integration", () => {
 		const agent = new Agent({ initialState: { model: actorModel, tools: [tool] }, streamFn: streams.stream });
 		const installed = installSpeculativeAction(agent, {
 			cwd: "/workspace",
-			getSettings: () => ({ enabled: true, predictionTimeoutMs: 100, tools: { liveReadonly: ["read"] } }),
+			getSettings: () => ({ enabled: true, predictionTimeoutMs: 100, tools: { resourceCached: ["read"] } }),
 			draftModel,
 			getDraftOptions: (context) => {
 				optionCalls++;
@@ -337,7 +350,7 @@ describe("Pi Agent speculative integration", () => {
 		const agent = new Agent({ initialState: { model: createModel(), tools: [tool] }, streamFn: streams.stream });
 		const installed = installSpeculativeAction(agent, {
 			cwd: "/workspace",
-			getSettings: () => ({ enabled: true, predictionTimeoutMs: 100, tools: { liveReadonly: ["read"] } }),
+			getSettings: () => ({ enabled: true, predictionTimeoutMs: 100, tools: { resourceCached: ["read"] } }),
 			preflight: () => true,
 			onEvent: (event) => {
 				events.push(event);
@@ -369,7 +382,7 @@ describe("Pi Agent speculative integration", () => {
 		const agent = new Agent({ initialState: { model: createModel(), tools: [tool] }, streamFn: streams.stream });
 		const installed = installSpeculativeAction(agent, {
 			cwd: "/workspace",
-			getSettings: () => ({ enabled: true, predictionTimeoutMs: 100, tools: { liveReadonly: ["read"] } }),
+			getSettings: () => ({ enabled: true, predictionTimeoutMs: 100, tools: { resourceCached: ["read"] } }),
 			preflight: () => true,
 			onEvent: (event) => {
 				events.push(event);
@@ -408,7 +421,7 @@ describe("Pi Agent speculative integration", () => {
 			const agent = new Agent({ initialState: { model: createModel(), tools: [tool] }, streamFn: streams.stream });
 			const installed = installSpeculativeAction(agent, {
 				cwd: root,
-				getSettings: () => ({ enabled: true, tools: { liveReadonly: [], sandbox: ["write"] } }),
+				getSettings: () => ({ enabled: true, tools: { resourceCached: [], sandbox: ["write"] } }),
 				preflight: () => true,
 				sandbox: createWorkspaceSandbox(),
 			});
@@ -451,7 +464,7 @@ describe("Pi Agent speculative integration", () => {
 			const agent = new Agent({ initialState: { model: createModel(), tools: [tool] }, streamFn: streams.stream });
 			const installed = installSpeculativeAction(agent, {
 				cwd: root,
-				getSettings: () => ({ enabled: true, tools: { liveReadonly: [], sandbox: ["write"] } }),
+				getSettings: () => ({ enabled: true, tools: { resourceCached: [], sandbox: ["write"] } }),
 				preflight: () => true,
 				sandbox: createWorkspaceSandbox(),
 				onEvent: (event) => {
@@ -495,7 +508,7 @@ describe("Pi Agent speculative integration", () => {
 			const agent = new Agent({ initialState: { model: createModel(), tools: [tool] }, streamFn: streams.stream });
 			const installed = installSpeculativeAction(agent, {
 				cwd: root,
-				getSettings: () => ({ enabled: true, tools: { liveReadonly: [], sandbox: ["write"] } }),
+				getSettings: () => ({ enabled: true, tools: { resourceCached: [], sandbox: ["write"] } }),
 				preflight: () => true,
 				onEvent: (event) => {
 					events.push(event);
@@ -535,7 +548,7 @@ describe("Pi Agent speculative integration", () => {
 		const agent = new Agent({ initialState: { model: createModel(), tools: [tool] }, streamFn: streams.stream });
 		const installed = installSpeculativeAction(agent, {
 			cwd: "/workspace",
-			getSettings: () => ({ enabled: true, tools: { liveReadonly: ["read"] } }),
+			getSettings: () => ({ enabled: true, tools: { resourceCached: ["read"] } }),
 			preflight: () => {
 				preflightCalls++;
 				return true;

@@ -1,4 +1,5 @@
 import type {
+	ActualToolCallContext,
 	Agent,
 	AgentTool,
 	AgentToolCall,
@@ -35,6 +36,8 @@ export interface SpeculativeAgentSettingsInput {
 	readonly resourceCacheMaxEntries?: number;
 	readonly predictionTimeoutMs?: number;
 	readonly tools?: {
+		readonly resourceCached?: readonly string[];
+		/** @deprecated Use resourceCached. */
 		readonly liveReadonly?: readonly string[];
 		readonly sandbox?: readonly string[];
 	};
@@ -131,6 +134,7 @@ export function installSpeculativeAction(
 	const sessionID = agent.sessionId ?? `pi_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
 	const baseStream = agent.streamFunction;
 	const previousSettlement = agent.settleToolCall;
+	const previousActual = agent.actualToolCall;
 	const sandboxExecutions = new WeakMap<SettleToolCallResult, SpeculativeSandboxExecution>();
 	const resolveSettings = async (): Promise<SpeculativeActionSettings> => {
 		const settings = (await options.getSettings?.()) ?? {};
@@ -144,7 +148,10 @@ export function installSpeculativeAction(
 			),
 			predictionTimeoutMs: normalizeTimeout(settings.predictionTimeoutMs),
 			tools: {
-				liveReadonly: normalizeStringArray(settings.tools?.liveReadonly, DEFAULTS.tools.liveReadonly),
+				resourceCached: normalizeStringArray(
+					settings.tools?.resourceCached ?? settings.tools?.liveReadonly,
+					DEFAULTS.tools.resourceCached,
+				),
 				sandbox: normalizeStringArray(settings.tools?.sandbox, DEFAULTS.tools.sandbox),
 			},
 		};
@@ -341,8 +348,29 @@ export function installSpeculativeAction(
 		);
 	};
 
+	const installedActual = async (context: ActualToolCallContext, signal?: AbortSignal): Promise<void> => {
+		try {
+			await previousActual?.(context, signal);
+		} catch {
+			// Telemetry observers compose independently.
+		}
+		if (!currentTurnID) return;
+		try {
+			await runtime.actual({
+				sessionID,
+				turnID: currentTurnID,
+				tool: context.toolCall.name,
+				args: context.args,
+				durationMs: context.durationMs,
+			});
+		} catch {
+			// Speculative telemetry must never alter real tool execution.
+		}
+	};
+
 	agent.streamFunction = wrappedStream;
 	agent.settleToolCall = installedSettlement;
+	agent.actualToolCall = installedActual;
 	const unsubscribe = agent.subscribe(async (event) => {
 		if ((event.type !== "turn_end" && event.type !== "agent_end") || !currentTurnID) return;
 		const finishedTurnID = currentTurnID;
@@ -357,6 +385,7 @@ export function installSpeculativeAction(
 			unsubscribe();
 			if (agent.streamFunction === wrappedStream) agent.streamFunction = baseStream;
 			if (agent.settleToolCall === installedSettlement) agent.settleToolCall = previousSettlement;
+			if (agent.actualToolCall === installedActual) agent.actualToolCall = previousActual;
 			await runtime.disposeSession(sessionID);
 		},
 	};

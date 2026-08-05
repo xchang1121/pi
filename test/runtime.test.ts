@@ -41,7 +41,7 @@ const enabledSettings: SpeculativeActionSettings = {
 	maxCandidates: 4,
 	resourceCacheMaxEntries: 512,
 	predictionTimeoutMs: 250,
-	tools: { liveReadonly: ["read", "grep", "find"], sandbox: [] },
+	tools: { resourceCached: ["read", "grep", "find"], sandbox: [] },
 };
 
 function createHarness(options: HarnessOptions) {
@@ -122,6 +122,76 @@ describe("speculative action runtime", () => {
 
 		expect(await harness.runtime.consume(consume("turn-1"))).toBe("ready-prefetch");
 		expect(harness.executions()).toBe(1);
+	});
+
+	it("publishes running and completed cache snapshots before a hit", async () => {
+		const execution = deferred<string>();
+		const harness = createHarness({
+			settings: { ...enabledSettings, resourceCacheMaxEntries: 7 },
+			predict: () => prediction(readCandidate()),
+			execute: () => execution.promise,
+		});
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-cache" });
+		await waitFor(() => harness.events.some((event) => event.type === "started"));
+
+		const started = harness.events.find((event) => event.type === "started");
+		expect(started).toMatchObject({
+			cacheEntries: 1,
+			cacheCapacity: 7,
+			cacheRunning: 1,
+			cacheCompleted: 0,
+			activeCandidates: 1,
+			turnCandidates: 0,
+			resourceCandidates: 1,
+			cacheTools: ["read"],
+			cacheExecutions: ["resource_cached"],
+		});
+		const result = harness.runtime.consume(consume("turn-cache"));
+		execution.resolve("cached");
+		expect(await result).toBe("cached");
+
+		const eventTypes = harness.events.map((event) => event.type);
+		expect(eventTypes.indexOf("cache")).toBeGreaterThan(eventTypes.indexOf("started"));
+		expect(eventTypes.indexOf("cache")).toBeLessThan(eventTypes.indexOf("hit"));
+		expect(harness.events.find((event) => event.type === "cache")).toMatchObject({
+			cacheEntries: 1,
+			cacheRunning: 0,
+			cacheCompleted: 1,
+			activeCandidates: 0,
+		});
+	});
+
+	it("refreshes cache telemetry when a candidate completes without an actor hit", async () => {
+		const harness = createHarness({ predict: () => prediction(readCandidate()), execute: () => "ready" });
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-background" });
+		await waitFor(() => harness.events.some((event) => event.type === "cache"));
+
+		expect(harness.events.some((event) => event.type === "hit")).toBe(false);
+		expect(harness.events.find((event) => event.type === "cache")).toMatchObject({
+			cacheCompleted: 1,
+			cacheRunning: 0,
+		});
+	});
+
+	it("publishes actual fallback duration without creating another speculative miss", async () => {
+		const harness = createHarness({ predict: () => prediction() });
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-actual" });
+		await waitFor(() => harness.runtime.inspect().pendingPredictions === 0);
+		expect(await harness.runtime.consume(consume("turn-actual"))).toBeUndefined();
+		const misses = harness.events.filter((event) => event.type === "miss").length;
+
+		await harness.runtime.actual({ ...consume("turn-actual"), durationMs: 23 });
+
+		expect(harness.events.filter((event) => event.type === "miss")).toHaveLength(misses);
+		expect(harness.events.find((event) => event.type === "actual")).toMatchObject({
+			type: "actual",
+			tool: "read",
+			execution: "resource_cached",
+			actionKeyHash: expect.any(String),
+			actualAction: expect.any(String),
+			actualDurationMs: 23,
+			cacheEntries: 0,
+		});
 	});
 
 	it("waits for a drafter candidate that arrives after the actor call", async () => {
@@ -420,7 +490,7 @@ describe("speculative action runtime", () => {
 
 	it("reports adoption failure and leaves the actor on the normal execution path", async () => {
 		const harness = createHarness({
-			settings: { ...enabledSettings, tools: { liveReadonly: [], sandbox: ["write"] } },
+			settings: { ...enabledSettings, tools: { resourceCached: [], sandbox: ["write"] } },
 			predict: () => prediction({ type: "tool_call", tool: "write", input: { path: "out.txt", content: "draft" } }),
 			execute: () => "staged",
 			adopt: () => undefined,
@@ -480,7 +550,7 @@ describe("speculative action runtime", () => {
 		expect(started[0]).toMatchObject({
 			type: "started",
 			tool: "read",
-			execution: "live_readonly",
+			execution: "resource_cached",
 			draftTokens: 7,
 			totalDraftTokens: 7,
 			predictionLatencyMs: expect.any(Number),

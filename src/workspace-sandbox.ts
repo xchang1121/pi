@@ -1,4 +1,5 @@
-import { cp, lstat, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { lstat, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { AgentTool, SettleToolCallResult } from "@earendil-works/pi-agent-core";
@@ -16,7 +17,7 @@ export interface SandboxFileChange {
 export interface SpeculativeSandboxExecution {
 	readonly output: SettleToolCallResult;
 	readonly changes: readonly SandboxFileChange[];
-	readonly sandbox: "temporary_workspace";
+	readonly sandbox: "git_worktree";
 }
 
 export interface SpeculativeSandboxExecuteContext {
@@ -34,7 +35,7 @@ export interface SpeculativeAgentSandbox {
 	readonly supports: (toolName: string) => boolean;
 	/** Execute without changing the real workspace. */
 	readonly execute: (context: SpeculativeSandboxExecuteContext) => Promise<SpeculativeSandboxExecution>;
-	/** Revalidate and adopt an execution. Throw when adoption is unsafe. */
+	/** Revalidate and atomically adopt an execution, rolling back partial writes on failure. */
 	readonly adopt: (execution: SpeculativeSandboxExecution) => Promise<SettleToolCallResult>;
 }
 
@@ -51,28 +52,36 @@ export type SandboxProcessRunner = (input: SandboxProcessRunnerInput) => Promise
 export interface WorkspaceSandboxOptions {
 	/**
 	 * Process isolation provider used for bash. The provider must prevent access to sourceRoot;
-	 * a temporary cwd alone is not a security boundary.
+	 * a detached worktree alone is not a process security boundary.
 	 */
 	readonly processRunner?: SandboxProcessRunner;
+	readonly gitBinary?: string;
 }
 
-/**
- * Create M3's conservative workspace sandbox.
- *
- * Pi write/edit calls are redirected to a temporary file and adopted only after byte-for-byte
- * base validation. Bash additionally requires an explicit process isolation provider. Full
- * worktree transactions and native process isolation are intentionally deferred to M4/M5.
- */
+export interface SandboxWorkspaceContext {
+	readonly sourceRoot: string;
+	readonly sandboxRoot: string;
+}
+
+interface PrivateGitWorkspace extends SandboxWorkspaceContext {
+	readonly parent: string;
+	readonly repository: string;
+	readonly gitBinary: string;
+}
+
+const SNAPSHOT_EXCLUDES = [".git", ".pi", "node_modules", "dist", ".next"] as const;
+
+/** Create M4's private Git snapshot sandbox with transactional multi-file adoption. */
 export function createWorkspaceSandbox(options: WorkspaceSandboxOptions = {}): SpeculativeAgentSandbox {
 	return {
 		supports: (toolName) =>
 			toolName === "write" || toolName === "edit" || (toolName === "bash" && !!options.processRunner),
 		execute: async (context) => {
 			if (context.toolName === "write" || context.toolName === "edit") {
-				return executeMutation(context);
+				return executeMutation(context, options.gitBinary);
 			}
 			if (context.toolName === "bash" && options.processRunner) {
-				return executeBash(context, options.processRunner);
+				return executeBash(context, options.processRunner, options.gitBinary);
 			}
 			throw new Error(`Sandbox does not support tool ${context.toolName}`);
 		},
@@ -82,57 +91,89 @@ export function createWorkspaceSandbox(options: WorkspaceSandboxOptions = {}): S
 
 export async function commitSandboxExecution(execution: SpeculativeSandboxExecution): Promise<SettleToolCallResult> {
 	for (const change of execution.changes) {
-		await assertNoSymlinkPath(change.root, change.target);
-		const current = await readOptional(change.target);
+		const root = path.resolve(change.root);
+		const target = path.resolve(change.target);
+		if (!contains(root, target) || target === root || target !== path.resolve(root, change.resource)) {
+			throw new Error(`sandbox adoption path escapes workspace: ${change.resource}`);
+		}
+		await assertNoSymlinkPath(root, target);
+		const current = await readOptional(target);
 		if (!sameOptionalBytes(current, change.before)) {
 			throw new Error(`resource changed before adoption: ${change.resource}`);
 		}
 	}
-	for (const change of execution.changes) {
-		if (change.after === undefined) throw new Error(`M3 sandbox cannot delete files: ${change.resource}`);
-		await mkdir(path.dirname(change.target), { recursive: true });
-		await writeFile(change.target, change.after);
+
+	const applied: SandboxFileChange[] = [];
+	try {
+		for (const change of execution.changes) {
+			applied.push(change);
+			await applyBytes(change.target, change.after);
+		}
+	} catch (error) {
+		for (const change of applied.reverse()) {
+			try {
+				await applyBytes(change.target, change.before);
+			} catch {
+				// Continue restoring the remaining paths before surfacing the adoption failure.
+			}
+		}
+		throw error;
 	}
 	return execution.output;
 }
 
-async function executeMutation(context: SpeculativeSandboxExecuteContext): Promise<SpeculativeSandboxExecution> {
+export async function withSandboxWorkspace<T>(
+	cwd: string,
+	run: (workspace: SandboxWorkspaceContext) => Promise<T>,
+	gitBinary = "git",
+): Promise<T> {
+	const workspace = await createPrivateGitWorkspace(cwd, gitBinary);
+	try {
+		return await run(workspace);
+	} finally {
+		await cleanupPrivateGitWorkspace(workspace);
+	}
+}
+
+async function executeMutation(
+	context: SpeculativeSandboxExecuteContext,
+	gitBinary?: string,
+): Promise<SpeculativeSandboxExecution> {
 	const args = asRecord(context.args);
 	if (!args || typeof args.path !== "string") throw new Error(`${context.toolName}.path must be a string`);
-	const root = path.resolve(context.cwd);
-	const target = path.resolve(root, args.path);
-	if (!contains(root, target) || target === root)
+	const sourceRoot = path.resolve(context.cwd);
+	const target = path.resolve(sourceRoot, args.path);
+	if (!contains(sourceRoot, target) || target === sourceRoot) {
 		throw new Error(`sandbox mutation path escapes workspace: ${args.path}`);
-	await assertNoSymlinkPath(root, target);
+	}
+	await assertNoSymlinkPath(sourceRoot, target);
+	const resource = slash(path.relative(sourceRoot, target));
+	const requestedPath = args.path;
 
-	const before = await readOptional(target);
-	const sandboxParent = await mkdtemp(path.join(os.tmpdir(), "pi-speculative-action-"));
-	const sandboxRoot = path.join(sandboxParent, "workspace");
-	const resource = slash(path.relative(root, target));
-	const sandboxTarget = path.join(sandboxRoot, resource);
-	try {
-		await mkdir(path.dirname(sandboxTarget), { recursive: true });
-		if (before !== undefined) await writeFile(sandboxTarget, before);
+	return withPrivateGitWorkspace(sourceRoot, gitBinary ?? "git", async (workspace) => {
+		const sandboxTarget = path.resolve(workspace.sandboxRoot, resource);
+		await assertNoSymlinkPath(workspace.sandboxRoot, sandboxTarget);
 		const redirected = { ...args, path: sandboxTarget };
 		const result = await context.tool.execute(context.callID, redirected as never, context.signal);
-		const after = await readOptional(sandboxTarget);
-		if (after === undefined) throw new Error(`${context.toolName} did not produce its target file`);
+		const changes = await collectSandboxChanges(workspace);
 		return {
 			output: {
-				result: sanitizeToolResult(result, sandboxTarget, args.path),
+				result: replacePaths(result, [
+					[sandboxTarget, requestedPath],
+					[workspace.sandboxRoot, sourceRoot],
+				]),
 				isError: false,
 			},
-			changes: [{ root, target, resource, before, after }],
-			sandbox: "temporary_workspace",
+			changes,
+			sandbox: "git_worktree",
 		};
-	} finally {
-		await rm(sandboxParent, { recursive: true, force: true });
-	}
+	});
 }
 
 async function executeBash(
 	context: SpeculativeSandboxExecuteContext,
 	runner: SandboxProcessRunner,
+	gitBinary?: string,
 ): Promise<SpeculativeSandboxExecution> {
 	const args = asRecord(context.args);
 	if (!args || typeof args.command !== "string") throw new Error("bash.command must be a string");
@@ -140,32 +181,137 @@ async function executeBash(
 		throw new Error("bash.timeout must be a finite number");
 	}
 	const sourceRoot = path.resolve(context.cwd);
-	const sandboxParent = await mkdtemp(path.join(os.tmpdir(), "pi-speculative-action-"));
-	const sandboxRoot = path.join(sandboxParent, "workspace");
-	try {
-		await cp(sourceRoot, sandboxRoot, {
-			recursive: true,
-			dereference: false,
-			filter: (source) => shouldCopyWorkspacePath(sourceRoot, source),
-		});
+	const command = args.command;
+	return withPrivateGitWorkspace(sourceRoot, gitBinary ?? "git", async (workspace) => {
 		const output = await runner({
-			command: args.command,
-			cwd: sandboxRoot,
+			command,
+			cwd: workspace.sandboxRoot,
 			sourceRoot,
 			...(typeof args.timeout === "number" ? { timeout: args.timeout } : {}),
 			signal: context.signal,
 		});
-		return { output, changes: [], sandbox: "temporary_workspace" };
-	} finally {
-		await rm(sandboxParent, { recursive: true, force: true });
+		return {
+			output: replacePaths(output, [[workspace.sandboxRoot, sourceRoot]]),
+			changes: await collectSandboxChanges(workspace),
+			sandbox: "git_worktree",
+		};
+	});
+}
+
+async function createPrivateGitWorkspace(cwd: string, gitBinary: string): Promise<PrivateGitWorkspace> {
+	const sourceRoot = path.resolve(cwd);
+	await assertNoSymlinkPath(sourceRoot, sourceRoot);
+	const parent = await mkdtemp(path.join(os.tmpdir(), "pi-speculative-action-"));
+	const repository = path.join(parent, "snapshot.git");
+	const sandboxRoot = path.join(parent, "workspace");
+	const authorEnvironment = {
+		GIT_AUTHOR_NAME: "Pi Speculative Action",
+		GIT_AUTHOR_EMAIL: "speculative-action@localhost",
+		GIT_COMMITTER_NAME: "Pi Speculative Action",
+		GIT_COMMITTER_EMAIL: "speculative-action@localhost",
+	};
+	try {
+		await git(gitBinary, ["init", "--bare", repository], parent);
+		await git(gitBinary, ["--git-dir", repository, "config", "core.autocrlf", "false"], parent);
+		const pathspecs = SNAPSHOT_EXCLUDES.flatMap((item) => [
+			`:(glob,exclude)**/${item}`,
+			`:(glob,exclude)**/${item}/**`,
+		]);
+		await git(
+			gitBinary,
+			["--git-dir", repository, "--work-tree", sourceRoot, "add", "-f", "-A", "--", ".", ...pathspecs],
+			sourceRoot,
+		);
+		const tree = (await git(gitBinary, ["--git-dir", repository, "write-tree"], parent)).toString("utf8").trim();
+		const commit = (
+			await git(
+				gitBinary,
+				["--git-dir", repository, "commit-tree", tree, "-m", "speculative baseline"],
+				parent,
+				authorEnvironment,
+			)
+		)
+			.toString("utf8")
+			.trim();
+		await git(gitBinary, ["--git-dir", repository, "update-ref", "refs/heads/baseline", commit], parent);
+		await git(gitBinary, ["--git-dir", repository, "worktree", "add", "--detach", sandboxRoot, commit], parent);
+		return { sourceRoot, sandboxRoot, parent, repository, gitBinary };
+	} catch (error) {
+		await rm(parent, { recursive: true, force: true });
+		throw error;
 	}
 }
 
-function shouldCopyWorkspacePath(root: string, source: string): boolean {
-	const relative = path.relative(root, source);
-	if (relative === "") return true;
-	const first = relative.split(path.sep)[0];
-	return first !== ".git" && first !== ".pi" && first !== "node_modules" && first !== "dist" && first !== ".next";
+async function withPrivateGitWorkspace<T>(
+	cwd: string,
+	gitBinary: string,
+	run: (workspace: PrivateGitWorkspace) => Promise<T>,
+): Promise<T> {
+	const workspace = await createPrivateGitWorkspace(cwd, gitBinary);
+	try {
+		return await run(workspace);
+	} finally {
+		await cleanupPrivateGitWorkspace(workspace);
+	}
+}
+
+async function cleanupPrivateGitWorkspace(workspace: PrivateGitWorkspace): Promise<void> {
+	try {
+		await git(
+			workspace.gitBinary,
+			["--git-dir", workspace.repository, "worktree", "remove", "--force", workspace.sandboxRoot],
+			workspace.parent,
+		);
+	} catch {
+		// The private parent removal below is the final cleanup boundary.
+	}
+	await rm(workspace.parent, { recursive: true, force: true });
+}
+
+async function collectSandboxChanges(workspace: PrivateGitWorkspace): Promise<readonly SandboxFileChange[]> {
+	const tracked = await git(
+		workspace.gitBinary,
+		["-C", workspace.sandboxRoot, "diff", "--name-only", "--no-renames", "-z", "HEAD", "--"],
+		workspace.sandboxRoot,
+	);
+	const untracked = await git(
+		workspace.gitBinary,
+		["-C", workspace.sandboxRoot, "ls-files", "--others", "--exclude-standard", "-z", "--"],
+		workspace.sandboxRoot,
+	);
+	const resources = [...new Set([...parseNullList(tracked), ...parseNullList(untracked)])].sort();
+	const changes: SandboxFileChange[] = [];
+	for (const resource of resources) {
+		if (!resource || path.isAbsolute(resource) || resource.split("/").includes("..")) {
+			throw new Error(`invalid sandbox change path: ${resource}`);
+		}
+		const target = path.resolve(workspace.sourceRoot, resource);
+		const sandboxTarget = path.resolve(workspace.sandboxRoot, resource);
+		if (!contains(workspace.sourceRoot, target) || !contains(workspace.sandboxRoot, sandboxTarget)) {
+			throw new Error(`sandbox change escapes workspace: ${resource}`);
+		}
+		await assertNoSymlinkPath(workspace.sourceRoot, target);
+		await assertNoSymlinkPath(workspace.sandboxRoot, sandboxTarget);
+		const before = await readBaselineBytes(workspace, resource);
+		const after = await readOptional(sandboxTarget);
+		if (!sameOptionalBytes(before, after)) {
+			changes.push({ root: workspace.sourceRoot, target, resource, before, after });
+		}
+	}
+	return changes;
+}
+
+async function readBaselineBytes(workspace: PrivateGitWorkspace, resource: string): Promise<Uint8Array | undefined> {
+	const entry = await git(
+		workspace.gitBinary,
+		["-C", workspace.sandboxRoot, "ls-tree", "-z", "HEAD", "--", resource],
+		workspace.sandboxRoot,
+	);
+	if (entry.length === 0) return undefined;
+	const metadata = entry.subarray(0, entry.indexOf(0)).toString("utf8").split("\t", 1)[0];
+	const hash = metadata.split(" ")[2];
+	if (!hash) throw new Error(`invalid Git baseline entry: ${resource}`);
+	return git(workspace.gitBinary, ["-C", workspace.sandboxRoot, "cat-file", "blob", hash], workspace.sandboxRoot);
 }
 
 async function assertNoSymlinkPath(root: string, target: string): Promise<void> {
@@ -185,13 +331,23 @@ async function assertNoSymlinkPath(root: string, target: string): Promise<void> 
 		current = path.join(current, segment);
 		try {
 			const stats = await lstat(current);
-			if (stats.isSymbolicLink())
+			if (stats.isSymbolicLink()) {
 				throw new Error(`sandbox path contains symlink: ${slash(path.relative(resolvedRoot, current))}`);
+			}
 		} catch (error) {
 			if (isMissing(error)) break;
 			throw error;
 		}
 	}
+}
+
+async function applyBytes(target: string, bytes: Uint8Array | undefined): Promise<void> {
+	if (bytes === undefined) {
+		await rm(target, { force: true });
+		return;
+	}
+	await mkdir(path.dirname(target), { recursive: true });
+	await writeFile(target, bytes);
 }
 
 async function readOptional(target: string): Promise<Uint8Array | undefined> {
@@ -214,19 +370,51 @@ function sameOptionalBytes(left: Uint8Array | undefined, right: Uint8Array | und
 	return true;
 }
 
-function sanitizeToolResult<T>(result: T, sandboxTarget: string, requestedPath: string): T {
-	return replaceSandboxPath(result, sandboxTarget, requestedPath) as T;
+function parseNullList(value: Uint8Array): string[] {
+	return value
+		.toString()
+		.split("\0")
+		.filter(Boolean)
+		.map((item) => slash(item));
 }
 
-function replaceSandboxPath(value: unknown, sandboxTarget: string, requestedPath: string): unknown {
-	if (typeof value === "string") return value.replaceAll(sandboxTarget, requestedPath);
-	if (Array.isArray(value)) return value.map((item) => replaceSandboxPath(item, sandboxTarget, requestedPath));
+function replacePaths<T>(value: T, replacements: readonly (readonly [string, string])[]): T {
+	if (typeof value === "string") {
+		let result: string = value;
+		for (const [from, to] of replacements) result = result.replaceAll(from, to);
+		return result as T;
+	}
+	if (Array.isArray(value)) return value.map((item) => replacePaths(item, replacements)) as T;
 	if (!value || typeof value !== "object" || value instanceof Uint8Array) return value;
 	if (Object.getPrototypeOf(value) !== Object.prototype) return value;
 	return Object.fromEntries(
-		Object.entries(value as Record<string, unknown>).map(([key, item]) => [
-			key,
-			replaceSandboxPath(item, sandboxTarget, requestedPath),
-		]),
-	);
+		Object.entries(value as Record<string, unknown>).map(([key, item]) => [key, replacePaths(item, replacements)]),
+	) as T;
+}
+
+function git(
+	command: string,
+	args: readonly string[],
+	cwd: string,
+	environment: Readonly<Record<string, string>> = {},
+): Promise<Buffer> {
+	return new Promise((resolve, reject) => {
+		execFile(
+			command,
+			[...args],
+			{
+				cwd,
+				env: { ...process.env, ...environment },
+				encoding: "buffer",
+				maxBuffer: 64 * 1024 * 1024,
+			},
+			(error, stdout, stderr) => {
+				if (error) {
+					reject(new Error(`${command} ${args.join(" ")} failed: ${Buffer.from(stderr).toString("utf8").trim()}`));
+					return;
+				}
+				resolve(Buffer.from(stdout));
+			},
+		);
+	});
 }

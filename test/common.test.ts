@@ -92,10 +92,10 @@ describe("speculative action common", () => {
 				maxCandidates: 4,
 				resourceCacheMaxEntries: 8,
 				predictionTimeoutMs: 100,
-				tools: { liveReadonly: ["read"], sandbox: ["bash", "write"] },
+				tools: { resourceCached: ["read"], sandbox: ["bash", "write"] },
 			}),
 		).toEqual(["read", "bash", "write"]);
-		expect(inferredExecution("read")).toBe("live_readonly");
+		expect(inferredExecution("read")).toBe("resource_cached");
 		expect(inferredExecution("edit")).toBe("sandbox");
 	});
 

@@ -1,6 +1,6 @@
 import path from "node:path";
 
-export type SpeculativeExecution = "live_readonly" | "sandbox";
+export type SpeculativeExecution = "resource_cached" | "sandbox";
 export type CandidateLifetime = "turn" | "resource";
 
 export interface ActionKey {
@@ -35,7 +35,7 @@ export const DEFAULTS = {
 	resourceCacheMaxEntries: 512,
 	predictionTimeoutMs: 300_000,
 	tools: {
-		liveReadonly: ["read", "grep", "find"] as readonly string[],
+		resourceCached: ["read", "grep", "find"] as readonly string[],
 		sandbox: ["write", "edit"] as readonly string[],
 	},
 };
@@ -95,7 +95,7 @@ export function buildPiActionKey(tool: string, input: unknown, cwd: string): Act
 		if (resource === undefined) return undefined;
 		return buildActionKey({
 			tool,
-			execution: "live_readonly",
+			execution: "resource_cached",
 			resources: [resource],
 			input: {
 				path: resource,
@@ -111,7 +111,7 @@ export function buildPiActionKey(tool: string, input: unknown, cwd: string): Act
 		if (root === undefined) return undefined;
 		return buildActionKey({
 			tool,
-			execution: "live_readonly",
+			execution: "resource_cached",
 			resources: [root],
 			input: {
 				pattern: record.pattern,
@@ -131,7 +131,7 @@ export function buildPiActionKey(tool: string, input: unknown, cwd: string): Act
 		if (root === undefined) return undefined;
 		return buildActionKey({
 			tool,
-			execution: "live_readonly",
+			execution: "resource_cached",
 			resources: [root],
 			input: {
 				pattern: record.pattern,
@@ -224,7 +224,7 @@ export function normalizeRelativeRoot(value: unknown, cwd: string): string | und
 }
 
 export function inferredExecution(tool: string): SpeculativeExecution | undefined {
-	if ((IDEMPOTENT_ACTION_TOOLS as readonly string[]).includes(tool)) return "live_readonly";
+	if ((IDEMPOTENT_ACTION_TOOLS as readonly string[]).includes(tool)) return "resource_cached";
 	if ((SANDBOX_ACTION_TOOLS as readonly string[]).includes(tool)) return "sandbox";
 	return undefined;
 }
