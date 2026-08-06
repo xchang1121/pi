@@ -359,6 +359,46 @@ describe("PatternAware", () => {
 		await next.release();
 	});
 
+	test("migrates v9 patterns without treating ambiguous unused work as actor misses", async () => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "pi-pattern-aware-migration-"));
+		temporary.push(directory);
+		const file = path.join(directory, "patterns.json");
+		const {
+			actorMisses: _actorMisses,
+			staleInvalidations: _staleInvalidations,
+			systemCancellations: _systemCancellations,
+			recentSuccessWeight: _recentSuccessWeight,
+			recentFailureWeight: _recentFailureWeight,
+			feedbackSequence: _feedbackSequence,
+			...legacy
+		} = validatedGapPattern(
+			{ "0": 10 },
+			{
+				id: "migrated",
+				opportunities: 9,
+				consumed: 2,
+				unused: 7,
+			},
+		);
+		await fs.writeFile(file, JSON.stringify({ version: 9, patterns: [legacy], pools: [] }));
+
+		const store = new PatternAwareStore(settings(), file);
+		await store.load();
+		const migrated = store.snapshot().find((item) => item.id === "migrated");
+
+		expect(migrated).toMatchObject({
+			consumed: 2,
+			unused: 7,
+			actorMisses: 0,
+			staleInvalidations: 0,
+			systemCancellations: 0,
+			recentSuccessWeight: 2,
+			recentFailureWeight: 0,
+		});
+		store.observe(input({ sessionID: "probe", tool: "grep", input: { pattern: "TODO" } }));
+		expect(store.predict("probe").some((item) => item.patternID === "migrated")).toBe(true);
+	});
+
 	test("discards persisted patterns from an incompatible analyzer version", async () => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "pi-pattern-aware-version-"));
 		temporary.push(directory);
@@ -366,7 +406,7 @@ describe("PatternAware", () => {
 		await fs.writeFile(
 			file,
 			JSON.stringify({
-				version: 9,
+				version: 8,
 				patterns: [validatedGapPattern({ "0": 10 })],
 				pools: [],
 			}),
@@ -830,6 +870,73 @@ describe("PatternAware", () => {
 		expect(bash?.input).toEqual({ command: "bun test tests/gamma.test.ts" });
 		expect(bash?.depth).toBe(3);
 		expect(new Set(bash?.continuation.visitedPatternIDs).size).toBe(3);
+	});
+
+	test("replays held-out workflows with top-one bindings across a three-step frontier", () => {
+		const store = new PatternAwareStore(settings());
+		for (const [sessionID, sourcePath, testPath] of [
+			["train-one", "src/invoice.ts", "test/invoice.test.ts"],
+			["train-two", "src/payment.ts", "test/payment.test.ts"],
+			["train-three", "src/refund.ts", "test/refund.test.ts"],
+		] as const) {
+			trainFrontier(store, sessionID, sourcePath, testPath);
+		}
+
+		let predictions = 0;
+		let topOneHits = 0;
+		let deepestFrontier = 0;
+		for (const [sessionID, sourcePath, testPath] of [
+			["held-out-one", "src/order.ts", "test/order.test.ts"],
+			["held-out-two", "src/ledger.ts", "test/ledger.test.ts"],
+			["held-out-three", "src/receipt.ts", "test/receipt.test.ts"],
+		] as const) {
+			store.observe(input({ sessionID, tool: "grep", input: {}, outputPaths: [sourcePath] }));
+			const read = store.predict(sessionID).find((item) => item.type === "tool_call");
+			predictions++;
+			if (read?.tool === "read" && read.input.filePath === sourcePath) topOneHits++;
+			deepestFrontier = Math.max(deepestFrontier, read?.depth ?? 0);
+
+			const lsp = read
+				? store
+						.continue(
+							read.continuation,
+							input({
+								sessionID,
+								tool: "read",
+								input: { filePath: sourcePath },
+								output: { nextPath: testPath },
+							}),
+						)
+						.find((item) => item.type === "tool_call")
+				: undefined;
+			predictions++;
+			if (lsp?.tool === "lsp" && lsp.input.filePath === testPath) topOneHits++;
+			deepestFrontier = Math.max(deepestFrontier, lsp?.depth ?? 0);
+
+			const command = `bun test ${testPath}`;
+			const bash = lsp
+				? store
+						.continue(
+							lsp.continuation,
+							input({
+								sessionID,
+								tool: "lsp",
+								input: lsp.input,
+								output: { command },
+							}),
+						)
+						.find((item) => item.type === "tool_call")
+				: undefined;
+			predictions++;
+			if (bash?.tool === "bash" && bash.input.command === command) topOneHits++;
+			deepestFrontier = Math.max(deepestFrontier, bash?.depth ?? 0);
+		}
+
+		expect({ topOneHits, predictions, deepestFrontier }).toEqual({
+			topOneHits: 9,
+			predictions: 9,
+			deepestFrontier: 3,
+		});
 	});
 
 	test("keeps LLM turn boundaries transparent to multi-step continuation", () => {

@@ -240,6 +240,7 @@ const MAX_BINDING_VARIANTS = 32;
 const MAX_COMPOSABLE_SOURCES = 48;
 const PERSIST_DEBOUNCE_MS = 200;
 const PERSISTENCE_VERSION = 10;
+const MIGRATABLE_PERSISTENCE_VERSION = 9;
 
 class PredictiveContextTrie {
 	private readonly root: TrieNode = { children: new Map(), patterns: new Set() };
@@ -322,7 +323,12 @@ export class PatternAwareStore {
 			.readFile(this.persistenceFile, "utf8")
 			.then((value) => JSON.parse(value) as PersistedState)
 			.catch(() => undefined);
-		if (!parsed || parsed.version !== PERSISTENCE_VERSION || !Array.isArray(parsed.patterns)) return;
+		if (
+			!parsed ||
+			(parsed.version !== PERSISTENCE_VERSION && parsed.version !== MIGRATABLE_PERSISTENCE_VERSION) ||
+			!Array.isArray(parsed.patterns)
+		)
+			return;
 		for (const item of parsed.patterns) {
 			const pattern = mutablePattern(item);
 			if (!pattern || pattern.context.some((event) => event.tool === "$llm")) continue;
