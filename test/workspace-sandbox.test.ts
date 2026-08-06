@@ -438,7 +438,7 @@ describe("M4 workspace sandbox", () => {
 		}
 	});
 
-	it("refreshes a pooled baseline after incremental workspace changes", async () => {
+	it("refreshes a pooled baseline even before filesystem watcher delivery", async () => {
 		const root = await mkdtemp(path.join(os.tmpdir(), "pi-spec-pool-refresh-test-"));
 		try {
 			await writeFile(path.join(root, "value.txt"), "one\n");
@@ -447,7 +447,6 @@ describe("M4 workspace sandbox", () => {
 			});
 			await writeFile(path.join(root, "value.txt"), "two\n");
 			await writeFile(path.join(root, "added.txt"), "added\n");
-			await new Promise((resolve) => setTimeout(resolve, 80));
 
 			await withSandboxWorkspace(root, async (workspace) => {
 				expect(await readFile(path.join(workspace.sandboxRoot, "value.txt"), "utf8")).toBe("two\n");

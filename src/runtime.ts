@@ -1,5 +1,5 @@
-import type { ActionKey, CandidateLifetime, DrafterToolDefinition, SpeculativeExecution } from "./common.ts";
-import { actionKeyMatches, actionLifetime, clampMaxCandidates, inferredExecution, KEYABLE_TOOLS } from "./common.ts";
+import type { ActionKey, DrafterToolDefinition, SpeculativeExecution } from "./common.ts";
+import { actionKeyMatches, clampMaxCandidates, DEFAULTS, inferredExecution, KEYABLE_TOOLS } from "./common.ts";
 import type { PatternAwareSettings } from "./pattern-aware.ts";
 import {
 	expectedUtility,
@@ -13,6 +13,7 @@ import {
 export interface SpeculativeActionSettings {
 	readonly enabled: boolean;
 	readonly mode: "predict_action_single_step";
+	readonly drafterEnabled?: boolean;
 	readonly maxCandidates: number;
 	readonly resourceCacheMaxEntries: number;
 	readonly resourceCacheMaxBytes?: number;
@@ -47,7 +48,6 @@ export interface SpeculativeDraftCandidate {
 export interface SpeculativePrediction {
 	readonly candidates: readonly SpeculativeDraftCandidate[];
 	readonly draftTokens: number;
-	readonly deferDrafter?: boolean;
 }
 
 export interface CandidatePreflightAllowed {
@@ -72,17 +72,43 @@ export interface ResourceValidationResult {
 }
 
 export interface PredictionLease {
+	readonly id: string;
 	readonly source: "drafter" | "pattern_aware";
 	readonly patternID?: string;
 	readonly patternContext?: unknown;
-	remainingHorizon?: number;
-	active: boolean;
-	outcome?: "consumed" | "unused";
+	readonly providerTurnID: string;
+	readonly anchorActionSeq: number;
+	readonly horizon?: number;
+	readonly validThroughActionSeq?: number;
+	state: "active" | "matched" | "hit" | "expired" | "invalidated";
+	resolvedActionSeq?: number;
 }
 
+export type SpeculativeJobRun<Output> =
+	| { readonly status: "running" }
+	| { readonly status: "ready"; readonly completedAt: number; readonly executionMs: number; readonly output: Output }
+	| {
+			readonly status: "closed";
+			readonly reason: string;
+			readonly completedAt?: number;
+			readonly executionMs?: number;
+	  };
+
+export type SpeculativeJobReuse =
+	| { readonly kind: "shared" }
+	| {
+			readonly kind: "exclusive";
+			state: "available" | "claimed" | "adopted";
+			claimTurnID?: string;
+	  };
+
 export interface SpeculativeCandidate {
+	readonly id: string;
 	readonly key: ActionKey;
-	readonly lifetime: CandidateLifetime;
+	readonly tool: string;
+	readonly input: Readonly<Record<string, unknown>>;
+	readonly reuse: SpeculativeJobReuse;
+	run: SpeculativeJobRun<unknown>;
 	resourceVersion?: unknown;
 	releaseResourceWatch?: () => void;
 	resourceCaptureMs?: number;
@@ -113,14 +139,9 @@ export interface SpeculativeCandidate {
 	scheduling: SpeculativeSchedulingMetadata;
 	utility: number;
 	readonly patternID?: string;
-	remainingHorizon?: number;
-	predictionActive: boolean;
 	readonly leases: PredictionLease[];
-	completedAt?: number;
-	executionMs?: number;
-	consumed: boolean;
 	hits: number;
-	promoted: boolean;
+	authoritativeSequence?: number;
 	schedulerOutcome?: "reused" | "promoted" | "discarded" | "preempted";
 }
 
@@ -339,17 +360,6 @@ export interface SpeculativeActionRuntimeAdapter<
 		readonly candidate: SpeculativeDraftCandidate;
 		readonly signal: AbortSignal;
 	}) => MaybePromise<void>;
-	readonly candidateLifetime?: (input: {
-		readonly startInput: StartInput;
-		readonly data: StateData;
-		readonly settings: SpeculativeActionSettings;
-		readonly candidate: SpeculativeDraftCandidate;
-		readonly tool: string;
-		readonly concrete: Record<string, unknown>;
-		readonly action: ActionKey;
-		readonly callID: string;
-		readonly index: number;
-	}) => CandidateLifetime;
 	readonly captureResourceVersion?: (input: {
 		readonly startInput: StartInput;
 		readonly data: StateData;
@@ -459,6 +469,7 @@ type CandidateExecution<Output> =
 	| { readonly ok: false; readonly error: unknown };
 
 interface RuntimeCandidate<Output> extends SpeculativeCandidate {
+	run: SpeculativeJobRun<Output>;
 	readonly execution: DeferredState<CandidateExecution<Output>>;
 	readonly controller: AbortController;
 }
@@ -475,10 +486,17 @@ interface TurnState<SessionID, Output, StateData> {
 	readonly predictionController: AbortController;
 	readonly actorKeys: Set<string>;
 	readonly preparedHints: Set<string>;
-	readonly candidateFailures: Map<string, string>;
+	readonly pendingActionSequences: Set<number>;
+	actionSequence: number;
 	admittedCandidates: number;
 	drafterAttempted: boolean;
 	drafterFeedback?: "success" | "failure";
+	drafterPlanMismatch?: boolean;
+	pendingDrafterMismatch?: {
+		readonly key: ActionKey;
+		readonly actualAction: string;
+		readonly predictedAction?: string;
+	};
 	terminal: boolean;
 	finished: boolean;
 	noCandidateReported: boolean;
@@ -490,6 +508,16 @@ class PredictionTimeoutError extends Error {
 	constructor() {
 		super("Speculative prediction timed out");
 		this.name = "PredictionTimeoutError";
+	}
+}
+
+class SpeculativeJobError extends Error {
+	readonly reason: string;
+
+	constructor(reason: string, cause: unknown) {
+		super(cause instanceof Error ? cause.message : String(cause), { cause });
+		this.reason = reason;
+		this.name = "SpeculativeJobError";
 	}
 }
 
@@ -507,6 +535,7 @@ export function makeSpeculativeActionRuntime<
 	const persistentCandidates = new Map<string, RuntimeCandidate<Output>>();
 	const tokenTotals = new Map<SessionID, number>();
 	const wallTimes = new Map<SessionID, number>();
+	const actionSequences = new Map<SessionID, number>();
 	const schedulers = new Map<SessionID, ToolSpeculationScheduler<RuntimeCandidate<Output>>>();
 	const candidateOwners = new WeakMap<RuntimeCandidate<Output>, TurnState<SessionID, Output, StateData>>();
 	const serviceTimes = new Map<string, { count: number; averageMs: number }>();
@@ -547,8 +576,22 @@ export function makeSpeculativeActionRuntime<
 		observeAverage(executionOverheadTimes, tool, durationMs);
 	const observeHitOverhead = (tool: string, durationMs: number): void =>
 		observeAverage(hitOverheadTimes, tool, durationMs);
+	const masterEnabled = (settings: SpeculativeActionSettings): boolean =>
+		settings.enabled && settings.mode === "predict_action_single_step";
+	const sourceEnabled = (settings: SpeculativeActionSettings, source: "drafter" | "pattern_aware"): boolean =>
+		masterEnabled(settings) &&
+		(source === "drafter"
+			? (settings.drafterEnabled ?? DEFAULTS.drafterEnabled)
+			: (settings.patternAware?.enabled ?? false));
+	const latestSettings = async (): Promise<SpeculativeActionSettings | undefined> => {
+		try {
+			return await adapter.settings();
+		} catch {
+			return undefined;
+		}
+	};
 	const adaptiveDrafter = (state: TurnState<SessionID, Output, StateData>): boolean =>
-		state.settings.adaptiveDrafter ?? true;
+		state.settings.adaptiveDrafter ?? DEFAULTS.adaptiveDrafter;
 	const takeDrafterOpportunity = (sessionID: SessionID): boolean => {
 		const feedback = drafterBackoff.get(sessionID);
 		if (!feedback?.skips) return true;
@@ -559,7 +602,7 @@ export function makeSpeculativeActionRuntime<
 		state: TurnState<SessionID, Output, StateData>,
 		candidate?: RuntimeCandidate<Output>,
 	): void => {
-		if (!adaptiveDrafter(state) || !state.drafterAttempted || state.drafterFeedback) return;
+		if (!adaptiveDrafter(state) || (!state.drafterAttempted && !candidate) || state.drafterFeedback) return;
 		if (candidate && !candidate.leases.some((lease) => lease.source === "drafter")) return;
 		state.drafterFeedback = "failure";
 		const feedback = drafterBackoff.get(state.sessionID) ?? { failures: 0, skips: 0 };
@@ -572,19 +615,29 @@ export function makeSpeculativeActionRuntime<
 		}
 		drafterBackoff.set(state.sessionID, feedback);
 	};
-	const recordPredictionHit = (
+	const matchPredictionLeases = async (
 		state: TurnState<SessionID, Output, StateData>,
 		candidate: RuntimeCandidate<Output>,
-	): void => {
-		const sources = new Set(candidate.leases.map((lease) => lease.source));
-		if (sources.has("drafter")) {
+		actionSequence: number,
+	): Promise<void> => {
+		const matched = candidate.leases.filter(
+			(lease) =>
+				lease.state === "active" &&
+				(lease.validThroughActionSeq === undefined || actionSequence <= lease.validThroughActionSeq),
+		);
+		for (const lease of matched) {
+			lease.state = "matched";
+			lease.resolvedActionSeq = actionSequence;
+			if (lease.source !== "pattern_aware" || !lease.patternID || !adapter.onPatternResolved) continue;
+			try {
+				await adapter.onPatternResolved(lease.patternID, "consumed", lease.patternContext);
+			} catch {
+				// Pattern feedback must not alter tool semantics.
+			}
+		}
+		if (matched.some((lease) => lease.source === "drafter")) {
 			state.drafterFeedback = "success";
 			drafterBackoff.delete(state.sessionID);
-		}
-		if (adaptiveDrafter(state) && sources.has("pattern_aware")) {
-			const feedback = drafterBackoff.get(state.sessionID) ?? { failures: 0, skips: 0 };
-			feedback.skips = Math.max(feedback.skips, 1);
-			drafterBackoff.set(state.sessionID, feedback);
 		}
 	};
 
@@ -638,7 +691,7 @@ export function makeSpeculativeActionRuntime<
 		for (const candidate of sessionPersistentCandidates(state.sessionID))
 			candidates.set(candidate.key.key, candidate);
 		for (const candidate of state.candidates.values()) {
-			if (candidate.consumed && candidate.lifetime === "turn") continue;
+			if (candidate.run.status === "closed") continue;
 			candidates.set(candidate.key.key, candidate);
 		}
 		return [...candidates.values()];
@@ -646,7 +699,7 @@ export function makeSpeculativeActionRuntime<
 
 	const cacheSnapshot = (state: TurnState<SessionID, Output, StateData>): SpeculativeCacheSnapshot => {
 		const candidates = cachedCandidates(state);
-		const running = candidates.filter((candidate) => candidate.completedAt === undefined).length;
+		const running = candidates.filter((candidate) => candidate.run.status === "running").length;
 		return {
 			cacheEntries: candidates.length,
 			cacheCapacity: state.settings.resourceCacheMaxEntries,
@@ -655,8 +708,8 @@ export function makeSpeculativeActionRuntime<
 			cacheRunning: running,
 			cacheCompleted: candidates.length - running,
 			activeCandidates: running,
-			turnCandidates: candidates.filter((candidate) => candidate.lifetime === "turn").length,
-			resourceCandidates: candidates.filter((candidate) => candidate.lifetime === "resource").length,
+			turnCandidates: candidates.filter((candidate) => candidate.reuse.kind === "exclusive").length,
+			resourceCandidates: candidates.filter((candidate) => candidate.reuse.kind === "shared").length,
 			cacheTools: [...new Set(candidates.map((candidate) => candidate.key.tool))].sort(),
 			cacheExecutions: [...new Set(candidates.map((candidate) => candidate.key.execution))].sort(),
 			observedWallMs:
@@ -670,7 +723,7 @@ export function makeSpeculativeActionRuntime<
 	): SpeculativeSchedulingEventFields => ({
 		source,
 		...(candidate.patternID ? { patternID: candidate.patternID } : {}),
-		...(candidate.remainingHorizon !== undefined ? { futureHorizon: candidate.remainingHorizon } : {}),
+		...(candidateFutureHorizon(candidate) !== undefined ? { futureHorizon: candidateFutureHorizon(candidate) } : {}),
 		...(candidate.empiricalProbability !== undefined ? { empiricalProbability: candidate.empiricalProbability } : {}),
 		...(candidate.conditionalProbability !== undefined
 			? { conditionalProbability: candidate.conditionalProbability }
@@ -770,7 +823,7 @@ export function makeSpeculativeActionRuntime<
 			tool: candidate.key.tool,
 			actionKeyHash: candidate.key.hash,
 			execution: candidate.key.execution,
-			executionMs: candidate.executionMs ?? 0,
+			executionMs: candidateExecutionMs(candidate),
 			...schedulingEventFields(candidate),
 			...cacheSnapshot(state),
 		});
@@ -852,7 +905,9 @@ export function makeSpeculativeActionRuntime<
 				entries.reduce((total, [, candidate]) => total + candidate.estimatedBytes, 0) >
 				resourceCacheByteLimit(settings);
 			if (!overEntries && !overBytes) break;
-			const victim = entries.find(([, candidate]) => candidate !== protectedCandidate && !candidate.promoted);
+			const victim = entries.find(
+				([, candidate]) => candidate !== protectedCandidate && candidate.schedulerOutcome !== "promoted",
+			);
 			if (!victim) break;
 			persistentCandidates.delete(victim[0]);
 			releaseResourceWatch(victim[1]);
@@ -869,22 +924,80 @@ export function makeSpeculativeActionRuntime<
 		return trimPersistentCandidates(state.sessionID, state.settings, candidate);
 	};
 
-	const resolvePatternLeases = async (
+	const settlePatternLeases = async (
 		candidate: RuntimeCandidate<Output>,
-		outcome: "consumed" | "unused",
+		state: "expired" | "invalidated",
 	): Promise<void> => {
 		for (const lease of candidate.leases) {
-			if (!lease.active || lease.source !== "pattern_aware") continue;
-			lease.active = false;
-			lease.outcome = outcome;
+			if (lease.state !== "active" || lease.source !== "pattern_aware") continue;
+			lease.state = state;
 			if (!lease.patternID || !adapter.onPatternResolved) continue;
 			try {
-				await adapter.onPatternResolved(lease.patternID, outcome, lease.patternContext);
+				await adapter.onPatternResolved(lease.patternID, "unused", lease.patternContext);
 			} catch {
 				// Pattern feedback must not alter tool semantics.
 			}
 		}
-		candidate.predictionActive = candidate.leases.some((lease) => lease.active);
+	};
+
+	const completePredictionMatch = (candidate: RuntimeCandidate<Output>, actionSequence: number): void => {
+		for (const lease of candidate.leases) {
+			if (lease.state === "matched" && lease.resolvedActionSeq === actionSequence) lease.state = "hit";
+		}
+	};
+
+	const expireDrafterLeases = (
+		candidate: RuntimeCandidate<Output>,
+		providerTurnID?: string,
+		state: PredictionLease["state"] = "expired",
+	): void => {
+		for (const lease of candidate.leases) {
+			if (lease.state !== "active" || lease.source !== "drafter") continue;
+			if (providerTurnID !== undefined && lease.providerTurnID !== providerTurnID) continue;
+			lease.state = state;
+		}
+	};
+
+	const expireDrafterPlan = (state: TurnState<SessionID, Output, StateData>): void => {
+		for (const candidate of availableCandidates(state).values()) expireDrafterLeases(candidate);
+	};
+
+	const pruneResolvedLeases = (candidate: RuntimeCandidate<Output>): void => {
+		const unresolved = candidate.leases.filter((lease) => lease.state === "active" || lease.state === "matched");
+		candidate.leases.splice(0, candidate.leases.length, ...unresolved);
+	};
+
+	const closeCandidate = async (
+		state: TurnState<SessionID, Output, StateData>,
+		candidate: RuntimeCandidate<Output>,
+		reason: string,
+		leaseState: "expired" | "invalidated" = "invalidated",
+		publish = false,
+		schedulerOutcome: "preempted" | "discarded" = "discarded",
+	): Promise<boolean> => {
+		if (candidate.run.status === "closed") return false;
+		const completedAt = candidateCompletedAt(candidate);
+		const executionMs = candidateExecutionMs(candidate);
+		candidate.schedulerOutcome = schedulerOutcome;
+		candidate.run = {
+			status: "closed",
+			reason,
+			...(completedAt !== undefined ? { completedAt } : {}),
+			...(executionMs > 0 ? { executionMs } : {}),
+		};
+		expireDrafterLeases(candidate, undefined, leaseState);
+		await settlePatternLeases(candidate, leaseState);
+		for (const lease of candidate.leases) {
+			if (lease.state === "matched") lease.state = "invalidated";
+		}
+		schedulerFor(state.sessionID).discard(candidate);
+		if (state.candidates.get(candidate.key.key) === candidate) state.candidates.delete(candidate.key.key);
+		removePersistentCandidate(state, candidate);
+		releaseResourceWatch(candidate);
+		candidate.controller.abort();
+		candidate.execution.resolve({ ok: false, error: new Error(reason) });
+		if (publish) await publishCancelled(state, candidate, reason);
+		return true;
 	};
 
 	const preemptCandidate = async (
@@ -893,20 +1006,16 @@ export function makeSpeculativeActionRuntime<
 		outcome: "preempted" | "discarded" = "preempted",
 	): Promise<void> => {
 		const owner = candidateOwners.get(candidate);
-		if (owner) schedulerFor(owner.sessionID).discard(candidate);
-		candidate.schedulerOutcome = outcome;
-		candidate.consumed = true;
-		await resolvePatternLeases(candidate, "unused");
-		if (owner) {
-			owner.candidates.delete(candidate.key.key);
-			removePersistentCandidate(owner, candidate);
+		if (!owner) {
+			candidate.schedulerOutcome = outcome;
+			candidate.run = { status: "closed", reason };
+			releaseResourceWatch(candidate);
+			candidate.controller.abort();
+			candidate.execution.resolve({ ok: false, error: new Error(reason) });
+			return;
 		}
-		candidate.controller.abort();
-		candidate.execution.resolve({ ok: false, error: new Error(reason) });
-		if (owner) {
-			await publishCancelled(owner, candidate, reason);
-			await publishCache(owner);
-		}
+		await closeCandidate(owner, candidate, reason, "invalidated", true, outcome);
+		await publishCache(owner);
 	};
 
 	const preemptForAuthoritative = async (
@@ -921,130 +1030,144 @@ export function makeSpeculativeActionRuntime<
 		}
 	};
 
+	const disableSession = async (sessionID: SessionID, reason = "speculative_action_disabled"): Promise<void> => {
+		const candidates = new Set<RuntimeCandidate<Output>>(sessionPersistentCandidates(sessionID));
+		for (const [key, state] of turns) {
+			if (state.sessionID !== sessionID) continue;
+			state.finished = true;
+			state.terminal = true;
+			state.predictionController.abort();
+			for (const candidate of state.candidates.values()) candidates.add(candidate);
+			turns.delete(key);
+		}
+		for (const candidate of candidates) await preemptCandidate(candidate, reason, "discarded");
+		drafterBackoff.delete(sessionID);
+		if (!schedulerFor(sessionID).snapshot().length) schedulers.delete(sessionID);
+	};
+
+	const reconcilePersistentCandidates = async (state: TurnState<SessionID, Output, StateData>): Promise<void> => {
+		for (const candidate of sessionPersistentCandidates(state.sessionID)) {
+			const configured =
+				candidate.key.execution === "resource_cached"
+					? state.settings.tools.resourceCached.includes(candidate.tool)
+					: state.settings.tools.sandbox.includes(candidate.tool);
+			if (!configured) await preemptCandidate(candidate, "tool_disabled", "discarded");
+		}
+		for (const candidate of trimPersistentCandidates(state.sessionID, state.settings)) {
+			await preemptCandidate(candidate, "resource_cache_limit_changed", "discarded");
+		}
+	};
+
 	const cancelCandidate = async (
 		state: TurnState<SessionID, Output, StateData>,
 		candidate: RuntimeCandidate<Output>,
 		reason: string,
 		detail?: string,
 	): Promise<void> => {
-		for (const lease of candidate.leases) {
-			if (lease.source === "drafter") lease.active = false;
-		}
-		candidate.predictionActive = candidate.leases.some((lease) => lease.active);
-		if (!candidate.predictionActive && candidate.lifetime !== "resource") {
-			candidate.schedulerOutcome = "discarded";
-			schedulerFor(state.sessionID).discard(candidate);
-			candidate.consumed = true;
-			state.candidates.delete(candidate.key.key);
-			removePersistentCandidate(state, candidate);
-			candidate.controller.abort();
-			candidate.execution.resolve({ ok: false, error: new Error(reason) });
+		expireDrafterLeases(candidate, state.turnID);
+		if (candidate.reuse.kind === "exclusive" && !hasActivePredictionLease(candidate)) {
+			await closeCandidate(state, candidate, reason);
 		}
 		await publishCancelled(state, candidate, reason, detail);
-	};
-
-	const cancelUnmatchedTurnCandidates = async (
-		state: TurnState<SessionID, Output, StateData>,
-		actual: ActionKey | undefined,
-		reason: string,
-	): Promise<void> => {
-		for (const candidate of [...state.candidates.values()]) {
-			if (candidate.consumed || candidate.lifetime === "resource") continue;
-			if (candidate.leases.some((lease) => lease.active && lease.source === "pattern_aware")) continue;
-			if (actual && candidate.key.key === actual.key) continue;
-			await cancelCandidate(state, candidate, reason);
-		}
 	};
 
 	const expireCandidate = async (
 		state: TurnState<SessionID, Output, StateData>,
 		candidate: RuntimeCandidate<Output>,
-		reason = "resource_expired",
 	): Promise<void> => {
-		await resolvePatternLeases(candidate, "unused");
-		candidate.schedulerOutcome = "discarded";
-		schedulerFor(state.sessionID).discard(candidate);
-		candidate.consumed = true;
-		state.candidates.delete(candidate.key.key);
-		removePersistentCandidate(state, candidate);
-		candidate.controller.abort();
-		candidate.execution.resolve({ ok: false, error: new Error(reason) });
+		await closeCandidate(state, candidate, "candidate_expired");
+	};
+
+	const expirePatternLeasesAfterAction = async (state: TurnState<SessionID, Output, StateData>): Promise<void> => {
+		const settledThrough =
+			state.pendingActionSequences.size > 0 ? Math.min(...state.pendingActionSequences) - 1 : state.actionSequence;
+		for (const candidate of availableCandidates(state).values()) {
+			if (candidate.run.status === "closed") continue;
+			let expired = false;
+			for (const lease of candidate.leases) {
+				if (
+					lease.state !== "active" ||
+					lease.source !== "pattern_aware" ||
+					lease.validThroughActionSeq === undefined ||
+					lease.validThroughActionSeq > settledThrough
+				) {
+					continue;
+				}
+				lease.state = "expired";
+				expired = true;
+				if (!lease.patternID || !adapter.onPatternResolved) continue;
+				try {
+					await adapter.onPatternResolved(lease.patternID, "unused", lease.patternContext);
+				} catch {
+					// Pattern feedback must not alter tool semantics.
+				}
+			}
+			if (expired && candidate.reuse.kind === "exclusive" && !hasActivePredictionLease(candidate)) {
+				await closeCandidate(state, candidate, "pattern_horizon_expired", "expired", true);
+			}
+		}
 	};
 
 	const invalidateChangedResources = async (
 		state: TurnState<SessionID, Output, StateData>,
 		action: ActionKey,
 		excluded?: RuntimeCandidate<Output>,
-		changedResources: readonly string[] = action.resources,
 	): Promise<void> => {
 		if (action.execution !== "sandbox") return;
-		if (!changedResources.length) return;
 		for (const candidate of availableCandidates(state).values()) {
-			if (candidate === excluded || candidate.lifetime !== "resource") continue;
+			if (candidate === excluded || candidate.reuse.kind !== "shared") continue;
 			if (
-				!changedResources.some((changed) =>
+				action.tool !== "bash" &&
+				!action.resources.some((changed) =>
 					candidate.key.resources.some((cached) => resourcePathsOverlap(changed, cached)),
 				)
 			) {
 				continue;
 			}
-			await expireCandidate(state, candidate, "authoritative_resource_changed");
+			await expireCandidate(state, candidate);
 			await publishCancelled(state, candidate, "authoritative_resource_changed");
-		}
-	};
-
-	const advancePatternLeases = async (
-		state: TurnState<SessionID, Output, StateData>,
-		matched?: RuntimeCandidate<Output>,
-	): Promise<void> => {
-		for (const candidate of availableCandidates(state).values()) {
-			if (candidate === matched) continue;
-			let expired = false;
-			for (const lease of candidate.leases) {
-				if (!lease.active || lease.source !== "pattern_aware") continue;
-				lease.remainingHorizon = (lease.remainingHorizon ?? 0) - 1;
-				if (lease.remainingHorizon >= 0) continue;
-				lease.active = false;
-				lease.outcome = "unused";
-				expired = true;
-				if (lease.patternID && adapter.onPatternResolved) {
-					try {
-						await adapter.onPatternResolved(lease.patternID, "unused", lease.patternContext);
-					} catch {
-						// Pattern feedback must not alter tool semantics.
-					}
-				}
-			}
-			candidate.predictionActive = candidate.leases.some((lease) => lease.active);
-			if (!expired || candidate.predictionActive || candidate.lifetime === "resource") continue;
-			candidate.schedulerOutcome = "discarded";
-			schedulerFor(state.sessionID).discard(candidate);
-			state.candidates.delete(candidate.key.key);
-			removePersistentCandidate(state, candidate);
-			candidate.controller.abort();
-			candidate.execution.resolve({ ok: false, error: new Error("pattern_horizon_expired") });
-			await publishCancelled(state, candidate, "pattern_horizon_expired");
 		}
 	};
 
 	const findCandidate = (
 		state: TurnState<SessionID, Output, StateData>,
 		actual: ActionKey,
+		actionSequence: number,
 	): RuntimeCandidate<Output> | undefined => {
 		const exact =
 			state.candidates.get(actual.key) ?? persistentCandidates.get(persistentKey(state.sessionID, actual));
-		if (exact) {
+		if (exact && candidateCanMatch(exact, actionSequence) && claimCandidate(exact, state.turnID)) {
 			touchPersistentCandidate(state, exact);
 			return exact;
 		}
-		if (!adapter.projectOutput) return undefined;
 		for (const candidate of availableCandidates(state).values()) {
-			if (candidate.consumed && candidate.lifetime === "turn") continue;
+			if (!candidateCanMatch(candidate, actionSequence)) continue;
+			if (adapter.projectOutput === undefined && candidate.key.key !== actual.key) continue;
 			if (!actionKeyMatches(candidate.key, actual)) continue;
+			if (!claimCandidate(candidate, state.turnID)) continue;
 			touchPersistentCandidate(state, candidate);
 			return candidate;
 		}
 		return undefined;
+	};
+
+	const candidateCanMatch = (candidate: RuntimeCandidate<Output>, actionSequence: number): boolean => {
+		if (candidate.run.status === "closed") return false;
+		if (candidate.reuse.kind === "shared") return true;
+		if (candidate.reuse.state !== "available") return false;
+		return candidate.leases.some(
+			(lease) =>
+				lease.state === "active" &&
+				(lease.validThroughActionSeq === undefined || actionSequence <= lease.validThroughActionSeq),
+		);
+	};
+
+	const claimCandidate = (candidate: RuntimeCandidate<Output>, turnID: string): boolean => {
+		if (candidate.reuse.kind === "shared") return candidate.run.status !== "closed";
+		if (candidate.reuse.state !== "available") return false;
+		candidate.reuse.state = "claimed";
+		candidate.reuse.claimTurnID = turnID;
+		return true;
 	};
 
 	const findReusableCandidate = async (
@@ -1052,7 +1175,8 @@ export function makeSpeculativeActionRuntime<
 		action: ActionKey,
 	): Promise<RuntimeCandidate<Output> | undefined> => {
 		for (const candidate of availableCandidates(state).values()) {
-			if (candidate.consumed && candidate.lifetime === "turn") continue;
+			if (candidate.run.status === "closed") continue;
+			if (candidate.reuse.kind === "exclusive" && candidate.reuse.state !== "available") continue;
 			const matches =
 				candidate.key.key === action.key ||
 				(adapter.projectOutput !== undefined && actionKeyMatches(candidate.key, action));
@@ -1067,37 +1191,77 @@ export function makeSpeculativeActionRuntime<
 		return undefined;
 	};
 
-	const attachPatternLease = async (
+	const continuationAnchorActionSeq = (
+		state: TurnState<SessionID, Output, StateData>,
+		candidate: RuntimeCandidate<Output>,
+	): number =>
+		candidate.authoritativeSequence ??
+		Math.max(
+			state.actionSequence,
+			...candidate.leases.flatMap((lease) =>
+				lease.source === "pattern_aware" && lease.validThroughActionSeq !== undefined
+					? [lease.validThroughActionSeq]
+					: [],
+			),
+		);
+
+	const attachPredictionLease = async (
 		state: TurnState<SessionID, Output, StateData>,
 		candidate: RuntimeCandidate<Output>,
 		draft: SpeculativeDraftCandidate,
+		source: PredictionLease["source"],
+		anchorActionSeq: number,
 	): Promise<void> => {
-		if (draft.source !== "pattern_aware" || !draft.patternID) return;
-		if (candidate.leases.some((lease) => lease.active && lease.patternID === draft.patternID)) return;
+		pruneResolvedLeases(candidate);
+		if (source === "drafter") {
+			if (
+				!candidate.leases.some(
+					(lease) =>
+						lease.state === "active" && lease.source === "drafter" && lease.providerTurnID === state.turnID,
+				)
+			) {
+				candidate.leases.push({
+					id: `${candidate.id}:drafter:${state.turnID}`,
+					source: "drafter",
+					providerTurnID: state.turnID,
+					anchorActionSeq,
+					state: "active",
+				});
+			}
+			return;
+		}
+		if (!draft.patternID) return;
+		if (candidate.leases.some((lease) => lease.state === "active" && lease.patternID === draft.patternID)) return;
+		const horizon = Math.max(0, Math.floor(draft.horizon ?? 0));
 		candidate.leases.push({
+			id: `${candidate.id}:pattern:${draft.patternID}:${anchorActionSeq}`,
 			source: "pattern_aware",
 			patternID: draft.patternID,
 			...(draft.patternContext !== undefined ? { patternContext: draft.patternContext } : {}),
-			remainingHorizon: Math.max(0, Math.floor(draft.horizon ?? 0)),
-			active: true,
+			providerTurnID: state.turnID,
+			anchorActionSeq,
+			horizon,
+			validThroughActionSeq: anchorActionSeq + horizon + 1,
+			state: "active",
 		});
-		candidate.predictionActive = true;
 		const scheduling = schedulingMetadata(draft, candidate.key);
 		if (expectedUtility(scheduling) > candidate.utility) {
 			candidate.empiricalProbability = draft.empiricalProbability;
+			candidate.conditionalProbability = draft.conditionalProbability;
+			candidate.depth = draft.depth;
 			candidate.scheduling = scheduling;
 			candidate.utility = expectedUtility(scheduling);
 			schedulerFor(state.sessionID).update(candidate, scheduling);
-		}
-		if (!persistentCandidates.has(persistentKey(state.sessionID, candidate.key))) {
-			for (const evicted of addPersistentCandidate(state, candidate)) {
-				await preemptCandidate(evicted, "resource_cache_evicted", "discarded");
-			}
 		}
 		try {
 			await adapter.onPatternLaunched?.(draft.patternID, draft.patternContext);
 		} catch {
 			// Pattern feedback must not alter tool semantics.
+		}
+		if (persistentCandidates.get(persistentKey(state.sessionID, candidate.key)) !== candidate) {
+			for (const evicted of addPersistentCandidate(state, candidate)) {
+				await preemptCandidate(evicted, "resource_cache_evicted", "discarded");
+			}
 		}
 	};
 
@@ -1110,8 +1274,14 @@ export function makeSpeculativeActionRuntime<
 		totalDraftTokens: number,
 		batchSource: "drafter" | "pattern_aware",
 		candidateNames: readonly string[],
+		predictionAnchorActionSeq = state.actionSequence,
 	): Promise<number> => {
 		let accepted = 0;
+		const enabled = await latestSettings();
+		if (!enabled || !sourceEnabled(enabled, batchSource)) {
+			if (!enabled || !masterEnabled(enabled)) state.terminal = true;
+			return accepted;
+		}
 		const candidateLimit = clampMaxCandidates(state.settings.maxCandidates);
 		const ordered = [...drafts].sort(
 			(left, right) =>
@@ -1145,7 +1315,7 @@ export function makeSpeculativeActionRuntime<
 				}
 				continue;
 			}
-			if (state.terminal || (state.finished && batchSource === "drafter")) break;
+			if (state.terminal) return accepted;
 			const concrete = asConcreteInput(draft.input);
 			const draftCandidate = draftCandidateDiagnostic(draft);
 			if (!concrete) {
@@ -1172,25 +1342,16 @@ export function makeSpeculativeActionRuntime<
 				continue;
 			}
 			const callID = `spec_${fastCandidateID(`${input.turnID}:${source}:${index}:${action.key}`)}`;
-			const lifetime =
-				adapter.candidateLifetime?.({
-					startInput: input,
-					data: state.data,
-					settings: state.settings,
-					candidate: draft,
-					tool: draft.tool,
-					concrete,
-					action,
-					callID,
-					index,
-				}) ?? actionLifetime(action.tool);
 			const reusable = await findReusableCandidate(state, action);
 			if (reusable) {
-				await attachPatternLease(state, reusable, draft);
+				await attachPredictionLease(state, reusable, draft, source, predictionAnchorActionSeq);
 				accepted++;
+				if (source === "pattern_aware" && reusable.run.status === "ready") {
+					await continuePatternCandidate(state, input, reusable, reusable.run.output, false);
+				}
 				continue;
 			}
-			if (state.admittedCandidates >= candidateLimit) continue;
+			if (state.admittedCandidates >= candidateLimit) return accepted;
 			const execution = draft.execution ?? inferredExecution(draft.tool);
 			if (execution !== action.execution) {
 				await publishMiss(state, "execution_mismatch", action, undefined, { draftCandidate, predictedAction });
@@ -1213,43 +1374,43 @@ export function makeSpeculativeActionRuntime<
 				await publishMiss(state, preflight.reason, action, preflight.detail, { draftCandidate, predictedAction });
 				continue;
 			}
-			if (adapter.prepareCandidate) {
-				try {
-					await adapter.prepareCandidate({
-						startInput: input,
-						data: state.data,
-						settings: state.settings,
-						candidate: draft,
-						signal: candidateController.signal,
-					});
-				} catch (error) {
-					await publishMiss(state, "candidate_preparation_failed", action, errorDetail(error), {
-						draftCandidate,
-						predictedAction,
-					});
-					continue;
-				}
+			const current = await latestSettings();
+			if (!current || !sourceEnabled(current, source)) {
+				candidateController.abort();
+				if (!current || !masterEnabled(current)) state.terminal = true;
+				return accepted;
 			}
 			if (state.actorKeys.has(action.key)) {
 				candidateController.abort();
 				accepted++;
 				continue;
 			}
-			if (state.terminal || (state.finished && batchSource === "drafter")) {
+			if (state.terminal) {
 				candidateController.abort();
-				break;
+				return accepted;
 			}
+			const horizon = source === "pattern_aware" ? Math.max(0, Math.floor(draft.horizon ?? 0)) : undefined;
 			const sourceLease: PredictionLease = {
+				id: `${callID}:${source}:${draft.patternID ?? state.turnID}`,
 				source,
 				...(draft.patternID ? { patternID: draft.patternID } : {}),
 				...(draft.patternContext !== undefined ? { patternContext: draft.patternContext } : {}),
-				...(source === "pattern_aware" ? { remainingHorizon: Math.max(0, Math.floor(draft.horizon ?? 0)) } : {}),
-				active: true,
+				providerTurnID: state.turnID,
+				anchorActionSeq: predictionAnchorActionSeq,
+				...(horizon !== undefined
+					? { horizon, validThroughActionSeq: predictionAnchorActionSeq + horizon + 1 }
+					: {}),
+				state: "active",
 			};
 			const scheduling = schedulingMetadata(draft, action);
 			const candidate: RuntimeCandidate<Output> = {
+				id: callID,
 				key: action,
-				lifetime,
+				tool: draft.tool,
+				input: concrete,
+				reuse:
+					action.execution === "resource_cached" ? { kind: "shared" } : { kind: "exclusive", state: "available" },
+				run: { status: "running" },
 				validationMs: 0,
 				validationBytes: 0,
 				validationFiles: 0,
@@ -1271,14 +1432,10 @@ export function makeSpeculativeActionRuntime<
 				scheduling,
 				utility: expectedUtility(scheduling),
 				...(draft.patternID ? { patternID: draft.patternID } : {}),
-				...(sourceLease.remainingHorizon !== undefined ? { remainingHorizon: sourceLease.remainingHorizon } : {}),
-				predictionActive: true,
 				leases: [sourceLease],
 				execution: deferred<CandidateExecution<Output>>(),
 				controller: candidateController,
-				consumed: false,
 				hits: 0,
-				promoted: false,
 			};
 			const admission = schedulerFor(state.sessionID).admit(
 				candidate,
@@ -1291,31 +1448,10 @@ export function makeSpeculativeActionRuntime<
 				continue;
 			}
 			for (const victim of admission.preempted) await preemptCandidate(victim);
-			if (action.execution === "resource_cached" && adapter.captureResourceVersion) {
-				try {
-					candidate.resourceVersion = await adapter.captureResourceVersion({
-						startInput: input,
-						data: state.data,
-						settings: state.settings,
-						candidate: draft,
-						tool: draft.tool,
-						concrete,
-						action,
-						callID,
-						index,
-					});
-					Object.assign(candidate, resourceCaptureMetrics(candidate.resourceVersion));
-				} catch (error) {
-					schedulerFor(state.sessionID).discard(candidate);
-					candidate.schedulerOutcome = "discarded";
-					await publishCancelled(state, candidate, "resource_capture_failed", errorDetail(error));
-					continue;
-				}
-			}
 			state.admittedCandidates++;
 			state.candidates.set(action.key, candidate);
 			candidateOwners.set(candidate, state);
-			if (lifetime === "resource" || source === "pattern_aware") {
+			if (candidate.reuse.kind === "shared" || source === "pattern_aware") {
 				for (const evicted of addPersistentCandidate(state, candidate)) {
 					await preemptCandidate(evicted, "resource_cache_evicted", "discarded");
 				}
@@ -1329,10 +1465,88 @@ export function makeSpeculativeActionRuntime<
 				}
 			}
 			await publishStarted(state, candidate);
-			const executionStarted = Date.now();
+			let executionStarted = candidate.startedAt;
 			void Promise.resolve()
-				.then(() =>
-					adapter.executeCandidate({
+				.then(async () => {
+					await Promise.resolve();
+					const current = await latestSettings();
+					if (!current || !sourceEnabled(current, source)) {
+						throw new SpeculativeJobError(
+							current && masterEnabled(current) ? `${source}_disabled` : "speculative_action_disabled",
+							new Error("speculative action source disabled"),
+						);
+					}
+					if (adapter.prepareCandidate) {
+						try {
+							await adapter.prepareCandidate({
+								startInput: input,
+								data: state.data,
+								settings: state.settings,
+								candidate: draft,
+								signal: candidateController.signal,
+							});
+						} catch (error) {
+							throw new SpeculativeJobError("candidate_preparation_failed", error);
+						}
+					}
+					const prepared = await latestSettings();
+					if (!prepared || !sourceEnabled(prepared, source)) {
+						throw new SpeculativeJobError(
+							prepared && masterEnabled(prepared) ? `${source}_disabled` : "speculative_action_disabled",
+							new Error("speculative action source disabled"),
+						);
+					}
+					if (state.terminal) {
+						throw new SpeculativeJobError(
+							"request_finished_without_hit",
+							new Error("speculative request finished"),
+						);
+					}
+					if (
+						(action.execution === "resource_cached" || action.tool === "bash") &&
+						adapter.captureResourceVersion
+					) {
+						try {
+							const captured = await adapter.captureResourceVersion({
+								startInput: input,
+								data: state.data,
+								settings: state.settings,
+								candidate: draft,
+								tool: draft.tool,
+								concrete,
+								action,
+								callID,
+								index,
+							});
+							candidate.resourceVersion = captured;
+							Object.assign(candidate, resourceCaptureMetrics(captured));
+						} catch (error) {
+							throw new SpeculativeJobError("resource_capture_failed", error);
+						}
+					}
+					if (action.execution === "resource_cached" && adapter.watchResourceVersion) {
+						try {
+							candidate.releaseResourceWatch = await adapter.watchResourceVersion({
+								stateData: state.data,
+								action,
+								candidate,
+								onInvalidated: (changedPath) => {
+									void preemptCandidate(
+										candidate,
+										changedPath ? `resource_changed:${changedPath}` : "resource_changed",
+										"discarded",
+									);
+								},
+							});
+						} catch {
+							candidate.releaseResourceWatch = undefined;
+						}
+					}
+					if (candidate.run.status === "closed") {
+						throw new SpeculativeJobError(candidate.run.reason, new Error(`speculative ${candidate.run.reason}`));
+					}
+					executionStarted = Date.now();
+					return adapter.executeCandidate({
 						startInput: input,
 						data: state.data,
 						candidate: draft,
@@ -1342,19 +1556,20 @@ export function makeSpeculativeActionRuntime<
 						callID,
 						index,
 						signal: candidateController.signal,
-					}),
-				)
+					});
+				})
 				.then(
 					async (output) => {
-						if (candidate.schedulerOutcome === "preempted" || candidate.schedulerOutcome === "discarded") {
+						if (candidate.run.status === "closed") {
 							candidate.execution.resolve({
 								ok: false,
-								error: new Error(`speculative_${candidate.schedulerOutcome}`),
+								error: new Error(`speculative_${candidate.run.reason}`),
 							});
 							return;
 						}
-						candidate.completedAt = Date.now();
-						candidate.executionMs = Math.max(0, candidate.completedAt - executionStarted);
+						const completedAt = Date.now();
+						const executionMs = Math.max(0, completedAt - executionStarted);
+						candidate.run = { status: "ready", completedAt, executionMs, output };
 						Object.assign(candidate, adapter.candidateExecutionMetrics?.({ output, candidate }) ?? {});
 						observeExecutionOverhead(
 							candidate.key.tool,
@@ -1373,87 +1588,94 @@ export function makeSpeculativeActionRuntime<
 						await publishCache(state);
 						await publishCompleted(state, candidate);
 						candidate.execution.resolve({ ok: true, output });
-						if (adapter.continuePatternAware && !state.terminal) {
-							for (const lease of candidate.leases) {
-								if (lease.source !== "pattern_aware" || !lease.patternID || lease.outcome === "unused")
-									continue;
-								let prediction: SpeculativePrediction | undefined;
-								try {
-									prediction = await adapter.continuePatternAware({
-										startInput: input,
-										data: state.data,
-										settings: state.settings,
-										candidate,
-										patternID: lease.patternID,
-										patternContext: lease.patternContext,
-										output,
-										parentConfirmed: candidate.promoted || candidate.hits > 0 || lease.outcome === "consumed",
-									});
-								} catch {
-									continue;
-								}
-								if (!prediction?.candidates.length || state.terminal) continue;
-								await admitPredictions(
-									state,
-									input,
-									prediction.candidates,
-									0,
-									0,
-									tokenTotals.get(state.sessionID) ?? 0,
-									"pattern_aware",
-									candidateToolNames(state.settings),
-								);
-							}
+						if (action.execution !== "sandbox") {
+							await continuePatternCandidate(
+								state,
+								input,
+								candidate,
+								output,
+								candidate.hits > 0 ||
+									candidate.leases.some((lease) => lease.state === "matched" || lease.state === "hit"),
+							);
 						}
 					},
 					async (error: unknown) => {
-						if (candidate.schedulerOutcome === "preempted" || candidate.schedulerOutcome === "discarded") {
+						if (candidate.run.status === "closed") {
 							candidate.execution.resolve({ ok: false, error });
 							return;
 						}
-						candidate.completedAt = Date.now();
-						candidate.executionMs = Math.max(0, candidate.completedAt - executionStarted);
-						schedulerFor(state.sessionID).complete(candidate);
-						if (!candidate.promoted) {
-							state.candidateFailures.set(candidate.key.key, errorDetail(error));
-							candidate.schedulerOutcome = "discarded";
-							candidate.consumed = true;
-							await resolvePatternLeases(candidate, "unused");
-							state.candidates.delete(candidate.key.key);
-							removePersistentCandidate(state, candidate);
-							await publishCancelled(state, candidate, "candidate_execution_failed", errorDetail(error));
-							await publishCache(state);
+						const reason = error instanceof SpeculativeJobError ? error.reason : "candidate_execution_failed";
+						const completedAt = Date.now();
+						const executionMs = Math.max(0, completedAt - executionStarted);
+						candidate.run = { status: "closed", reason, completedAt, executionMs };
+						schedulerFor(state.sessionID).discard(candidate);
+						candidate.schedulerOutcome = "discarded";
+						recordDrafterFailure(state, candidate);
+						expireDrafterLeases(candidate, undefined, "invalidated");
+						await settlePatternLeases(candidate, "invalidated");
+						for (const lease of candidate.leases) {
+							if (lease.state === "matched") lease.state = "invalidated";
 						}
+						if (state.candidates.get(candidate.key.key) === candidate) state.candidates.delete(candidate.key.key);
+						removePersistentCandidate(state, candidate);
+						releaseResourceWatch(candidate);
+						await publishCancelled(state, candidate, reason, errorDetail(error));
+						await publishCache(state);
 						candidate.execution.resolve({ ok: false, error });
 					},
 				);
-			if (action.execution === "resource_cached" && adapter.watchResourceVersion) {
-				try {
-					candidate.releaseResourceWatch = await adapter.watchResourceVersion({
-						stateData: state.data,
-						action,
-						candidate,
-						onInvalidated: (changedPath) => {
-							void preemptCandidate(
-								candidate,
-								changedPath ? `resource_changed:${changedPath}` : "resource_changed",
-								"discarded",
-							);
-						},
-					});
-				} catch {
-					candidate.releaseResourceWatch = undefined;
-				}
-				if (
-					candidate.consumed ||
-					candidate.schedulerOutcome === "discarded" ||
-					candidate.schedulerOutcome === "preempted"
-				) {
-					releaseResourceWatch(candidate);
-				}
-			}
 		}
 		return accepted;
+	};
+
+	const continuePatternCandidate = async (
+		state: TurnState<SessionID, Output, StateData>,
+		input: StartInput,
+		candidate: RuntimeCandidate<Output>,
+		output: Output,
+		parentConfirmed: boolean,
+	): Promise<void> => {
+		const settings = await latestSettings();
+		if (!settings || !sourceEnabled(settings, "pattern_aware") || !adapter.continuePatternAware || state.terminal) {
+			return;
+		}
+		for (const lease of candidate.leases) {
+			if (
+				lease.source !== "pattern_aware" ||
+				!lease.patternID ||
+				lease.state === "expired" ||
+				lease.state === "invalidated"
+			) {
+				continue;
+			}
+			let prediction: SpeculativePrediction | undefined;
+			try {
+				prediction = await adapter.continuePatternAware({
+					startInput: input,
+					data: state.data,
+					settings,
+					candidate,
+					patternID: lease.patternID,
+					patternContext: lease.patternContext,
+					output,
+					parentConfirmed,
+				});
+			} catch {
+				continue;
+			}
+			if (!prediction?.candidates.length || state.terminal) continue;
+			await admitPredictions(
+				state,
+				input,
+				prediction.candidates,
+				0,
+				0,
+				tokenTotals.get(state.sessionID) ?? 0,
+				"pattern_aware",
+				candidateToolNames(settings),
+				continuationAnchorActionSeq(state, candidate),
+			);
+		}
 	};
 
 	const recordAndPredict = async (
@@ -1465,13 +1687,16 @@ export function makeSpeculativeActionRuntime<
 		durationMs: number,
 		speculativeHit: boolean,
 	): Promise<void> => {
-		if (!adapter.recordAuthoritative || !state.settings.patternAware?.enabled || state.finished) return;
+		const settings = await latestSettings();
+		if (!adapter.recordAuthoritative || !settings || !sourceEnabled(settings, "pattern_aware") || state.finished) {
+			return;
+		}
 		const concrete = asConcreteInput(actualCall.input);
 		if (!concrete) return;
 		const prediction = await adapter.recordAuthoritative({
 			startInput: state.startInput as StartInput,
 			data: state.data,
-			settings: state.settings,
+			settings,
 			consumeInput,
 			action,
 			tool: actualCall.tool,
@@ -1489,7 +1714,7 @@ export function makeSpeculativeActionRuntime<
 			0,
 			tokenTotals.get(state.sessionID) ?? 0,
 			"pattern_aware",
-			candidateToolNames(state.settings),
+			candidateToolNames(settings),
 		);
 	};
 
@@ -1501,7 +1726,7 @@ export function makeSpeculativeActionRuntime<
 	): Promise<void> => {
 		let accepted = 0;
 		try {
-			if (adapter.predictPatternAware && state.settings.patternAware?.enabled) {
+			if (adapter.predictPatternAware && sourceEnabled(state.settings, "pattern_aware")) {
 				try {
 					const patternPrediction = await adapter.predictPatternAware(
 						input,
@@ -1522,14 +1747,19 @@ export function makeSpeculativeActionRuntime<
 					);
 					const immediatePatternCandidate = [...availableCandidates(state).values()].some((candidate) =>
 						candidate.leases.some(
-							(lease) => lease.active && lease.source === "pattern_aware" && lease.remainingHorizon === 0,
+							(lease) => lease.state === "active" && lease.source === "pattern_aware" && lease.horizon === 0,
 						),
 					);
-					if (adaptiveDrafter(state) && (immediatePatternCandidate || patternPrediction.deferDrafter)) return;
+					const activeDrafterPlan = [...availableCandidates(state).values()].some(hasActiveSharedDrafterLease);
+					if (adaptiveDrafter(state) && (immediatePatternCandidate || activeDrafterPlan)) return;
 				} catch {
 					// Learned predictions are optional; drafter prediction remains available.
 				}
 			}
+			const current = await latestSettings();
+			if (!current || !sourceEnabled(current, "drafter")) return;
+			const activeDrafterPlan = [...availableCandidates(state).values()].some(hasActiveSharedDrafterLease);
+			if (adaptiveDrafter(state) && activeDrafterPlan) return;
 			if (adaptiveDrafter(state) && !takeDrafterOpportunity(input.sessionID)) return;
 
 			state.drafterAttempted = true;
@@ -1595,11 +1825,8 @@ export function makeSpeculativeActionRuntime<
 		const settings = await adapter.settings();
 		const definitions = adapter.definitions(input);
 		const candidateNames = candidateToolNames(settings);
-		if (!settings.enabled || settings.mode !== "predict_action_single_step") {
-			for (const candidate of sessionPersistentCandidates(input.sessionID)) {
-				await preemptCandidate(candidate, "speculative_action_disabled", "discarded");
-			}
-			drafterBackoff.delete(input.sessionID);
+		if (!masterEnabled(settings)) {
+			await disableSession(input.sessionID);
 			return;
 		}
 		if (!candidateNames.length) {
@@ -1629,7 +1856,8 @@ export function makeSpeculativeActionRuntime<
 			predictionController: new AbortController(),
 			actorKeys: new Set(),
 			preparedHints: new Set(),
-			candidateFailures: new Map(),
+			pendingActionSequences: new Set(),
+			actionSequence: actionSequences.get(input.sessionID) ?? 0,
 			admittedCandidates: 0,
 			drafterAttempted: false,
 			terminal: false,
@@ -1639,13 +1867,7 @@ export function makeSpeculativeActionRuntime<
 			predictionPending: true,
 		};
 		turns.set(turnKey(input), state);
-		for (const candidate of sessionPersistentCandidates(input.sessionID)) {
-			const configured = candidateNames.includes(candidate.key.tool);
-			if (!configured) await preemptCandidate(candidate, "tool_disabled", "discarded");
-		}
-		for (const evicted of trimPersistentCandidates(input.sessionID, settings)) {
-			await preemptCandidate(evicted, "resource_cache_limit_changed", "discarded");
-		}
+		await reconcilePersistentCandidates(state);
 		if (signal) {
 			signal.addEventListener(
 				"abort",
@@ -1659,219 +1881,262 @@ export function makeSpeculativeActionRuntime<
 	};
 
 	const consume = async (input: ConsumeInput, signal?: AbortSignal): Promise<Output | undefined> => {
+		const settings = await latestSettings();
+		if (!settings || !masterEnabled(settings)) {
+			await disableSession(input.sessionID);
+			return undefined;
+		}
 		const state = turns.get(turnKey(input));
 		if (!state || signal?.aborted) return undefined;
-		const actualCall = adapter.actual(input);
-		const actual = await adapter.actionKey(actualCall.tool, actualCall.input, {
-			type: "consume",
-			consumeInput: input,
-		});
-		const actualAction = diagnosticAction(actualCall.tool, actualCall.input, actual);
-		if (!actual) {
-			await preemptForAuthoritative(state, { class: "global", units: 1 });
-			await advancePatternLeases(state);
-			await cancelUnmatchedTurnCandidates(state, undefined, "explicit_miss");
-			return undefined;
-		}
-
-		state.actorKeys.add(actual.key);
-		const candidate = findCandidate(state, actual);
-		if (!candidate) {
-			const candidateFailure = state.candidateFailures.get(actual.key);
-			if (candidateFailure) {
-				state.candidateFailures.delete(actual.key);
-				await publishMiss(state, "candidate_execution_failed", actual, candidateFailure, { actualAction });
+		const actionSequence = (actionSequences.get(state.sessionID) ?? state.actionSequence) + 1;
+		actionSequences.set(state.sessionID, actionSequence);
+		state.actionSequence = Math.max(state.actionSequence, actionSequence);
+		state.pendingActionSequences.add(actionSequence);
+		try {
+			const actualCall = adapter.actual(input);
+			const actual = await adapter.actionKey(actualCall.tool, actualCall.input, {
+				type: "consume",
+				consumeInput: input,
+			});
+			const actualAction = diagnosticAction(actualCall.tool, actualCall.input, actual);
+			const activeDrafterPlan = [...availableCandidates(state).values()].some(hasActiveDrafterLease);
+			if (!actual) {
+				if (activeDrafterPlan) state.drafterPlanMismatch = true;
+				await preemptForAuthoritative(state, { class: "global", units: 1 });
 				return undefined;
 			}
-			const immediate = new Map(
-				[...availableCandidates(state)].filter(([, item]) =>
-					item.leases.some((lease) => lease.active && lease.source === "drafter"),
-				),
-			);
-			if (immediate.size > 0) {
-				recordDrafterFailure(state);
-				await publishMiss(state, "key_mismatch", actual, undefined, {
-					actualAction,
-					predictedAction: candidatesDiagnostic(immediate),
-				});
-			}
-			await preemptForAuthoritative(state, resourceProfile(actual.tool, actual.execution));
-			await advancePatternLeases(state);
-			await cancelUnmatchedTurnCandidates(state, actual, "explicit_miss");
-			return undefined;
-		}
 
-		await advancePatternLeases(state, candidate);
-		if (adapter.authorizeCandidate) {
-			const actualConcrete = asConcreteInput(actualCall.input);
-			if (!actualConcrete) return undefined;
-			let authorization: CandidatePreflight;
-			try {
-				authorization = await adapter.authorizeCandidate({
+			state.actorKeys.add(actual.key);
+			const candidate = findCandidate(state, actual, actionSequence);
+			if (!candidate) {
+				const predicted = new Map(
+					[...availableCandidates(state)].filter(([, item]) => hasActiveDrafterLease(item)),
+				);
+				if (predicted.size > 0) {
+					state.drafterPlanMismatch = true;
+					state.pendingDrafterMismatch = {
+						key: actual,
+						actualAction,
+						predictedAction: candidatesDiagnostic(predicted),
+					};
+				}
+				await preemptForAuthoritative(state, resourceProfile(actual.tool, actual.execution));
+				return undefined;
+			}
+			if (activeDrafterPlan && !hasActiveDrafterLease(candidate)) state.drafterPlanMismatch = true;
+			await matchPredictionLeases(state, candidate, actionSequence);
+			const inFlightAtMatch = candidate.run.status === "running";
+
+			if (adapter.authorizeCandidate) {
+				const actualConcrete = asConcreteInput(actualCall.input);
+				if (!actualConcrete) return undefined;
+				let authorization: CandidatePreflight;
+				try {
+					authorization = await adapter.authorizeCandidate({
+						stateData: state.data,
+						consumeInput: input,
+						settings,
+						action: actual,
+						candidate,
+						tool: actualCall.tool,
+						concrete: actualConcrete,
+						signal,
+					});
+				} catch (error) {
+					authorization = { ok: false, reason: "authorization_failed", detail: errorDetail(error) };
+				}
+				if (!authorization.ok) {
+					recordDrafterFailure(state, candidate);
+					await expireCandidate(state, candidate);
+					await publishMiss(state, authorization.reason, actual, authorization.detail, {
+						actualAction,
+						draftCandidate: candidate.draftCandidate,
+						predictedAction: candidate.predictedAction,
+					});
+					return undefined;
+				}
+			}
+
+			const consumeStarted = Date.now();
+			if (await isExpired(adapter, state, input, actual, candidate)) {
+				recordDrafterFailure(state, candidate);
+				await expireCandidate(state, candidate);
+				await publishMiss(state, "resource_expired", actual, undefined, {
+					actualAction,
+					draftCandidate: candidate.draftCandidate,
+					predictedAction: candidate.predictedAction,
+				});
+				return undefined;
+			}
+			if (inFlightAtMatch) {
+				schedulerFor(state.sessionID).promote(candidate);
+				candidate.schedulerOutcome = "promoted";
+			} else {
+				candidate.schedulerOutcome = "reused";
+			}
+			const waitStarted = Date.now();
+			const execution = await waitForCandidate(candidate.execution.promise, signal);
+			if (!execution || signal?.aborted) return undefined;
+			if (!execution.ok) {
+				const reason =
+					execution.error instanceof SpeculativeJobError ? execution.error.reason : "candidate_execution_failed";
+				recordDrafterFailure(state, candidate);
+				await closeCandidate(state, candidate, reason);
+				await publishMiss(state, reason, actual, errorDetail(execution.error), {
+					actualAction,
+					draftCandidate: candidate.draftCandidate,
+					predictedAction: candidate.predictedAction,
+				});
+				return undefined;
+			}
+			if (inFlightAtMatch && (await isExpired(adapter, state, input, actual, candidate))) {
+				recordDrafterFailure(state, candidate);
+				await expireCandidate(state, candidate);
+				await publishMiss(
+					state,
+					"resource_expired",
+					actual,
+					"Resource changed before the speculative result could be consumed.",
+					{
+						actualAction,
+						draftCandidate: candidate.draftCandidate,
+						predictedAction: candidate.predictedAction,
+					},
+				);
+				return undefined;
+			}
+
+			let output = execution.output;
+			if (adapter.adoptCandidate) {
+				let adopted: Output | undefined;
+				try {
+					adopted = await adapter.adoptCandidate({
+						stateData: state.data,
+						consumeInput: input,
+						action: actual,
+						candidate,
+						output,
+					});
+				} catch (error) {
+					recordDrafterFailure(state, candidate);
+					await expireCandidate(state, candidate);
+					await publishMiss(state, "adoption_failed", actual, errorDetail(error), {
+						actualAction,
+						draftCandidate: candidate.draftCandidate,
+						predictedAction: candidate.predictedAction,
+					});
+					return undefined;
+				}
+				if (adopted === undefined) {
+					recordDrafterFailure(state, candidate);
+					await expireCandidate(state, candidate);
+					await publishMiss(state, "adoption_failed", actual, undefined, {
+						actualAction,
+						draftCandidate: candidate.draftCandidate,
+						predictedAction: candidate.predictedAction,
+					});
+					return undefined;
+				}
+				output = adopted;
+			}
+			if (candidate.key.key !== actual.key && adapter.projectOutput) {
+				const projected = await adapter.projectOutput({
 					stateData: state.data,
 					consumeInput: input,
-					settings: state.settings,
 					action: actual,
 					candidate,
-					tool: actualCall.tool,
-					concrete: actualConcrete,
-					signal,
+					output,
 				});
-			} catch (error) {
-				authorization = { ok: false, reason: "authorization_failed", detail: errorDetail(error) };
+				if (projected === undefined) {
+					recordDrafterFailure(state, candidate);
+					await expireCandidate(state, candidate);
+					await publishMiss(state, "projection_failed", actual, undefined, {
+						actualAction,
+						draftCandidate: candidate.draftCandidate,
+						predictedAction: candidate.predictedAction,
+					});
+					return undefined;
+				}
+				output = projected;
 			}
-			if (!authorization.ok) {
-				recordDrafterFailure(state, candidate);
-				await expireCandidate(state, candidate, authorization.reason);
-				await publishMiss(state, authorization.reason, actual, authorization.detail, {
-					actualAction,
-					draftCandidate: candidate.draftCandidate,
-					predictedAction: candidate.predictedAction,
-				});
-				return undefined;
+
+			const waitedMs = Math.max(0, Date.now() - waitStarted);
+			const consumeOverheadMs = Math.max(0, Date.now() - consumeStarted);
+			const executionMs = candidateExecutionMs(candidate) || Math.max(0, Date.now() - candidate.startedAt);
+			observeServiceTime(actual.tool, executionMs);
+			observeHitOverhead(actual.tool, candidate.validationMs + (candidate.commitMs ?? 0));
+			completePredictionMatch(candidate, actionSequence);
+			candidate.hits++;
+			candidate.authoritativeSequence = Math.max(candidate.authoritativeSequence ?? 0, actionSequence);
+			if (candidate.reuse.kind === "exclusive") {
+				candidate.reuse.state = "adopted";
+				candidate.reuse.claimTurnID = undefined;
+				const completedAt = candidateCompletedAt(candidate);
+				candidate.run = {
+					status: "closed",
+					reason: "adopted",
+					...(completedAt !== undefined ? { completedAt } : {}),
+					executionMs,
+				};
+				schedulerFor(state.sessionID).discard(candidate);
+				if (state.candidates.get(candidate.key.key) === candidate) state.candidates.delete(candidate.key.key);
+				removePersistentCandidate(state, candidate);
+				releaseResourceWatch(candidate);
 			}
-		}
-		const consumeStarted = Date.now();
-		if (await isExpired(adapter, state, input, actual, candidate)) {
-			recordDrafterFailure(state, candidate);
-			await expireCandidate(state, candidate);
-			await publishMiss(state, "resource_expired", actual, undefined, {
-				actualAction,
+			if ((candidate.commitValidationFiles ?? 0) > 0) {
+				await invalidateChangedResources(state, actual, candidate);
+			}
+			const patternLease = candidate.leases.find(
+				(lease) =>
+					lease.source === "pattern_aware" && lease.state === "hit" && lease.resolvedActionSeq === actionSequence,
+			);
+			const drafterLease = candidate.leases.find(
+				(lease) =>
+					lease.source === "drafter" && lease.state === "hit" && lease.resolvedActionSeq === actionSequence,
+			);
+			const eventSource: SpeculativeSchedulingEventFields["source"] = patternLease
+				? "pattern_aware"
+				: drafterLease
+					? "drafter"
+					: "cache";
+			await emit({
+				type: "hit",
+				sessionID: state.sessionID,
+				turnID: state.turnID,
+				timestamp: Date.now(),
+				tool: actual.tool,
+				actionKeyHash: actual.hash,
+				savedMs: Math.max(0, executionMs - consumeOverheadMs),
+				waitedMs,
+				consumeOverheadMs,
+				predictionLatencyMs: candidate.predictionLatencyMs,
+				draftTokens: candidate.draftTokens,
+				totalDraftTokens: candidate.totalDraftTokens,
 				draftCandidate: candidate.draftCandidate,
 				predictedAction: candidate.predictedAction,
-			});
-			return undefined;
-		}
-
-		if (candidate.completedAt === undefined) {
-			schedulerFor(state.sessionID).promote(candidate);
-			candidate.promoted = true;
-			candidate.schedulerOutcome = "promoted";
-		} else {
-			candidate.schedulerOutcome = "reused";
-		}
-		const waitStarted = Date.now();
-		const execution = await waitForCandidate(candidate.execution.promise, signal);
-		if (!execution || signal?.aborted) return undefined;
-		if (!execution.ok) {
-			recordDrafterFailure(state, candidate);
-			await resolvePatternLeases(candidate, "unused");
-			candidate.schedulerOutcome = "discarded";
-			candidate.consumed = true;
-			state.candidates.delete(candidate.key.key);
-			removePersistentCandidate(state, candidate);
-			await publishMiss(state, "candidate_execution_failed", actual, errorDetail(execution.error), {
 				actualAction,
-				draftCandidate: candidate.draftCandidate,
-				predictedAction: candidate.predictedAction,
+				...schedulingEventFields(candidate, eventSource),
+				...cacheSnapshot(state),
 			});
-			return undefined;
-		}
-		if (await isExpired(adapter, state, input, actual, candidate)) {
-			recordDrafterFailure(state, candidate);
-			await expireCandidate(state, candidate);
-			await publishMiss(state, "resource_expired", actual, "Resource changed before result adoption.", {
-				actualAction,
-				draftCandidate: candidate.draftCandidate,
-				predictedAction: candidate.predictedAction,
-			});
-			return undefined;
-		}
-
-		let output = execution.output;
-		if (adapter.adoptCandidate) {
-			const adopted = await adapter.adoptCandidate({
-				stateData: state.data,
-				consumeInput: input,
-				action: actual,
-				candidate,
-				output,
-			});
-			if (adopted === undefined) {
-				recordDrafterFailure(state, candidate);
-				await expireCandidate(state, candidate, "adoption_failed");
-				await publishMiss(state, "adoption_failed", actual, undefined, {
-					actualAction,
-					draftCandidate: candidate.draftCandidate,
-					predictedAction: candidate.predictedAction,
-				});
-				return undefined;
+			await recordAndPredict(state, input, actualCall, actual, output, executionMs, true);
+			if (actual.execution === "sandbox") {
+				await continuePatternCandidate(state, state.startInput as StartInput, candidate, output, true);
 			}
-			output = adopted;
+			return output;
+		} finally {
+			state.pendingActionSequences.delete(actionSequence);
+			await expirePatternLeasesAfterAction(state);
 		}
-		if (candidate.key.key !== actual.key && adapter.projectOutput) {
-			const projected = await adapter.projectOutput({
-				stateData: state.data,
-				consumeInput: input,
-				action: actual,
-				candidate,
-				output,
-			});
-			if (projected === undefined) {
-				recordDrafterFailure(state, candidate);
-				await expireCandidate(state, candidate, "projection_failed");
-				await publishMiss(state, "projection_failed", actual, undefined, {
-					actualAction,
-					draftCandidate: candidate.draftCandidate,
-					predictedAction: candidate.predictedAction,
-				});
-				return undefined;
-			}
-			output = projected;
-		}
-
-		const waitedMs = Math.max(0, Date.now() - waitStarted);
-		const consumeOverheadMs = Math.max(0, Date.now() - consumeStarted);
-		const executionMs = candidate.executionMs ?? Math.max(0, Date.now() - candidate.startedAt);
-		observeServiceTime(actual.tool, executionMs);
-		observeHitOverhead(actual.tool, candidate.validationMs + (candidate.commitMs ?? 0));
-		await resolvePatternLeases(candidate, "consumed");
-		candidate.consumed = true;
-		candidate.hits++;
-		candidate.promoted = false;
-		recordPredictionHit(state, candidate);
-		if (candidate.lifetime === "turn") {
-			state.candidates.delete(candidate.key.key);
-			removePersistentCandidate(state, candidate);
-		}
-		if ((candidate.commitValidationFiles ?? 0) > 0) {
-			await invalidateChangedResources(state, actual, candidate, candidate.changedResources ?? actual.resources);
-		}
-		const patternLease = candidate.leases.find(
-			(lease) => lease.source === "pattern_aware" && lease.outcome === "consumed",
-		);
-		const eventSource: SpeculativeSchedulingEventFields["source"] =
-			candidate.hits > 1 || (!patternLease && !candidate.predictionActive)
-				? "cache"
-				: patternLease
-					? "pattern_aware"
-					: candidate.source;
-		await emit({
-			type: "hit",
-			sessionID: state.sessionID,
-			turnID: state.turnID,
-			timestamp: Date.now(),
-			tool: actual.tool,
-			actionKeyHash: actual.hash,
-			savedMs: Math.max(0, executionMs - consumeOverheadMs),
-			waitedMs,
-			consumeOverheadMs,
-			predictionLatencyMs: candidate.predictionLatencyMs,
-			draftTokens: candidate.draftTokens,
-			totalDraftTokens: candidate.totalDraftTokens,
-			draftCandidate: candidate.draftCandidate,
-			predictedAction: candidate.predictedAction,
-			actualAction,
-			...schedulingEventFields(candidate, eventSource),
-			...cacheSnapshot(state),
-		});
-		await recordAndPredict(state, input, actualCall, actual, output, executionMs, true);
-		return output;
 	};
 
 	const actual = async (
 		input: ConsumeInput & { readonly durationMs: number; readonly output?: Output },
 	): Promise<void> => {
+		const settings = await latestSettings();
+		if (!settings || !masterEnabled(settings)) {
+			await disableSession(input.sessionID);
+			return;
+		}
 		const state = turns.get(turnKey(input));
 		if (!state) return;
 		const actualCall = adapter.actual(input);
@@ -1901,7 +2166,6 @@ export function makeSpeculativeActionRuntime<
 		state.finished = true;
 		state.terminal = terminal;
 		wallTimes.set(state.sessionID, (wallTimes.get(state.sessionID) ?? 0) + Math.max(0, Date.now() - state.startedAt));
-		state.predictionController.abort();
 		turns.delete(turnKey(state));
 		try {
 			await adapter.onTurnFinished?.({
@@ -1913,37 +2177,38 @@ export function makeSpeculativeActionRuntime<
 		} catch {
 			// Analyzer lifecycle must not alter actor semantics.
 		}
-		const candidates = terminal
-			? new Set([...state.candidates.values(), ...sessionPersistentCandidates(state.sessionID)])
-			: new Set(state.candidates.values());
-		for (const candidate of candidates) {
-			if (candidate.consumed && candidate.lifetime !== "resource") continue;
-			if (terminal) {
-				await resolvePatternLeases(candidate, "unused");
-				for (const lease of candidate.leases) {
-					if (!lease.active) continue;
-					lease.active = false;
-					lease.outcome = "unused";
-				}
-				candidate.predictionActive = false;
-				if (candidate.lifetime === "resource") continue;
-				candidate.consumed = true;
-				state.candidates.delete(candidate.key.key);
-				removePersistentCandidate(state, candidate);
-				schedulerFor(state.sessionID).discard(candidate);
-				candidate.schedulerOutcome = "discarded";
-				candidate.controller.abort();
-				candidate.execution.resolve({
-					ok: false,
-					error: new Error("request_finished_without_hit"),
+		const activeDrafterCandidate = [...availableCandidates(state).values()].find(hasActiveDrafterLease);
+		const drafterPlanMissed = state.drafterPlanMismatch === true && state.drafterFeedback !== "success";
+		if ((state.actorKeys.size > 0 && state.drafterAttempted && !state.drafterFeedback) || drafterPlanMissed) {
+			recordDrafterFailure(state, activeDrafterCandidate);
+			if (state.pendingDrafterMismatch) {
+				await publishMiss(state, "key_mismatch", state.pendingDrafterMismatch.key, undefined, {
+					predictedAction: state.pendingDrafterMismatch.predictedAction,
+					actualAction: state.pendingDrafterMismatch.actualAction,
 				});
-				await publishCancelled(state, candidate, "request_finished_without_hit");
+			}
+		}
+		if (drafterPlanMissed) expireDrafterPlan(state);
+		for (const candidate of availableCandidates(state).values()) {
+			if (candidate.run.status === "closed") continue;
+			if (terminal) {
+				expireDrafterLeases(candidate, undefined, "invalidated");
+				await settlePatternLeases(candidate, "invalidated");
+				if (candidate.reuse.kind === "shared") continue;
+				await closeCandidate(state, candidate, "request_finished_without_hit", "invalidated", true);
 				continue;
 			}
-			if (candidate.lifetime === "resource") continue;
-			if (candidate.leases.some((lease) => lease.active && lease.source === "pattern_aware")) continue;
+			if (candidate.reuse.kind === "shared") {
+				if (state.drafterAttempted && state.drafterFeedback !== "success") {
+					expireDrafterLeases(candidate, state.turnID);
+				}
+				continue;
+			}
+			expireDrafterLeases(candidate, state.turnID);
+			if (hasActivePredictionLease(candidate)) continue;
 			await cancelCandidate(state, candidate, "turn_finished_without_hit");
 		}
+		await publishCache(state);
 		if (terminal) {
 			try {
 				await adapter.flushPatternStore?.();
@@ -1957,11 +2222,7 @@ export function makeSpeculativeActionRuntime<
 	const finishTerminalSession = async (sessionID: SessionID): Promise<void> => {
 		const candidates = sessionPersistentCandidates(sessionID);
 		if (!candidates.length) return;
-		for (const candidate of candidates) {
-			await resolvePatternLeases(candidate, "unused");
-			if (candidate.lifetime === "resource") continue;
-			await preemptCandidate(candidate, "request_finished_without_hit", "discarded");
-		}
+		for (const candidate of candidates) await settlePatternLeases(candidate, "invalidated");
 		try {
 			await adapter.flushPatternStore?.();
 		} catch {
@@ -1975,13 +2236,17 @@ export function makeSpeculativeActionRuntime<
 		state.predictionController.abort();
 		turns.delete(turnKey(state));
 		for (const candidate of [...state.candidates.values()]) {
-			if (candidate.consumed) continue;
-			await resolvePatternLeases(candidate, "unused");
+			if (candidate.run.status === "closed") continue;
 			await preemptCandidate(candidate, reason, "discarded");
 		}
 	};
 
 	const finishTurn = async (input: FinishInput): Promise<void> => {
+		const settings = await latestSettings();
+		if (!settings || !masterEnabled(settings)) {
+			await disableSession(input.sessionID);
+			return;
+		}
 		const state = turns.get(turnKey(input));
 		if (state) await finishState(state, input.terminal === true);
 		else if (input.terminal === true) await finishTerminalSession(input.sessionID);
@@ -1994,17 +2259,11 @@ export function makeSpeculativeActionRuntime<
 		const settings = await adapter.settings();
 		const stateForEvents = createDisposalState<SessionID, Output, StateData>(sessionID, settings);
 		for (const candidate of sessionPersistentCandidates(sessionID)) {
-			await resolvePatternLeases(candidate, "unused");
-			schedulerFor(sessionID).discard(candidate);
-			candidate.schedulerOutcome = "discarded";
-			candidate.consumed = true;
-			removePersistentCandidate(stateForEvents, candidate);
-			candidate.controller.abort();
-			candidate.execution.resolve({ ok: false, error: new Error("session_disposed") });
-			await publishCancelled(stateForEvents, candidate, "session_disposed");
+			await closeCandidate(stateForEvents, candidate, "session_disposed", "invalidated", true);
 		}
 		tokenTotals.delete(sessionID);
 		wallTimes.delete(sessionID);
+		actionSequences.delete(sessionID);
 		schedulers.delete(sessionID);
 		drafterBackoff.delete(sessionID);
 		try {
@@ -2025,6 +2284,7 @@ export function makeSpeculativeActionRuntime<
 		for (const sessionID of sessions) await disposeSession(sessionID);
 		schedulers.clear();
 		drafterBackoff.clear();
+		actionSequences.clear();
 	};
 
 	const inspect = (sessionID?: SessionID): SpeculativeRuntimeInspection => {
@@ -2035,10 +2295,11 @@ export function makeSpeculativeActionRuntime<
 			activeTurns: states.length,
 			turnCandidates: states.reduce(
 				(count, state) =>
-					count + [...state.candidates.values()].filter((candidate) => candidate.lifetime === "turn").length,
+					count +
+					[...state.candidates.values()].filter((candidate) => candidate.reuse.kind === "exclusive").length,
 				0,
 			),
-			resourceCandidates: persistent.filter((candidate) => candidate.lifetime === "resource").length,
+			resourceCandidates: persistent.filter((candidate) => candidate.reuse.kind === "shared").length,
 			pendingPredictions: states.filter((state) => state.predictionPending).length,
 		};
 	};
@@ -2052,6 +2313,32 @@ export function candidateToolNames(settings: SpeculativeActionSettings): readonl
 	return KEYABLE_TOOLS.filter((tool) =>
 		inferredExecution(tool) === "sandbox" ? sandbox.has(tool) : resourceCached.has(tool),
 	);
+}
+
+export function candidateExecutionMs(candidate: SpeculativeCandidate): number {
+	return candidate.run.status === "ready" || candidate.run.status === "closed" ? (candidate.run.executionMs ?? 0) : 0;
+}
+
+function candidateCompletedAt(candidate: SpeculativeCandidate): number | undefined {
+	return candidate.run.status === "ready" || candidate.run.status === "closed" ? candidate.run.completedAt : undefined;
+}
+
+function hasActivePredictionLease(candidate: SpeculativeCandidate): boolean {
+	return candidate.leases.some((lease) => lease.state === "active");
+}
+
+function hasActiveDrafterLease(candidate: SpeculativeCandidate): boolean {
+	return candidate.leases.some((lease) => lease.state === "active" && lease.source === "drafter");
+}
+
+function hasActiveSharedDrafterLease(candidate: SpeculativeCandidate): boolean {
+	return candidate.reuse.kind === "shared" && hasActiveDrafterLease(candidate);
+}
+
+function candidateFutureHorizon(candidate: SpeculativeCandidate): number | undefined {
+	return candidate.leases.find(
+		(lease) => lease.source === "pattern_aware" && (lease.state === "active" || lease.state === "hit"),
+	)?.horizon;
 }
 
 function resourcePathsOverlap(left: string, right: string): boolean {
@@ -2118,7 +2405,7 @@ async function isExpired<
 	action: ActionKey,
 	candidate: RuntimeCandidate<Output>,
 ): Promise<boolean> {
-	if (!adapter.isResourceExpired || candidate.lifetime !== "resource") return false;
+	if (!adapter.isResourceExpired || candidate.resourceVersion === undefined) return false;
 	try {
 		const result = await adapter.isResourceExpired({
 			stateData: state.data,
@@ -2153,7 +2440,8 @@ function createDisposalState<SessionID, Output, StateData>(
 		predictionController: new AbortController(),
 		actorKeys: new Set(),
 		preparedHints: new Set(),
-		candidateFailures: new Map(),
+		pendingActionSequences: new Set(),
+		actionSequence: 0,
 		admittedCandidates: 0,
 		drafterAttempted: false,
 		terminal: true,

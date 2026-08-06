@@ -40,11 +40,17 @@ import type {
 	SpeculativeCandidate,
 	SpeculativeDraftCandidate,
 } from "./runtime.ts";
-import { candidateToolNames, estimateValueBytes, makeSpeculativeActionRuntime } from "./runtime.ts";
+import {
+	candidateExecutionMs,
+	candidateToolNames,
+	estimateValueBytes,
+	makeSpeculativeActionRuntime,
+} from "./runtime.ts";
 import type { SpeculativeAgentSandbox, SpeculativeSandboxExecution } from "./workspace-sandbox.ts";
 
 export interface SpeculativeAgentSettingsInput {
 	readonly enabled?: boolean;
+	readonly drafterEnabled?: boolean;
 	readonly maxCandidates?: number;
 	readonly resourceCacheMaxEntries?: number;
 	readonly resourceCacheMaxBytes?: number;
@@ -164,6 +170,8 @@ export function installSpeculativeAction(
 		return {
 			enabled: typeof settings.enabled === "boolean" ? settings.enabled : DEFAULTS.enabled,
 			mode: "predict_action_single_step",
+			drafterEnabled:
+				typeof settings.drafterEnabled === "boolean" ? settings.drafterEnabled : DEFAULTS.drafterEnabled,
 			maxCandidates: clampMaxCandidates(settings.maxCandidates ?? DEFAULTS.maxCandidates),
 			resourceCacheMaxEntries: normalizePositiveInteger(
 				settings.resourceCacheMaxEntries,
@@ -303,13 +311,11 @@ export function installSpeculativeAction(
 		predictPatternAware: async (input, settings, definitions) => {
 			if (!settings.patternAware?.enabled) return { candidates: [], draftTokens: 0 };
 			const store = await resolvePatternStore(settings);
-			const deferDrafter = store.hasLearnedPatterns() && !store.hasObservedAction(input.sessionID);
 			return {
 				candidates: store
 					.predict(input.sessionID, definitionSchemaHashes(definitions))
 					.map((candidate) => ({ ...candidate, patternContext: patternAwareRuntimeContext(store, candidate) })),
 				draftTokens: 0,
-				deferDrafter,
 			};
 		},
 		actionKey: (toolName, input, context) => {
@@ -437,7 +443,7 @@ export function installSpeculativeAction(
 					actionKey: candidate.key.key,
 					outcome: output.isError ? "failure" : "success",
 					...observation,
-					durationMs: candidate.executionMs ?? 0,
+					durationMs: candidateExecutionMs(candidate),
 					...(typeof candidate.key.input.operation === "string"
 						? { operation: candidate.key.input.operation }
 						: {}),

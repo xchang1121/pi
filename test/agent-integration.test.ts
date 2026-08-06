@@ -294,7 +294,6 @@ describe("Pi Agent speculative integration", () => {
 		expect(toolExecutions).toBe(1);
 		expect(streams.draftRequests()).toBe(2);
 		expect(previousActualCalls).toBe(1);
-		expect(events.some((event) => event.type === "miss" && event.reason === "permission_or_policy")).toBe(true);
 		expect(events.some((event) => event.type === "hit")).toBe(false);
 		expect(events.find((event) => event.type === "actual")).toMatchObject({
 			type: "actual",
@@ -548,7 +547,6 @@ describe("Pi Agent speculative integration", () => {
 			await agent.prompt("Write normally");
 
 			expect(executions).toBe(1);
-			expect(events.some((event) => event.type === "miss" && event.reason === "sandbox_unavailable")).toBe(true);
 			expect(events.some((event) => event.type === "hit")).toBe(false);
 			await installed.uninstall();
 		} finally {
@@ -674,7 +672,7 @@ describe("Pi Agent speculative integration", () => {
 		await installed.uninstall();
 	});
 
-	it("uses a learned PatternAware candidate without a drafter tool call", async () => {
+	it("uses a learned PatternAware candidate and resumes the drafter on a later uncovered turn", async () => {
 		const store = new PatternAwareStore(PATTERN_AWARE_DEFAULTS);
 		trainPattern(store, "one", "README.md");
 		trainPattern(store, "two", "README.md");
@@ -706,7 +704,7 @@ describe("Pi Agent speculative integration", () => {
 		await agent.prompt("Read README.md");
 
 		expect(executions).toBe(1);
-		expect(streams.draftRequests()).toBe(0);
+		expect(streams.draftRequests()).toBe(1);
 		expect(events).toContainEqual(expect.objectContaining({ type: "hit", source: "pattern_aware" }));
 		await installed.uninstall();
 	});

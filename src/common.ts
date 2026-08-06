@@ -1,7 +1,6 @@
 import path from "node:path";
 
 export type SpeculativeExecution = "resource_cached" | "sandbox";
-export type CandidateLifetime = "turn" | "resource";
 
 export interface ActionKey {
 	readonly key: string;
@@ -32,6 +31,7 @@ export const KEYABLE_TOOLS = [...IDEMPOTENT_ACTION_TOOLS, ...SANDBOX_ACTION_TOOL
 export const DEFAULTS = {
 	enabled: false,
 	mode: "predict_action_single_step" as const,
+	drafterEnabled: true,
 	maxCandidates: 8,
 	resourceCacheMaxEntries: 512,
 	resourceCacheMaxBytes: 256 * 1024 * 1024,
@@ -253,10 +253,6 @@ export function isAdoptableSandboxAction(tool: string): boolean {
 
 export function isObservableSandboxAction(tool: string): boolean {
 	return tool === "bash";
-}
-
-export function actionLifetime(tool: string): CandidateLifetime {
-	return isIdempotentAction(tool) ? "resource" : "turn";
 }
 
 export function normalizeReadOffset(value: unknown): number {

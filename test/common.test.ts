@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
 	actionKeyMatches,
-	actionLifetime,
 	buildDrafterToolCallPrompt,
 	buildPiActionKey,
 	clampMaxCandidates,
@@ -32,13 +31,6 @@ describe("speculative action common", () => {
 		expect(clampMaxCandidates(4.9)).toBe(4);
 		expect(clampMaxCandidates(100)).toBe(8);
 		expect(clampMaxCandidates("4")).toBe(1);
-	});
-
-	it("assigns resource lifetime only to M1 read-only actions", () => {
-		expect(actionLifetime("read")).toBe("resource");
-		expect(actionLifetime("grep")).toBe("resource");
-		expect(actionLifetime("find")).toBe("resource");
-		expect(actionLifetime("bash")).toBe("turn");
 	});
 
 	it("canonicalizes Pi defaults and rejects paths outside the workspace", () => {

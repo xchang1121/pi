@@ -284,6 +284,10 @@ export class ResourceVersionManager {
 const managers = new Map<string, ResourceVersionManager>();
 
 export function resourceDependencies(action: ActionKey, root: string): ReadonlyArray<ResourceDependency> {
+	if (action.tool === "bash") {
+		const workdir = typeof action.input.workdir === "string" ? action.input.workdir : ".";
+		return [{ path: path.resolve(root, workdir), scope: "tree_content" }];
+	}
 	if (action.tool === "lsp" && action.input.operation !== "documentSymbol") {
 		return [{ path: root, scope: "tree_content" }];
 	}

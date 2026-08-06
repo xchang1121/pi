@@ -328,15 +328,20 @@ async function acquireSandboxBaseline(
 ): Promise<string> {
 	return withRepositoryLock(repository, async () => {
 		if (repository.commit && repository.version) {
-			const current = await repository.versions.validate(repository.version);
-			if (!current.expired) return repository.commit;
+			const [current, indexed] = await Promise.all([
+				repository.versions.validate(repository.version),
+				sandboxIndexChanges(repository),
+			]);
+			if (!current.expired && indexed.length === 0) return repository.commit;
 		}
 		for (let attempt = 0; attempt < 3; attempt++) {
 			const version = await repository.versions.capture([{ path: repository.sourceRoot, scope: "tree_content" }]);
 			const changes = repository.version ? repository.versions.changesSince(repository.version) : undefined;
+			const indexed = repository.commit ? await sandboxIndexChanges(repository) : [];
+			const changedPaths = [...new Set([...(changes?.paths ?? []), ...indexed])];
 			const changedPathspecs =
 				repository.commit && changes && !changes.uncertain
-					? incrementalPathspecs(repository.sourceRoot, changes.paths)
+					? incrementalPathspecs(repository.sourceRoot, changedPaths)
 					: undefined;
 			if (repository.commit && changedPathspecs) {
 				await git(
@@ -445,6 +450,25 @@ async function acquireSandboxBaseline(
 		}
 		throw new Error("workspace changed repeatedly while preparing sandbox baseline");
 	});
+}
+
+async function sandboxIndexChanges(repository: PooledGitRepository): Promise<string[]> {
+	const prefix = ["--git-dir", repository.repository, "--work-tree", repository.sourceRoot];
+	const [tracked, untracked] = await Promise.all([
+		git(
+			repository.gitBinary,
+			[...prefix, "diff-files", "--name-only", "--no-renames", "-z", "--"],
+			repository.sourceRoot,
+		),
+		git(
+			repository.gitBinary,
+			[...prefix, "ls-files", "--others", "--exclude-standard", "-z", "--"],
+			repository.sourceRoot,
+		),
+	]);
+	return [...new Set([...parseNullList(tracked), ...parseNullList(untracked)])].map((file) =>
+		path.resolve(repository.sourceRoot, file),
+	);
 }
 
 async function withRepositoryLock<T>(repository: PooledGitRepository, run: () => Promise<T>): Promise<T> {

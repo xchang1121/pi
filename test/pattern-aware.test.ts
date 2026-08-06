@@ -115,6 +115,19 @@ describe("PatternAware", () => {
 		expect(store.predict("probe").find((item) => item.tool === "read")?.horizon).toBe(0);
 	});
 
+	test("keeps a pattern eligible while runtime benefit and waste are tied", () => {
+		const store = new PatternAwareStore(settings());
+		expect(
+			store.registerValidatedPattern(
+				validatedGapPattern({ "0": 2 }, { id: "balanced-runtime", opportunities: 2, consumed: 1, unused: 1 }),
+			),
+		).toBe(true);
+
+		store.observe(input({ sessionID: "probe", tool: "grep", input: { pattern: "TODO" } }));
+
+		expect(store.predict("probe").some((item) => item.tool === "read")).toBe(true);
+	});
+
 	test("lets recent gap behavior replace stale high-volume history", () => {
 		const store = new PatternAwareStore(
 			settings({
@@ -598,11 +611,11 @@ describe("PatternAware", () => {
 				input: expect.objectContaining({ agent: "build" }),
 			}),
 		);
-		expect(store.hasObservedAction("session")).toBe(false);
+		expect(store.recent("session").some((event) => event.tool !== "$llm")).toBe(false);
 
 		store.observe(input({ sessionID: "session", tool: "read", input: { filePath: "src/index.ts" } }));
 
-		expect(store.hasObservedAction("session")).toBe(true);
+		expect(store.recent("session").some((event) => event.tool !== "$llm")).toBe(true);
 	});
 
 	test("validates overlapping occurrences of the same future pattern independently", () => {

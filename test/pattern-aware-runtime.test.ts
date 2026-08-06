@@ -614,7 +614,7 @@ describe("PatternAware runtime integration", () => {
 		expect(executions).toBe(1);
 	});
 
-	it("honors a PatternAware request to defer the adaptive drafter", async () => {
+	it("does not defer the adaptive drafter without an immediate concrete PatternAware action", async () => {
 		let requests = 0;
 		const runtime = makeSpeculativeActionRuntime(
 			adapter({
@@ -629,7 +629,7 @@ describe("PatternAware runtime integration", () => {
 		await runtime.startTurn(start("turn"));
 		await waitFor(() => runtime.inspect().pendingPredictions === 0);
 
-		expect(requests).toBe(0);
+		expect(requests).toBe(1);
 	});
 
 	it("publishes byte and lifecycle phase diagnostics on completion and hit", async () => {
@@ -676,9 +676,9 @@ describe("PatternAware runtime integration", () => {
 		expect(await runtime.consume(call("turn", "read", { path: "a.ts" }))).toBe("prefetched");
 		expect(events.find((event) => event.type === "hit")).toEqual(
 			expect.objectContaining({
-				validationMs: 8,
-				validationBytes: 10,
-				validationFiles: 2,
+				validationMs: 4,
+				validationBytes: 5,
+				validationFiles: 1,
 				validationMode: "exact",
 				commitMs: 8,
 				commitValidationMs: 3,
@@ -688,7 +688,106 @@ describe("PatternAware runtime integration", () => {
 		);
 	});
 
-	it("invalidates only resources changed by a successful sandbox adoption", async () => {
+	it("resolves a PatternAware lease attached to a resource job from an earlier turn", async () => {
+		const outcomes: string[] = [];
+		let executions = 0;
+		const runtime = makeSpeculativeActionRuntime(
+			adapter({
+				predict: (input) => ({
+					candidates:
+						input.turnID === "seed" ? [{ type: "tool_call", tool: "read", input: { path: "README.md" } }] : [],
+					draftTokens: 0,
+				}),
+				predictPatternAware: (input) => ({
+					candidates:
+						input.turnID === "reuse"
+							? [patternCandidate("read", { path: "README.md" }, "reused_pattern", 0)]
+							: [],
+					draftTokens: 0,
+				}),
+				executeCandidate: () => {
+					executions++;
+					return "cached";
+				},
+				onPatternResolved: (id, outcome) => {
+					outcomes.push(`${id}:${outcome}`);
+				},
+			}),
+		);
+
+		await runtime.startTurn(start("seed"));
+		await waitFor(() => executions === 1);
+		await runtime.finishTurn(start("seed"));
+		await runtime.startTurn(start("reuse"));
+		await waitFor(() => runtime.inspect().pendingPredictions === 0);
+		await runtime.finishTurn({ ...start("reuse"), terminal: true });
+
+		expect(executions).toBe(1);
+		expect(outcomes).toEqual(["reused_pattern:unused"]);
+	});
+
+	it("credits a matching pattern independently from resource freshness", async () => {
+		const outcomes: string[] = [];
+		const events: SpeculativeActionEvent<string>[] = [];
+		const runtime = makeSpeculativeActionRuntime(
+			adapter({
+				predictPatternAware: () => ({
+					candidates: [patternCandidate("read", { path: "stale.txt" }, "stale_pattern", 0)],
+					draftTokens: 0,
+				}),
+				captureResourceVersion: () => "version",
+				isResourceExpired: () => true,
+				onPatternResolved: (id, outcome) => {
+					outcomes.push(`${id}:${outcome}`);
+				},
+				onEvent: (event) => {
+					events.push(event);
+				},
+			}),
+		);
+
+		await runtime.startTurn(start("freshness"));
+		await waitFor(() => runtime.inspect().pendingPredictions === 0);
+		expect(await runtime.consume(call("freshness", "read", { path: "stale.txt" }))).toBeUndefined();
+
+		expect(outcomes).toEqual(["stale_pattern:consumed"]);
+		expect(events).toContainEqual(expect.objectContaining({ type: "miss", reason: "resource_expired" }));
+	});
+
+	it("expands a sandbox-dependent chain only after the parent is adopted", async () => {
+		const executions: string[] = [];
+		let continuations = 0;
+		const runtime = makeSpeculativeActionRuntime(
+			adapter({
+				predictPatternAware: () => ({
+					candidates: [patternCandidate("bash", { command: "prepare" }, "sandbox_parent", 0)],
+					draftTokens: 0,
+				}),
+				executeCandidate: ({ tool }) => {
+					executions.push(tool);
+					return `${tool}-result`;
+				},
+				adoptCandidate: ({ output }) => output,
+				continuePatternAware: ({ candidate }) => {
+					if (candidate.tool !== "bash") return undefined;
+					continuations++;
+					return {
+						candidates: [patternCandidate("read", { path: "generated.txt" }, "sandbox_child", 0)],
+						draftTokens: 0,
+					};
+				},
+			}),
+		);
+
+		await runtime.startTurn(start("sandbox-chain"));
+		await waitFor(() => executions.includes("bash"));
+		expect(continuations).toBe(0);
+		expect(await runtime.consume(call("sandbox-chain", "bash", { command: "prepare" }))).toBe("bash-result");
+		await waitFor(() => executions.includes("read"));
+		expect(continuations).toBe(1);
+	});
+
+	it("invalidates the full bash workdir after successful sandbox adoption", async () => {
 		const runtime = makeSpeculativeActionRuntime(
 			adapter({
 				predict: () => ({
@@ -719,7 +818,7 @@ describe("PatternAware runtime integration", () => {
 		expect(await runtime.consume(call("turn", "bash", { command: "update a" }))).toContain("bash:update a");
 
 		expect(await runtime.consume(call("turn", "read", { path: "a.ts" }))).toBeUndefined();
-		expect(await runtime.consume(call("turn", "read", { path: "b.ts" }))).toBe("read:b.ts");
+		expect(await runtime.consume(call("turn", "read", { path: "b.ts" }))).toBeUndefined();
 	});
 });
 

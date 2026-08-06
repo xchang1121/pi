@@ -554,14 +554,6 @@ export class PatternAwareStore {
 		return [...(this.history.get(sessionID) ?? [])];
 	}
 
-	hasLearnedPatterns() {
-		return this.patterns.size > 0;
-	}
-
-	hasObservedAction(sessionID: string) {
-		return (this.history.get(sessionID) ?? []).some(isActionEvent);
-	}
-
 	async flush(): Promise<void> {
 		while (true) {
 			if (this.persistTimer) {
@@ -1548,7 +1540,7 @@ function runtimeEligible(pattern: MutablePattern, settings: PatternAwareSettings
 	if (pattern.opportunities < settings.minOccurrences) return true;
 	const useful = pattern.consumed * pattern.averageDurationMs;
 	const wasted = pattern.unused * pattern.averageDurationMs;
-	return useful > wasted;
+	return useful >= wasted;
 }
 
 function structurallyEligible(pattern: MutablePattern, settings: PatternAwareSettings) {

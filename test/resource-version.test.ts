@@ -40,4 +40,25 @@ describe("speculative resource versions", () => {
 			await rm(cwd, { recursive: true, force: true });
 		}
 	});
+
+	it("tracks a sandbox bash result against the complete Pi workspace", async () => {
+		const cwd = await mkdtemp(path.join(tmpdir(), "pi-speculative-resource-"));
+		try {
+			await mkdir(path.join(cwd, "src"));
+			await writeFile(path.join(cwd, "src", "value.txt"), "one");
+			await writeFile(path.join(cwd, "outside.txt"), "outside-one");
+			const action = buildPiActionKey("bash", { command: "cat value.txt", workdir: "src" }, cwd);
+			expect(action).toBeDefined();
+			if (!action) return;
+			const before = await fingerprintActionResources(action, cwd);
+			await writeFile(path.join(cwd, "outside.txt"), "outside-two");
+			const afterWorkspaceChange = await fingerprintActionResources(action, cwd);
+			expect(afterWorkspaceChange).not.toBe(before);
+
+			await writeFile(path.join(cwd, "src", "value.txt"), "two");
+			expect(await fingerprintActionResources(action, cwd)).not.toBe(afterWorkspaceChange);
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
 });
