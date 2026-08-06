@@ -504,8 +504,8 @@ interface TurnState<SessionID, Output, StateData> {
 	readonly actorCallSequences: Map<string, number>;
 	readonly preparedHints: Set<string>;
 	readonly pendingActionSequences: Set<number>;
+	readonly turnAdmissions: Map<string, RuntimeCandidate<Output>>;
 	actionSequence: number;
-	admittedCandidates: number;
 	drafterAttempted: boolean;
 	drafterFeedback?: "success" | "failure";
 	drafterPlanMismatch?: boolean;
@@ -727,6 +727,54 @@ export function makeSpeculativeActionRuntime<
 		const source = draft.source ?? batchSource;
 		const hidden = Math.min(duration, observedLeadTime(source, draft.tool, draft.horizon) ?? duration);
 		return Math.min(hidden, draft.expectedLatencyBenefitMs ?? probability * hidden);
+	};
+
+	const removeTurnAdmission = (
+		state: TurnState<SessionID, Output, StateData>,
+		candidate: RuntimeCandidate<Output>,
+	): void => {
+		for (const [key, admitted] of state.turnAdmissions) {
+			if (admitted === candidate) state.turnAdmissions.delete(key);
+		}
+	};
+
+	const turnAdmission = (
+		state: TurnState<SessionID, Output, StateData>,
+		key: string,
+		utility: number,
+	): { readonly admitted: true; readonly victim?: RuntimeCandidate<Output> } | { readonly admitted: false } => {
+		for (const [candidateKey, candidate] of state.turnAdmissions) {
+			if (candidate.run.status === "closed") state.turnAdmissions.delete(candidateKey);
+		}
+		if (state.turnAdmissions.has(key)) return { admitted: true };
+		if (state.turnAdmissions.size < candidateLimit(state.settings)) return { admitted: true };
+		const victim = [...state.turnAdmissions.values()].sort(
+			(left, right) => left.utility - right.utility || left.startedAt - right.startedAt,
+		)[0];
+		if (!victim || victim.utility >= utility) return { admitted: false };
+		return { admitted: true, victim };
+	};
+
+	const drafterCandidateBudget = (state: TurnState<SessionID, Output, StateData>): number => {
+		const limit = candidateLimit(state.settings);
+		if (limit <= 1) return 1;
+		const patterns = [...availableCandidates(state).values()].filter((candidate) =>
+			candidate.leases.some(
+				(lease) =>
+					lease.state === "active" && lease.source === "pattern_aware" && lease.providerTurnID === state.turnID,
+			),
+		);
+		const coverage = Math.min(
+			1,
+			patterns.reduce((total, candidate) => {
+				const probability = candidate.empiricalProbability;
+				return (
+					total + (typeof probability === "number" && Number.isFinite(probability) ? Math.max(0, probability) : 0)
+				);
+			}, 0),
+		);
+		const coveredSlots = Math.floor(coverage * Math.min(patterns.length, limit - 1));
+		return Math.max(1, limit - coveredSlots);
 	};
 
 	const emit = async (event: SpeculativeActionEvent<SessionID>): Promise<void> => {
@@ -1055,6 +1103,7 @@ export function makeSpeculativeActionRuntime<
 		}
 		schedulerFor(state.sessionID).discard(candidate);
 		if (state.candidates.get(candidate.key.key) === candidate) state.candidates.delete(candidate.key.key);
+		removeTurnAdmission(state, candidate);
 		removePersistentCandidate(state, candidate);
 		releaseCandidateResourceVersion(candidate);
 		candidate.controller.abort();
@@ -1443,7 +1492,6 @@ export function makeSpeculativeActionRuntime<
 				}
 				continue;
 			}
-			if (state.admittedCandidates >= turnCandidateLimit) return accepted;
 			const execution = draft.execution ?? inferredExecution(draft.tool);
 			if (execution !== action.execution) {
 				await publishMiss(state, "execution_mismatch", action, undefined, { draftCandidate, predictedAction });
@@ -1530,6 +1578,13 @@ export function makeSpeculativeActionRuntime<
 				controller: candidateController,
 				hits: 0,
 			};
+			const turnDecision = turnAdmission(state, action.key, candidate.utility);
+			if (!turnDecision.admitted) {
+				candidate.schedulerOutcome = "discarded";
+				candidateController.abort();
+				await publishCancelled(state, candidate, "candidate_budget_insufficient_expected_benefit");
+				continue;
+			}
 			const admission = schedulerFor(state.sessionID).admit(
 				candidate,
 				scheduling,
@@ -1537,11 +1592,16 @@ export function makeSpeculativeActionRuntime<
 			);
 			if (!admission.admitted) {
 				candidate.schedulerOutcome = "discarded";
+				candidateController.abort();
 				await publishCancelled(state, candidate, `scheduler_${admission.reason}`);
 				continue;
 			}
 			for (const victim of admission.preempted) await preemptCandidate(victim);
-			state.admittedCandidates++;
+			if (turnDecision.victim && !admission.preempted.includes(turnDecision.victim)) {
+				await preemptCandidate(turnDecision.victim, "candidate_budget_preempted");
+			}
+			if (turnDecision.victim) state.turnAdmissions.delete(turnDecision.victim.key.key);
+			state.turnAdmissions.set(action.key, candidate);
 			state.candidates.set(action.key, candidate);
 			candidateOwners.set(candidate, state);
 			if (candidate.reuse.kind === "shared" || source === "pattern_aware") {
@@ -1719,6 +1779,7 @@ export function makeSpeculativeActionRuntime<
 							if (lease.state === "matched") lease.state = "invalidated";
 						}
 						if (state.candidates.get(candidate.key.key) === candidate) state.candidates.delete(candidate.key.key);
+						removeTurnAdmission(state, candidate);
 						removePersistentCandidate(state, candidate);
 						releaseCandidateResourceVersion(candidate);
 						await publishCancelled(state, candidate, reason, errorDetail(error));
@@ -1849,13 +1910,6 @@ export function makeSpeculativeActionRuntime<
 						"pattern_aware",
 						candidateNames,
 					);
-					const immediatePatternCandidate = [...availableCandidates(state).values()].some((candidate) =>
-						candidate.leases.some(
-							(lease) => lease.state === "active" && lease.source === "pattern_aware" && lease.horizon === 0,
-						),
-					);
-					const activeDrafterPlan = [...availableCandidates(state).values()].some(hasActiveSharedDrafterLease);
-					if (adaptiveDrafter(state) && (immediatePatternCandidate || activeDrafterPlan)) return;
 				} catch {
 					// Learned predictions are optional; drafter prediction remains available.
 				}
@@ -1865,12 +1919,11 @@ export function makeSpeculativeActionRuntime<
 			const activeDrafterPlan = [...availableCandidates(state).values()].some(hasActiveSharedDrafterLease);
 			if (adaptiveDrafter(state) && activeDrafterPlan) return;
 			if (adaptiveDrafter(state) && !takeDrafterOpportunity(input.sessionID)) return;
-			const remainingCandidates = candidateLimit(state.settings) - state.admittedCandidates;
-			if (remainingCandidates <= 0) return;
+			const drafterBudget = drafterCandidateBudget(state);
 			const drafterSettings =
-				remainingCandidates === candidateLimit(state.settings)
+				drafterBudget === candidateLimit(state.settings)
 					? state.settings
-					: { ...state.settings, candidateLimit: remainingCandidates, maxCandidates: remainingCandidates };
+					: { ...state.settings, candidateLimit: drafterBudget, maxCandidates: drafterBudget };
 
 			state.drafterAttempted = true;
 			const predictionStarted = Date.now();
@@ -1968,8 +2021,8 @@ export function makeSpeculativeActionRuntime<
 			actorCallSequences: new Map(),
 			preparedHints: new Set(),
 			pendingActionSequences: new Set(),
+			turnAdmissions: new Map(),
 			actionSequence: actionSequences.get(input.sessionID) ?? 0,
-			admittedCandidates: 0,
 			drafterAttempted: false,
 			terminal: false,
 			finished: false,
@@ -2203,6 +2256,7 @@ export function makeSpeculativeActionRuntime<
 				};
 				schedulerFor(state.sessionID).discard(candidate);
 				if (state.candidates.get(candidate.key.key) === candidate) state.candidates.delete(candidate.key.key);
+				removeTurnAdmission(state, candidate);
 				removePersistentCandidate(state, candidate);
 				releaseCandidateResourceVersion(candidate);
 			}
@@ -2571,8 +2625,8 @@ function createDisposalState<SessionID, Output, StateData>(
 		actorCallSequences: new Map(),
 		preparedHints: new Set(),
 		pendingActionSequences: new Set(),
+		turnAdmissions: new Map(),
 		actionSequence: 0,
-		admittedCandidates: 0,
 		drafterAttempted: false,
 		terminal: true,
 		finished: true,

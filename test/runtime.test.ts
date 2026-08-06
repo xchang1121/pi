@@ -476,7 +476,7 @@ describe("speculative action runtime", () => {
 		expect(releases).toBe(1);
 	});
 
-	it("adaptive drafter skips only for an immediate concrete PatternAware candidate", async () => {
+	it("keeps one drafter challenger when PatternAware has an immediate candidate", async () => {
 		for (const horizon of [0, 1]) {
 			let drafterCalls = 0;
 			const harness = createHarness({
@@ -502,7 +502,7 @@ describe("speculative action runtime", () => {
 			await harness.runtime.startTurn({ sessionID: "session", turnID: `turn-pattern-${horizon}` });
 			await waitFor(() => harness.runtime.inspect().pendingPredictions === 0);
 
-			expect(drafterCalls).toBe(horizon === 0 ? 0 : 1);
+			expect(drafterCalls).toBe(1);
 			await harness.runtime.disposeSession("session");
 		}
 	});
@@ -666,6 +666,7 @@ describe("speculative action runtime", () => {
 					source: "pattern_aware",
 					patternID: "pattern-limit",
 					horizon: 1,
+					empiricalProbability: 1,
 				}),
 			predict: (_input, _signal, settings) => {
 				drafterCandidateLimit = settings.candidateLimit ?? 0;
@@ -677,6 +678,80 @@ describe("speculative action runtime", () => {
 
 		expect(harness.executions()).toBe(2);
 		expect(drafterCandidateLimit).toBe(1);
+	});
+
+	it("lets a higher-utility drafter action replace a weaker PatternAware action", async () => {
+		const executed: string[] = [];
+		const harness = createHarness({
+			settings: {
+				...enabledSettings,
+				candidateLimit: 1,
+				maxConcurrentActions: 2,
+				patternAware: { ...PATTERN_AWARE_DEFAULTS, enabled: true },
+			},
+			predictPatternAware: () =>
+				prediction({
+					...readCandidate("pattern.txt"),
+					source: "pattern_aware",
+					patternID: "weak-pattern",
+					horizon: 0,
+					empiricalProbability: 0.2,
+					expectedDurationMs: 10,
+				}),
+			predict: () => prediction({ ...readCandidate("draft.txt"), expectedDurationMs: 100 }),
+			execute: (candidate, signal) => {
+				const candidatePath = String((candidate.input as { path: string }).path);
+				if (candidatePath === "draft.txt") {
+					executed.push(candidatePath);
+					return candidatePath;
+				}
+				return new Promise<string>((_resolve, reject) => {
+					signal.addEventListener("abort", () => reject(new Error("preempted")), { once: true });
+				});
+			},
+		});
+
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-utility-arbitration" });
+		await waitFor(() => executed.includes("draft.txt"));
+
+		expect(executed).toEqual(["draft.txt"]);
+		expect(harness.events).toContainEqual(
+			expect.objectContaining({
+				type: "cancelled",
+				tool: "read",
+				reason: "candidate_budget_preempted",
+			}),
+		);
+	});
+
+	it("keeps drafter budgeting finite when PatternAware reports malformed probability", async () => {
+		let drafterCandidateLimit: number | undefined;
+		const harness = createHarness({
+			settings: {
+				...enabledSettings,
+				candidateLimit: 3,
+				maxConcurrentActions: 3,
+				patternAware: { ...PATTERN_AWARE_DEFAULTS, enabled: true },
+			},
+			predictPatternAware: () =>
+				prediction({
+					...readCandidate("pattern.txt"),
+					source: "pattern_aware",
+					patternID: "malformed-pattern",
+					horizon: 0,
+					empiricalProbability: Number.NaN,
+				}),
+			predict: (_input, _signal, settings) => {
+				drafterCandidateLimit = settings.candidateLimit;
+				return prediction();
+			},
+		});
+
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-malformed-coverage" });
+		await waitFor(() => harness.runtime.inspect().pendingPredictions === 0);
+
+		expect(drafterCandidateLimit).toBe(3);
+		expect(Number.isFinite(drafterCandidateLimit)).toBe(true);
 	});
 
 	it("learns actor lead time and prioritizes latency that can actually be hidden", async () => {
@@ -1220,6 +1295,7 @@ describe("speculative action runtime", () => {
 
 		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-1" });
 		await waitFor(() => harness.runtime.inspect().pendingPredictions === 0);
+		await new Promise((resolve) => setTimeout(resolve, 5));
 		expect(await harness.runtime.consume(consume("turn-1"))).toBe("prefetched");
 		await harness.runtime.finishTurn(consume("turn-1", {}));
 		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-2" });

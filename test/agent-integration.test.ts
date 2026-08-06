@@ -689,7 +689,7 @@ describe("Pi Agent speculative integration", () => {
 		await installed.uninstall();
 	});
 
-	it("uses a learned PatternAware candidate and resumes the drafter on a later uncovered turn", async () => {
+	it("uses a learned PatternAware candidate while keeping drafter arbitration active", async () => {
 		const store = new PatternAwareStore(PATTERN_AWARE_DEFAULTS);
 		trainPattern(store, "one", "README.md");
 		trainPattern(store, "two", "README.md");
@@ -721,7 +721,7 @@ describe("Pi Agent speculative integration", () => {
 		await agent.prompt("Read README.md");
 
 		expect(executions).toBe(1);
-		expect(streams.draftRequests()).toBe(1);
+		expect(streams.draftRequests()).toBe(2);
 		expect(events).toContainEqual(expect.objectContaining({ type: "hit", source: "pattern_aware" }));
 		await installed.uninstall();
 	});
