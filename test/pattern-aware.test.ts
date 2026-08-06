@@ -183,13 +183,75 @@ describe("PatternAware", () => {
 		const store = new PatternAwareStore(settings());
 		expect(
 			store.registerValidatedPattern(
-				validatedGapPattern({ "0": 2 }, { id: "balanced-runtime", opportunities: 2, consumed: 1, unused: 1 }),
+				validatedGapPattern(
+					{ "0": 2 },
+					{
+						id: "balanced-runtime",
+						opportunities: 2,
+						consumed: 1,
+						unused: 1,
+						actorMisses: 1,
+						recentSuccessWeight: 1,
+						recentFailureWeight: 1,
+					},
+				),
 			),
 		).toBe(true);
 
 		store.observe(input({ sessionID: "probe", tool: "grep", input: { pattern: "TODO" } }));
 
 		expect(store.predict("probe").some((item) => item.tool === "read")).toBe(true);
+	});
+
+	test("attributes only actor choices as negative predictor feedback", () => {
+		const store = new PatternAwareStore(settings({ minOccurrences: 2 }));
+		expect(store.registerValidatedPattern(validatedGapPattern({ "0": 10 }, { id: "attributed" }))).toBe(true);
+		store.observe(input({ sessionID: "probe", tool: "grep", input: { pattern: "TODO" } }));
+
+		for (const outcome of ["system", "stale", "system", "stale"] as const) {
+			store.launched("attributed");
+			store.resolved("attributed", outcome);
+		}
+		expect(store.predict("probe").some((item) => item.patternID === "attributed")).toBe(true);
+
+		for (let index = 0; index < 2; index++) {
+			store.launched("attributed");
+			store.resolved("attributed", "actor_miss");
+		}
+		const pattern = store.snapshot().find((item) => item.id === "attributed");
+		expect(pattern).toMatchObject({
+			opportunities: 6,
+			unused: 6,
+			actorMisses: 2,
+			staleInvalidations: 2,
+			systemCancellations: 2,
+		});
+		expect(store.predict("probe").some((item) => item.patternID === "attributed")).toBe(false);
+	});
+
+	test("discounts stale runtime failures so fresh successes recover after drift", () => {
+		const store = new PatternAwareStore(settings({ minOccurrences: 2, decayHalfLifeEvents: 2 }));
+		expect(store.registerValidatedPattern(validatedGapPattern({ "0": 10 }, { id: "drift" }))).toBe(true);
+		store.observe(input({ sessionID: "probe", tool: "grep", input: { pattern: "TODO" } }));
+		for (let index = 0; index < 2; index++) {
+			store.launched("drift");
+			store.resolved("drift", "actor_miss");
+		}
+		expect(store.predict("probe").some((item) => item.patternID === "drift")).toBe(false);
+
+		for (let index = 0; index < 8; index++) {
+			store.observeTurn({
+				sessionID: "probe",
+				turnID: `turn-${index}`,
+				phase: index % 2 === 0 ? "start" : "finish",
+			});
+		}
+		for (let index = 0; index < 2; index++) {
+			store.launched("drift");
+			store.resolved("drift", "consumed");
+		}
+
+		expect(store.predict("probe").some((item) => item.patternID === "drift")).toBe(true);
 	});
 
 	test("lets recent gap behavior replace stale high-volume history", () => {
@@ -271,7 +333,7 @@ describe("PatternAware", () => {
 
 		const raw = await fs.readFile(file, "utf8");
 		expect(raw).not.toContain('"history"');
-		expect(JSON.parse(raw).version).toBe(9);
+		expect(JSON.parse(raw).version).toBe(10);
 		const second = new PatternAwareStore(settings(), file);
 		await second.load();
 		second.observe(input({ sessionID: "three", tool: "grep", input: {}, outputPaths: ["src/c.ts"] }));
@@ -304,7 +366,7 @@ describe("PatternAware", () => {
 		await fs.writeFile(
 			file,
 			JSON.stringify({
-				version: 8,
+				version: 9,
 				patterns: [validatedGapPattern({ "0": 10 })],
 				pools: [],
 			}),
@@ -1040,6 +1102,12 @@ function validatedGapPattern(
 		opportunities: 0,
 		consumed: 0,
 		unused: 0,
+		actorMisses: 0,
+		staleInvalidations: 0,
+		systemCancellations: 0,
+		recentSuccessWeight: 0,
+		recentFailureWeight: 0,
+		feedbackSequence: 1,
 		averageDurationMs: 100,
 		lastSeenSequence: 1,
 		...overrides,

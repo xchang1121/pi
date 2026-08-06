@@ -78,7 +78,7 @@ describe("PatternAware runtime integration", () => {
 		await waitFor(() => events.some((event) => event.type === "completed"));
 		await runtime.consume(call("turn", "find", { pattern: "*" }));
 
-		expect(outcomes).toEqual(["bash:unused"]);
+		expect(outcomes).toEqual(["bash:actor_miss"]);
 		expect(events).toContainEqual(expect.objectContaining({ type: "cancelled", reason: "pattern_horizon_expired" }));
 	});
 
@@ -117,7 +117,7 @@ describe("PatternAware runtime integration", () => {
 		await runtime.finishTurn({ ...start("turn"), terminal: true });
 		await waitFor(() => aborted === 1);
 
-		expect(outcomes).toEqual(["terminal:unused"]);
+		expect(outcomes).toEqual(["terminal:actor_miss"]);
 		expect(events).toContainEqual(
 			expect.objectContaining({ type: "cancelled", reason: "request_finished_without_hit" }),
 		);
@@ -150,7 +150,7 @@ describe("PatternAware runtime integration", () => {
 		await waitFor(() => runtime.inspect().pendingPredictions === 0);
 		expect(await runtime.consume(call("turn_2", "read", { path: "README.md" }))).toBe("cached");
 
-		expect(outcomes).toEqual(["cached:unused"]);
+		expect(outcomes).toEqual(["cached:actor_miss"]);
 		expect(executions).toBe(1);
 	});
 
@@ -215,7 +215,7 @@ describe("PatternAware runtime integration", () => {
 		expect(launched).toEqual([first, second]);
 		expect(resolved).toEqual([
 			{ context: first, outcome: "consumed" },
-			{ context: second, outcome: "unused" },
+			{ context: second, outcome: "actor_miss" },
 		]);
 	});
 
@@ -331,6 +331,57 @@ describe("PatternAware runtime integration", () => {
 		expect(aborted).toBe(1);
 		expect(events).toContainEqual(expect.objectContaining({ type: "cancelled", reason: "scheduler_preempted" }));
 		expect(events.filter((event) => event.type === "completed")).toHaveLength(1);
+	});
+
+	it("attributes scheduler preemption as a system outcome instead of an actor miss", async () => {
+		const outcomes: string[] = [];
+		const runtime = makeSpeculativeActionRuntime(
+			adapter({
+				settings: () => ({
+					...settings(),
+					drafterEnabled: false,
+					candidateLimit: 1,
+					maxConcurrentActions: 1,
+				}),
+				predictPatternAware: (input) => ({
+					candidates:
+						input.turnID === "turn_1"
+							? [
+									{
+										...patternCandidate("read", { path: "a.ts" }, "low", 8),
+										expectedDurationMs: 100,
+										empiricalProbability: 0.55,
+										expectedLatencyBenefitMs: 55,
+									},
+								]
+							: input.turnID === "turn_2"
+								? [
+										{
+											...patternCandidate("read", { path: "b.ts" }, "high", 8),
+											expectedDurationMs: 100,
+											empiricalProbability: 0.95,
+											expectedLatencyBenefitMs: 95,
+										},
+									]
+								: [],
+					draftTokens: 0,
+				}),
+				executeCandidate: ({ concrete }) =>
+					concrete.path === "a.ts" ? new Promise<string>(() => {}) : "higher utility",
+				onPatternResolved: (id, outcome) => {
+					outcomes.push(`${id}:${outcome}`);
+				},
+			}),
+		);
+
+		await runtime.startTurn(start("turn_1"));
+		await waitFor(() => runtime.inspect().resourceCandidates === 1);
+		await runtime.finishTurn(start("turn_1"));
+		await runtime.startTurn(start("turn_2"));
+		await waitFor(() => outcomes.includes("low:system"));
+
+		expect(outcomes).toContain("low:system");
+		await runtime.dispose();
 	});
 
 	it("interrupts an in-flight resource job when per-session LRU evicts it", async () => {
@@ -728,7 +779,7 @@ describe("PatternAware runtime integration", () => {
 		await runtime.finishTurn({ ...start("reuse"), terminal: true });
 
 		expect(executions).toBe(1);
-		expect(outcomes).toEqual(["reused_pattern:unused"]);
+		expect(outcomes).toEqual(["reused_pattern:actor_miss"]);
 	});
 
 	it("credits a matching pattern independently from resource freshness", async () => {

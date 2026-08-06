@@ -118,9 +118,17 @@ export type PatternAwarePattern = {
 	readonly opportunities: number;
 	readonly consumed: number;
 	readonly unused: number;
+	readonly actorMisses: number;
+	readonly staleInvalidations: number;
+	readonly systemCancellations: number;
+	readonly recentSuccessWeight: number;
+	readonly recentFailureWeight: number;
+	readonly feedbackSequence: number;
 	readonly averageDurationMs: number;
 	readonly lastSeenSequence: number;
 };
+
+export type PatternAwareResolution = "consumed" | "actor_miss" | "stale" | "system";
 
 export type PatternAwareCandidate = {
 	readonly type: "tool_call" | "preparation_hint";
@@ -171,6 +179,12 @@ type MutablePattern = {
 	opportunities: number;
 	consumed: number;
 	unused: number;
+	actorMisses: number;
+	staleInvalidations: number;
+	systemCancellations: number;
+	recentSuccessWeight: number;
+	recentFailureWeight: number;
+	feedbackSequence: number;
 	averageDurationMs: number;
 	lastSeenSequence: number;
 };
@@ -225,7 +239,7 @@ export const PATTERN_AWARE_DEFAULTS: PatternAwareSettings = {
 const MAX_BINDING_VARIANTS = 32;
 const MAX_COMPOSABLE_SOURCES = 48;
 const PERSIST_DEBOUNCE_MS = 200;
-const PERSISTENCE_VERSION = 9;
+const PERSISTENCE_VERSION = 10;
 
 class PredictiveContextTrie {
 	private readonly root: TrieNode = { children: new Map(), patterns: new Set() };
@@ -426,7 +440,7 @@ export class PatternAwareStore {
 
 	registerValidatedPattern(input: PatternAwarePattern) {
 		const pattern = mutablePattern(input);
-		if (!pattern || !eligible(pattern, this.settings)) return false;
+		if (!pattern || !eligible(pattern, this.settings, Math.max(this.clock, pattern.lastSeenSequence))) return false;
 		this.patterns.set(pattern.id, pattern);
 		this.clock = Math.max(this.clock, pattern.lastSeenSequence);
 		this.indexDirty = true;
@@ -486,7 +500,11 @@ export class PatternAwareStore {
 		this.ensureIndex();
 		for (const patternID of this.trie.matching(predictiveHistory)) {
 			const pattern = this.patterns.get(patternID);
-			if (!pattern || !structurallyEligible(pattern, this.settings) || !runtimeEligible(pattern, this.settings))
+			if (
+				!pattern ||
+				!structurallyEligible(pattern, this.settings) ||
+				!runtimeEligible(pattern, this.settings, this.clock)
+			)
 				continue;
 			if (continuation.visitedPatternIDs.includes(pattern.id)) continue;
 			if (pattern.targetSchemaHash && schemaHashes[pattern.targetTool] !== pattern.targetSchemaHash) continue;
@@ -642,10 +660,27 @@ export class PatternAwareStore {
 		this.persist();
 	}
 
-	resolved(patternID: string, outcome: "consumed" | "unused") {
+	resolved(patternID: string, outcome: PatternAwareResolution) {
 		const pattern = this.patterns.get(patternID);
 		if (!pattern) return;
-		pattern[outcome]++;
+		const recent = feedbackEvidence(pattern, this.clock, this.settings.decayHalfLifeEvents);
+		pattern.recentSuccessWeight = recent.success;
+		pattern.recentFailureWeight = recent.failure;
+		pattern.feedbackSequence = this.clock;
+		if (outcome === "consumed") {
+			pattern.consumed++;
+			pattern.recentSuccessWeight++;
+		} else {
+			pattern.unused++;
+			if (outcome === "actor_miss") {
+				pattern.actorMisses++;
+				pattern.recentFailureWeight++;
+			} else if (outcome === "stale") {
+				pattern.staleInvalidations++;
+			} else {
+				pattern.systemCancellations++;
+			}
+		}
 		this.persist();
 	}
 
@@ -772,6 +807,12 @@ export class PatternAwareStore {
 			opportunities: 0,
 			consumed: 0,
 			unused: 0,
+			actorMisses: 0,
+			staleInvalidations: 0,
+			systemCancellations: 0,
+			recentSuccessWeight: 0,
+			recentFailureWeight: 0,
+			feedbackSequence: target.sequence,
 			averageDurationMs: Math.max(0, target.durationMs),
 			lastSeenSequence: target.sequence,
 		});
@@ -1809,16 +1850,17 @@ function leaves(value: unknown, prefix: Array<string | number> = []): Array<[Arr
 	return result;
 }
 
-function eligible(pattern: MutablePattern, settings: PatternAwareSettings) {
+function eligible(pattern: MutablePattern, settings: PatternAwareSettings, clock = pattern.lastSeenSequence) {
 	if (!structurallyEligible(pattern, settings)) return false;
 	if (probability(pattern) < settings.minEmpiricalProbability) return false;
-	return runtimeEligible(pattern, settings);
+	return runtimeEligible(pattern, settings, clock);
 }
 
-function runtimeEligible(pattern: MutablePattern, settings: PatternAwareSettings) {
-	if (pattern.opportunities < settings.minOccurrences) return true;
-	const useful = pattern.consumed * pattern.averageDurationMs;
-	const wasted = pattern.unused * pattern.averageDurationMs;
+function runtimeEligible(pattern: MutablePattern, settings: PatternAwareSettings, clock: number) {
+	const feedback = feedbackEvidence(pattern, clock, settings.decayHalfLifeEvents);
+	if (feedback.success + feedback.failure < settings.minOccurrences) return true;
+	const useful = feedback.success * pattern.averageDurationMs;
+	const wasted = feedback.failure * pattern.averageDurationMs;
 	return useful >= wasted;
 }
 
@@ -2005,8 +2047,9 @@ function backoffProbability(patterns: ReadonlyArray<MutablePattern>, clock: numb
 	let estimate = 0.5;
 	for (const pattern of [...byLength.values()].sort((left, right) => left.context.length - right.context.length)) {
 		const weight = recencyWeight(pattern.lastSeenSequence, clock, halfLife);
-		const opportunities = Math.max(1, (pattern.historicalOpportunities + pattern.opportunities) * weight);
-		const matches = Math.min(opportunities, (pattern.historicalMatches + pattern.consumed) * weight);
+		const feedback = feedbackEvidence(pattern, clock, halfLife);
+		const opportunities = Math.max(1, pattern.historicalOpportunities * weight + feedback.success + feedback.failure);
+		const matches = Math.min(opportunities, pattern.historicalMatches * weight + feedback.success);
 		const local = matches / opportunities;
 		const escapeProbability = 1 / (opportunities + 1);
 		estimate = local * (1 - escapeProbability) + estimate * escapeProbability;
@@ -2015,10 +2058,19 @@ function backoffProbability(patterns: ReadonlyArray<MutablePattern>, clock: numb
 }
 
 function patternRank(pattern: MutablePattern, clock: number, halfLife: number) {
+	const feedback = feedbackEvidence(pattern, clock, halfLife);
 	return (
-		(pattern.consumed * 4 + pattern.replayMatches * 2 + probability(pattern) - pattern.unused) *
+		(feedback.success * 4 + pattern.replayMatches * 2 + probability(pattern) - feedback.failure) *
 		recencyWeight(pattern.lastSeenSequence, clock, halfLife)
 	);
+}
+
+function feedbackEvidence(pattern: MutablePattern, clock: number, halfLife: number) {
+	const weight = recencyWeight(pattern.feedbackSequence, clock, halfLife);
+	return {
+		success: pattern.recentSuccessWeight * weight,
+		failure: pattern.recentFailureWeight * weight,
+	};
 }
 
 function recencyWeight(lastSeen: number, clock: number, halfLife: number) {
@@ -2067,6 +2119,18 @@ function mutablePattern(value: PatternAwarePattern): MutablePattern | undefined 
 		opportunities: finite(value.opportunities),
 		consumed: finite(value.consumed),
 		unused: finite(value.unused),
+		actorMisses: finite(value.actorMisses),
+		staleInvalidations: finite(value.staleInvalidations),
+		systemCancellations: finite(value.systemCancellations),
+		recentSuccessWeight: isFiniteNumber(value.recentSuccessWeight)
+			? Math.max(0, value.recentSuccessWeight)
+			: finite(value.consumed),
+		recentFailureWeight: isFiniteNumber(value.recentFailureWeight)
+			? Math.max(0, value.recentFailureWeight)
+			: finite(value.actorMisses),
+		feedbackSequence: isFiniteNumber(value.feedbackSequence)
+			? Math.max(0, value.feedbackSequence)
+			: finite(value.lastSeenSequence),
 		averageDurationMs: finite(value.averageDurationMs),
 		lastSeenSequence: finite(value.lastSeenSequence),
 	};

@@ -1,6 +1,6 @@
 import type { ActionKey, DrafterToolDefinition, SpeculativeExecution } from "./common.ts";
 import { actionKeyMatches, clampCandidateLimit, DEFAULTS, inferredExecution, KEYABLE_TOOLS } from "./common.ts";
-import type { PatternAwareDependency, PatternAwareSettings } from "./pattern-aware.ts";
+import type { PatternAwareDependency, PatternAwareResolution, PatternAwareSettings } from "./pattern-aware.ts";
 import {
 	expectedUtility,
 	resourceProfile,
@@ -435,7 +435,7 @@ export interface SpeculativeActionRuntimeAdapter<
 	readonly onPatternLaunched?: (patternID: string, context?: unknown) => MaybePromise<void>;
 	readonly onPatternResolved?: (
 		patternID: string,
-		outcome: "consumed" | "unused",
+		outcome: PatternAwareResolution,
 		context?: unknown,
 	) => MaybePromise<void>;
 	readonly flushPatternStore?: () => MaybePromise<void>;
@@ -507,7 +507,7 @@ interface TurnState<SessionID, Output, StateData> {
 	readonly turnAdmissions: Map<string, RuntimeCandidate<Output>>;
 	actionSequence: number;
 	drafterAttempted: boolean;
-	drafterFeedback?: "success" | "failure";
+	drafterFeedback?: "success" | "actor_miss" | "source_error";
 	drafterPlanMismatch?: boolean;
 	pendingDrafterMismatch?: {
 		readonly key: ActionKey;
@@ -559,7 +559,7 @@ export function makeSpeculativeActionRuntime<
 	const executionOverheadTimes = new Map<string, { count: number; averageMs: number }>();
 	const hitOverheadTimes = new Map<string, { count: number; averageMs: number }>();
 	const actorLeadTimes = new Map<string, { count: number; averageMs: number }>();
-	const drafterBackoff = new Map<SessionID, { failures: number; skips: number }>();
+	const drafterBackoff = new Map<SessionID, { actorMisses: number; sourceErrors: number; skips: number }>();
 	let notifiedMasterEnabled: boolean | undefined;
 
 	const turnKey = (input: TurnInput<SessionID>): string => `${String(input.sessionID)}:${input.turnID}`;
@@ -638,16 +638,18 @@ export function makeSpeculativeActionRuntime<
 	const recordDrafterFailure = (
 		state: TurnState<SessionID, Output, StateData>,
 		candidate?: RuntimeCandidate<Output>,
+		kind: "actor_miss" | "source_error" = "actor_miss",
 	): void => {
 		if (!adaptiveDrafter(state) || (!state.drafterAttempted && !candidate) || state.drafterFeedback) return;
 		if (candidate && !candidate.leases.some((lease) => lease.source === "drafter")) return;
-		state.drafterFeedback = "failure";
-		const feedback = drafterBackoff.get(state.sessionID) ?? { failures: 0, skips: 0 };
-		feedback.failures++;
-		if (feedback.failures >= 2) {
+		state.drafterFeedback = kind;
+		const feedback = drafterBackoff.get(state.sessionID) ?? { actorMisses: 0, sourceErrors: 0, skips: 0 };
+		feedback[kind === "actor_miss" ? "actorMisses" : "sourceErrors"]++;
+		const failures = feedback.actorMisses + feedback.sourceErrors;
+		if (failures >= 2) {
 			feedback.skips = Math.max(
 				feedback.skips,
-				Math.min(candidateLimit(state.settings), 2 ** Math.max(0, feedback.failures - 2)),
+				Math.min(candidateLimit(state.settings), 2 ** Math.max(0, failures - 2)),
 			);
 		}
 		drafterBackoff.set(state.sessionID, feedback);
@@ -1035,16 +1037,37 @@ export function makeSpeculativeActionRuntime<
 		return trimPersistentCandidates(state.sessionID, state.settings, candidate);
 	};
 
+	const patternResolution = (reason: string): Exclude<PatternAwareResolution, "consumed"> => {
+		if (
+			reason === "pattern_horizon_expired" ||
+			reason === "request_finished_without_hit" ||
+			reason === "turn_finished_without_hit"
+		) {
+			return "actor_miss";
+		}
+		if (
+			reason === "resource_expired" ||
+			reason === "authoritative_resource_changed" ||
+			reason === "candidate_resource_expired" ||
+			reason === "resource_changed" ||
+			reason.startsWith("resource_changed:")
+		) {
+			return "stale";
+		}
+		return "system";
+	};
+
 	const settlePatternLeases = async (
 		candidate: RuntimeCandidate<Output>,
 		state: "expired" | "invalidated",
+		outcome: Exclude<PatternAwareResolution, "consumed">,
 	): Promise<void> => {
 		for (const lease of candidate.leases) {
 			if (lease.state !== "active" || lease.source !== "pattern_aware") continue;
 			lease.state = state;
 			if (!lease.patternID || !adapter.onPatternResolved) continue;
 			try {
-				await adapter.onPatternResolved(lease.patternID, "unused", lease.patternContext);
+				await adapter.onPatternResolved(lease.patternID, outcome, lease.patternContext);
 			} catch {
 				// Pattern feedback must not alter tool semantics.
 			}
@@ -1097,7 +1120,7 @@ export function makeSpeculativeActionRuntime<
 			...(executionMs > 0 ? { executionMs } : {}),
 		};
 		expireDrafterLeases(candidate, undefined, leaseState);
-		await settlePatternLeases(candidate, leaseState);
+		await settlePatternLeases(candidate, leaseState, patternResolution(reason));
 		for (const lease of candidate.leases) {
 			if (lease.state === "matched") lease.state = "invalidated";
 		}
@@ -1212,8 +1235,9 @@ export function makeSpeculativeActionRuntime<
 	const expireCandidate = async (
 		state: TurnState<SessionID, Output, StateData>,
 		candidate: RuntimeCandidate<Output>,
+		reason = "candidate_expired",
 	): Promise<void> => {
-		await closeCandidate(state, candidate, "candidate_expired");
+		await closeCandidate(state, candidate, reason);
 	};
 
 	const expirePatternLeasesAfterAction = async (state: TurnState<SessionID, Output, StateData>): Promise<void> => {
@@ -1235,7 +1259,7 @@ export function makeSpeculativeActionRuntime<
 				expired = true;
 				if (!lease.patternID || !adapter.onPatternResolved) continue;
 				try {
-					await adapter.onPatternResolved(lease.patternID, "unused", lease.patternContext);
+					await adapter.onPatternResolved(lease.patternID, "actor_miss", lease.patternContext);
 				} catch {
 					// Pattern feedback must not alter tool semantics.
 				}
@@ -1262,7 +1286,7 @@ export function makeSpeculativeActionRuntime<
 			) {
 				continue;
 			}
-			await expireCandidate(state, candidate);
+			await expireCandidate(state, candidate, "authoritative_resource_changed");
 			await publishCancelled(state, candidate, "authoritative_resource_changed");
 		}
 	};
@@ -1320,7 +1344,7 @@ export function makeSpeculativeActionRuntime<
 				(adapter.projectOutput !== undefined && actionKeyMatches(candidate.key, action));
 			if (!matches) continue;
 			if (await isExpired(adapter, state, undefined, action, candidate)) {
-				await expireCandidate(state, candidate);
+				await expireCandidate(state, candidate, "candidate_resource_expired");
 				continue;
 			}
 			touchPersistentCandidate(state, candidate);
@@ -1772,9 +1796,9 @@ export function makeSpeculativeActionRuntime<
 						candidate.run = { status: "closed", reason, completedAt, executionMs };
 						schedulerFor(state.sessionID).discard(candidate);
 						candidate.schedulerOutcome = "discarded";
-						recordDrafterFailure(state, candidate);
+						recordDrafterFailure(state, candidate, "source_error");
 						expireDrafterLeases(candidate, undefined, "invalidated");
-						await settlePatternLeases(candidate, "invalidated");
+						await settlePatternLeases(candidate, "invalidated", "system");
 						for (const lease of candidate.leases) {
 							if (lease.state === "matched") lease.state = "invalidated";
 						}
@@ -1939,7 +1963,7 @@ export function makeSpeculativeActionRuntime<
 			tokenTotals.set(input.sessionID, totalDraftTokens);
 			if (state.finished) return;
 			if (!prediction.candidates.length) {
-				recordDrafterFailure(state);
+				recordDrafterFailure(state, undefined, "source_error");
 				if (!accepted) {
 					state.noCandidateReported = true;
 					await publishMiss(state, "no_candidate", undefined, "Drafter returned no tool-call candidates.");
@@ -1957,7 +1981,7 @@ export function makeSpeculativeActionRuntime<
 				candidateNames,
 			);
 			accepted += drafterAccepted;
-			if (!drafterAccepted) recordDrafterFailure(state);
+			if (!drafterAccepted) recordDrafterFailure(state, undefined, "source_error");
 			if (!accepted && !state.noCandidateReported) {
 				state.noCandidateReported = true;
 				await publishMiss(
@@ -1971,7 +1995,7 @@ export function makeSpeculativeActionRuntime<
 			if (state.finished) return;
 			if (error instanceof PredictionTimeoutError) state.predictionTimedOut = true;
 			state.noCandidateReported = true;
-			recordDrafterFailure(state);
+			recordDrafterFailure(state, undefined, "source_error");
 			await publishMiss(
 				state,
 				error instanceof PredictionTimeoutError ? "prediction_timeout" : "drafter_error",
@@ -2123,8 +2147,7 @@ export function makeSpeculativeActionRuntime<
 					authorization = { ok: false, reason: "authorization_failed", detail: errorDetail(error) };
 				}
 				if (!authorization.ok) {
-					recordDrafterFailure(state, candidate);
-					await expireCandidate(state, candidate);
+					await expireCandidate(state, candidate, "authorization_failed");
 					await publishMiss(state, authorization.reason, actual, authorization.detail, {
 						actualAction,
 						draftCandidate: candidate.draftCandidate,
@@ -2136,8 +2159,7 @@ export function makeSpeculativeActionRuntime<
 
 			const consumeStarted = Date.now();
 			if (await isExpired(adapter, state, input, actual, candidate)) {
-				recordDrafterFailure(state, candidate);
-				await expireCandidate(state, candidate);
+				await expireCandidate(state, candidate, "resource_expired");
 				await publishMiss(state, "resource_expired", actual, undefined, {
 					actualAction,
 					draftCandidate: candidate.draftCandidate,
@@ -2157,7 +2179,6 @@ export function makeSpeculativeActionRuntime<
 			if (!execution.ok) {
 				const reason =
 					execution.error instanceof SpeculativeJobError ? execution.error.reason : "candidate_execution_failed";
-				recordDrafterFailure(state, candidate);
 				await closeCandidate(state, candidate, reason);
 				await publishMiss(state, reason, actual, errorDetail(execution.error), {
 					actualAction,
@@ -2167,8 +2188,7 @@ export function makeSpeculativeActionRuntime<
 				return undefined;
 			}
 			if (inFlightAtMatch && (await isExpired(adapter, state, input, actual, candidate))) {
-				recordDrafterFailure(state, candidate);
-				await expireCandidate(state, candidate);
+				await expireCandidate(state, candidate, "resource_expired");
 				await publishMiss(
 					state,
 					"resource_expired",
@@ -2195,8 +2215,7 @@ export function makeSpeculativeActionRuntime<
 						output,
 					});
 				} catch (error) {
-					recordDrafterFailure(state, candidate);
-					await expireCandidate(state, candidate);
+					await expireCandidate(state, candidate, "adoption_failed");
 					await publishMiss(state, "adoption_failed", actual, errorDetail(error), {
 						actualAction,
 						draftCandidate: candidate.draftCandidate,
@@ -2205,8 +2224,7 @@ export function makeSpeculativeActionRuntime<
 					return undefined;
 				}
 				if (adopted === undefined) {
-					recordDrafterFailure(state, candidate);
-					await expireCandidate(state, candidate);
+					await expireCandidate(state, candidate, "adoption_failed");
 					await publishMiss(state, "adoption_failed", actual, undefined, {
 						actualAction,
 						draftCandidate: candidate.draftCandidate,
@@ -2225,8 +2243,7 @@ export function makeSpeculativeActionRuntime<
 					output,
 				});
 				if (projected === undefined) {
-					recordDrafterFailure(state, candidate);
-					await expireCandidate(state, candidate);
+					await expireCandidate(state, candidate, "projection_failed");
 					await publishMiss(state, "projection_failed", actual, undefined, {
 						actualAction,
 						draftCandidate: candidate.draftCandidate,
@@ -2362,7 +2379,7 @@ export function makeSpeculativeActionRuntime<
 		}
 		const activeDrafterCandidate = [...availableCandidates(state).values()].find(hasActiveDrafterLease);
 		const drafterPlanMissed = state.drafterPlanMismatch === true && state.drafterFeedback !== "success";
-		if ((state.actorKeys.size > 0 && state.drafterAttempted && !state.drafterFeedback) || drafterPlanMissed) {
+		if (drafterPlanMissed) {
 			recordDrafterFailure(state, activeDrafterCandidate);
 			if (state.pendingDrafterMismatch) {
 				await publishMiss(state, "key_mismatch", state.pendingDrafterMismatch.key, undefined, {
@@ -2376,7 +2393,7 @@ export function makeSpeculativeActionRuntime<
 			if (candidate.run.status === "closed") continue;
 			if (terminal) {
 				expireDrafterLeases(candidate, undefined, "invalidated");
-				await settlePatternLeases(candidate, "invalidated");
+				await settlePatternLeases(candidate, "invalidated", "actor_miss");
 				if (candidate.reuse.kind === "shared") continue;
 				await closeCandidate(state, candidate, "request_finished_without_hit", "invalidated", true);
 				continue;
@@ -2405,7 +2422,7 @@ export function makeSpeculativeActionRuntime<
 	const finishTerminalSession = async (sessionID: SessionID): Promise<void> => {
 		const candidates = sessionPersistentCandidates(sessionID);
 		if (!candidates.length) return;
-		for (const candidate of candidates) await settlePatternLeases(candidate, "invalidated");
+		for (const candidate of candidates) await settlePatternLeases(candidate, "invalidated", "actor_miss");
 		try {
 			await adapter.flushPatternStore?.();
 		} catch {
