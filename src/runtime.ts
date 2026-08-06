@@ -84,6 +84,7 @@ export interface PredictionLease {
 	readonly anchorActionSeq: number;
 	readonly horizon?: number;
 	readonly validThroughActionSeq?: number;
+	continuationExpanded?: boolean;
 	state: "active" | "matched" | "hit" | "expired" | "invalidated";
 	resolvedActionSeq?: number;
 }
@@ -1374,27 +1375,30 @@ export function makeSpeculativeActionRuntime<
 		draft: SpeculativeDraftCandidate,
 		source: PredictionLease["source"],
 		anchorActionSeq: number,
-	): Promise<void> => {
+	): Promise<boolean> => {
 		pruneResolvedLeases(candidate);
 		if (source === "drafter") {
 			if (
-				!candidate.leases.some(
+				candidate.leases.some(
 					(lease) =>
 						lease.state === "active" && lease.source === "drafter" && lease.providerTurnID === state.turnID,
 				)
 			) {
-				candidate.leases.push({
-					id: `${candidate.id}:drafter:${state.turnID}`,
-					source: "drafter",
-					providerTurnID: state.turnID,
-					anchorActionSeq,
-					state: "active",
-				});
+				return false;
 			}
-			return;
+			candidate.leases.push({
+				id: `${candidate.id}:drafter:${state.turnID}`,
+				source: "drafter",
+				providerTurnID: state.turnID,
+				anchorActionSeq,
+				state: "active",
+			});
+			return true;
 		}
-		if (!draft.patternID) return;
-		if (candidate.leases.some((lease) => lease.state === "active" && lease.patternID === draft.patternID)) return;
+		if (!draft.patternID) return false;
+		if (candidate.leases.some((lease) => lease.state === "active" && lease.patternID === draft.patternID)) {
+			return false;
+		}
 		const horizon = Math.max(0, Math.floor(draft.horizon ?? 0));
 		candidate.leases.push({
 			id: `${candidate.id}:pattern:${draft.patternID}:${anchorActionSeq}`,
@@ -1426,6 +1430,7 @@ export function makeSpeculativeActionRuntime<
 				await preemptCandidate(evicted, "resource_cache_evicted", "discarded");
 			}
 		}
+		return true;
 	};
 
 	const admitPredictions = async (
@@ -1510,7 +1515,8 @@ export function makeSpeculativeActionRuntime<
 			const callID = `spec_${fastCandidateID(`${input.turnID}:${source}:${index}:${action.key}`)}`;
 			const reusable = await findReusableCandidate(state, action);
 			if (reusable) {
-				await attachPredictionLease(state, reusable, draft, source, predictionAnchorActionSeq);
+				const attached = await attachPredictionLease(state, reusable, draft, source, predictionAnchorActionSeq);
+				if (!attached) continue;
 				accepted++;
 				if (source === "pattern_aware" && reusable.run.status === "ready") {
 					await continuePatternCandidate(state, input, reusable, reusable.run.output, false);
@@ -1831,11 +1837,13 @@ export function makeSpeculativeActionRuntime<
 			if (
 				lease.source !== "pattern_aware" ||
 				!lease.patternID ||
+				lease.continuationExpanded ||
 				lease.state === "expired" ||
 				lease.state === "invalidated"
 			) {
 				continue;
 			}
+			lease.continuationExpanded = true;
 			let prediction: SpeculativePrediction | undefined;
 			try {
 				prediction = await adapter.continuePatternAware({

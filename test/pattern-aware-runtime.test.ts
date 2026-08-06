@@ -530,6 +530,39 @@ describe("PatternAware runtime integration", () => {
 		expect(executions).toBe(0);
 	});
 
+	it("expands each PatternAware lease once when a continuation reuses the same result", async () => {
+		const continuations: string[] = [];
+		let executions = 0;
+		const runtime = makeSpeculativeActionRuntime(
+			adapter({
+				predictPatternAware: () => ({
+					candidates: [patternCandidate("read", { path: "src/a.ts" }, "parent", 2)],
+					draftTokens: 0,
+				}),
+				executeCandidate: () => {
+					executions++;
+					return "file";
+				},
+				continuePatternAware: ({ patternID }) => {
+					continuations.push(patternID);
+					return patternID === "parent"
+						? {
+								candidates: [patternCandidate("read", { path: "src/a.ts" }, "child", 1)],
+								draftTokens: 0,
+							}
+						: undefined;
+				},
+			}),
+		);
+
+		await runtime.startTurn(start("turn"));
+		await waitFor(() => continuations.length === 2);
+
+		expect(executions).toBe(1);
+		expect(continuations).toEqual(["parent", "child"]);
+		await runtime.dispose();
+	});
+
 	it("expands a completed speculative result into a multi-step frontier", async () => {
 		const executed: string[] = [];
 		const runtime = makeSpeculativeActionRuntime(
