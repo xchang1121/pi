@@ -1,6 +1,6 @@
 import type { ActionKey, DrafterToolDefinition, SpeculativeExecution } from "./common.ts";
 import { actionKeyMatches, clampCandidateLimit, DEFAULTS, inferredExecution, KEYABLE_TOOLS } from "./common.ts";
-import type { PatternAwareSettings } from "./pattern-aware.ts";
+import type { PatternAwareDependency, PatternAwareSettings } from "./pattern-aware.ts";
 import {
 	expectedUtility,
 	resourceProfile,
@@ -46,6 +46,7 @@ export interface SpeculativeDraftCandidate {
 	readonly expectedLatencyBenefitMs?: number;
 	readonly resourceDemand?: number;
 	readonly depth?: number;
+	readonly dependencies?: ReadonlyArray<PatternAwareDependency>;
 }
 
 export interface SpeculativePrediction {
@@ -141,6 +142,7 @@ export interface SpeculativeCandidate {
 	empiricalProbability?: number;
 	conditionalProbability?: number;
 	depth?: number;
+	readonly dependencies?: ReadonlyArray<PatternAwareDependency>;
 	scheduling: SpeculativeSchedulingMetadata;
 	utility: number;
 	readonly patternID?: string;
@@ -178,6 +180,7 @@ interface SpeculativeSchedulingEventFields {
 	readonly empiricalProbability?: number;
 	readonly conditionalProbability?: number;
 	readonly patternDepth?: number;
+	readonly dependencyEdges?: number;
 	readonly expectedDurationMs: number;
 	readonly expectedLeadMs?: number;
 	readonly expectedBenefitMs: number;
@@ -281,6 +284,7 @@ interface TurnInput<SessionID> {
 }
 
 interface ActualToolCall {
+	readonly id?: string;
 	readonly tool: string;
 	readonly input: unknown;
 }
@@ -416,6 +420,7 @@ export interface SpeculativeActionRuntimeAdapter<
 		readonly output?: Output;
 		readonly durationMs: number;
 		readonly speculativeHit: boolean;
+		readonly order: number;
 	}) => MaybePromise<SpeculativePrediction | undefined>;
 	readonly continuePatternAware?: (input: {
 		readonly startInput: StartInput;
@@ -496,6 +501,7 @@ interface TurnState<SessionID, Output, StateData> {
 	readonly settings: SpeculativeActionSettings;
 	readonly predictionController: AbortController;
 	readonly actorKeys: Set<string>;
+	readonly actorCallSequences: Map<string, number>;
 	readonly preparedHints: Set<string>;
 	readonly pendingActionSequences: Set<number>;
 	actionSequence: number;
@@ -781,6 +787,7 @@ export function makeSpeculativeActionRuntime<
 			? { conditionalProbability: candidate.conditionalProbability }
 			: {}),
 		...(candidate.depth !== undefined ? { patternDepth: candidate.depth } : {}),
+		...(candidate.dependencies?.length ? { dependencyEdges: candidate.dependencies.length } : {}),
 		expectedDurationMs: candidate.scheduling.expectedDurationMs,
 		...(candidate.scheduling.expectedLeadMs !== undefined
 			? { expectedLeadMs: candidate.scheduling.expectedLeadMs }
@@ -1514,6 +1521,7 @@ export function makeSpeculativeActionRuntime<
 					? { conditionalProbability: Math.max(0, Math.min(1, draft.conditionalProbability)) }
 					: {}),
 				...(typeof draft.depth === "number" ? { depth: Math.max(0, Math.floor(draft.depth)) } : {}),
+				...(draft.dependencies?.length ? { dependencies: draft.dependencies } : {}),
 				scheduling,
 				utility: expectedUtility(scheduling),
 				...(draft.patternID ? { patternID: draft.patternID } : {}),
@@ -1780,6 +1788,7 @@ export function makeSpeculativeActionRuntime<
 		output: Output | undefined,
 		durationMs: number,
 		speculativeHit: boolean,
+		order: number,
 	): Promise<void> => {
 		const settings = await latestSettings();
 		if (!adapter.recordAuthoritative || !settings || !sourceEnabled(settings, "pattern_aware") || state.finished) {
@@ -1798,6 +1807,7 @@ export function makeSpeculativeActionRuntime<
 			output,
 			durationMs: Math.max(0, durationMs),
 			speculativeHit,
+			order,
 		});
 		if (!prediction?.candidates.length || state.finished) return;
 		await admitPredictions(
@@ -1955,6 +1965,7 @@ export function makeSpeculativeActionRuntime<
 			settings,
 			predictionController: new AbortController(),
 			actorKeys: new Set(),
+			actorCallSequences: new Map(),
 			preparedHints: new Set(),
 			pendingActionSequences: new Set(),
 			actionSequence: actionSequences.get(input.sessionID) ?? 0,
@@ -1995,6 +2006,7 @@ export function makeSpeculativeActionRuntime<
 		state.pendingActionSequences.add(actionSequence);
 		try {
 			const actualCall = adapter.actual(input);
+			if (actualCall.id) state.actorCallSequences.set(actualCall.id, actionSequence);
 			const actual = await adapter.actionKey(actualCall.tool, actualCall.input, {
 				type: "consume",
 				consumeInput: input,
@@ -2229,7 +2241,8 @@ export function makeSpeculativeActionRuntime<
 				...schedulingEventFields(candidate, eventSource),
 				...cacheSnapshot(state),
 			});
-			await recordAndPredict(state, input, actualCall, actual, output, executionMs, true);
+			await recordAndPredict(state, input, actualCall, actual, output, executionMs, true, actionSequence);
+			if (actualCall.id) state.actorCallSequences.delete(actualCall.id);
 			if (actual.execution === "sandbox") {
 				await continuePatternCandidate(state, state.startInput as StartInput, candidate, output, true);
 			}
@@ -2251,6 +2264,9 @@ export function makeSpeculativeActionRuntime<
 		const state = turns.get(turnKey(input));
 		if (!state) return;
 		const actualCall = adapter.actual(input);
+		const actionSequence = actualCall.id
+			? (state.actorCallSequences.get(actualCall.id) ?? state.actionSequence)
+			: state.actionSequence;
 		const key = await adapter.actionKey(actualCall.tool, actualCall.input, {
 			type: "consume",
 			consumeInput: input,
@@ -2269,7 +2285,8 @@ export function makeSpeculativeActionRuntime<
 			...cacheSnapshot(state),
 		});
 		if (key) await invalidateChangedResources(state, key);
-		await recordAndPredict(state, input, actualCall, key, input.output, durationMs, false);
+		await recordAndPredict(state, input, actualCall, key, input.output, durationMs, false, actionSequence);
+		if (actualCall.id) state.actorCallSequences.delete(actualCall.id);
 	};
 
 	const finishState = async (state: TurnState<SessionID, Output, StateData>, terminal: boolean): Promise<void> => {
@@ -2551,6 +2568,7 @@ function createDisposalState<SessionID, Output, StateData>(
 		settings,
 		predictionController: new AbortController(),
 		actorKeys: new Set(),
+		actorCallSequences: new Map(),
 		preparedHints: new Set(),
 		pendingActionSequences: new Set(),
 		actionSequence: 0,

@@ -95,6 +95,69 @@ describe("PatternAware", () => {
 		);
 	});
 
+	test("learns provider batches canonically without inventing sibling causality", () => {
+		const store = new PatternAwareStore(settings());
+		for (const [sessionID, filePath, reverse] of [
+			["one", "src/a.ts", false],
+			["two", "src/b.ts", true],
+		] as const) {
+			const batch = [
+				input({
+					sessionID,
+					turnID: `${sessionID}:scan`,
+					tool: "grep",
+					input: { pattern: "TODO" },
+					outputPaths: [filePath],
+				}),
+				input({
+					sessionID,
+					turnID: `${sessionID}:scan`,
+					tool: "find",
+					input: { pattern: "src/**/*.ts" },
+					output: { count: 1 },
+				}),
+			];
+			store.observeBatch(reverse ? [...batch].reverse() : batch);
+			store.observeBatch([input({ sessionID, turnID: `${sessionID}:read`, tool: "read", input: { filePath } })]);
+			store.finishSession(sessionID);
+		}
+
+		store.observeBatch([
+			input({
+				sessionID: "probe",
+				turnID: "probe:scan",
+				tool: "find",
+				input: { pattern: "src/**/*.ts" },
+				output: { count: 1 },
+			}),
+			input({
+				sessionID: "probe",
+				turnID: "probe:scan",
+				tool: "grep",
+				input: { pattern: "TODO" },
+				outputPaths: ["src/c.ts"],
+			}),
+		]);
+		const candidate = store.predict("probe").find((item) => item.tool === "read");
+
+		expect(candidate?.input).toEqual({ filePath: "src/c.ts" });
+		expect(candidate?.dependencies).toContainEqual(
+			expect.objectContaining({
+				targetPath: ["filePath"],
+				sources: expect.arrayContaining([expect.objectContaining({ field: "outputPaths", path: [0] })]),
+			}),
+		);
+		expect(
+			store
+				.snapshot()
+				.some(
+					(pattern) =>
+						(pattern.targetTool === "grep" || pattern.targetTool === "find") &&
+						pattern.context.some((event) => event.tool === "grep" || event.tool === "find"),
+				),
+		).toBe(false);
+	});
+
 	test("learns future gaps instead of expiring at the next unrelated event", () => {
 		const store = new PatternAwareStore(settings({ maxFutureGap: 3 }));
 		trainGappedRead(store, "one", "src/a.ts");
@@ -208,7 +271,7 @@ describe("PatternAware", () => {
 
 		const raw = await fs.readFile(file, "utf8");
 		expect(raw).not.toContain('"history"');
-		expect(JSON.parse(raw).version).toBe(8);
+		expect(JSON.parse(raw).version).toBe(9);
 		const second = new PatternAwareStore(settings(), file);
 		await second.load();
 		second.observe(input({ sessionID: "three", tool: "grep", input: {}, outputPaths: ["src/c.ts"] }));
@@ -241,7 +304,7 @@ describe("PatternAware", () => {
 		await fs.writeFile(
 			file,
 			JSON.stringify({
-				version: 7,
+				version: 8,
 				patterns: [validatedGapPattern({ "0": 10 })],
 				pools: [],
 			}),

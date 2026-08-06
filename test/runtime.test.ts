@@ -17,6 +17,7 @@ interface StartInput {
 }
 
 interface ConsumeInput extends StartInput {
+	readonly id?: string;
 	readonly tool: string;
 	readonly input: Record<string, unknown>;
 }
@@ -102,7 +103,7 @@ function createHarness(options: HarnessOptions) {
 			: {}),
 		actionKey: (tool, input, context) =>
 			options.actionKey?.(tool, input, context) ?? buildPiActionKey(tool, input, "/workspace"),
-		actual: (input) => ({ tool: input.tool, input: input.input }),
+		actual: (input) => ({ id: input.id, tool: input.tool, input: input.input }),
 		preflightCandidate: ({ candidate, signal }) => options.preflight?.(candidate, signal) ?? { ok: true },
 		...(options.prepare ? { prepareCandidate: ({ candidate, signal }) => options.prepare?.(candidate, signal) } : {}),
 		executeCandidate: ({ candidate, signal }) => {
@@ -1290,6 +1291,70 @@ describe("speculative action runtime", () => {
 			resourceCandidates: 0,
 			pendingPredictions: 0,
 		});
+	});
+
+	it("preserves provider call order when authoritative tools finish out of order", async () => {
+		const observed: Array<{ id: string | undefined; order: number }> = [];
+		const runtime = makeSpeculativeActionRuntime<
+			string,
+			string,
+			StartInput,
+			ConsumeInput,
+			ConsumeInput,
+			{ readonly cwd: string }
+		>({
+			settings: () => ({ ...enabledSettings, patternAware: PATTERN_AWARE_DEFAULTS }),
+			definitions: () => [{ name: "read" }],
+			stateData: () => ({ cwd: "." }),
+			predict: () => prediction(),
+			actionKey: (tool, input) => buildPiActionKey(tool, input, "/workspace"),
+			actual: (input) => ({ id: input.id, tool: input.tool, input: input.input }),
+			preflightCandidate: () => ({ ok: true }),
+			executeCandidate: () => "unused",
+			recordAuthoritative: ({ consumeInput, order }) => {
+				observed.push({ id: consumeInput.id, order });
+				return prediction();
+			},
+		});
+
+		await runtime.startTurn({ sessionID: "session", turnID: "turn" });
+		await runtime.consume({
+			sessionID: "session",
+			turnID: "turn",
+			id: "first",
+			tool: "read",
+			input: { path: "a.ts" },
+		});
+		await runtime.consume({
+			sessionID: "session",
+			turnID: "turn",
+			id: "second",
+			tool: "read",
+			input: { path: "b.ts" },
+		});
+		await runtime.actual({
+			sessionID: "session",
+			turnID: "turn",
+			id: "second",
+			tool: "read",
+			input: { path: "b.ts" },
+			durationMs: 1,
+			output: "b",
+		});
+		await runtime.actual({
+			sessionID: "session",
+			turnID: "turn",
+			id: "first",
+			tool: "read",
+			input: { path: "a.ts" },
+			durationMs: 1,
+			output: "a",
+		});
+
+		expect(observed).toEqual([
+			{ id: "second", order: 2 },
+			{ id: "first", order: 1 },
+		]);
 	});
 
 	it("releases a deleted session without publishing stale lifecycle events", async () => {

@@ -25,6 +25,7 @@ import {
 	acquirePatternAwareStore,
 	asPatternAwareRuntimeContext,
 	PATTERN_AWARE_DEFAULTS,
+	type PatternAwareEventInput,
 	type PatternAwareSettings,
 	type PatternAwareStore,
 	type PatternAwareStoreLease,
@@ -136,6 +137,7 @@ interface AgentStartInput {
 interface AgentConsumeInput {
 	readonly sessionID: string;
 	readonly turnID: string;
+	readonly id?: string;
 	readonly tool: string;
 	readonly args: unknown;
 	readonly terminal?: boolean;
@@ -174,6 +176,13 @@ export function installSpeculativeAction(
 	const previousActual = agent.actualToolCall;
 	const sandboxExecutions = new WeakMap<SettleToolCallResult, SpeculativeSandboxExecution>();
 	let openedPatternStore: Promise<PatternAwareStoreLease> | undefined;
+	const authoritativeBatches = new Map<string, Map<number, PatternAwareEventInput>>();
+	const authoritativeBatchKey = (batchSessionID: string, turnID: string) => JSON.stringify([batchSessionID, turnID]);
+	const clearAuthoritativeSession = (batchSessionID: string) => {
+		for (const [key, batch] of authoritativeBatches) {
+			if (batch.values().next().value?.sessionID === batchSessionID) authoritativeBatches.delete(key);
+		}
+	};
 	const resolveSettings = async (): Promise<SpeculativeActionSettings> => {
 		const settings = (await options.getSettings?.()) ?? {};
 		const legacyLimit = settings.maxCandidates;
@@ -223,6 +232,7 @@ export function installSpeculativeAction(
 		return store;
 	};
 	const finishPatternSession = async (): Promise<void> => {
+		clearAuthoritativeSession(sessionID);
 		const store = options.patternStore
 			? await options.patternStore
 			: openedPatternStore
@@ -347,7 +357,7 @@ export function installSpeculativeAction(
 			const validated = validateCandidateArguments(tool, toolName, input, "spec_key");
 			return validated === undefined ? undefined : buildPiActionKey(toolName, validated, options.cwd);
 		},
-		actual: (input) => ({ tool: input.tool, input: input.args }),
+		actual: (input) => ({ id: input.id, tool: input.tool, input: input.args }),
 		preflightCandidate: async ({ data, tool: toolName, concrete, action, callID, signal }) => {
 			const tool = data.tools.get(toolName);
 			if (!tool || !options.preflight) return { ok: false, reason: "permission_or_policy" };
@@ -485,7 +495,6 @@ export function installSpeculativeAction(
 		},
 		recordAuthoritative: async ({
 			startInput,
-			data,
 			settings,
 			consumeInput,
 			action,
@@ -493,38 +502,32 @@ export function installSpeculativeAction(
 			concrete,
 			output,
 			durationMs,
+			order,
 		}) => {
 			if (!settings.patternAware?.enabled) return undefined;
-			const store = await resolvePatternStore(settings);
 			const definition = startInput.tools.find((item) => item.name === tool);
 			const observation = projectPatternAwareObservation(
 				output?.result,
 				extractOutputPaths(tool, output?.result),
 				options.cwd,
 			);
-			const candidates = store.observe(
-				{
-					sessionID: consumeInput.sessionID,
-					turnID: consumeInput.turnID,
-					tool,
-					input: action ? patternAwareInput(action) : concrete,
-					actionKey: action?.key ?? stableHash({ tool, input: concrete }),
-					outcome: output?.isError ? "failure" : "success",
-					...observation,
-					durationMs,
-					...(typeof concrete.operation === "string" ? { operation: concrete.operation } : {}),
-					...(definition ? { schemaHash: stableHash(definition.parameters) } : {}),
-					learnTarget: candidateToolNames(settings).includes(tool),
-				},
-				data.schemaHashes,
-			);
-			return {
-				candidates: candidates.map((candidate) => ({
-					...candidate,
-					patternContext: patternAwareRuntimeContext(store, candidate),
-				})),
-				draftTokens: 0,
-			};
+			const key = authoritativeBatchKey(consumeInput.sessionID, consumeInput.turnID);
+			const batch = authoritativeBatches.get(key) ?? new Map();
+			batch.set(order, {
+				sessionID: consumeInput.sessionID,
+				turnID: consumeInput.turnID,
+				tool,
+				input: action ? patternAwareInput(action) : concrete,
+				actionKey: action?.key ?? stableHash({ tool, input: concrete }),
+				outcome: output?.isError ? "failure" : "success",
+				...observation,
+				durationMs,
+				...(typeof concrete.operation === "string" ? { operation: concrete.operation } : {}),
+				...(definition ? { schemaHash: stableHash(definition.parameters) } : {}),
+				learnTarget: candidateToolNames(settings).includes(tool),
+			});
+			authoritativeBatches.set(key, batch);
+			return { candidates: [], draftTokens: 0 };
 		},
 		prepareCandidate: async ({ candidate, signal }) => {
 			if (candidate.execution !== "sandbox" && inferredExecution(candidate.tool) !== "sandbox") return;
@@ -544,6 +547,7 @@ export function installSpeculativeAction(
 			if (options.patternStore) await (await options.patternStore).flush();
 		},
 		onTurnStarted: async ({ startInput, settings, signal }) => {
+			authoritativeBatches.delete(authoritativeBatchKey(startInput.sessionID, startInput.turnID));
 			void prepareSandbox(settings.tools.sandbox, signal).catch(() => {
 				// Turn warm-up is best-effort; concrete candidate preparation retries it.
 			});
@@ -557,8 +561,19 @@ export function installSpeculativeAction(
 			});
 		},
 		onTurnFinished: async ({ startInput, settings, terminal, durationMs }) => {
+			const key = authoritativeBatchKey(startInput.sessionID, startInput.turnID);
+			const batch = authoritativeBatches.get(key);
+			authoritativeBatches.delete(key);
 			if (!settings.patternAware?.enabled) return;
 			const store = await resolvePatternStore(settings);
+			if (batch?.size) {
+				store.observeBatch(
+					[...batch.entries()].sort(([left], [right]) => left - right).map(([, event]) => event),
+					definitionSchemaHashes(
+						startInput.tools.map((tool) => ({ name: tool.name, inputSchema: tool.parameters })),
+					),
+				);
+			}
 			store.observeTurn({
 				sessionID: startInput.sessionID,
 				turnID: startInput.turnID,
@@ -605,6 +620,7 @@ export function installSpeculativeAction(
 			{
 				sessionID,
 				turnID: currentTurnID,
+				id: context.toolCall.id,
 				tool: context.toolCall.name,
 				args: context.args,
 			},
@@ -623,6 +639,7 @@ export function installSpeculativeAction(
 			await runtime.actual({
 				sessionID,
 				turnID: currentTurnID,
+				id: context.toolCall.id,
 				tool: context.toolCall.name,
 				args: context.args,
 				durationMs: context.durationMs,

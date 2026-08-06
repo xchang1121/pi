@@ -636,10 +636,15 @@ describe("Pi Agent speculative integration", () => {
 	it("records authoritative output paths and schema metadata in the PatternAware store", async () => {
 		class RecordingStore extends PatternAwareStore {
 			readonly observed: PatternAwareEventInput[] = [];
+			readonly batches: ReadonlyArray<PatternAwareEventInput>[] = [];
 
-			override observe(input: PatternAwareEventInput) {
-				this.observed.push(input);
-				return super.observe(input);
+			override observeBatch(
+				inputs: ReadonlyArray<PatternAwareEventInput>,
+				schemaHashes: Readonly<Record<string, string>> = {},
+			) {
+				this.batches.push(inputs);
+				this.observed.push(...inputs);
+				return super.observeBatch(inputs, schemaHashes);
 			}
 		}
 		const store = new RecordingStore(PATTERN_AWARE_DEFAULTS);
@@ -679,6 +684,8 @@ describe("Pi Agent speculative integration", () => {
 			learnTarget: true,
 		});
 		expect(event?.schemaHash).toMatch(/^[a-f0-9]{32}$/);
+		expect(store.batches).toHaveLength(1);
+		expect(store.batches[0]?.map((item) => item.tool)).toEqual(["find"]);
 		await installed.uninstall();
 	});
 

@@ -38,9 +38,24 @@ export type PatternAwareEventInput = {
 
 export type PatternAwareEvent = PatternAwareEventInput & {
 	readonly sequence: number;
+	readonly batchID?: string;
+	readonly batchIndex?: number;
+	readonly batchSize?: number;
 };
 
 export type PatternAwarePath = ReadonlyArray<string | number>;
+
+export type PatternAwareDependencySource = {
+	readonly relativeEvent: number;
+	readonly field: "input" | "output" | "outputPaths";
+	readonly path: PatternAwarePath;
+	readonly itemPath?: PatternAwarePath;
+};
+
+export type PatternAwareDependency = {
+	readonly targetPath: PatternAwarePath;
+	readonly sources: ReadonlyArray<PatternAwareDependencySource>;
+};
 
 export type PatternAwareBinding = (
 	| {
@@ -91,6 +106,7 @@ export type PatternAwarePattern = {
 	readonly context: ReadonlyArray<PatternAwareEventSignature>;
 	readonly targetTool: string;
 	readonly bindings: Readonly<Record<string, PatternAwareBinding>>;
+	readonly dependencies?: ReadonlyArray<PatternAwareDependency>;
 	readonly targetSchemaHash?: string;
 	readonly gapCounts: Readonly<Record<string, number>>;
 	readonly gapLastSeen?: Readonly<Record<string, number>>;
@@ -117,6 +133,7 @@ export type PatternAwareCandidate = {
 	readonly empiricalProbability: number;
 	readonly conditionalProbability: number;
 	readonly expectedDurationMs: number;
+	readonly dependencies: ReadonlyArray<PatternAwareDependency>;
 	readonly continuation: PatternAwareContinuation;
 	readonly depth: number;
 	readonly diagnostic: string;
@@ -143,6 +160,7 @@ type MutablePattern = {
 	context: PatternAwareEventSignature[];
 	targetTool: string;
 	bindings: Record<string, PatternAwareBinding>;
+	dependencies: PatternAwareDependency[];
 	targetSchemaHash?: string;
 	gapCounts: Record<string, number>;
 	gapLastSeen: Record<string, number>;
@@ -207,6 +225,7 @@ export const PATTERN_AWARE_DEFAULTS: PatternAwareSettings = {
 const MAX_BINDING_VARIANTS = 32;
 const MAX_COMPOSABLE_SOURCES = 48;
 const PERSIST_DEBOUNCE_MS = 200;
+const PERSISTENCE_VERSION = 9;
 
 class PredictiveContextTrie {
 	private readonly root: TrieNode = { children: new Map(), patterns: new Set() };
@@ -289,7 +308,7 @@ export class PatternAwareStore {
 			.readFile(this.persistenceFile, "utf8")
 			.then((value) => JSON.parse(value) as PersistedState)
 			.catch(() => undefined);
-		if (!parsed || parsed.version !== 8 || !Array.isArray(parsed.patterns)) return;
+		if (!parsed || parsed.version !== PERSISTENCE_VERSION || !Array.isArray(parsed.patterns)) return;
 		for (const item of parsed.patterns) {
 			const pattern = mutablePattern(item);
 			if (!pattern || pattern.context.some((event) => event.tool === "$llm")) continue;
@@ -316,19 +335,52 @@ export class PatternAwareStore {
 	}
 
 	observe(input: PatternAwareEventInput, schemaHashes: Readonly<Record<string, string>> = {}) {
+		return this.observeEvents([input], schemaHashes);
+	}
+
+	observeBatch(inputs: ReadonlyArray<PatternAwareEventInput>, schemaHashes: Readonly<Record<string, string>> = {}) {
+		const first = inputs[0];
+		if (!first) return [];
+		if (inputs.some((input) => input.sessionID !== first.sessionID || input.turnID !== first.turnID)) {
+			throw new Error("PatternAware batch actions must belong to one provider turn");
+		}
+		const ordered = inputs
+			.map((input, index) => ({ input, index, key: canonicalBatchActionKey(input) }))
+			.sort((left, right) => left.key.localeCompare(right.key) || left.index - right.index)
+			.map((item) => item.input);
+		return this.observeEvents(ordered, schemaHashes, first.turnID);
+	}
+
+	private observeEvents(
+		inputs: ReadonlyArray<PatternAwareEventInput>,
+		schemaHashes: Readonly<Record<string, string>>,
+		batchID?: string,
+	) {
 		if (!this.settings.enabled) return [];
-		const event: PatternAwareEvent = { ...input, sequence: ++this.clock };
-		const history = this.history.get(input.sessionID) ?? [];
-		if (isActionEvent(event)) this.resolvePending(input.sessionID, event);
-		if (input.learnTarget !== false) this.learn(actionHistory(history), event);
-		history.push(event);
-		this.history.set(input.sessionID, history);
-		if (isActionEvent(event)) this.startPending(input.sessionID, actionHistory(history));
+		const first = inputs[0];
+		if (!first) return [];
+		const events = inputs.map(
+			(input, index): PatternAwareEvent => ({
+				...input,
+				sequence: ++this.clock,
+				...(batchID ? { batchID, batchIndex: index, batchSize: inputs.length } : {}),
+			}),
+		);
+		const history = this.history.get(first.sessionID) ?? [];
+		const actions = events.filter(isActionEvent);
+		if (actions.length) this.resolvePendingBatch(first.sessionID, actions);
+		const prior = actionHistory(history);
+		for (const event of actions) {
+			if (event.learnTarget !== false) this.learn(prior, event);
+		}
+		history.push(...events);
+		this.history.set(first.sessionID, history);
+		if (actions.length) this.startPending(first.sessionID, actionHistory(history));
 		this.trimSessionHistory(history);
 		this.trimPools();
 		this.trimPatterns();
 		this.persist();
-		return this.predict(input.sessionID, schemaHashes);
+		return this.predict(first.sessionID, schemaHashes);
 	}
 
 	observeTurn(input: {
@@ -554,6 +606,7 @@ export class PatternAwareStore {
 				empiricalProbability,
 				conditionalProbability,
 				expectedDurationMs,
+				dependencies: representative.pattern.dependencies,
 				continuation: nextContinuation,
 				depth: nextContinuation.visitedPatternIDs.length,
 				diagnostic: JSON.stringify(
@@ -571,6 +624,7 @@ export class PatternAwareStore {
 						variantProbability,
 						gapCoverage,
 						expectedDurationMs,
+						dependencies: representative.pattern.dependencies,
 						depth: nextContinuation.visitedPatternIDs.length,
 					},
 					null,
@@ -628,12 +682,13 @@ export class PatternAwareStore {
 	}
 
 	private learn(history: ReadonlyArray<PatternAwareEvent>, target: PatternAwareEvent) {
-		const maxGap = Math.min(this.settings.maxFutureGap, Math.max(0, history.length - 1));
+		const batches = actionBatches(history);
+		const maxGap = Math.min(this.settings.maxFutureGap, Math.max(0, batches.length - 1));
 		for (let gap = 0; gap <= maxGap; gap++) {
-			const contextEnd = history.length - gap;
+			const contextEnd = batches.length - gap;
 			const maxLength = Math.min(this.settings.maxContextLength, contextEnd);
 			for (let length = 1; length <= maxLength; length++) {
-				const context = history.slice(contextEnd - length, contextEnd);
+				const context = batches.slice(contextEnd - length, contextEnd).flat();
 				this.learnOccurrence(context, target, gap);
 			}
 		}
@@ -689,6 +744,7 @@ export class PatternAwareStore {
 		const existing = this.patterns.get(id);
 		if (existing) {
 			existing.bindings = inferred;
+			existing.dependencies = bindingDependencies(inferred);
 			existing.occurrences = pool.samples.length;
 			existing.replayMatches = replayMatches;
 			existing.historicalOpportunities = Math.max(existing.historicalOpportunities, pool.samples.length);
@@ -705,6 +761,7 @@ export class PatternAwareStore {
 			context: signatures,
 			targetTool: target.tool,
 			bindings: inferred,
+			dependencies: bindingDependencies(inferred),
 			...(target.schemaHash ? { targetSchemaHash: target.schemaHash } : {}),
 			gapCounts: { [String(gap)]: 1 },
 			gapLastSeen: { [String(gap)]: target.sequence },
@@ -721,17 +778,19 @@ export class PatternAwareStore {
 		this.indexDirty = true;
 	}
 
-	private resolvePending(sessionID: string, event: PatternAwareEvent) {
+	private resolvePendingBatch(sessionID: string, events: ReadonlyArray<PatternAwareEvent>) {
 		const pending = this.pending.get(sessionID);
 		if (!pending?.length) return;
 		const remaining: PendingValidation[] = [];
 		for (const item of pending) {
 			const pattern = this.patterns.get(item.patternID);
 			if (!pattern) continue;
-			const matched =
-				event.tool === pattern.targetTool &&
-				item.expectedInput !== undefined &&
-				sameValue(item.expectedInput, event.input);
+			const matched = events.some(
+				(event) =>
+					event.tool === pattern.targetTool &&
+					item.expectedInput !== undefined &&
+					sameValue(item.expectedInput, event.input),
+			);
 			if (matched) {
 				this.recordValidation(item.patternID, true);
 				continue;
@@ -782,10 +841,10 @@ export class PatternAwareStore {
 
 	private trimSessionHistory(history: PatternAwareEvent[]) {
 		const limit = this.settings.maxContextLength + this.settings.maxFutureGap + 1;
-		const actions = history.flatMap((event, index) => (isActionEvent(event) ? [index] : []));
+		const batches = indexedActionBatches(history);
 		const controls = history.flatMap((event, index) => (isActionEvent(event) ? [] : [index]));
-		if (actions.length <= limit && controls.length <= limit) return;
-		const keep = new Set([...actions.slice(-limit), ...controls.slice(-limit)]);
+		if (batches.length <= limit && controls.length <= limit) return;
+		const keep = new Set([...batches.slice(-limit).flat(), ...controls.slice(-limit)]);
 		history.splice(0, history.length, ...history.filter((_, index) => keep.has(index)));
 	}
 
@@ -828,7 +887,7 @@ export class PatternAwareStore {
 		if (!this.persistenceFile || !this.loaded || !this.dirty) return;
 		this.dirty = false;
 		const state: PersistedState = {
-			version: 8,
+			version: PERSISTENCE_VERSION,
 			patterns: this.snapshot(),
 			pools: this.persistedPools(),
 		};
@@ -1539,6 +1598,49 @@ function bindingStructure(value: unknown): unknown {
 	);
 }
 
+function bindingDependencies(bindings: Readonly<Record<string, PatternAwareBinding>>): PatternAwareDependency[] {
+	return Object.entries(bindings).flatMap(([encoded, binding]) => {
+		const sources = uniqueDependencySources(bindingSources(binding));
+		return sources.length ? [{ targetPath: decodePath(encoded), sources }] : [];
+	});
+}
+
+function bindingSources(binding: PatternAwareBinding): PatternAwareDependencySource[] {
+	if (binding.type === "event") {
+		return [
+			{
+				relativeEvent: binding.relativeEvent,
+				field: binding.field,
+				path: binding.path,
+			},
+		];
+	}
+	if (binding.type === "each") {
+		return [
+			{
+				relativeEvent: binding.relativeEvent,
+				field: binding.field,
+				path: binding.path,
+				itemPath: binding.itemPath,
+			},
+		];
+	}
+	if (binding.type === "constant") return [];
+	if (binding.type === "coalesce") return binding.sources.flatMap(bindingSources);
+	if (binding.type === "join") return [...bindingSources(binding.left), ...bindingSources(binding.right)];
+	return bindingSources(binding.source);
+}
+
+function uniqueDependencySources(sources: ReadonlyArray<PatternAwareDependencySource>) {
+	const seen = new Set<string>();
+	return sources.filter((source) => {
+		const key = stableStringify(source);
+		if (seen.has(key)) return false;
+		seen.add(key);
+		return true;
+	});
+}
+
 function isPathSource(field: "input" | "output" | "outputPaths", sourcePath: PatternAwarePath, value: string) {
 	if (field === "outputPaths") return true;
 	if (!value.length || /[\r\n"'|&<>]/.test(value)) return false;
@@ -1798,8 +1900,36 @@ function matchesSuffix(history: ReadonlyArray<PatternAwareEvent>, context: Reado
 	return sameSignatures(history.slice(-context.length).map(signature), context);
 }
 
+function canonicalBatchActionKey(input: PatternAwareEventInput) {
+	return stableStringify({
+		tool: input.tool,
+		outcome: input.outcome,
+		...(input.operation ? { operation: input.operation } : {}),
+		input: input.input,
+	});
+}
+
 function actionHistory(history: ReadonlyArray<PatternAwareEvent>) {
 	return history.filter(isActionEvent);
+}
+
+function actionBatches(history: ReadonlyArray<PatternAwareEvent>) {
+	return indexedActionBatches(history).map((batch) => batch.map((index) => history[index]!));
+}
+
+function indexedActionBatches(history: ReadonlyArray<PatternAwareEvent>) {
+	const batches: number[][] = [];
+	let activeBatchID: string | undefined;
+	for (const [index, event] of history.entries()) {
+		if (!isActionEvent(event)) continue;
+		if (event.batchID && event.batchID === activeBatchID) {
+			batches.at(-1)!.push(index);
+			continue;
+		}
+		batches.push([index]);
+		activeBatchID = event.batchID;
+	}
+	return batches;
 }
 
 function isActionEvent(event: PatternAwareEvent) {
@@ -1902,6 +2032,7 @@ function readonlyPattern(pattern: MutablePattern): PatternAwarePattern {
 		empiricalProbability: probability(pattern),
 		context: pattern.context.map((item) => ({ ...item })),
 		bindings: structuredClone(pattern.bindings),
+		dependencies: structuredClone(pattern.dependencies),
 		gapCounts: { ...pattern.gapCounts },
 		gapLastSeen: { ...pattern.gapLastSeen },
 	};
@@ -1915,6 +2046,7 @@ function mutablePattern(value: PatternAwarePattern): MutablePattern | undefined 
 		context: value.context.map((item) => ({ ...item })),
 		targetTool: value.targetTool,
 		bindings: structuredClone(value.bindings),
+		dependencies: bindingDependencies(value.bindings),
 		...(value.targetSchemaHash ? { targetSchemaHash: value.targetSchemaHash } : {}),
 		gapCounts: { ...value.gapCounts },
 		gapLastSeen: Object.fromEntries(
