@@ -706,7 +706,7 @@ describe("Pi Agent speculative integration", () => {
 		await agent.prompt("Read README.md");
 
 		expect(executions).toBe(1);
-		expect(streams.draftRequests()).toBeGreaterThan(0);
+		expect(streams.draftRequests()).toBe(0);
 		expect(events).toContainEqual(expect.objectContaining({ type: "hit", source: "pattern_aware" }));
 		await installed.uninstall();
 	});

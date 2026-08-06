@@ -18,16 +18,20 @@ import {
 	clampMaxCandidates,
 	DEFAULTS,
 	inferredExecution,
+	patternAwareInput,
 	usageTokenCount,
 } from "./common.ts";
 import {
+	asPatternAwareRuntimeContext,
 	openPatternAwareStore,
 	PATTERN_AWARE_DEFAULTS,
 	type PatternAwareSettings,
 	type PatternAwareStore,
+	patternAwareRuntimeContext,
 	patternAwareSettings,
+	projectPatternAwareObservation,
 } from "./pattern-aware.ts";
-import { fingerprintActionResources } from "./resource-version.ts";
+import { captureResourceVersion, validateResourceVersion, watchResourceVersion } from "./resource-version.ts";
 import type {
 	CandidatePreflight,
 	SpeculativeActionEvent,
@@ -36,14 +40,16 @@ import type {
 	SpeculativeCandidate,
 	SpeculativeDraftCandidate,
 } from "./runtime.ts";
-import { candidateToolNames, makeSpeculativeActionRuntime } from "./runtime.ts";
+import { candidateToolNames, estimateValueBytes, makeSpeculativeActionRuntime } from "./runtime.ts";
 import type { SpeculativeAgentSandbox, SpeculativeSandboxExecution } from "./workspace-sandbox.ts";
 
 export interface SpeculativeAgentSettingsInput {
 	readonly enabled?: boolean;
 	readonly maxCandidates?: number;
 	readonly resourceCacheMaxEntries?: number;
+	readonly resourceCacheMaxBytes?: number;
 	readonly predictionTimeoutMs?: number;
+	readonly adaptiveDrafter?: boolean;
 	readonly patternAware?: Partial<PatternAwareSettings>;
 	readonly tools?: {
 		readonly resourceCached?: readonly string[];
@@ -122,6 +128,7 @@ interface AgentConsumeInput {
 
 interface AgentStateData {
 	readonly tools: ReadonlyMap<string, AgentTool>;
+	readonly schemaHashes: Readonly<Record<string, string>>;
 }
 
 export interface InstalledSpeculativeAction {
@@ -162,7 +169,13 @@ export function installSpeculativeAction(
 				settings.resourceCacheMaxEntries,
 				DEFAULTS.resourceCacheMaxEntries,
 			),
+			resourceCacheMaxBytes: normalizePositiveInteger(
+				settings.resourceCacheMaxBytes,
+				DEFAULTS.resourceCacheMaxBytes,
+			),
 			predictionTimeoutMs: normalizeTimeout(settings.predictionTimeoutMs),
+			adaptiveDrafter:
+				typeof settings.adaptiveDrafter === "boolean" ? settings.adaptiveDrafter : DEFAULTS.adaptiveDrafter,
 			patternAware: patternAwareSettings(settings.patternAware ?? PATTERN_AWARE_DEFAULTS),
 			tools: {
 				resourceCached: normalizeStringArray(
@@ -196,7 +209,11 @@ export function installSpeculativeAction(
 				: undefined;
 		if (!store) return;
 		store.finishSession(sessionID);
-		await store.flush();
+		try {
+			await store.flush();
+		} catch {
+			// Persistence failure must not change Agent lifecycle semantics.
+		}
 	};
 
 	const projection = options.projectOutput
@@ -218,7 +235,12 @@ export function installSpeculativeAction(
 		settings: resolveSettings,
 		definitions: (input) =>
 			input.tools.map((tool) => ({ name: tool.name, description: tool.description, inputSchema: tool.parameters })),
-		stateData: (input) => ({ tools: new Map(input.tools.map((tool) => [tool.name, tool])) }),
+		stateData: (input) => ({
+			tools: new Map(input.tools.map((tool) => [tool.name, tool])),
+			schemaHashes: definitionSchemaHashes(
+				input.tools.map((tool) => ({ name: tool.name, inputSchema: tool.parameters })),
+			),
+		}),
 		predict: async (input, settings, definitions, _candidateNames, signal) => {
 			const draftModel =
 				typeof options.draftModel === "function"
@@ -281,11 +303,13 @@ export function installSpeculativeAction(
 		predictPatternAware: async (input, settings, definitions) => {
 			if (!settings.patternAware?.enabled) return { candidates: [], draftTokens: 0 };
 			const store = await resolvePatternStore(settings);
+			const deferDrafter = store.hasLearnedPatterns() && !store.hasObservedAction(input.sessionID);
 			return {
 				candidates: store
 					.predict(input.sessionID, definitionSchemaHashes(definitions))
-					.map((candidate) => ({ ...candidate, patternContext: store })),
+					.map((candidate) => ({ ...candidate, patternContext: patternAwareRuntimeContext(store, candidate) })),
 				draftTokens: 0,
+				deferDrafter,
 			};
 		},
 		actionKey: (toolName, input, context) => {
@@ -310,6 +334,23 @@ export function installSpeculativeAction(
 					? { ok: true }
 					: { ok: false, reason: "permission_or_policy" }
 				: result;
+		},
+		authorizeCandidate: async ({ stateData, tool: toolName, concrete, action, signal }) => {
+			const tool = stateData.tools.get(toolName);
+			if (!tool || !options.preflight) return { ok: false, reason: "permission_or_policy_changed" };
+			const args = validateCandidateArguments(tool, toolName, concrete, "spec_authorize");
+			if (args === undefined) return { ok: false, reason: "invalid_tool_call_input" };
+			const result = await options.preflight({
+				tool,
+				toolName,
+				args,
+				action,
+				signal: signal ?? new AbortController().signal,
+			});
+			if (typeof result === "boolean") {
+				return result ? { ok: true } : { ok: false, reason: "permission_or_policy_changed" };
+			}
+			return result.ok ? result : { ...result, reason: "permission_or_policy_changed" };
 		},
 		executeCandidate: async ({ data, tool: toolName, concrete, action, callID, signal }) => {
 			const tool = data.tools.get(toolName);
@@ -336,28 +377,86 @@ export function installSpeculativeAction(
 				return errorSettlement(error instanceof Error ? error.message : String(error));
 			}
 		},
-		captureResourceVersion: ({ action }) => fingerprintActionResources(action, options.cwd),
-		isResourceExpired: async ({ action, candidate }) => {
-			if (typeof candidate.resourceVersion !== "string") return true;
-			return candidate.resourceVersion !== (await fingerprintActionResources(action, options.cwd));
+		candidateSizeBytes: ({ output }) => {
+			const execution = sandboxExecutions.get(output);
+			return (
+				estimateValueBytes(output) +
+				(execution?.changes.reduce(
+					(total, change) => total + (change.before?.byteLength ?? 0) + (change.after?.byteLength ?? 0),
+					0,
+				) ?? 0)
+			);
 		},
+		candidateExecutionMetrics: ({ output }) => {
+			const execution = sandboxExecutions.get(output);
+			return execution
+				? { sandboxSetupMs: execution.setupMs, changeCollectionMs: execution.changeCollectionMs }
+				: {};
+		},
+		captureResourceVersion: ({ action }) => captureResourceVersion(action, options.cwd),
+		isResourceExpired: ({ candidate }) => validateResourceVersion(candidate.resourceVersion),
+		watchResourceVersion: ({ candidate, onInvalidated }) =>
+			watchResourceVersion(candidate.resourceVersion, onInvalidated),
 		...(projection
 			? {
 					projectOutput: ({ action, candidate, output }) => projection({ action, candidate, output }),
 				}
 			: {}),
-		adoptCandidate: async ({ action, output }) => {
+		adoptCandidate: async ({ action, candidate, output }) => {
 			if (action.execution !== "sandbox") return output;
 			const execution = sandboxExecutions.get(output);
 			if (!execution || !options.sandbox) return undefined;
+			const started = performance.now();
 			try {
-				return await options.sandbox.adopt(execution);
+				const adopted = await options.sandbox.adopt(execution);
+				candidate.commitMs = execution.commitMetrics?.durationMs ?? Math.max(0, performance.now() - started);
+				candidate.commitValidationMs = execution.commitMetrics?.validationMs;
+				candidate.commitValidationFiles = execution.commitMetrics?.filesValidated;
+				candidate.commitValidationBytes = execution.commitMetrics?.bytesValidated;
+				candidate.changedResources = execution.changes.map((change) => change.resource);
+				return adopted;
 			} catch {
 				return undefined;
 			}
 		},
+		continuePatternAware: async ({ startInput, data, candidate, patternContext, output, parentConfirmed }) => {
+			const context = asPatternAwareRuntimeContext(patternContext);
+			if (!context) return undefined;
+			const observation = projectPatternAwareObservation(
+				output.result,
+				extractOutputPaths(candidate.key.tool, output.result),
+				options.cwd,
+			);
+			const candidates = context.store.continue(
+				context.continuation,
+				{
+					sessionID: startInput.sessionID,
+					turnID: startInput.turnID,
+					tool: candidate.key.tool,
+					input: patternAwareInput(candidate.key),
+					actionKey: candidate.key.key,
+					outcome: output.isError ? "failure" : "success",
+					...observation,
+					durationMs: candidate.executionMs ?? 0,
+					...(typeof candidate.key.input.operation === "string"
+						? { operation: candidate.key.input.operation }
+						: {}),
+					learnTarget: false,
+				},
+				data.schemaHashes,
+				parentConfirmed,
+			);
+			return {
+				candidates: candidates.map((next) => ({
+					...next,
+					patternContext: patternAwareRuntimeContext(context.store, next),
+				})),
+				draftTokens: 0,
+			};
+		},
 		recordAuthoritative: async ({
 			startInput,
+			data,
 			settings,
 			consumeInput,
 			action,
@@ -369,22 +468,32 @@ export function installSpeculativeAction(
 			if (!settings.patternAware?.enabled) return undefined;
 			const store = await resolvePatternStore(settings);
 			const definition = startInput.tools.find((item) => item.name === tool);
-			const candidates = store.observe({
-				sessionID: consumeInput.sessionID,
-				turnID: consumeInput.turnID,
-				tool,
-				input: concrete,
-				actionKey: action?.key ?? stableHash({ tool, input: concrete }),
-				outcome: output?.isError ? "failure" : "success",
-				output: output?.result,
-				outputPaths: extractOutputPaths(tool, output?.result),
-				durationMs,
-				...(typeof concrete.operation === "string" ? { operation: concrete.operation } : {}),
-				...(definition ? { schemaHash: stableHash(definition.parameters) } : {}),
-				learnTarget: candidateToolNames(settings).includes(tool),
-			});
+			const observation = projectPatternAwareObservation(
+				output?.result,
+				extractOutputPaths(tool, output?.result),
+				options.cwd,
+			);
+			const candidates = store.observe(
+				{
+					sessionID: consumeInput.sessionID,
+					turnID: consumeInput.turnID,
+					tool,
+					input: action ? patternAwareInput(action) : concrete,
+					actionKey: action?.key ?? stableHash({ tool, input: concrete }),
+					outcome: output?.isError ? "failure" : "success",
+					...observation,
+					durationMs,
+					...(typeof concrete.operation === "string" ? { operation: concrete.operation } : {}),
+					...(definition ? { schemaHash: stableHash(definition.parameters) } : {}),
+					learnTarget: candidateToolNames(settings).includes(tool),
+				},
+				data.schemaHashes,
+			);
 			return {
-				candidates: candidates.map((candidate) => ({ ...candidate, patternContext: store })),
+				candidates: candidates.map((candidate) => ({
+					...candidate,
+					patternContext: patternAwareRuntimeContext(store, candidate),
+				})),
 				draftTokens: 0,
 			};
 		},
@@ -393,10 +502,12 @@ export function installSpeculativeAction(
 			if (!options.sandbox?.supports(candidate.tool)) throw new Error(`Sandbox unavailable for ${candidate.tool}`);
 		},
 		onPatternLaunched: (patternID, context) => {
-			if (isPatternStore(context)) context.launched(patternID);
+			const store = asPatternAwareRuntimeContext(context)?.store ?? (isPatternStore(context) ? context : undefined);
+			store?.launched(patternID);
 		},
 		onPatternResolved: (patternID, outcome, context) => {
-			if (isPatternStore(context)) context.resolved(patternID, outcome);
+			const store = asPatternAwareRuntimeContext(context)?.store ?? (isPatternStore(context) ? context : undefined);
+			store?.resolved(patternID, outcome);
 		},
 		flushPatternStore: async () => {
 			if (openedPatternStore) await (await openedPatternStore).flush();

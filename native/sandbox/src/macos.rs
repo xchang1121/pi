@@ -88,6 +88,7 @@ pub fn execute(request: &ExecuteRequest) -> Result<ExecuteResponse> {
         timeout: outcome.timeout,
         truncated: outcome.truncated,
         sandbox: SANDBOX_KIND.into(),
+        isolated: true,
     })
 }
 
@@ -100,14 +101,17 @@ fn exec_command(request: &ExecuteRequest, temporary: &Path, profile: &str) -> Re
     environment.insert("TMP".into(), temporary.clone());
     environment.insert("TEMP".into(), temporary);
 
-    let error = Command::new("/bin/sh")
-        .arg("-c")
-        .arg(&request.command)
+    let shell = request.shell.as_deref().unwrap_or("/bin/sh");
+    let error = Command::new(shell)
+        .args(crate::protocol::shell_arguments(
+            Path::new(shell),
+            &request.command,
+        ))
         .current_dir(&request.cwd)
         .env_clear()
         .envs(environment)
         .exec();
-    Err(error).context("exec /bin/sh")
+    Err(error).with_context(|| format!("exec sandbox shell {shell}"))
 }
 
 fn apply_profile(profile: &str) -> Result<()> {
@@ -198,6 +202,7 @@ mod tests {
         let request = ExecuteRequest {
             version: PROTOCOL_VERSION,
             command: "true".into(),
+            shell: None,
             cwd: PathBuf::from("/private/tmp/sandbox"),
             sandbox_root: PathBuf::from("/private/tmp/sandbox"),
             source_root: PathBuf::from("/Users/me/source"),

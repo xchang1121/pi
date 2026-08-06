@@ -233,6 +233,7 @@ describe("speculative action runtime", () => {
 
 		expect(harness.executions()).toBe(0);
 		expect(harness.events.some((event) => event.type === "started")).toBe(false);
+		expect(harness.events.some((event) => event.type === "miss" && event.reason === "no_candidate")).toBe(false);
 	});
 
 	it("times out and falls back when the drafter never produces a candidate", async () => {

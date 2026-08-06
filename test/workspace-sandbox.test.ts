@@ -4,13 +4,19 @@ import os from "node:os";
 import path from "node:path";
 import type { AgentTool, SettleToolCallResult } from "@earendil-works/pi-agent-core";
 import { Type } from "typebox";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { buildPiActionKey } from "../src/common.ts";
 import {
+	closeWorkspaceSandboxPools,
 	commitSandboxExecution,
 	createWorkspaceSandbox,
 	type SpeculativeSandboxExecution,
+	withSandboxWorkspace,
 } from "../src/workspace-sandbox.ts";
+
+afterEach(async () => {
+	await closeWorkspaceSandboxPools();
+});
 
 const writeParameters = Type.Object({ path: Type.String(), content: Type.String() });
 const editParameters = Type.Object({
@@ -80,6 +86,9 @@ describe("M4 workspace sandbox", () => {
 			]);
 			await sandbox.adopt(execution);
 			expect(await readFile(path.join(root, args.path), "utf8")).toBe("from sandbox\n");
+			expect(execution.commitMetrics).toEqual(
+				expect.objectContaining({ filesValidated: 1, filesCommitted: 1, bytesValidated: 0 }),
+			);
 		} finally {
 			await rm(root, { recursive: true, force: true });
 		}
@@ -146,7 +155,9 @@ describe("M4 workspace sandbox", () => {
 			await writeFile(path.join(root, "input.txt"), "hello", "utf8");
 			await writeFile(path.join(root, "delete.txt"), "remove me", "utf8");
 			const sandbox = createWorkspaceSandbox({
-				processRunner: async ({ command, cwd, processRoot, sourceRoot, signal }) => {
+				shell: "/bin/bash",
+				processRunner: async ({ command, shell, cwd, processRoot, sourceRoot, signal }) => {
+					expect(shell).toBe("/bin/bash");
 					expect(path.dirname(cwd)).toBe(processRoot);
 					expect(sourceRoot).toBe(root);
 					expect(processRoot).not.toBe(root);
@@ -393,6 +404,7 @@ describe("M4 workspace sandbox", () => {
 						key: "invalid",
 						hash: "invalid",
 						tool: "write",
+						input: args,
 						resources: ["../outside.txt"],
 						execution: "sandbox",
 					},
@@ -400,6 +412,72 @@ describe("M4 workspace sandbox", () => {
 					signal: new AbortController().signal,
 				}),
 			).rejects.toThrow("escapes workspace");
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("reuses one private repository while keeping action worktrees isolated", async () => {
+		const root = await mkdtemp(path.join(os.tmpdir(), "pi-spec-pool-test-"));
+		try {
+			await writeFile(path.join(root, "value.txt"), "one\n");
+			const contexts = [] as Array<{ processRoot: string; sandboxRoot: string }>;
+			await withSandboxWorkspace(root, async (workspace) => {
+				contexts.push({ processRoot: workspace.processRoot, sandboxRoot: workspace.sandboxRoot });
+				expect(await readFile(path.join(workspace.sandboxRoot, "value.txt"), "utf8")).toBe("one\n");
+			});
+			await withSandboxWorkspace(root, async (workspace) => {
+				contexts.push({ processRoot: workspace.processRoot, sandboxRoot: workspace.sandboxRoot });
+			});
+
+			expect(contexts[0]?.processRoot).not.toBe(contexts[1]?.processRoot);
+			expect(path.dirname(contexts[0]!.processRoot)).toBe(path.dirname(contexts[1]!.processRoot));
+			expect(contexts[0]?.sandboxRoot).not.toBe(contexts[1]?.sandboxRoot);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("refreshes a pooled baseline after incremental workspace changes", async () => {
+		const root = await mkdtemp(path.join(os.tmpdir(), "pi-spec-pool-refresh-test-"));
+		try {
+			await writeFile(path.join(root, "value.txt"), "one\n");
+			await withSandboxWorkspace(root, async (workspace) => {
+				expect(await readFile(path.join(workspace.sandboxRoot, "value.txt"), "utf8")).toBe("one\n");
+			});
+			await writeFile(path.join(root, "value.txt"), "two\n");
+			await writeFile(path.join(root, "added.txt"), "added\n");
+			await new Promise((resolve) => setTimeout(resolve, 80));
+
+			await withSandboxWorkspace(root, async (workspace) => {
+				expect(await readFile(path.join(workspace.sandboxRoot, "value.txt"), "utf8")).toBe("two\n");
+				expect(await readFile(path.join(workspace.sandboxRoot, "added.txt"), "utf8")).toBe("added\n");
+			});
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("allows parallel action worktrees without cross-contamination", async () => {
+		const root = await mkdtemp(path.join(os.tmpdir(), "pi-spec-pool-parallel-test-"));
+		try {
+			await writeFile(path.join(root, "value.txt"), "base\n");
+			const values = await Promise.all(
+				["first\n", "second\n"].map((content) =>
+					withSandboxWorkspace(root, async (workspace) => {
+						await writeFile(path.join(workspace.sandboxRoot, "value.txt"), content);
+						await new Promise((resolve) => setTimeout(resolve, 10));
+						return {
+							root: workspace.sandboxRoot,
+							content: await readFile(path.join(workspace.sandboxRoot, "value.txt"), "utf8"),
+						};
+					}),
+				),
+			);
+
+			expect(new Set(values.map((value) => value.root)).size).toBe(2);
+			expect(values.map((value) => value.content).sort()).toEqual(["first\n", "second\n"]);
+			expect(await readFile(path.join(root, "value.txt"), "utf8")).toBe("base\n");
 		} finally {
 			await rm(root, { recursive: true, force: true });
 		}

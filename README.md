@@ -18,7 +18,10 @@ const installed = installSpeculativeAction(agent, {
 		enabled: true,
 		maxCandidates: 4,
 		resourceCacheMaxEntries: 256,
+		resourceCacheMaxBytes: 256 * 1024 * 1024,
 		predictionTimeoutMs: 1_000,
+		adaptiveDrafter: true,
+		patternAware: { futureGapCoverage: 0.9, decayHalfLifeEvents: 2048 },
 		tools: { resourceCached: ["read", "grep", "find"], sandbox: ["bash", "write", "edit"] },
 	}),
 	preflight: () => true,
@@ -72,5 +75,14 @@ await installed.uninstall();
 - Packaged assets are selected by platform, architecture, and Linux libc, verified against `native/sandbox/prebuilds/manifest.json`, and materialized as a private executable.
 - Set `PI_SPECULATIVE_SANDBOX_NATIVE_BIN` only for an explicitly trusted development build. Missing, corrupt, incompatible, aborted, or failed brokers reject speculative execution so the actor follows Pi's normal tool path; there is no implicit direct-execution fallback.
 - Build a host asset from the included Rust source with `npm run build:native --workspace @earendil-works/pi-speculative-action`.
+
+## M8 behavior
+
+- PatternAware learns weighted future gaps with event-age decay, suffix backoff, collection-aware mappings, persisted analyzer results, and bounded retry scheduling.
+- Completed PatternAware candidates can open a multi-step speculative frontier; terminal cancellation stops the entire frontier.
+- Resource candidates use watcher-backed version tokens with exact-validation fallback, eager invalidation, and per-session entry and byte limits.
+- Sandbox worktrees reuse a pooled private Git repository while keeping each action isolated; setup, change collection, validation, commit, and cache-memory costs are emitted as runtime diagnostics.
+- The adaptive drafter skips redundant model calls after immediate pattern deployment and applies bounded deterministic backoff after empty drafts. Disable `adaptiveDrafter` for ablation runs.
+- Native protocol v3 forwards Pi's configured shell and rejects results that do not explicitly attest native process isolation.
 
 If the drafter uses a different provider from the actor, provide `getDraftOptions` so the drafter receives the correct credentials. The generic Pi stream interface does not promise a provider-independent “required tool choice”; the system prompt enforces tool-call-only output and non-tool output is treated as no candidate.

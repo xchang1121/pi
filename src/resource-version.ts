@@ -1,87 +1,609 @@
-import type { Dirent, Stats } from "node:fs";
-import { lstat, readdir, readlink } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { createReadStream, type FSWatcher, watch } from "node:fs";
+import fs from "node:fs/promises";
 import path from "node:path";
 import type { ActionKey } from "./common.ts";
-import { contains, slash } from "./common.ts";
 
-export const MAX_FINGERPRINT_ENTRIES = 10_000;
-const TRUNCATED_FINGERPRINT = { truncated: true, maxEntries: MAX_FINGERPRINT_ENTRIES } as const;
+export type ResourceDependencyScope = "content" | "tree_entries" | "tree_query" | "tree_content";
 
-interface FingerprintBudget {
-	count: number;
-	truncated: boolean;
-}
+export type ResourceDependency = {
+	readonly path: string;
+	readonly scope: ResourceDependencyScope;
+};
 
-/** Capture a deterministic version for every file or directory resource used by an action. */
-export async function fingerprintActionResources(action: ActionKey, cwd: string): Promise<string> {
-	const root = path.resolve(cwd);
-	const resources = await Promise.all(
-		action.resources
-			.slice()
-			.sort()
-			.map(async (resource) => {
-				const absolute = path.resolve(root, resource);
-				if (!contains(root, absolute)) return { path: resource, invalid: true };
-				return fingerprintPath(absolute, root, { count: 0, truncated: false });
-			}),
-	);
-	return JSON.stringify({ tool: action.tool, resources });
-}
+export type ResourceValidationMetrics = {
+	readonly durationMs: number;
+	readonly bytesRead: number;
+	readonly filesRead: number;
+	readonly mode: "watcher" | "exact";
+};
 
-async function fingerprintPath(absolute: string, root: string, budget: FingerprintBudget): Promise<unknown> {
-	if (budget.truncated) return TRUNCATED_FINGERPRINT;
-	budget.count++;
-	if (budget.count > MAX_FINGERPRINT_ENTRIES) {
-		budget.truncated = true;
-		return TRUNCATED_FINGERPRINT;
-	}
+export type ResourceValidation = ResourceValidationMetrics & {
+	readonly expired: boolean;
+	readonly reason?: string;
+};
 
-	const relative = slash(path.relative(root, absolute) || ".");
-	let stats: Stats;
-	try {
-		stats = await lstat(absolute);
-	} catch (error) {
-		const code = error && typeof error === "object" && "code" in error ? String(error.code) : "unknown";
-		return { path: relative, exists: false, code };
-	}
+export type ResourceChangeSet = {
+	readonly uncertain: boolean;
+	readonly paths: ReadonlyArray<string>;
+};
 
-	if (stats.isSymbolicLink()) {
-		let target = "<unreadable>";
+export type ResourceVersionToken = {
+	readonly root: string;
+	readonly dependencies: ReadonlyArray<ResourceDependency>;
+	readonly epoch: number;
+	readonly quick: ReadonlyArray<string>;
+	readonly preciseContent: ReadonlyArray<string>;
+	readonly exact?: ReadonlyArray<string>;
+	readonly captureMs: number;
+	readonly captureBytes: number;
+	readonly captureFiles: number;
+	readonly manager: ResourceVersionManager;
+	readonly releasePreciseWatch?: () => void;
+};
+
+type ResourceEvent = {
+	readonly epoch: number;
+	readonly path: string;
+	readonly type: "change" | "rename" | "unknown";
+	readonly source: "root" | "precise";
+};
+
+type ResourceSubscriber = {
+	readonly dependencies: ReadonlyArray<ResourceDependency>;
+	readonly preciseContent: ReadonlySet<string>;
+	readonly callback: (path: string) => void;
+};
+
+const MAX_EVENT_HISTORY = 4096;
+const FINGERPRINT_CONCURRENCY = 12;
+const IGNORED_DIRECTORIES = new Set([".git"]);
+const QUERY_CONTROL_FILES = new Set([".gitignore", ".ignore", ".rgignore"]);
+
+export class ResourceVersionManager {
+	private epoch = 0;
+	private readonly events: ResourceEvent[] = [];
+	private readonly subscribers = new Set<ResourceSubscriber>();
+	private readonly preciseWatches = new Map<string, { readonly watcher: FSWatcher; references: number }>();
+	private watcher?: FSWatcher;
+	private reliable = false;
+	private ready: Promise<void> = Promise.resolve();
+	readonly root: string;
+	private readonly options: { readonly watch?: boolean; readonly onIdle?: () => void };
+
+	constructor(root: string, options: { readonly watch?: boolean; readonly onIdle?: () => void } = {}) {
+		this.root = root;
+		this.options = options;
+		if (options.watch === false) return;
 		try {
-			target = await readlink(absolute);
+			this.watcher = watch(root, { recursive: true }, (event, filename) => {
+				const changed = filename ? path.resolve(root, filename) : root;
+				this.changed(changed, event, "root");
+			});
+			this.watcher.on("error", () => {
+				this.reliable = false;
+				this.changed(root, "unknown", "root");
+			});
+			this.reliable = true;
+			this.ready = watcherTurn();
 		} catch {
-			// Keep the explicit unreadable marker.
+			this.reliable = false;
 		}
+	}
+
+	async capture(dependencies: ReadonlyArray<ResourceDependency>): Promise<ResourceVersionToken> {
+		const started = performance.now();
+		await this.ready;
+		const normalized = normalizeDependencies(this.root, dependencies);
+		const epoch = this.epoch;
+		if (this.reliable) {
+			const precise = this.acquirePreciseWatches(normalized);
+			try {
+				const quick = await Promise.all(
+					normalized.map(async (dependency) =>
+						dependency.scope === "content" ? quickContent(dependency.path) : "",
+					),
+				);
+				return {
+					root: this.root,
+					dependencies: normalized,
+					epoch,
+					quick,
+					preciseContent: precise.paths,
+					captureMs: elapsed(started),
+					captureBytes: 0,
+					captureFiles: 0,
+					manager: this,
+					releasePreciseWatch: precise.release,
+				};
+			} catch (error) {
+				precise.release();
+				throw error;
+			}
+		}
+		const exact = await fingerprintDependencies(normalized);
 		return {
-			path: relative,
-			type: "symlink",
-			target,
-			mtimeMs: Math.trunc(stats.mtimeMs),
-			size: stats.size,
+			root: this.root,
+			dependencies: normalized,
+			epoch,
+			quick: [],
+			preciseContent: [],
+			exact: exact.fingerprints,
+			captureMs: elapsed(started),
+			captureBytes: exact.bytesRead,
+			captureFiles: exact.filesRead,
+			manager: this,
 		};
 	}
-	if (stats.isFile()) {
-		return { path: relative, type: "file", mtimeMs: Math.trunc(stats.mtimeMs), size: stats.size };
-	}
-	if (!stats.isDirectory()) {
-		return { path: relative, type: "other", mtimeMs: Math.trunc(stats.mtimeMs), size: stats.size };
+
+	async validate(token: ResourceVersionToken): Promise<ResourceValidation> {
+		const started = performance.now();
+		if (token.manager !== this || token.root !== this.root) {
+			return validation(started, true, "resource_version_owner_changed", "exact");
+		}
+		await watcherTurn();
+		if (this.reliable) {
+			const quick = await Promise.all(
+				token.dependencies.map(async (dependency) =>
+					dependency.scope === "content" ? quickContent(dependency.path) : "",
+				),
+			);
+			const expired = this.changedSince(token) || !sameStrings(quick, token.quick);
+			return {
+				expired,
+				...validationMetrics(started, 0, 0, "watcher"),
+				...(expired ? { reason: "resource_changed" } : {}),
+			};
+		}
+		if (!token.exact) return validation(started, true, "resource_exact_baseline_missing", "exact");
+		try {
+			const exact = await fingerprintDependencies(token.dependencies);
+			return {
+				expired: !sameStrings(exact.fingerprints, token.exact),
+				...validationMetrics(started, exact.bytesRead, exact.filesRead, "exact"),
+				...(!sameStrings(exact.fingerprints, token.exact) ? { reason: "resource_fingerprint_changed" } : {}),
+			};
+		} catch {
+			return validation(started, true, "resource_validation_failed", "exact");
+		}
 	}
 
-	let entries: Dirent[];
+	changesSince(token: ResourceVersionToken): ResourceChangeSet {
+		if (token.manager !== this || token.root !== this.root || !this.reliable) {
+			return { uncertain: true, paths: [] };
+		}
+		const oldest = this.events[0]?.epoch ?? this.epoch;
+		if (token.epoch < oldest && this.events.length >= MAX_EVENT_HISTORY) {
+			return { uncertain: true, paths: [] };
+		}
+		const events = this.events.filter((event) => event.epoch > token.epoch);
+		return {
+			uncertain: events.some((event) => event.type === "unknown"),
+			paths: [...new Set(events.map((event) => event.path))],
+		};
+	}
+
+	subscribe(token: ResourceVersionToken, callback: (path: string) => void) {
+		const subscriber: ResourceSubscriber = {
+			dependencies: token.dependencies,
+			preciseContent: new Set(token.preciseContent.map(pathKey)),
+			callback,
+		};
+		this.subscribers.add(subscriber);
+		let released = false;
+		return () => {
+			if (released) return;
+			released = true;
+			this.subscribers.delete(subscriber);
+			token.releasePreciseWatch?.();
+			this.checkIdle();
+		};
+	}
+
+	close() {
+		this.watcher?.close();
+		this.watcher = undefined;
+		this.reliable = false;
+		for (const precise of this.preciseWatches.values()) precise.watcher.close();
+		this.preciseWatches.clear();
+		this.subscribers.clear();
+		this.events.length = 0;
+	}
+
+	private changedSince(token: ResourceVersionToken) {
+		if (this.changesSince(token).uncertain) return true;
+		const preciseContent = new Set(token.preciseContent.map(pathKey));
+		return this.events.some(
+			(event) =>
+				event.epoch > token.epoch &&
+				token.dependencies.some((dependency) => affects(dependency, event, preciseContent)),
+		);
+	}
+
+	private changed(changedPath: string, type: ResourceEvent["type"], source: ResourceEvent["source"]) {
+		const absolute = path.resolve(changedPath);
+		const event = { epoch: ++this.epoch, path: absolute, type, source };
+		this.events.push(event);
+		if (this.events.length > MAX_EVENT_HISTORY) this.events.splice(0, this.events.length - MAX_EVENT_HISTORY);
+		for (const subscriber of this.subscribers) {
+			if (subscriber.dependencies.some((dependency) => affects(dependency, event, subscriber.preciseContent))) {
+				subscriber.callback(absolute);
+			}
+		}
+	}
+
+	private acquirePreciseWatches(dependencies: ReadonlyArray<ResourceDependency>) {
+		const paths: string[] = [];
+		for (const target of new Set(
+			dependencies.filter((dependency) => dependency.scope === "content").map((dependency) => dependency.path),
+		)) {
+			const key = pathKey(target);
+			const existing = this.preciseWatches.get(key);
+			if (existing) {
+				existing.references++;
+				paths.push(target);
+				continue;
+			}
+			try {
+				const watcher = watch(target, (event) => this.changed(target, event, "precise"));
+				watcher.on("error", () => {
+					this.reliable = false;
+					this.changed(target, "unknown", "precise");
+				});
+				this.preciseWatches.set(key, { watcher, references: 1 });
+				paths.push(target);
+			} catch {
+				// A missing file is covered conservatively by its nearest root-watcher event.
+			}
+		}
+		let released = false;
+		return {
+			paths,
+			release: () => {
+				if (released) return;
+				released = true;
+				for (const target of paths) {
+					const key = pathKey(target);
+					const current = this.preciseWatches.get(key);
+					if (!current) continue;
+					current.references--;
+					if (current.references > 0) continue;
+					current.watcher.close();
+					this.preciseWatches.delete(key);
+				}
+			},
+		};
+	}
+
+	private checkIdle() {
+		if (this.subscribers.size || this.preciseWatches.size) return;
+		this.options.onIdle?.();
+	}
+}
+
+const managers = new Map<string, ResourceVersionManager>();
+
+export function resourceDependencies(action: ActionKey, root: string): ReadonlyArray<ResourceDependency> {
+	if (action.tool === "lsp" && action.input.operation !== "documentSymbol") {
+		return [{ path: root, scope: "tree_content" }];
+	}
+	const scope: ResourceDependencyScope =
+		action.tool === "find" ? "tree_query" : action.tool === "grep" ? "tree_content" : "content";
+	const dependencies = action.resources.map((resource) => ({
+		path: path.resolve(root, resource),
+		scope,
+	}));
+	if (action.tool === "find") {
+		for (const resource of action.resources) {
+			const base = path.resolve(root, resource);
+			const relative = path.relative(root, base);
+			if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) continue;
+			let current = path.resolve(root);
+			for (const segment of relative.split(path.sep).filter(Boolean)) {
+				for (const control of QUERY_CONTROL_FILES) {
+					dependencies.push({ path: path.join(current, control), scope: "content" });
+				}
+				current = path.join(current, segment);
+			}
+		}
+		dependencies.push({ path: path.resolve(root, ".git", "info", "exclude"), scope: "content" });
+	}
+	return dependencies;
+}
+
+export function captureResourceVersion(action: ActionKey, root: string) {
+	return resourceVersionManager(root).capture(resourceDependencies(action, root));
+}
+
+export function validateResourceVersion(token: unknown): Promise<ResourceValidation> {
+	if (!isResourceVersionToken(token)) {
+		return Promise.resolve({
+			expired: true,
+			reason: "resource_version_missing",
+			durationMs: 0,
+			bytesRead: 0,
+			filesRead: 0,
+			mode: "exact",
+		});
+	}
+	return token.manager.validate(token);
+}
+
+export function watchResourceVersion(token: unknown, callback: (path: string) => void) {
+	if (!isResourceVersionToken(token)) return () => {};
+	return token.manager.subscribe(token, callback);
+}
+
+export function isResourceVersionToken(value: unknown): value is ResourceVersionToken {
+	if (!value || typeof value !== "object") return false;
+	const token = value as Partial<ResourceVersionToken>;
+	return (
+		typeof token.root === "string" &&
+		typeof token.epoch === "number" &&
+		Array.isArray(token.dependencies) &&
+		Array.isArray(token.preciseContent) &&
+		token.manager instanceof ResourceVersionManager
+	);
+}
+
+export function closeResourceVersionManagers() {
+	for (const manager of managers.values()) manager.close();
+	managers.clear();
+}
+
+function resourceVersionManager(root: string) {
+	const normalized = path.resolve(root);
+	const existing = managers.get(normalized);
+	if (existing) return existing;
+	let manager: ResourceVersionManager;
+	manager = new ResourceVersionManager(normalized, {
+		onIdle: () => {
+			if (managers.get(normalized) !== manager) return;
+			manager.close();
+			managers.delete(normalized);
+		},
+	});
+	managers.set(normalized, manager);
+	return manager;
+}
+
+function normalizeDependencies(root: string, dependencies: ReadonlyArray<ResourceDependency>) {
+	const result = new Map<string, ResourceDependency>();
+	for (const dependency of dependencies) {
+		const absolute = path.resolve(root, dependency.path);
+		const relative = path.relative(root, absolute);
+		if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+			throw new Error(`resource dependency escapes workspace: ${dependency.path}`);
+		}
+		result.set(`${dependency.scope}:${pathKey(absolute)}`, { path: absolute, scope: dependency.scope });
+	}
+	return [...result.values()];
+}
+
+function affects(dependency: ResourceDependency, event: ResourceEvent, preciseContent: ReadonlySet<string>) {
+	if (event.type === "unknown") return true;
+	const dependencyPath = pathKey(dependency.path);
+	const changed = pathKey(event.path);
+	if (dependency.scope === "content") {
+		if (dependencyPath === changed) return true;
+		// Some recursive watchers report only the containing directory for a file write.
+		return !preciseContent.has(dependencyPath) && dependencyPath.startsWith(`${changed}/`);
+	}
+	const inside = changed === dependencyPath || changed.startsWith(`${dependencyPath}/`);
+	if (!inside) return false;
+	if (path.basename(event.path).startsWith(".pi-speculative-")) return false;
+	const relative = path.relative(dependency.path, event.path);
+	if (relative === ".git" || relative.startsWith(`.git${path.sep}`)) return false;
+	if (dependency.scope === "tree_entries") return event.type !== "change";
+	if (dependency.scope === "tree_query") {
+		return event.type !== "change" || QUERY_CONTROL_FILES.has(path.basename(event.path).toLowerCase());
+	}
+	return true;
+}
+
+async function quickContent(target: string) {
 	try {
-		entries = await readdir(absolute, { withFileTypes: true });
-	} catch {
-		return { path: relative, type: "dir", unreadable: true, mtimeMs: Math.trunc(stats.mtimeMs) };
+		const info = await fingerprintIO(() => fs.lstat(target, { bigint: true }));
+		return JSON.stringify({
+			type: info.isSymbolicLink() ? "symlink" : info.isFile() ? "file" : info.isDirectory() ? "directory" : "other",
+			size: info.size.toString(),
+			mtimeNs: info.mtimeNs.toString(),
+			ctimeNs: info.ctimeNs.toString(),
+			mode: Number(info.mode),
+			ino: info.ino.toString(),
+			dev: info.dev.toString(),
+		});
+	} catch (error) {
+		return JSON.stringify({ error: errorCode(error) });
 	}
-	const children: unknown[] = [];
-	for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
-		children.push(await fingerprintPath(path.join(absolute, entry.name), root, budget));
-		if (budget.truncated) break;
-	}
+}
+
+async function fingerprintDependencies(dependencies: ReadonlyArray<ResourceDependency>) {
+	const results = await mapLimit(dependencies, FINGERPRINT_CONCURRENCY, fingerprintDependency);
 	return {
-		path: relative,
-		type: "dir",
-		mtimeMs: Math.trunc(stats.mtimeMs),
-		children: budget.truncated ? [TRUNCATED_FINGERPRINT] : children,
+		fingerprints: results.map((result) => result.fingerprint),
+		bytesRead: results.reduce((total, result) => total + result.bytesRead, 0),
+		filesRead: results.reduce((total, result) => total + result.filesRead, 0),
 	};
+}
+
+async function fingerprintDependency(dependency: ResourceDependency) {
+	const result = await fingerprintPath(dependency.path, dependency.scope);
+	return {
+		fingerprint: createHash("sha256")
+			.update(JSON.stringify({ path: pathKey(dependency.path), scope: dependency.scope, value: result.value }))
+			.digest("hex"),
+		bytesRead: result.bytesRead,
+		filesRead: result.filesRead,
+	};
+}
+
+type FingerprintResult = {
+	readonly value: unknown;
+	readonly bytesRead: number;
+	readonly filesRead: number;
+};
+
+async function fingerprintPath(target: string, scope: ResourceDependencyScope): Promise<FingerprintResult> {
+	let info: import("node:fs").BigIntStats;
+	try {
+		info = await fingerprintIO(() => fs.lstat(target, { bigint: true }));
+	} catch (error) {
+		return { value: { exists: false, error: errorCode(error) }, bytesRead: 0, filesRead: 0 };
+	}
+	const mode = Number(info.mode);
+	if (info.isSymbolicLink()) {
+		const link = await fingerprintIO(() => fs.readlink(target)).catch(() => "<unreadable>");
+		return { value: { type: "symlink", link, mode }, bytesRead: 0, filesRead: 0 };
+	}
+	if (info.isFile()) {
+		if (scope === "tree_entries") {
+			return { value: { type: "file", mode }, bytesRead: 0, filesRead: 0 };
+		}
+		if (scope === "tree_query" && !QUERY_CONTROL_FILES.has(path.basename(target).toLowerCase())) {
+			return { value: { type: "file", mode }, bytesRead: 0, filesRead: 0 };
+		}
+		const content = await fingerprintIO(() => hashFile(target));
+		return {
+			value: {
+				type: "file",
+				mode,
+				size: content.bytesRead,
+				hash: content.hash,
+			},
+			bytesRead: content.bytesRead,
+			filesRead: 1,
+		};
+	}
+	if (!info.isDirectory()) {
+		return { value: { type: "other", mode, size: info.size.toString() }, bytesRead: 0, filesRead: 0 };
+	}
+	const entries = await fingerprintIO(() => fs.readdir(target, { withFileTypes: true }));
+	const selected = entries
+		.filter((entry) => !IGNORED_DIRECTORIES.has(entry.name))
+		.sort((left, right) => left.name.localeCompare(right.name));
+	const children = await mapLimit(selected, FINGERPRINT_CONCURRENCY, async (entry) => {
+		const child = await fingerprintPath(path.join(target, entry.name), scope);
+		return { name: entry.name, ...child };
+	});
+	return {
+		value: {
+			type: "directory",
+			mode,
+			children: children.map((child) => ({ name: child.name, value: child.value })),
+		},
+		bytesRead: children.reduce((total, child) => total + child.bytesRead, 0),
+		filesRead: children.reduce((total, child) => total + child.filesRead, 0),
+	};
+}
+
+export async function mapLimit<Input, Output>(
+	values: ReadonlyArray<Input>,
+	limit: number,
+	run: (value: Input, index: number) => Promise<Output>,
+) {
+	const output: Output[] = [];
+	let cursor = 0;
+	await Promise.all(
+		Array.from({ length: Math.min(Math.max(1, limit), values.length) }, async () => {
+			while (cursor < values.length) {
+				const index = cursor++;
+				output[index] = await run(values[index], index);
+			}
+		}),
+	);
+	return output;
+}
+
+function validation(
+	started: number,
+	expired: boolean,
+	reason: string,
+	mode: ResourceValidationMetrics["mode"],
+): ResourceValidation {
+	return { expired, reason, ...validationMetrics(started, 0, 0, mode) };
+}
+
+function validationMetrics(
+	started: number,
+	bytesRead: number,
+	filesRead: number,
+	mode: ResourceValidationMetrics["mode"],
+): ResourceValidationMetrics {
+	return { durationMs: elapsed(started), bytesRead, filesRead, mode };
+}
+
+function elapsed(started: number) {
+	return Math.max(0, performance.now() - started);
+}
+
+function sameStrings(left: ReadonlyArray<string>, right: ReadonlyArray<string>) {
+	return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function watcherTurn() {
+	return new Promise<void>((resolve) => setImmediate(resolve));
+}
+
+function hashFile(target: string) {
+	return new Promise<{ readonly hash: string; readonly bytesRead: number }>((resolve, reject) => {
+		const hash = createHash("sha256");
+		let bytesRead = 0;
+		const stream = createReadStream(target);
+		stream.on("data", (chunk: string | Buffer) => {
+			const data = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+			bytesRead += data.byteLength;
+			hash.update(data);
+		});
+		stream.once("error", reject);
+		stream.once("end", () => resolve({ hash: hash.digest("hex"), bytesRead }));
+	});
+}
+
+function errorCode(error: unknown) {
+	return error && typeof error === "object" && "code" in error ? String(error.code) : "unknown";
+}
+
+function pathKey(value: string) {
+	const normalized = path.resolve(value).replaceAll("\\", "/");
+	return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+}
+
+class AsyncGate {
+	private active = 0;
+	private readonly waiting: Array<() => void> = [];
+	private readonly limit: number;
+
+	constructor(limit: number) {
+		this.limit = limit;
+	}
+
+	async run<Value>(task: () => Promise<Value>) {
+		if (this.active < this.limit) this.active++;
+		else await new Promise<void>((resolve) => this.waiting.push(resolve));
+		try {
+			return await task();
+		} finally {
+			const next = this.waiting.shift();
+			if (next) next();
+			else this.active--;
+		}
+	}
+}
+
+const fingerprintGate = new AsyncGate(FINGERPRINT_CONCURRENCY);
+
+function fingerprintIO<Value>(task: () => Promise<Value>) {
+	return fingerprintGate.run(task);
+}
+
+/** @deprecated M8 callers should retain and validate ResourceVersionToken instead. */
+export async function fingerprintActionResources(action: ActionKey, root: string): Promise<string> {
+	const manager = new ResourceVersionManager(path.resolve(root), { watch: false });
+	try {
+		const token = await manager.capture(resourceDependencies(action, root));
+		return JSON.stringify({ tool: action.tool, exact: token.exact ?? [], quick: token.quick });
+	} finally {
+		manager.close();
+	}
 }

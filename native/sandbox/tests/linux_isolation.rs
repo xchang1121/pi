@@ -44,6 +44,7 @@ fn run(
     let request = ExecuteRequest {
         version: PROTOCOL_VERSION,
         command: command.into(),
+        shell: None,
         cwd: sandbox.to_path_buf(),
         sandbox_root: sandbox.to_path_buf(),
         source_root: source.to_path_buf(),
@@ -192,6 +193,7 @@ fn terminating_the_broker_kills_descendants() {
     let request = ExecuteRequest {
         version: PROTOCOL_VERSION,
         command: "(sleep 2; printf leaked > late.txt) & wait".into(),
+        shell: None,
         cwd: sandbox.clone(),
         sandbox_root: sandbox.clone(),
         source_root: source,

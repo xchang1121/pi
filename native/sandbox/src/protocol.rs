@@ -6,13 +6,15 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ExecuteRequest {
     pub version: u32,
     pub command: String,
+    #[serde(default)]
+    pub shell: Option<String>,
     pub cwd: PathBuf,
     pub sandbox_root: PathBuf,
     pub source_root: PathBuf,
@@ -29,6 +31,7 @@ pub struct ExecuteResponse {
     pub timeout: bool,
     pub truncated: bool,
     pub sandbox: String,
+    pub isolated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -38,6 +41,26 @@ pub struct CheckResponse {
     pub platform: String,
     pub ready: bool,
     pub detail: String,
+}
+
+pub fn shell_arguments(shell: &Path, command: &str) -> Vec<String> {
+    let path = shell.as_os_str().to_string_lossy();
+    let filename = path.rsplit(['/', '\\']).next().unwrap_or_default();
+    let lowercase = filename.to_ascii_lowercase();
+    let name = lowercase.strip_suffix(".exe").unwrap_or(&lowercase);
+    if name == "cmd" {
+        return vec!["/d".into(), "/s".into(), "/c".into(), command.into()];
+    }
+    if name == "powershell" || name == "pwsh" {
+        return vec![
+            "-NoLogo".into(),
+            "-NoProfile".into(),
+            "-NonInteractive".into(),
+            "-Command".into(),
+            command.into(),
+        ];
+    }
+    vec!["-c".into(), command.into()]
 }
 
 pub fn run(args: &[OsString]) -> i32 {
@@ -221,6 +244,7 @@ mod tests {
         let request = ExecuteRequest {
             version: PROTOCOL_VERSION,
             command: "printf ok".into(),
+            shell: Some("/bin/sh".into()),
             cwd: PathBuf::from("/tmp/sandbox/work"),
             sandbox_root: PathBuf::from("/tmp/sandbox"),
             source_root: PathBuf::from("/source"),
@@ -230,6 +254,7 @@ mod tests {
         let value = serde_json::to_value(&request).unwrap();
         assert_eq!(value["sandboxRoot"], "/tmp/sandbox");
         assert_eq!(value["timeoutMs"], 1_000);
+        assert_eq!(value["shell"], "/bin/sh");
         assert_eq!(
             serde_json::from_value::<ExecuteRequest>(value).unwrap(),
             request
@@ -241,6 +266,7 @@ mod tests {
         let request = ExecuteRequest {
             version: PROTOCOL_VERSION,
             command: "true".into(),
+            shell: None,
             cwd: PathBuf::from("/tmp/elsewhere"),
             sandbox_root: PathBuf::from("/tmp/sandbox"),
             source_root: PathBuf::from("/source"),
@@ -255,6 +281,7 @@ mod tests {
         let request = ExecuteRequest {
             version: PROTOCOL_VERSION,
             command: "true".into(),
+            shell: None,
             cwd: PathBuf::from("/tmp/source/sandbox"),
             sandbox_root: PathBuf::from("/tmp/source/sandbox"),
             source_root: PathBuf::from("/tmp/source"),
@@ -262,5 +289,46 @@ mod tests {
             max_output_bytes: 16_384,
         };
         assert!(validate_request(&request).is_err());
+    }
+
+    #[test]
+    fn response_reports_native_isolation() {
+        let response = ExecuteResponse {
+            version: PROTOCOL_VERSION,
+            output: "ok".into(),
+            exit: 0,
+            timeout: false,
+            truncated: false,
+            sandbox: "workspace+native-test".into(),
+            isolated: true,
+        };
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(value["isolated"], true);
+        assert_eq!(
+            serde_json::from_value::<ExecuteResponse>(value).unwrap(),
+            response
+        );
+    }
+
+    #[test]
+    fn uses_shell_specific_command_arguments() {
+        assert_eq!(
+            shell_arguments(Path::new("/bin/bash"), "printf ok"),
+            vec!["-c", "printf ok"]
+        );
+        assert_eq!(
+            shell_arguments(Path::new(r"C:\Windows\System32\cmd.exe"), "echo ok"),
+            vec!["/d", "/s", "/c", "echo ok"]
+        );
+        assert_eq!(
+            shell_arguments(Path::new("pwsh.exe"), "Write-Output ok"),
+            vec![
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Write-Output ok"
+            ]
+        );
     }
 }

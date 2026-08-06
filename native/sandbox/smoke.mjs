@@ -6,8 +6,9 @@ import path from "node:path";
 const binaryArgument = process.argv.find((argument) => argument.startsWith("--binary="));
 if (!binaryArgument) throw new Error("usage: node smoke.mjs --binary=FILE");
 const binary = path.resolve(binaryArgument.slice("--binary=".length));
+const protocolVersion = 3;
 const check = await invoke(["--native-sandbox", "check"]);
-if (check.status !== 0 || check.json.version !== 1 || check.json.ready !== true) {
+if (check.status !== 0 || check.json.version !== protocolVersion || check.json.ready !== true) {
 	throw new Error(`Native sandbox is not ready: ${check.stderr || check.stdout}`);
 }
 
@@ -27,8 +28,9 @@ try {
 	await writeFile(
 		requestFile,
 		JSON.stringify({
-			version: 1,
+			version: protocolVersion,
 			command,
+			shell: process.platform === "win32" ? process.env.ComSpec : "/bin/sh",
 			cwd: sandboxRoot,
 			sandboxRoot,
 			sourceRoot,
@@ -37,7 +39,12 @@ try {
 		}),
 	);
 	const execute = await invoke(["--native-sandbox", "execute", "--request", requestFile]);
-	if (execute.status !== 0 || execute.json.version !== 1 || execute.json.exit !== 0) {
+	if (
+		execute.status !== 0 ||
+		execute.json.version !== protocolVersion ||
+		execute.json.exit !== 0 ||
+		execute.json.isolated !== true
+	) {
 		throw new Error(`Native sandbox execution failed: ${execute.stderr || execute.stdout}`);
 	}
 	if (typeof execute.json.output !== "string" || !execute.json.output.includes("SOURCE_HIDDEN")) {

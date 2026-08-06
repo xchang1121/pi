@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { contains } from "./common.ts";
 import type { SandboxProcessRunner, SandboxProcessRunnerInput } from "./workspace-sandbox.ts";
 
-export const NATIVE_SANDBOX_PROTOCOL_VERSION = 1;
+export const NATIVE_SANDBOX_PROTOCOL_VERSION = 3;
 export const NATIVE_SANDBOX_DEFAULT_TIMEOUT_MS = 120_000;
 export const NATIVE_SANDBOX_DEFAULT_MAX_OUTPUT_BYTES = 1024 * 1024;
 
@@ -79,6 +79,7 @@ export interface NativeSandboxExecuteResponse {
 	readonly timeout: boolean;
 	readonly truncated: boolean;
 	readonly sandbox: string;
+	readonly isolated: boolean;
 }
 
 interface NativeSandboxCheckResponse {
@@ -121,6 +122,7 @@ export async function executeNativeSandbox(
 	const request = validateExecuteRequest({
 		version: NATIVE_SANDBOX_PROTOCOL_VERSION,
 		command: input.command,
+		...(input.shell ? { shell: input.shell } : {}),
 		cwd: path.resolve(input.cwd),
 		sandboxRoot: path.resolve(input.processRoot),
 		sourceRoot: path.resolve(input.sourceRoot),
@@ -143,6 +145,10 @@ export async function executeNativeSandbox(
 		}
 		const response = parseExecuteResponse(invocation.stdout);
 		assertProtocol(response.version);
+		if (!response.isolated) throw new Error("Native sandbox response did not attest process isolation.");
+		if (process.platform === "win32" && response.exit < 0) {
+			throw new Error(`Native sandbox process initialization failed with NTSTATUS ${windowsStatus(response.exit)}.`);
+		}
 		return response;
 	} finally {
 		await rm(requestDirectory, { recursive: true, force: true });
@@ -347,6 +353,7 @@ function validateExecuteRequest<
 		sourceRoot: string;
 		timeoutMs: number;
 		maxOutputBytes: number;
+		shell?: string;
 	},
 >(request: T): T {
 	if (request.version !== NATIVE_SANDBOX_PROTOCOL_VERSION) throw new Error("Unsupported native sandbox protocol.");
@@ -409,7 +416,8 @@ function parseExecuteResponse(value: string): NativeSandboxExecuteResponse {
 		!Number.isInteger(record.exit) ||
 		typeof record.timeout !== "boolean" ||
 		typeof record.truncated !== "boolean" ||
-		typeof record.sandbox !== "string"
+		typeof record.sandbox !== "string" ||
+		typeof record.isolated !== "boolean"
 	) {
 		throw new Error("Native sandbox execute response has an invalid shape.");
 	}
@@ -420,7 +428,12 @@ function parseExecuteResponse(value: string): NativeSandboxExecuteResponse {
 		timeout: record.timeout,
 		truncated: record.truncated,
 		sandbox: record.sandbox,
+		isolated: record.isolated,
 	};
+}
+
+function windowsStatus(value: number): string {
+	return `0x${(value >>> 0).toString(16).toUpperCase().padStart(8, "0")}`;
 }
 
 function parseJsonRecord(value: string, label: string): Record<string, unknown> {

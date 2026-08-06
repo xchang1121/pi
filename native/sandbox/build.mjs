@@ -5,7 +5,7 @@ import { chmod, copyFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-const PROTOCOL_VERSION = 1;
+const PROTOCOL_VERSION = 3;
 const crate = path.dirname(fileURLToPath(import.meta.url));
 const requested = parseArguments(process.argv.slice(2));
 const target = {

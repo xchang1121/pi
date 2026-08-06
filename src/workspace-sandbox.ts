@@ -5,6 +5,7 @@ import path from "node:path";
 import type { AgentTool, SettleToolCallResult } from "@earendil-works/pi-agent-core";
 import type { ActionKey } from "./common.ts";
 import { asRecord, contains, slash } from "./common.ts";
+import { ResourceVersionManager, type ResourceVersionToken } from "./resource-version.ts";
 
 export interface SandboxFileChange {
 	readonly root: string;
@@ -18,6 +19,17 @@ export interface SpeculativeSandboxExecution {
 	readonly output: SettleToolCallResult;
 	readonly changes: readonly SandboxFileChange[];
 	readonly sandbox: "git_worktree";
+	readonly setupMs?: number;
+	readonly changeCollectionMs?: number;
+	commitMetrics?: SandboxCommitMetrics;
+}
+
+export interface SandboxCommitMetrics {
+	readonly durationMs: number;
+	readonly validationMs: number;
+	readonly bytesValidated: number;
+	readonly filesValidated: number;
+	readonly filesCommitted: number;
 }
 
 export interface SpeculativeSandboxExecuteContext {
@@ -41,6 +53,7 @@ export interface SpeculativeAgentSandbox {
 
 export interface SandboxProcessRunnerInput {
 	readonly command: string;
+	readonly shell?: string;
 	readonly cwd: string;
 	/** Private parent mounted by native isolation; cwd must remain inside it. */
 	readonly processRoot: string;
@@ -57,6 +70,7 @@ export interface WorkspaceSandboxOptions {
 	 * a detached worktree alone is not a process security boundary.
 	 */
 	readonly processRunner?: SandboxProcessRunner;
+	readonly shell?: string;
 	readonly gitBinary?: string;
 }
 
@@ -69,9 +83,25 @@ export interface SandboxWorkspaceContext {
 interface PrivateGitWorkspace extends SandboxWorkspaceContext {
 	readonly repository: string;
 	readonly gitBinary: string;
+	readonly pool: PooledGitRepository;
+}
+
+interface PooledGitRepository {
+	readonly sourceRoot: string;
+	readonly parent: string;
+	readonly repository: string;
+	readonly gitBinary: string;
+	readonly versions: ResourceVersionManager;
+	commit?: string;
+	version?: ResourceVersionToken;
+	active: number;
+	lock: Promise<void>;
+	idleTimer?: ReturnType<typeof setTimeout>;
 }
 
 const SNAPSHOT_EXCLUDES = [".git", ".pi", "node_modules", "dist", ".next"] as const;
+const SANDBOX_REPOSITORY_IDLE_MS = 5 * 60 * 1000;
+const sandboxRepositories = new Map<string, Promise<PooledGitRepository>>();
 
 /** Create M4's private Git snapshot sandbox with transactional multi-file adoption. */
 export function createWorkspaceSandbox(options: WorkspaceSandboxOptions = {}): SpeculativeAgentSandbox {
@@ -83,7 +113,7 @@ export function createWorkspaceSandbox(options: WorkspaceSandboxOptions = {}): S
 				return executeMutation(context, options.gitBinary);
 			}
 			if (context.toolName === "bash" && options.processRunner) {
-				return executeBash(context, options.processRunner, options.gitBinary);
+				return executeBash(context, options.processRunner, options.gitBinary, options.shell);
 			}
 			throw new Error(`Sandbox does not support tool ${context.toolName}`);
 		},
@@ -92,6 +122,9 @@ export function createWorkspaceSandbox(options: WorkspaceSandboxOptions = {}): S
 }
 
 export async function commitSandboxExecution(execution: SpeculativeSandboxExecution): Promise<SettleToolCallResult> {
+	const started = performance.now();
+	const validationStarted = performance.now();
+	let bytesValidated = 0;
 	for (const change of execution.changes) {
 		const root = path.resolve(change.root);
 		const target = path.resolve(change.target);
@@ -100,10 +133,12 @@ export async function commitSandboxExecution(execution: SpeculativeSandboxExecut
 		}
 		await assertNoSymlinkPath(root, target);
 		const current = await readOptional(target);
+		bytesValidated += current?.byteLength ?? 0;
 		if (!sameOptionalBytes(current, change.before)) {
 			throw new Error(`resource changed before adoption: ${change.resource}`);
 		}
 	}
+	const validationMs = Math.max(0, performance.now() - validationStarted);
 
 	const applied: SandboxFileChange[] = [];
 	try {
@@ -121,6 +156,13 @@ export async function commitSandboxExecution(execution: SpeculativeSandboxExecut
 		}
 		throw error;
 	}
+	execution.commitMetrics = {
+		durationMs: Math.max(0, performance.now() - started),
+		validationMs,
+		bytesValidated,
+		filesValidated: execution.changes.length,
+		filesCommitted: execution.changes.length,
+	};
 	return execution.output;
 }
 
@@ -151,13 +193,17 @@ async function executeMutation(
 	await assertNoSymlinkPath(sourceRoot, target);
 	const resource = slash(path.relative(sourceRoot, target));
 	const requestedPath = args.path;
+	const setupStarted = performance.now();
 
 	return withPrivateGitWorkspace(sourceRoot, gitBinary ?? "git", async (workspace) => {
+		const setupMs = Math.max(0, performance.now() - setupStarted);
 		const sandboxTarget = path.resolve(workspace.sandboxRoot, resource);
 		await assertNoSymlinkPath(workspace.sandboxRoot, sandboxTarget);
 		const redirected = { ...args, path: sandboxTarget };
 		const result = await context.tool.execute(context.callID, redirected as never, context.signal);
+		const collectionStarted = performance.now();
 		const changes = await collectSandboxChanges(workspace);
+		const changeCollectionMs = Math.max(0, performance.now() - collectionStarted);
 		return {
 			output: {
 				result: replacePaths(result, [
@@ -168,6 +214,8 @@ async function executeMutation(
 			},
 			changes,
 			sandbox: "git_worktree",
+			setupMs,
+			changeCollectionMs,
 		};
 	});
 }
@@ -176,6 +224,7 @@ async function executeBash(
 	context: SpeculativeSandboxExecuteContext,
 	runner: SandboxProcessRunner,
 	gitBinary?: string,
+	shell?: string,
 ): Promise<SpeculativeSandboxExecution> {
 	const args = asRecord(context.args);
 	if (!args || typeof args.command !== "string") throw new Error("bash.command must be a string");
@@ -184,19 +233,26 @@ async function executeBash(
 	}
 	const sourceRoot = path.resolve(context.cwd);
 	const command = args.command;
+	const setupStarted = performance.now();
 	return withPrivateGitWorkspace(sourceRoot, gitBinary ?? "git", async (workspace) => {
+		const setupMs = Math.max(0, performance.now() - setupStarted);
 		const output = await runner({
 			command,
+			...(shell ? { shell } : {}),
 			cwd: workspace.sandboxRoot,
 			processRoot: workspace.processRoot,
 			sourceRoot,
 			...(typeof args.timeout === "number" ? { timeout: args.timeout } : {}),
 			signal: context.signal,
 		});
+		const collectionStarted = performance.now();
+		const changes = await collectSandboxChanges(workspace);
 		return {
 			output: replacePaths(output, [[workspace.sandboxRoot, sourceRoot]]),
-			changes: await collectSandboxChanges(workspace),
+			changes,
 			sandbox: "git_worktree",
+			setupMs,
+			changeCollectionMs: Math.max(0, performance.now() - collectionStarted),
 		};
 	});
 }
@@ -204,8 +260,9 @@ async function executeBash(
 async function createPrivateGitWorkspace(cwd: string, gitBinary: string): Promise<PrivateGitWorkspace> {
 	const sourceRoot = path.resolve(cwd);
 	await assertNoSymlinkPath(sourceRoot, sourceRoot);
-	const parent = await mkdtemp(path.join(os.tmpdir(), "pi-speculative-action-"));
-	const repository = path.join(parent, "snapshot.git");
+	const pool = await acquireSandboxRepository(sourceRoot, gitBinary);
+	const parent = await mkdtemp(path.join(pool.parent, "action-"));
+	const repository = pool.repository;
 	const sandboxRoot = path.join(parent, "workspace");
 	const authorEnvironment = {
 		GIT_AUTHOR_NAME: "Pi Speculative Action",
@@ -214,35 +271,239 @@ async function createPrivateGitWorkspace(cwd: string, gitBinary: string): Promis
 		GIT_COMMITTER_EMAIL: "speculative-action@localhost",
 	};
 	try {
+		const commit = await acquireSandboxBaseline(pool, authorEnvironment);
+		await git(gitBinary, ["--git-dir", repository, "worktree", "add", "--detach", sandboxRoot, commit], parent);
+		return { sourceRoot, sandboxRoot, processRoot: parent, repository, gitBinary, pool };
+	} catch (error) {
+		await rm(parent, { recursive: true, force: true });
+		releaseSandboxRepository(pool);
+		throw error;
+	}
+}
+
+async function acquireSandboxRepository(sourceRoot: string, gitBinary: string): Promise<PooledGitRepository> {
+	const key = `${pathKey(sourceRoot)}\0${gitBinary}`;
+	let pending = sandboxRepositories.get(key);
+	if (!pending) {
+		pending = createSandboxRepository(sourceRoot, gitBinary);
+		sandboxRepositories.set(key, pending);
+		void pending.catch(() => {
+			if (sandboxRepositories.get(key) === pending) sandboxRepositories.delete(key);
+		});
+	}
+	const repository = await pending;
+	if (repository.idleTimer) {
+		clearTimeout(repository.idleTimer);
+		repository.idleTimer = undefined;
+	}
+	repository.active++;
+	return repository;
+}
+
+async function createSandboxRepository(sourceRoot: string, gitBinary: string): Promise<PooledGitRepository> {
+	const parent = await mkdtemp(path.join(os.tmpdir(), "pi-speculative-action-pool-"));
+	const repository = path.join(parent, "snapshot.git");
+	try {
 		await git(gitBinary, ["init", "--bare", repository], parent);
 		await git(gitBinary, ["--git-dir", repository, "config", "core.autocrlf", "false"], parent);
-		const pathspecs = SNAPSHOT_EXCLUDES.flatMap((item) => [
-			`:(glob,exclude)**/${item}`,
-			`:(glob,exclude)**/${item}/**`,
-		]);
-		await git(
-			gitBinary,
-			["--git-dir", repository, "--work-tree", sourceRoot, "add", "-f", "-A", "--", ".", ...pathspecs],
+		await git(gitBinary, ["--git-dir", repository, "config", "core.longpaths", "true"], parent);
+		return {
 			sourceRoot,
-		);
-		const tree = (await git(gitBinary, ["--git-dir", repository, "write-tree"], parent)).toString("utf8").trim();
-		const commit = (
-			await git(
-				gitBinary,
-				["--git-dir", repository, "commit-tree", tree, "-m", "speculative baseline"],
-				parent,
-				authorEnvironment,
-			)
-		)
-			.toString("utf8")
-			.trim();
-		await git(gitBinary, ["--git-dir", repository, "update-ref", "refs/heads/baseline", commit], parent);
-		await git(gitBinary, ["--git-dir", repository, "worktree", "add", "--detach", sandboxRoot, commit], parent);
-		return { sourceRoot, sandboxRoot, processRoot: parent, repository, gitBinary };
+			parent,
+			repository,
+			gitBinary,
+			versions: new ResourceVersionManager(sourceRoot),
+			active: 0,
+			lock: Promise.resolve(),
+		};
 	} catch (error) {
 		await rm(parent, { recursive: true, force: true });
 		throw error;
 	}
+}
+
+async function acquireSandboxBaseline(
+	repository: PooledGitRepository,
+	authorEnvironment: Readonly<Record<string, string>>,
+): Promise<string> {
+	return withRepositoryLock(repository, async () => {
+		if (repository.commit && repository.version) {
+			const current = await repository.versions.validate(repository.version);
+			if (!current.expired) return repository.commit;
+		}
+		for (let attempt = 0; attempt < 3; attempt++) {
+			const version = await repository.versions.capture([{ path: repository.sourceRoot, scope: "tree_content" }]);
+			const changes = repository.version ? repository.versions.changesSince(repository.version) : undefined;
+			const changedPathspecs =
+				repository.commit && changes && !changes.uncertain
+					? incrementalPathspecs(repository.sourceRoot, changes.paths)
+					: undefined;
+			if (repository.commit && changedPathspecs) {
+				await git(
+					repository.gitBinary,
+					[
+						"--git-dir",
+						repository.repository,
+						"--work-tree",
+						repository.sourceRoot,
+						"read-tree",
+						repository.commit,
+					],
+					repository.sourceRoot,
+				);
+				if (changedPathspecs.length) {
+					await git(
+						repository.gitBinary,
+						[
+							"--git-dir",
+							repository.repository,
+							"--work-tree",
+							repository.sourceRoot,
+							"add",
+							"-f",
+							"-A",
+							"--",
+							...changedPathspecs,
+						],
+						repository.sourceRoot,
+					);
+				}
+			} else {
+				await git(
+					repository.gitBinary,
+					["--git-dir", repository.repository, "--work-tree", repository.sourceRoot, "read-tree", "--empty"],
+					repository.sourceRoot,
+				);
+				await git(
+					repository.gitBinary,
+					[
+						"--git-dir",
+						repository.repository,
+						"--work-tree",
+						repository.sourceRoot,
+						"add",
+						"-f",
+						"-A",
+						"--",
+						...snapshotPathspecs(),
+					],
+					repository.sourceRoot,
+				);
+			}
+			const tree = (
+				await git(
+					repository.gitBinary,
+					["--git-dir", repository.repository, "--work-tree", repository.sourceRoot, "write-tree"],
+					repository.sourceRoot,
+				)
+			)
+				.toString("utf8")
+				.trim();
+			if (repository.commit) {
+				const previousTree = (
+					await git(
+						repository.gitBinary,
+						["--git-dir", repository.repository, "show", "-s", "--format=%T", repository.commit],
+						repository.parent,
+					)
+				)
+					.toString("utf8")
+					.trim();
+				if (tree === previousTree) {
+					if ((await repository.versions.validate(version)).expired) continue;
+					repository.version = version;
+					return repository.commit;
+				}
+			}
+			const commit = (
+				await git(
+					repository.gitBinary,
+					[
+						"--git-dir",
+						repository.repository,
+						"commit-tree",
+						tree,
+						...(repository.commit ? ["-p", repository.commit] : []),
+						"-m",
+						"speculative baseline",
+					],
+					repository.parent,
+					authorEnvironment,
+				)
+			)
+				.toString("utf8")
+				.trim();
+			if ((await repository.versions.validate(version)).expired) continue;
+			await git(
+				repository.gitBinary,
+				["--git-dir", repository.repository, "update-ref", "refs/heads/baseline", commit],
+				repository.parent,
+			);
+			repository.commit = commit;
+			repository.version = version;
+			return commit;
+		}
+		throw new Error("workspace changed repeatedly while preparing sandbox baseline");
+	});
+}
+
+async function withRepositoryLock<T>(repository: PooledGitRepository, run: () => Promise<T>): Promise<T> {
+	const previous = repository.lock;
+	let release: () => void = () => {};
+	repository.lock = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	await previous;
+	try {
+		return await run();
+	} finally {
+		release();
+	}
+}
+
+function releaseSandboxRepository(repository: PooledGitRepository): void {
+	repository.active = Math.max(0, repository.active - 1);
+	if (repository.active > 0 || repository.idleTimer) return;
+	repository.idleTimer = setTimeout(() => {
+		if (repository.active > 0) return;
+		sandboxRepositories.delete(`${pathKey(repository.sourceRoot)}\0${repository.gitBinary}`);
+		repository.versions.close();
+		void rm(repository.parent, { recursive: true, force: true });
+	}, SANDBOX_REPOSITORY_IDLE_MS);
+	repository.idleTimer.unref?.();
+}
+
+export async function closeWorkspaceSandboxPools(): Promise<void> {
+	const pending = [...sandboxRepositories.values()];
+	sandboxRepositories.clear();
+	for (const item of pending) {
+		const repository = await item.catch(() => undefined);
+		if (!repository) continue;
+		if (repository.idleTimer) clearTimeout(repository.idleTimer);
+		repository.versions.close();
+		await rm(repository.parent, { recursive: true, force: true });
+	}
+}
+
+function incrementalPathspecs(root: string, changedPaths: readonly string[]): string[] | undefined {
+	const result = new Set<string>();
+	for (const changedPath of changedPaths) {
+		const relative = slash(path.relative(root, path.resolve(changedPath)) || ".");
+		if (relative === ".") return undefined;
+		if (relative === ".." || relative.startsWith("../") || path.isAbsolute(relative)) return undefined;
+		if (relative.split("/").some((segment) => (SNAPSHOT_EXCLUDES as readonly string[]).includes(segment))) continue;
+		result.add(relative);
+	}
+	return [...result].sort();
+}
+
+function snapshotPathspecs(): string[] {
+	return [".", ...SNAPSHOT_EXCLUDES.flatMap((item) => [`:(glob,exclude)**/${item}`, `:(glob,exclude)**/${item}/**`])];
+}
+
+function pathKey(value: string): string {
+	const normalized = path.resolve(value).replaceAll("\\", "/");
+	return process.platform === "win32" ? normalized.toLowerCase() : normalized;
 }
 
 async function withPrivateGitWorkspace<T>(
@@ -269,6 +530,7 @@ async function cleanupPrivateGitWorkspace(workspace: PrivateGitWorkspace): Promi
 		// The private parent removal below is the final cleanup boundary.
 	}
 	await rm(workspace.processRoot, { recursive: true, force: true });
+	releaseSandboxRepository(workspace.pool);
 }
 
 async function collectSandboxChanges(workspace: PrivateGitWorkspace): Promise<readonly SandboxFileChange[]> {

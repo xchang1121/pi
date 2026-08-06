@@ -3,6 +3,7 @@ use std::env;
 use std::ffi::{CString, OsStr};
 use std::fs;
 use std::io;
+use std::mem::size_of;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -45,6 +46,7 @@ fn probe_isolation() -> Result<()> {
     let response = execute(&ExecuteRequest {
         version: PROTOCOL_VERSION,
         command: "true".into(),
+        shell: None,
         cwd: sandbox.clone(),
         sandbox_root: sandbox,
         source_root: source,
@@ -92,6 +94,7 @@ pub fn execute(request: &ExecuteRequest) -> Result<ExecuteResponse> {
         timeout: outcome.timeout,
         truncated: outcome.truncated,
         sandbox: SANDBOX_KIND.into(),
+        isolated: true,
     })
 }
 
@@ -197,14 +200,17 @@ fn exec_command(request: &ExecuteRequest) -> Result<()> {
     environment.insert("TMP".into(), "/tmp".into());
     environment.insert("TEMP".into(), "/tmp".into());
 
-    let error = Command::new("/bin/sh")
-        .arg("-c")
-        .arg(&request.command)
+    let shell = request.shell.as_deref().unwrap_or("/bin/sh");
+    let error = Command::new(shell)
+        .args(crate::protocol::shell_arguments(
+            Path::new(shell),
+            &request.command,
+        ))
         .current_dir(&request.cwd)
         .env_clear()
         .envs(environment)
         .exec();
-    Err(error).context("exec /bin/sh")
+    Err(error).with_context(|| format!("exec sandbox shell {shell}"))
 }
 
 fn setup_filesystem(request: &ExecuteRequest, rootfs: &Path) -> Result<()> {
@@ -347,6 +353,9 @@ fn mount_tmpfs(target: &Path, mode: u32, size: &str) -> Result<()> {
 }
 
 fn remount_tree_read_only(rootfs: &Path, replaced: &[PathBuf]) -> Result<()> {
+    if recursive_read_only(rootfs).is_ok() {
+        return Ok(());
+    }
     let mountinfo = fs::read_to_string("/proc/self/mountinfo")?;
     let mut mounts = mountinfo
         .lines()
@@ -374,6 +383,43 @@ fn remount_tree_read_only(rootfs: &Path, replaced: &[PathBuf]) -> Result<()> {
         )?;
     }
     Ok(())
+}
+
+fn recursive_read_only(rootfs: &Path) -> Result<()> {
+    const AT_RECURSIVE: libc::c_uint = 0x8000;
+    const MOUNT_ATTR_RDONLY: u64 = 0x0000_0001;
+    #[repr(C)]
+    struct MountAttr {
+        attr_set: u64,
+        attr_clr: u64,
+        propagation: u64,
+        userns_fd: u64,
+    }
+    let attributes = MountAttr {
+        attr_set: MOUNT_ATTR_RDONLY,
+        attr_clr: 0,
+        propagation: 0,
+        userns_fd: 0,
+    };
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_mount_setattr,
+            libc::AT_FDCWD,
+            c_path(rootfs)?.as_ptr(),
+            AT_RECURSIVE,
+            &attributes as *const MountAttr,
+            size_of::<MountAttr>(),
+        )
+    };
+    if result < 0 {
+        Err(anyhow!(
+            "recursively remount {} read-only: {}",
+            rootfs.display(),
+            io::Error::last_os_error()
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 fn writable_mount_path(line: &str) -> Option<PathBuf> {
@@ -599,6 +645,7 @@ fn probe_namespaces() -> Result<()> {
                 "namespace probe",
             )
             .is_ok()
+            && probe_mount_isolation().is_ok()
         {
             0
         } else {
@@ -612,6 +659,30 @@ fn probe_namespaces() -> Result<()> {
     } else {
         bail!("kernel rejected unprivileged namespaces")
     }
+}
+
+fn probe_mount_isolation() -> Result<()> {
+    cvt(
+        unsafe {
+            libc::mount(
+                std::ptr::null(),
+                c_path(Path::new("/"))?.as_ptr(),
+                std::ptr::null(),
+                (libc::MS_REC | libc::MS_PRIVATE) as libc::c_ulong,
+                std::ptr::null(),
+            )
+        },
+        "make namespace probe mounts private",
+    )?;
+    let root = tempfile::tempdir().context("create namespace probe root")?;
+    let rootfs = root.path().join("rootfs");
+    fs::create_dir(&rootfs).context("create namespace probe mount point")?;
+    bind_mount(Path::new("/"), &rootfs, true)?;
+    let result = remount_tree_read_only(&rootfs, &[]);
+    unsafe {
+        libc::umount2(c_path(&rootfs)?.as_ptr(), libc::MNT_DETACH);
+    }
+    result
 }
 
 fn cvt(value: libc::c_int, operation: &str) -> Result<libc::c_int> {
@@ -643,7 +714,7 @@ mod tests {
     }
 
     #[test]
-    fn read_only_mounts_do_not_require_remounting() {
+    fn read_only_mounts_do_not_require_fallback_remounting() {
         let mountinfo = "1 0 0:1 / /tmp/root rw - ext4 /dev/root rw\n2 1 0:2 / /tmp/root/snap ro - squashfs snap ro\n";
         let writable = mountinfo
             .lines()

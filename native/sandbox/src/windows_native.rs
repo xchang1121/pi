@@ -48,7 +48,31 @@ pub fn execute(request: &ExecuteRequest) -> Result<ExecuteResponse> {
 }
 
 fn check_ready() -> Result<()> {
-    crate::appcontainer::AppContainer::open().map(|_| ())
+    crate::appcontainer::AppContainer::open()?;
+    let root = tempfile::tempdir().context("create native sandbox readiness workspace")?;
+    let source = root.path().join("source");
+    let sandbox = root.path().join("sandbox");
+    std::fs::create_dir(&source)?;
+    std::fs::create_dir(&sandbox)?;
+    let request = ExecuteRequest {
+        version: PROTOCOL_VERSION,
+        command: ">sandbox-ready.txt echo ready".into(),
+        shell: None,
+        cwd: sandbox.clone(),
+        sandbox_root: sandbox.clone(),
+        source_root: source,
+        timeout_ms: 10_000,
+        max_output_bytes: 16 * 1024,
+    };
+    let response = execute(&request).context("execute native sandbox readiness command")?;
+    if response.exit != 0 || !sandbox.join("sandbox-ready.txt").is_file() {
+        bail!(
+            "sandboxed external process probe failed with exit {}: {}",
+            response.exit,
+            response.output
+        );
+    }
+    Ok(())
 }
 
 fn set_workspace_access(request: &ExecuteRequest, sid: &str, enabled: bool) -> Result<()> {
@@ -139,6 +163,7 @@ fn execute_granted(request: &ExecuteRequest) -> Result<ExecuteResponse> {
         timeout: timed_out,
         truncated,
         sandbox: SANDBOX_KIND.into(),
+        isolated: true,
     })
 }
 
@@ -173,8 +198,8 @@ fn run_internal_inner(args: &[OsString]) -> Result<u32> {
         .tempdir_in(&request.sandbox_root)
         .context("create AppContainer temporary directory")?;
     std::env::set_current_dir(process_path(&request.cwd)).context("enter AppContainer cwd")?;
-    let command = command_processor()?;
-    let args = vec!["/d".into(), "/s".into(), "/c".into(), request.command];
+    let command = requested_shell(&request)?;
+    let args = sandbox_shell_arguments(&command, &request.command);
     let temporary_path = process_path(temporary.path());
     let environment = safe_environment_overlay(&temporary_path);
     let mut capabilities = appcontainer.security_capabilities();
@@ -213,6 +238,67 @@ fn command_processor() -> Result<PathBuf> {
     Ok(cmd)
 }
 
+fn requested_shell(request: &ExecuteRequest) -> Result<PathBuf> {
+    let Some(shell) = request.shell.as_deref() else {
+        return command_processor();
+    };
+    let requested = PathBuf::from(shell);
+    if requested.is_absolute() {
+        if requested.is_file() {
+            return Ok(requested);
+        }
+        bail!("configured shell not found: {}", requested.display());
+    }
+    let extensions = std::env::var_os("PATHEXT")
+        .map(|value| {
+            value
+                .to_string_lossy()
+                .split(';')
+                .filter(|item| !item.is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| vec![".COM".into(), ".EXE".into(), ".BAT".into(), ".CMD".into()]);
+    for directory in std::env::var_os("PATH")
+        .map(|value| std::env::split_paths(&value).collect::<Vec<_>>())
+        .unwrap_or_default()
+    {
+        let direct = directory.join(&requested);
+        if direct.is_file() {
+            return Ok(direct);
+        }
+        if requested.extension().is_some() {
+            continue;
+        }
+        for extension in &extensions {
+            let candidate = directory.join(format!("{shell}{extension}"));
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
+    }
+    bail!("configured shell not found on PATH: {shell}")
+}
+
+fn sandbox_shell_arguments(shell: &Path, command: &str) -> Vec<String> {
+    let name = shell
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if name != "powershell" && name != "pwsh" {
+        return crate::protocol::shell_arguments(shell, command);
+    }
+    let bootstrap = concat!(
+        "$__PiSandboxRoot=[Environment]::CurrentDirectory;",
+        "New-PSDrive -Name PiSandbox -PSProvider FileSystem ",
+        "-Root $__PiSandboxRoot -Scope Global | Out-Null;",
+        "Set-Location 'PiSandbox:\\';",
+        "Remove-Variable __PiSandboxRoot;"
+    );
+    crate::protocol::shell_arguments(shell, &format!("{bootstrap}{command}"))
+}
+
 fn safe_environment_overlay(temporary: &Path) -> Vec<(String, String)> {
     let mut environment = [
         "PATH",
@@ -220,6 +306,7 @@ fn safe_environment_overlay(temporary: &Path) -> Vec<(String, String)> {
         "SystemRoot",
         "WINDIR",
         "ComSpec",
+        "SystemDrive",
         "NUMBER_OF_PROCESSORS",
         "PROCESSOR_ARCHITECTURE",
         "PROCESSOR_IDENTIFIER",

@@ -7,6 +7,7 @@ export interface ActionKey {
 	readonly key: string;
 	readonly hash: string;
 	readonly tool: string;
+	readonly input: Readonly<Record<string, unknown>>;
 	readonly resources: readonly string[];
 	readonly execution: SpeculativeExecution;
 }
@@ -33,7 +34,9 @@ export const DEFAULTS = {
 	mode: "predict_action_single_step" as const,
 	maxCandidates: 8,
 	resourceCacheMaxEntries: 512,
+	resourceCacheMaxBytes: 256 * 1024 * 1024,
 	predictionTimeoutMs: 300_000,
+	adaptiveDrafter: true,
 	tools: {
 		resourceCached: ["read", "grep", "find"] as readonly string[],
 		sandbox: ["bash", "write", "edit"] as readonly string[],
@@ -79,8 +82,19 @@ export function buildActionKey(input: {
 		key,
 		hash: fastHash(key),
 		tool: input.tool,
+		input: structuredClone(input.input),
 		resources: input.resources,
 		execution: input.execution,
+	};
+}
+
+/** Normalize canonical inputs before they enter PatternAware learning and continuation. */
+export function patternAwareInput(action: ActionKey): Record<string, unknown> {
+	if (action.tool !== "read") return structuredClone(action.input) as Record<string, unknown>;
+	return {
+		...structuredClone(action.input),
+		offset: READ_DEFAULT_OFFSET,
+		limit: READ_DEFAULT_LIMIT,
 	};
 }
 

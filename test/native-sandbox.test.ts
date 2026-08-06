@@ -147,6 +147,7 @@ describe("M5 native sandbox broker", () => {
 				const response = await executeNativeSandbox(
 					{
 						command: "printf ok",
+						shell: "/bin/bash",
 						cwd,
 						processRoot,
 						sourceRoot,
@@ -160,8 +161,9 @@ describe("M5 native sandbox broker", () => {
 							requestFile = invocation.args.at(-1) ?? "";
 							const request = JSON.parse(await readFile(requestFile, "utf8")) as Record<string, unknown>;
 							expect(request).toEqual({
-								version: 1,
+								version: NATIVE_SANDBOX_PROTOCOL_VERSION,
 								command: "printf ok",
+								shell: "/bin/bash",
 								cwd,
 								sandboxRoot: processRoot,
 								sourceRoot,
@@ -209,6 +211,19 @@ describe("M5 native sandbox broker", () => {
 			} finally {
 				await rm(root, { recursive: true, force: true });
 			}
+		});
+	});
+
+	it("rejects a broker response that does not attest native isolation", async () => {
+		await withPlaceholderBinary(async (binaryPath) => {
+			const sourceRoot = path.join(os.tmpdir(), "pi-native-source");
+			const processRoot = path.join(os.tmpdir(), "pi-native-private");
+			await expect(
+				executeNativeSandbox(commandInput(sourceRoot, processRoot), {
+					binaryPath,
+					invoker: async () => invocationResult(executeResponse({ isolated: false })),
+				}),
+			).rejects.toThrow("did not attest process isolation");
 		});
 	});
 
@@ -307,7 +322,9 @@ function commandInput(sourceRoot: string, processRoot: string, cwd = processRoot
 
 function executeResponse(
 	overrides: Partial<
-		Record<"output" | "sandbox", string> & Record<"exit", number> & Record<"timeout" | "truncated", boolean>
+		Record<"output" | "sandbox", string> &
+			Record<"exit", number> &
+			Record<"timeout" | "truncated" | "isolated", boolean>
 	> = {},
 ) {
 	return {
@@ -317,6 +334,7 @@ function executeResponse(
 		timeout: false,
 		truncated: false,
 		sandbox: "workspace+native-test",
+		isolated: true,
 		...overrides,
 	};
 }

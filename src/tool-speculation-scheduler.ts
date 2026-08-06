@@ -13,6 +13,7 @@ export type SpeculativeResourceBudget = {
 export type SpeculativeSchedulingMetadata = {
 	readonly expectedDurationMs: number;
 	readonly expectedBenefitMs: number;
+	readonly overheadCostMs?: number;
 	readonly resource: SpeculativeResourceProfile;
 };
 
@@ -38,7 +39,7 @@ export class ToolSpeculationScheduler<Job extends object> {
 	): SpeculativeAdmission<Job> {
 		const normalized = normalizeMetadata(metadata);
 		const utility = expectedUtility(normalized);
-		if (normalized.expectedBenefitMs <= 0 || utility <= 0) {
+		if (utility <= 0) {
 			return { admitted: false, reason: "insufficient_expected_benefit" };
 		}
 		const budget = normalizeBudget(capacity);
@@ -79,17 +80,38 @@ export class ToolSpeculationScheduler<Job extends object> {
 		return this.running.delete(job);
 	}
 
-	preemptForAuthoritative(resource: SpeculativeResourceProfile): ReadonlyArray<Job> {
-		const required = normalizeUnits(resource.units);
+	preemptForAuthoritative(
+		resource: SpeculativeResourceProfile,
+		capacity?: number | SpeculativeResourceBudget,
+	): ReadonlyArray<Job> {
+		if (capacity === undefined) {
+			const required = normalizeUnits(resource.units);
+			const ordered = this.lowestUtility();
+			const conflicting = ordered.filter((entry) => conflicts(entry.metadata.resource, resource));
+			const fallback = ordered.filter((entry) => !conflicting.includes(entry));
+			const victims: SpeculativeSchedulerEntry<Job>[] = [];
+			let reclaimed = 0;
+			for (const entry of [...conflicting, ...fallback]) {
+				victims.push(entry);
+				reclaimed += entry.metadata.resource.units;
+				if (reclaimed >= required) break;
+			}
+			for (const victim of victims) this.running.delete(victim.job);
+			return victims.map((entry) => entry.job);
+		}
+		const requested = { class: resource.class, units: normalizeUnits(resource.units) };
+		const budget = normalizeBudget(capacity);
+		let remaining = [...this.running.values()];
+		if (fits(remaining, requested, budget)) return [];
 		const ordered = this.lowestUtility();
 		const conflicting = ordered.filter((entry) => conflicts(entry.metadata.resource, resource));
 		const fallback = ordered.filter((entry) => !conflicting.includes(entry));
 		const victims: SpeculativeSchedulerEntry<Job>[] = [];
-		let reclaimed = 0;
 		for (const entry of [...conflicting, ...fallback]) {
+			if (!helpsFit(remaining, entry, requested, budget)) continue;
 			victims.push(entry);
-			reclaimed += entry.metadata.resource.units;
-			if (reclaimed >= required) break;
+			remaining = remaining.filter((item) => item !== entry);
+			if (fits(remaining, requested, budget)) break;
 		}
 		for (const victim of victims) this.running.delete(victim.job);
 		return victims.map((entry) => entry.job);
@@ -128,7 +150,7 @@ export function speculativeResourceBudget(capacity: number): SpeculativeResource
 
 export function expectedUtility(metadata: SpeculativeSchedulingMetadata) {
 	const normalized = normalizeMetadata(metadata);
-	return normalized.expectedBenefitMs / normalized.resource.units;
+	return (normalized.expectedBenefitMs - (normalized.overheadCostMs ?? 0)) / normalized.resource.units;
 }
 
 export function resourceProfile(tool: string, execution: "resource_cached" | "sandbox"): SpeculativeResourceProfile {
@@ -140,9 +162,11 @@ export function resourceProfile(tool: string, execution: "resource_cached" | "sa
 function normalizeMetadata(metadata: SpeculativeSchedulingMetadata): SpeculativeSchedulingMetadata {
 	const expectedDurationMs = Math.max(0, finite(metadata.expectedDurationMs));
 	const expectedBenefitMs = Math.min(expectedDurationMs, Math.max(0, finite(metadata.expectedBenefitMs)));
+	const overheadCostMs = Math.max(0, finite(metadata.overheadCostMs ?? 0));
 	return {
 		expectedDurationMs,
 		expectedBenefitMs,
+		overheadCostMs,
 		resource: { class: metadata.resource.class, units: normalizeUnits(metadata.resource.units) },
 	};
 }

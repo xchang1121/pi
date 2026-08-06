@@ -11,6 +11,15 @@ describe("ToolSpeculationScheduler", () => {
 		expect(expectedUtility(metadata({ benefit: 80, units: 2 }))).toBe(40);
 	});
 
+	test("subtracts measured lifecycle overhead and rejects non-positive net utility", () => {
+		expect(expectedUtility({ ...metadata({ benefit: 80, units: 2 }), overheadCostMs: 20 })).toBe(30);
+		const scheduler = new ToolSpeculationScheduler<object>();
+		expect(scheduler.admit({}, { ...metadata({ benefit: 10 }), overheadCostMs: 10 }, 1)).toEqual({
+			admitted: false,
+			reason: "insufficient_expected_benefit",
+		});
+	});
+
 	test("preempts lower-utility speculative work when the budget is full", () => {
 		const scheduler = new ToolSpeculationScheduler<object>();
 		const low = {};
