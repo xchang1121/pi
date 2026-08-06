@@ -42,7 +42,7 @@ export type PatternAwareEvent = PatternAwareEventInput & {
 
 export type PatternAwarePath = ReadonlyArray<string | number>;
 
-export type PatternAwareBinding =
+export type PatternAwareBinding = (
 	| {
 			readonly type: "event";
 			readonly relativeEvent: number;
@@ -81,7 +81,10 @@ export type PatternAwareBinding =
 			readonly left: PatternAwareBinding;
 			readonly right: PatternAwareBinding;
 			readonly separator?: string;
-	  };
+	  }
+) & {
+	readonly variantCounts?: Readonly<Record<string, number>>;
+};
 
 export type PatternAwarePattern = {
 	readonly id: string;
@@ -425,6 +428,7 @@ export class PatternAwareStore {
 				readonly type: "tool_call" | "preparation_hint";
 				readonly input: Record<string, unknown>;
 				readonly missing: ReadonlyArray<PatternAwarePath>;
+				readonly variantProbability: number;
 			}>
 		>();
 		this.ensureIndex();
@@ -436,7 +440,7 @@ export class PatternAwareStore {
 			if (pattern.targetSchemaHash && schemaHashes[pattern.targetTool] !== pattern.targetSchemaHash) continue;
 			if (!matchesSuffix(predictiveHistory, pattern.context)) continue;
 			const context = predictiveHistory.slice(-pattern.context.length);
-			for (const applied of applyBindingsPartialVariants(pattern.bindings, context)) {
+			for (const applied of applyBindingsPartialWeightedVariants(pattern.bindings, context)) {
 				const type = applied.missing.length ? "preparation_hint" : "tool_call";
 				const identity = stableStringify({
 					type,
@@ -445,52 +449,95 @@ export class PatternAwareStore {
 					missing: applied.missing,
 				});
 				const group = groups.get(identity) ?? [];
-				group.push({ pattern, type, input: applied.input, missing: applied.missing });
+				group.push({
+					pattern,
+					type,
+					input: applied.input,
+					missing: applied.missing,
+					variantProbability: applied.probability,
+				});
 				groups.set(identity, group);
 			}
 		}
-		for (const group of groups.values()) {
-			const ordered = [...group].sort(
-				(left, right) =>
-					right.pattern.context.length - left.pattern.context.length ||
-					right.pattern.occurrences - left.pattern.occurrences,
-			);
-			const representative = ordered[0]!;
-			const horizon = learnedGroupHorizon(
-				ordered.map((item) => item.pattern),
-				this.settings,
-				this.clock,
-			);
-			const gapCoverage = groupGapCoverage(
-				ordered.map((item) => item.pattern),
-				horizon,
-				this.settings,
-				this.clock,
-			);
-			const conditionalProbability =
-				backoffProbability(
+		const predictions = [...groups.values()]
+			.map((group) => {
+				const ordered = [...group].sort(
+					(left, right) =>
+						right.pattern.context.length - left.pattern.context.length ||
+						right.pattern.occurrences - left.pattern.occurrences,
+				);
+				const representative = ordered[0]!;
+				const horizon = learnedGroupHorizon(
 					ordered.map((item) => item.pattern),
+					this.settings,
 					this.clock,
-					this.settings.decayHalfLifeEvents,
-				) * gapCoverage;
-			if (conditionalProbability < this.settings.minEmpiricalProbability) continue;
-			const empiricalProbability = Math.max(0, Math.min(1, continuation.pathProbability * conditionalProbability));
-			const totalWeight = ordered.reduce(
-				(total, item) =>
-					total +
-					Math.max(1, item.pattern.occurrences) *
-						recencyWeight(item.pattern.lastSeenSequence, this.clock, this.settings.decayHalfLifeEvents),
-				0,
-			);
-			const expectedDurationMs =
-				ordered.reduce(
+				);
+				const gapCoverage = groupGapCoverage(
+					ordered.map((item) => item.pattern),
+					horizon,
+					this.settings,
+					this.clock,
+				);
+				const controlProbability =
+					backoffProbability(
+						ordered.map((item) => item.pattern),
+						this.clock,
+						this.settings.decayHalfLifeEvents,
+					) * gapCoverage;
+				const totalWeight = ordered.reduce(
 					(total, item) =>
 						total +
-						Math.max(0, item.pattern.averageDurationMs) *
-							Math.max(1, item.pattern.occurrences) *
+						Math.max(1, item.pattern.occurrences) *
 							recencyWeight(item.pattern.lastSeenSequence, this.clock, this.settings.decayHalfLifeEvents),
 					0,
-				) / Math.max(1, totalWeight);
+				);
+				const variantProbability =
+					ordered.reduce(
+						(total, item) =>
+							total +
+							item.variantProbability *
+								Math.max(1, item.pattern.occurrences) *
+								recencyWeight(item.pattern.lastSeenSequence, this.clock, this.settings.decayHalfLifeEvents),
+						0,
+					) / Math.max(1, totalWeight);
+				const expectedDurationMs =
+					ordered.reduce(
+						(total, item) =>
+							total +
+							Math.max(0, item.pattern.averageDurationMs) *
+								Math.max(1, item.pattern.occurrences) *
+								recencyWeight(item.pattern.lastSeenSequence, this.clock, this.settings.decayHalfLifeEvents),
+						0,
+					) / Math.max(1, totalWeight);
+				return {
+					ordered,
+					representative,
+					horizon,
+					gapCoverage,
+					controlProbability,
+					variantProbability,
+					rawProbability: Math.max(0, controlProbability * variantProbability),
+					expectedDurationMs,
+				};
+			})
+			.filter((prediction) => prediction.controlProbability >= this.settings.minEmpiricalProbability);
+		const probabilityScale = Math.max(
+			1,
+			predictions.reduce((total, prediction) => total + prediction.rawProbability, 0),
+		);
+		for (const prediction of predictions) {
+			const {
+				ordered,
+				representative,
+				horizon,
+				gapCoverage,
+				controlProbability,
+				variantProbability,
+				rawProbability,
+				expectedDurationMs,
+			} = prediction;
+			const conditionalProbability = Math.max(0, Math.min(1, rawProbability / probabilityScale));
+			const empiricalProbability = Math.max(0, Math.min(1, continuation.pathProbability * conditionalProbability));
 			const nextContinuation: PatternAwareContinuation = {
 				history: predictiveHistory,
 				visitedPatternIDs: [...continuation.visitedPatternIDs, representative.pattern.id],
@@ -520,6 +567,8 @@ export class PatternAwareStore {
 						missing: representative.missing,
 						empiricalProbability,
 						conditionalProbability,
+						controlProbability,
+						variantProbability,
 						gapCoverage,
 						expectedDurationMs,
 						depth: nextContinuation.visitedPatternIDs.length,
@@ -612,7 +661,7 @@ export class PatternAwareStore {
 		const invalidated = inferred !== undefined && !bindingsMatchSample(inferred, pool.samples.at(-1)!);
 		if (!inferred || invalidated) {
 			if (!invalidated && pool.observations < (pool.nextInferenceAt ?? this.settings.minOccurrences)) return;
-			inferred = inferBindingsFromSamples(pool.samples);
+			inferred = inferBindingsFromSamples(pool.samples, Math.max(4, this.settings.minOccurrences * 2));
 			pool.inferred = inferred;
 			if (!inferred) {
 				pool.inferenceBackoff = Math.min(8, Math.max(2, (pool.inferenceBackoff ?? 1) * 2));
@@ -633,12 +682,13 @@ export class PatternAwareStore {
 			stableStringify({
 				context: signatures,
 				targetTool: target.tool,
-				bindings: inferred,
+				bindings: bindingMapStructure(inferred),
 				targetSchemaHash: target.schemaHash,
 			}),
 		);
 		const existing = this.patterns.get(id);
 		if (existing) {
+			existing.bindings = inferred;
 			existing.occurrences = pool.samples.length;
 			existing.replayMatches = replayMatches;
 			existing.historicalOpportunities = Math.max(existing.historicalOpportunities, pool.samples.length);
@@ -943,6 +993,7 @@ export function inferBindings(
 
 function inferBindingsFromSamples(
 	samples: ReadonlyArray<PatternSample>,
+	constantSupport = 4,
 ): Record<string, PatternAwareBinding> | undefined {
 	const first = samples[0];
 	if (!first) return;
@@ -950,7 +1001,8 @@ function inferBindingsFromSamples(
 	for (const [targetPath, firstTarget] of leaves(first.target.input)) {
 		const targets = samples.map((sample) => getPath(sample.target.input, targetPath));
 		if (targets.some((value) => value === MISSING)) return;
-		if (targets.every((value) => sameValue(value, firstTarget))) {
+		const constant = targets.every((value) => sameValue(value, firstTarget));
+		if (constant && !requiresProvenance(targetPath, firstTarget)) {
 			bindings[encodePath(targetPath)] = { type: "constant", value: firstTarget };
 			continue;
 		}
@@ -978,10 +1030,60 @@ function inferBindingsFromSamples(
 					selected = fallback;
 			}
 		}
+		if (selected) selected = withObservedVariantCounts(selected, samples, targets);
+		if (!selected && constant && stablePayloadConstant(samples, constantSupport)) {
+			selected = { type: "constant", value: firstTarget };
+		}
 		if (!selected) return;
 		bindings[encodePath(targetPath)] = selected;
 	}
 	return bindings;
+}
+
+function withObservedVariantCounts(
+	binding: PatternAwareBinding,
+	samples: ReadonlyArray<PatternSample>,
+	targets: ReadonlyArray<unknown>,
+): PatternAwareBinding {
+	const counts = new Map<number, number>();
+	let width = 1;
+	for (const [index, sample] of samples.entries()) {
+		const values = bindingValues(binding, sample.context);
+		width = Math.max(width, values.length);
+		const selected = values.findIndex((value) => sameValue(value, targets[index]));
+		if (selected >= 0) counts.set(selected, (counts.get(selected) ?? 0) + 1);
+	}
+	if (width <= 1 || counts.size === 0) return binding;
+	return {
+		...binding,
+		variantCounts: Object.fromEntries([...counts.entries()].map(([index, count]) => [String(index), count])),
+	};
+}
+
+function requiresProvenance(targetPath: PatternAwarePath, value: unknown): boolean {
+	const key = String(targetPath.at(-1) ?? "")
+		.toLowerCase()
+		.replaceAll("_", "");
+	if (isPathField(key)) return true;
+	if (typeof value !== "string") return false;
+	return [
+		"command",
+		"content",
+		"newstring",
+		"oldstring",
+		"patch",
+		"pattern",
+		"query",
+		"replacement",
+		"script",
+		"text",
+		"url",
+	].some((name) => key === name || key.endsWith(name));
+}
+
+function stablePayloadConstant(samples: ReadonlyArray<PatternSample>, minimum: number): boolean {
+	if (samples.length < minimum) return false;
+	return new Set(samples.map((sample) => `${sample.target.sessionID}:${sample.target.turnID}`)).size >= minimum;
 }
 
 function bindingsMatchSample(bindings: Readonly<Record<string, PatternAwareBinding>>, sample: PatternSample) {
@@ -997,24 +1099,9 @@ export function applyBindingsVariants(
 	context: ReadonlyArray<PatternAwareEvent>,
 	limit = MAX_BINDING_VARIANTS,
 ): ReadonlyArray<Record<string, unknown>> {
-	let variants: Record<string, unknown>[] = [{}];
-	for (const [encoded, binding] of Object.entries(bindings)) {
-		const values = bindingValues(binding, context);
-		if (!values.length) return [];
-		const targetPath = decodePath(encoded);
-		const next: Record<string, unknown>[] = [];
-		for (const variant of variants) {
-			for (const value of values) {
-				const candidate = structuredClone(variant);
-				if (setPath(candidate, targetPath, value)) next.push(candidate);
-				if (next.length >= limit) break;
-			}
-			if (next.length >= limit) break;
-		}
-		variants = next;
-		if (!variants.length) return [];
-	}
-	return variants;
+	return applyBindingsPartialWeightedVariants(bindings, context, limit)
+		.filter((variant) => variant.missing.length === 0)
+		.map((variant) => variant.input);
 }
 
 export function applyBindings(
@@ -1036,27 +1123,68 @@ export function applyBindingsPartialVariants(
 	context: ReadonlyArray<PatternAwareEvent>,
 	limit = MAX_BINDING_VARIANTS,
 ): ReadonlyArray<{ readonly input: Record<string, unknown>; readonly missing: ReadonlyArray<PatternAwarePath> }> {
-	let variants: Array<{ input: Record<string, unknown>; missing: PatternAwarePath[] }> = [{ input: {}, missing: [] }];
+	return applyBindingsPartialWeightedVariants(bindings, context, limit).map(({ input, missing }) => ({
+		input,
+		missing,
+	}));
+}
+
+function applyBindingsPartialWeightedVariants(
+	bindings: Readonly<Record<string, PatternAwareBinding>>,
+	context: ReadonlyArray<PatternAwareEvent>,
+	limit = MAX_BINDING_VARIANTS,
+): ReadonlyArray<{
+	readonly input: Record<string, unknown>;
+	readonly missing: ReadonlyArray<PatternAwarePath>;
+	readonly probability: number;
+}> {
+	let variants: Array<{ input: Record<string, unknown>; missing: PatternAwarePath[]; probability: number }> = [
+		{ input: {}, missing: [], probability: 1 },
+	];
 	for (const [encoded, binding] of Object.entries(bindings)) {
 		const targetPath = decodePath(encoded);
-		const values = bindingValues(binding, context);
+		const values = weightedBindingValues(binding, context);
 		if (!values.length) {
 			for (const variant of variants) variant.missing.push(targetPath);
 			continue;
 		}
-		const next: Array<{ input: Record<string, unknown>; missing: PatternAwarePath[] }> = [];
+		const next: Array<{ input: Record<string, unknown>; missing: PatternAwarePath[]; probability: number }> = [];
 		for (const variant of variants) {
 			for (const value of values) {
-				const candidate = { input: structuredClone(variant.input), missing: [...variant.missing] };
-				if (!setPath(candidate.input, targetPath, value)) candidate.missing.push(targetPath);
+				const candidate = {
+					input: structuredClone(variant.input),
+					missing: [...variant.missing],
+					probability: variant.probability * value.probability,
+				};
+				if (!setPath(candidate.input, targetPath, value.value)) candidate.missing.push(targetPath);
 				next.push(candidate);
-				if (next.length >= limit) break;
 			}
-			if (next.length >= limit) break;
 		}
-		variants = next;
+		variants = next.sort((left, right) => right.probability - left.probability).slice(0, limit);
 	}
 	return variants;
+}
+
+function weightedBindingValues(binding: PatternAwareBinding, context: ReadonlyArray<PatternAwareEvent>) {
+	const values = bindingValues(binding, context);
+	if (values.length <= 1) return values.map((value) => ({ value, probability: 1 }));
+	const counts = binding.variantCounts;
+	if (!counts) {
+		const probability = 1 / values.length;
+		return values.map((value) => ({ value, probability }));
+	}
+	const smoothing = 0.5;
+	const total = values.reduce<number>((sum, _, index) => sum + variantCount(counts, index), 0);
+	const denominator = total + smoothing * values.length;
+	return values.map((value, index) => ({
+		value,
+		probability: (variantCount(counts, index) + smoothing) / denominator,
+	}));
+}
+
+function variantCount(counts: Readonly<Record<string, number>>, index: number): number {
+	const value = counts[String(index)];
+	return typeof value === "number" && Number.isFinite(value) ? Math.max(0, value) : 0;
 }
 
 function findBinding(
@@ -1379,7 +1507,7 @@ function uniqueComposable(
 ) {
 	const seen = new Set<string>();
 	return values.filter((item) => {
-		const key = stableStringify(item.binding);
+		const key = stableStringify(bindingStructure(item.binding));
 		if (seen.has(key)) return false;
 		seen.add(key);
 		return true;
@@ -1389,11 +1517,26 @@ function uniqueComposable(
 function uniqueBindings(bindings: ReadonlyArray<PatternAwareBinding>) {
 	const seen = new Set<string>();
 	return bindings.filter((binding) => {
-		const key = stableStringify(binding);
+		const key = stableStringify(bindingStructure(binding));
 		if (seen.has(key)) return false;
 		seen.add(key);
 		return true;
 	});
+}
+
+function bindingMapStructure(bindings: Readonly<Record<string, PatternAwareBinding>>) {
+	return Object.fromEntries(Object.entries(bindings).map(([key, binding]) => [key, bindingStructure(binding)]));
+}
+
+function bindingStructure(value: unknown): unknown {
+	if (Array.isArray(value)) return value.map(bindingStructure);
+	const record = asRecord(value);
+	if (!record) return value;
+	return Object.fromEntries(
+		Object.entries(record)
+			.filter(([key]) => key !== "variantCounts")
+			.map(([key, item]) => [key, bindingStructure(item)]),
+	);
 }
 
 function isPathSource(field: "input" | "output" | "outputPaths", sourcePath: PatternAwarePath, value: string) {

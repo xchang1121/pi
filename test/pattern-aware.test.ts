@@ -439,6 +439,178 @@ describe("PatternAware", () => {
 		expect(paths).toContain("src/f.ts");
 	});
 
+	test("normalizes competing successors without filtering valid branches", () => {
+		const store = new PatternAwareStore(settings());
+		expect(
+			store.registerValidatedPattern(
+				validatedGapPattern(
+					{ "0": 10 },
+					{
+						id: "read-source",
+						bindings: { '["path"]': { type: "constant", value: "src/source.ts" } },
+					},
+				),
+			),
+		).toBe(true);
+		expect(
+			store.registerValidatedPattern(
+				validatedGapPattern(
+					{ "0": 10 },
+					{
+						id: "read-test",
+						bindings: { '["path"]': { type: "constant", value: "test/source.test.ts" } },
+					},
+				),
+			),
+		).toBe(true);
+
+		store.observe(input({ sessionID: "probe", tool: "grep", input: { pattern: "source" } }));
+		const candidates = store.predict("probe").filter((item) => item.tool === "read");
+
+		expect(candidates).toHaveLength(2);
+		expect(candidates.reduce((sum, item) => sum + item.conditionalProbability, 0)).toBeCloseTo(1);
+		expect(candidates.every((item) => item.conditionalProbability < 0.75)).toBe(true);
+	});
+
+	test("allocates collection variants by observed actor choice frequency", () => {
+		const store = new PatternAwareStore(settings());
+		expect(
+			store.registerValidatedPattern(
+				validatedGapPattern(
+					{ "0": 10 },
+					{
+						id: "ranked-results",
+						bindings: {
+							'["filePath"]': {
+								type: "each",
+								relativeEvent: -1,
+								field: "output",
+								path: ["results"],
+								itemPath: ["path"],
+								variantCounts: { "0": 9, "1": 1 },
+							},
+						},
+					},
+				),
+			),
+		).toBe(true);
+
+		store.observe(
+			input({
+				sessionID: "probe",
+				tool: "grep",
+				input: { pattern: "source" },
+				output: { results: [{ path: "src/likely.ts" }, { path: "src/unlikely.ts" }] },
+			}),
+		);
+		const candidates = store.predict("probe").filter((item) => item.tool === "read");
+		const likely = candidates.find((item) => item.input.filePath === "src/likely.ts");
+		const unlikely = candidates.find((item) => item.input.filePath === "src/unlikely.ts");
+
+		expect(likely?.conditionalProbability).toBeGreaterThan(unlikely?.conditionalProbability ?? 1);
+		expect(candidates.reduce((sum, item) => sum + item.conditionalProbability, 0)).toBeLessThanOrEqual(1);
+	});
+
+	test("updates ranked variant evidence without changing the structural pattern identity", async () => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "pi-pattern-ranked-identity-"));
+		temporary.push(directory);
+		const file = path.join(directory, "patterns.json");
+		const first = new PatternAwareStore(settings(), file);
+		await first.load();
+		trainResultReads(first, "one", ["src/a.ts", "src/b.ts"], ["src/a.ts"]);
+		first.finishSession("one");
+		trainResultReads(first, "two", ["src/c.ts", "src/d.ts"], ["src/d.ts"]);
+		first.finishSession("two");
+		const initial = first
+			.snapshot()
+			.find((pattern) => pattern.targetTool === "read" && pattern.bindings['["filePath"]']?.type === "each");
+		expect(initial).toBeDefined();
+		await first.flush();
+
+		const second = new PatternAwareStore(settings(), file);
+		await second.load();
+		trainResultReads(second, "three", ["src/e.ts", "src/f.ts"], ["src/f.ts"]);
+		second.finishSession("three");
+		const ranked = second
+			.snapshot()
+			.filter((pattern) => pattern.targetTool === "read" && pattern.bindings['["filePath"]']?.type === "each");
+
+		expect(ranked).toHaveLength(1);
+		expect(ranked[0]?.id).toBe(initial?.id);
+		expect(ranked[0]?.bindings['["filePath"]']?.variantCounts).toEqual({ "0": 1, "1": 2 });
+	});
+
+	test("contains non-finite persisted variant counts instead of emitting invalid probabilities", async () => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "pi-pattern-invalid-variants-"));
+		temporary.push(directory);
+		const file = path.join(directory, "patterns.json");
+		const first = new PatternAwareStore(settings(), file);
+		await first.load();
+		expect(
+			first.registerValidatedPattern(
+				validatedGapPattern(
+					{ "0": 10 },
+					{
+						id: "invalid-ranked-results",
+						bindings: {
+							'["filePath"]': {
+								type: "each",
+								relativeEvent: -1,
+								field: "output",
+								path: ["results"],
+								itemPath: ["path"],
+								variantCounts: { "0": Number.NaN, "1": Number.POSITIVE_INFINITY },
+							},
+						},
+					},
+				),
+			),
+		).toBe(true);
+		await first.flush();
+		const store = new PatternAwareStore(settings(), file);
+		await store.load();
+		store.observe(
+			input({
+				sessionID: "probe-invalid-counts",
+				tool: "grep",
+				input: {},
+				output: { results: [{ path: "src/a.ts" }, { path: "src/b.ts" }] },
+			}),
+		);
+
+		const probabilities = store
+			.predict("probe-invalid-counts")
+			.filter((item) => item.tool === "read")
+			.map((item) => item.conditionalProbability);
+		expect(probabilities).toHaveLength(2);
+		expect(probabilities.every(Number.isFinite)).toBe(true);
+		expect(probabilities.reduce((sum, value) => sum + value, 0)).toBeLessThanOrEqual(1);
+	});
+
+	test("requires cross-turn evidence before memorizing resource payload constants", () => {
+		const store = new PatternAwareStore(settings());
+		for (const sessionID of ["one", "two"]) {
+			store.observe(input({ sessionID, tool: "inspect", input: {}, output: { kind: "path" } }));
+			store.observe(input({ sessionID, tool: "read", input: { filePath: "README.md" } }));
+			store.finishSession(sessionID);
+		}
+
+		store.observe(input({ sessionID: "early", tool: "inspect", input: {}, output: { kind: "path" } }));
+		expect(store.predict("early").some((item) => item.tool === "read")).toBe(false);
+		store.finishSession("early");
+
+		for (const sessionID of ["three", "four"]) {
+			store.observe(input({ sessionID, tool: "inspect", input: {}, output: { kind: "path" } }));
+			store.observe(input({ sessionID, tool: "read", input: { filePath: "README.md" } }));
+			store.finishSession(sessionID);
+		}
+
+		store.observe(input({ sessionID: "stable", tool: "inspect", input: {}, output: { kind: "path" } }));
+		expect(store.predict("stable")).toContainEqual(
+			expect.objectContaining({ tool: "read", input: { filePath: "README.md" } }),
+		);
+	});
+
 	test("learns a reusable read range from varying actor windows", () => {
 		const store = new PatternAwareStore(settings());
 		for (const [sessionID, filePath, offset, limit] of [
