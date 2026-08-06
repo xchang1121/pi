@@ -113,7 +113,7 @@ export interface SpeculativeCandidate {
 	readonly reuse: SpeculativeJobReuse;
 	run: SpeculativeJobRun<unknown>;
 	resourceVersion?: unknown;
-	releaseResourceWatch?: () => void;
+	releaseResourceVersion?: () => void;
 	resourceCaptureMs?: number;
 	resourceCaptureBytes?: number;
 	resourceCaptureFiles?: number;
@@ -374,6 +374,7 @@ export interface SpeculativeActionRuntimeAdapter<
 		readonly callID: string;
 		readonly index: number;
 	}) => MaybePromise<unknown>;
+	readonly releaseResourceVersion?: (version: unknown) => void;
 	readonly isResourceExpired?: (input: {
 		readonly stateData: StateData;
 		readonly consumeInput?: ConsumeInput;
@@ -457,6 +458,7 @@ export interface SpeculativeActionRuntime<SessionID, Output, StartInput, Consume
 	readonly actual: (input: ConsumeInput & { readonly durationMs: number; readonly output?: Output }) => Promise<void>;
 	readonly finishTurn: (input: FinishInput) => Promise<void>;
 	readonly settingsChanged: (settings: SpeculativeActionSettings) => Promise<void>;
+	readonly releaseSession: (sessionID: SessionID) => Promise<void>;
 	readonly disposeSession: (sessionID: SessionID) => Promise<void>;
 	readonly dispose: () => Promise<void>;
 	readonly inspect: (sessionID?: SessionID) => SpeculativeRuntimeInspection;
@@ -876,17 +878,17 @@ export function makeSpeculativeActionRuntime<
 		const key = persistentKey(state.sessionID, candidate.key);
 		if (persistentCandidates.get(key) !== candidate) return false;
 		const removed = persistentCandidates.delete(key);
-		if (removed) releaseResourceWatch(candidate);
+		if (removed) releaseCandidateResourceVersion(candidate);
 		return removed;
 	};
 
-	const releaseResourceWatch = (candidate: RuntimeCandidate<Output>): void => {
-		const release = candidate.releaseResourceWatch;
-		candidate.releaseResourceWatch = undefined;
+	const releaseCandidateResourceVersion = (candidate: RuntimeCandidate<Output>): void => {
+		const release = candidate.releaseResourceVersion;
+		candidate.releaseResourceVersion = undefined;
 		try {
 			release?.();
 		} catch {
-			// Watch cleanup must not alter actor semantics.
+			// Resource cleanup must not alter actor semantics.
 		}
 	};
 
@@ -919,7 +921,7 @@ export function makeSpeculativeActionRuntime<
 			);
 			if (!victim) break;
 			persistentCandidates.delete(victim[0]);
-			releaseResourceWatch(victim[1]);
+			releaseCandidateResourceVersion(victim[1]);
 			evicted.push(victim[1]);
 		}
 		return evicted;
@@ -1002,7 +1004,7 @@ export function makeSpeculativeActionRuntime<
 		schedulerFor(state.sessionID).discard(candidate);
 		if (state.candidates.get(candidate.key.key) === candidate) state.candidates.delete(candidate.key.key);
 		removePersistentCandidate(state, candidate);
-		releaseResourceWatch(candidate);
+		releaseCandidateResourceVersion(candidate);
 		candidate.controller.abort();
 		candidate.execution.resolve({ ok: false, error: new Error(reason) });
 		if (publish) await publishCancelled(state, candidate, reason);
@@ -1013,18 +1015,19 @@ export function makeSpeculativeActionRuntime<
 		candidate: RuntimeCandidate<Output>,
 		reason = "scheduler_preempted",
 		outcome: "preempted" | "discarded" = "preempted",
+		publish = true,
 	): Promise<void> => {
 		const owner = candidateOwners.get(candidate);
 		if (!owner) {
 			candidate.schedulerOutcome = outcome;
 			candidate.run = { status: "closed", reason };
-			releaseResourceWatch(candidate);
+			releaseCandidateResourceVersion(candidate);
 			candidate.controller.abort();
 			candidate.execution.resolve({ ok: false, error: new Error(reason) });
 			return;
 		}
-		await closeCandidate(owner, candidate, reason, "invalidated", true, outcome);
-		await publishCache(owner);
+		await closeCandidate(owner, candidate, reason, "invalidated", publish, outcome);
+		if (publish) await publishCache(owner);
 	};
 
 	const preemptForAuthoritative = async (
@@ -1039,7 +1042,11 @@ export function makeSpeculativeActionRuntime<
 		}
 	};
 
-	const disableSession = async (sessionID: SessionID, reason = "speculative_action_disabled"): Promise<void> => {
+	const disableSession = async (
+		sessionID: SessionID,
+		reason = "speculative_action_disabled",
+		publish = true,
+	): Promise<void> => {
 		const candidates = new Set<RuntimeCandidate<Output>>(sessionPersistentCandidates(sessionID));
 		for (const [key, state] of turns) {
 			if (state.sessionID !== sessionID) continue;
@@ -1049,7 +1056,7 @@ export function makeSpeculativeActionRuntime<
 			for (const candidate of state.candidates.values()) candidates.add(candidate);
 			turns.delete(key);
 		}
-		for (const candidate of candidates) await preemptCandidate(candidate, reason, "discarded");
+		for (const candidate of candidates) await preemptCandidate(candidate, reason, "discarded", publish);
 		drafterBackoff.delete(sessionID);
 		if (!schedulerFor(sessionID).snapshot().length) schedulers.delete(sessionID);
 	};
@@ -1064,6 +1071,15 @@ export function makeSpeculativeActionRuntime<
 			if (owner) sessions.add(owner.sessionID);
 		}
 		await Promise.all([...sessions].map((sessionID) => disableSession(sessionID)));
+	};
+
+	const releaseSession = async (sessionID: SessionID): Promise<void> => {
+		await disableSession(sessionID, "session_deleted", false);
+		tokenTotals.delete(sessionID);
+		wallTimes.delete(sessionID);
+		actionSequences.delete(sessionID);
+		schedulers.delete(sessionID);
+		drafterBackoff.delete(sessionID);
 	};
 
 	const reconcilePersistentCandidates = async (state: TurnState<SessionID, Output, StateData>): Promise<void> => {
@@ -1540,14 +1556,18 @@ export function makeSpeculativeActionRuntime<
 								index,
 							});
 							candidate.resourceVersion = captured;
+							candidate.releaseResourceVersion = () => {
+								adapter.releaseResourceVersion?.(captured);
+							};
 							Object.assign(candidate, resourceCaptureMetrics(captured));
 						} catch (error) {
 							throw new SpeculativeJobError("resource_capture_failed", error);
 						}
 					}
 					if (action.execution === "resource_cached" && adapter.watchResourceVersion) {
+						let releaseWatch: (() => void) | undefined;
 						try {
-							candidate.releaseResourceWatch = await adapter.watchResourceVersion({
+							releaseWatch = await adapter.watchResourceVersion({
 								stateData: state.data,
 								action,
 								candidate,
@@ -1559,9 +1579,12 @@ export function makeSpeculativeActionRuntime<
 									);
 								},
 							});
-						} catch {
-							candidate.releaseResourceWatch = undefined;
-						}
+						} catch {}
+						const releaseVersion = candidate.releaseResourceVersion;
+						candidate.releaseResourceVersion = () => {
+							releaseWatch?.();
+							releaseVersion?.();
+						};
 					}
 					if (candidate.run.status === "closed") {
 						throw new SpeculativeJobError(candidate.run.reason, new Error(`speculative ${candidate.run.reason}`));
@@ -1639,7 +1662,7 @@ export function makeSpeculativeActionRuntime<
 						}
 						if (state.candidates.get(candidate.key.key) === candidate) state.candidates.delete(candidate.key.key);
 						removePersistentCandidate(state, candidate);
-						releaseResourceWatch(candidate);
+						releaseCandidateResourceVersion(candidate);
 						await publishCancelled(state, candidate, reason, errorDetail(error));
 						await publishCache(state);
 						candidate.execution.resolve({ ok: false, error });
@@ -2102,7 +2125,7 @@ export function makeSpeculativeActionRuntime<
 				schedulerFor(state.sessionID).discard(candidate);
 				if (state.candidates.get(candidate.key.key) === candidate) state.candidates.delete(candidate.key.key);
 				removePersistentCandidate(state, candidate);
-				releaseResourceWatch(candidate);
+				releaseCandidateResourceVersion(candidate);
 			}
 			if ((candidate.commitValidationFiles ?? 0) > 0) {
 				await invalidateChangedResources(state, actual, candidate);
@@ -2325,7 +2348,7 @@ export function makeSpeculativeActionRuntime<
 		};
 	};
 
-	return { startTurn, consume, actual, finishTurn, settingsChanged, disposeSession, dispose, inspect };
+	return { startTurn, consume, actual, finishTurn, settingsChanged, releaseSession, disposeSession, dispose, inspect };
 }
 
 export function candidateToolNames(settings: SpeculativeActionSettings): readonly string[] {

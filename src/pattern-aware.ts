@@ -817,23 +817,57 @@ export class PatternAwareStore {
 	}
 }
 
-const stores = new Map<string, Promise<PatternAwareStore>>();
+type PooledPatternAwareStore = {
+	readonly store: Promise<PatternAwareStore>;
+	references: number;
+};
 
-export function openPatternAwareStore(workspace: string, settings: PatternAwareSettings, stateDirectory?: string) {
+export type PatternAwareStoreLease = {
+	readonly store: PatternAwareStore;
+	readonly release: () => Promise<void>;
+};
+
+const stores = new Map<string, PooledPatternAwareStore>();
+
+export async function acquirePatternAwareStore(
+	workspace: string,
+	settings: PatternAwareSettings,
+	stateDirectory?: string,
+): Promise<PatternAwareStoreLease> {
 	const file = patternAwarePersistenceFile(workspace, stateDirectory);
-	const existing = stores.get(file);
-	if (existing) {
-		return existing.then((store) => {
-			store.configure(settings);
-			return store;
+	let pooled = stores.get(file);
+	if (!pooled) {
+		const store = Promise.resolve(new PatternAwareStore(settings, file)).then(async (value) => {
+			await value.load();
+			return value;
 		});
+		pooled = { store, references: 0 };
+		stores.set(file, pooled);
 	}
-	const opened = Promise.resolve(new PatternAwareStore(settings, file)).then(async (store) => {
-		await store.load();
-		return store;
-	});
-	stores.set(file, opened);
-	return opened;
+	pooled.references++;
+	let store: PatternAwareStore;
+	try {
+		store = await pooled.store;
+	} catch (error) {
+		pooled.references--;
+		if (pooled.references === 0 && stores.get(file) === pooled) stores.delete(file);
+		throw error;
+	}
+	store.configure(settings);
+	let released = false;
+	return {
+		store,
+		release: async () => {
+			if (released) return;
+			released = true;
+			pooled.references = Math.max(0, pooled.references - 1);
+			try {
+				await store.flush();
+			} finally {
+				if (pooled.references === 0 && stores.get(file) === pooled) stores.delete(file);
+			}
+		},
+	};
 }
 
 export function patternAwareSettings(value: unknown): PatternAwareSettings {

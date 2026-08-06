@@ -42,6 +42,7 @@ interface HarnessOptions {
 		context: { readonly type: "start" | "consume" },
 	) => Promise<ReturnType<typeof buildPiActionKey>> | ReturnType<typeof buildPiActionKey>;
 	readonly captureResourceVersion?: () => Promise<unknown> | unknown;
+	readonly releaseResourceVersion?: (version: unknown) => void;
 	readonly watchResourceVersion?: () => Promise<(() => void) | undefined> | (() => void) | undefined;
 	readonly isResourceExpired?: (input: {
 		readonly consumeInput?: ConsumeInput;
@@ -105,6 +106,9 @@ function createHarness(options: HarnessOptions) {
 			return options.execute?.(candidate, signal) ?? "prefetched";
 		},
 		...(options.captureResourceVersion ? { captureResourceVersion: () => options.captureResourceVersion?.() } : {}),
+		...(options.releaseResourceVersion
+			? { releaseResourceVersion: (version: unknown) => options.releaseResourceVersion?.(version) }
+			: {}),
 		...(options.watchResourceVersion ? { watchResourceVersion: () => options.watchResourceVersion?.() } : {}),
 		...(options.isResourceExpired
 			? { isResourceExpired: (input) => options.isResourceExpired?.(input) ?? false }
@@ -361,6 +365,7 @@ describe("speculative action runtime", () => {
 
 	it("validates sandbox snapshots without installing a watcher on their own adoption", async () => {
 		let watches = 0;
+		let releases = 0;
 		const harness = createHarness({
 			settings: {
 				...enabledSettings,
@@ -368,6 +373,9 @@ describe("speculative action runtime", () => {
 			},
 			predict: () => prediction(bashCandidate("safe bash")),
 			captureResourceVersion: () => "snapshot",
+			releaseResourceVersion: () => {
+				releases++;
+			},
 			isResourceExpired: () => false,
 			watchResourceVersion: () => {
 				watches++;
@@ -382,6 +390,7 @@ describe("speculative action runtime", () => {
 			"safe-result",
 		);
 		expect(watches).toBe(0);
+		expect(releases).toBe(1);
 	});
 
 	it("adaptive drafter skips only for an immediate concrete PatternAware candidate", async () => {
@@ -1132,6 +1141,31 @@ describe("speculative action runtime", () => {
 
 		expect(predictions).toBe(0);
 		expect(harness.runtime.inspect()).toEqual({
+			activeTurns: 0,
+			turnCandidates: 0,
+			resourceCandidates: 0,
+			pendingPredictions: 0,
+		});
+	});
+
+	it("releases a deleted session without publishing stale lifecycle events", async () => {
+		let releases = 0;
+		const harness = createHarness({
+			predict: () => prediction(readCandidate("session.txt")),
+			captureResourceVersion: () => ({ version: 1 }),
+			releaseResourceVersion: () => {
+				releases++;
+			},
+			execute: () => new Promise<string>(() => {}),
+		});
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-delete" });
+		await waitFor(() => harness.executions() === 1);
+
+		await harness.runtime.releaseSession("session");
+
+		expect(releases).toBe(1);
+		expect(harness.events.filter((event) => event.type === "cancelled")).toHaveLength(0);
+		expect(harness.runtime.inspect("session")).toEqual({
 			activeTurns: 0,
 			turnCandidates: 0,
 			resourceCandidates: 0,

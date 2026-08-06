@@ -7,6 +7,7 @@ import {
 	captureResourceVersion,
 	closeResourceVersionManagers,
 	ResourceVersionManager,
+	releaseResourceVersion,
 	resourceDependencies,
 	validateResourceVersion,
 	watchResourceVersion,
@@ -191,6 +192,43 @@ describe("speculative action resource versions", () => {
 		await fs.writeFile(file, "two\n");
 
 		expect(path.resolve(await invalidated)).toBe(path.resolve(file));
+	});
+
+	test("releases an unwatched sandbox token and retires its workspace manager", async () => {
+		const root = await workspace();
+		await fs.writeFile(path.join(root, "value.txt"), "one\n");
+		const key = buildActionKey({
+			tool: "bash",
+			execution: "sandbox",
+			resources: ["."],
+			input: { command: "cat value.txt" },
+		});
+		const first = await captureResourceVersion(key, root);
+
+		releaseResourceVersion(first);
+		const second = await captureResourceVersion(key, root);
+
+		expect(second.manager).not.toBe(first.manager);
+		releaseResourceVersion(second);
+	});
+
+	test("keeps a shared manager alive until every unwatched sandbox token is released", async () => {
+		const root = await workspace();
+		const key = buildActionKey({
+			tool: "bash",
+			execution: "sandbox",
+			resources: ["."],
+			input: { command: "echo test" },
+		});
+		const first = await captureResourceVersion(key, root);
+		const second = await captureResourceVersion(key, root);
+
+		releaseResourceVersion(first);
+		const third = await captureResourceVersion(key, root);
+
+		expect(third.manager).toBe(second.manager);
+		releaseResourceVersion(second);
+		releaseResourceVersion(third);
 	});
 });
 

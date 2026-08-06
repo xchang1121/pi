@@ -261,9 +261,10 @@ async function createPrivateGitWorkspace(cwd: string, gitBinary: string): Promis
 	const sourceRoot = path.resolve(cwd);
 	await assertNoSymlinkPath(sourceRoot, sourceRoot);
 	const pool = await acquireSandboxRepository(sourceRoot, gitBinary);
-	const parent = await mkdtemp(path.join(pool.parent, "action-"));
+	let parent: string | undefined;
+	let sandboxRoot: string | undefined;
+	let attached = false;
 	const repository = pool.repository;
-	const sandboxRoot = path.join(parent, "workspace");
 	const authorEnvironment = {
 		GIT_AUTHOR_NAME: "Pi Speculative Action",
 		GIT_AUTHOR_EMAIL: "speculative-action@localhost",
@@ -271,11 +272,23 @@ async function createPrivateGitWorkspace(cwd: string, gitBinary: string): Promis
 		GIT_COMMITTER_EMAIL: "speculative-action@localhost",
 	};
 	try {
+		parent = await mkdtemp(path.join(pool.parent, "action-"));
+		sandboxRoot = path.join(parent, "workspace");
+		const actionParent = parent;
+		const actionRoot = sandboxRoot;
 		const commit = await acquireSandboxBaseline(pool, authorEnvironment);
-		await git(gitBinary, ["--git-dir", repository, "worktree", "add", "--detach", sandboxRoot, commit], parent);
-		return { sourceRoot, sandboxRoot, processRoot: parent, repository, gitBinary, pool };
+		await git(gitBinary, ["--git-dir", repository, "worktree", "add", "--detach", actionRoot, commit], actionParent);
+		attached = true;
+		return { sourceRoot, sandboxRoot: actionRoot, processRoot: actionParent, repository, gitBinary, pool };
 	} catch (error) {
-		await rm(parent, { recursive: true, force: true });
+		if (attached && sandboxRoot) {
+			await git(
+				gitBinary,
+				["--git-dir", repository, "worktree", "remove", "--force", sandboxRoot],
+				pool.parent,
+			).catch(() => undefined);
+		}
+		if (parent) await rm(parent, { recursive: true, force: true }).catch(() => undefined);
 		releaseSandboxRepository(pool);
 		throw error;
 	}
@@ -336,27 +349,51 @@ async function acquireSandboxBaseline(
 		}
 		for (let attempt = 0; attempt < 3; attempt++) {
 			const version = await repository.versions.capture([{ path: repository.sourceRoot, scope: "tree_content" }]);
-			const changes = repository.version ? repository.versions.changesSince(repository.version) : undefined;
-			const indexed = repository.commit ? await sandboxIndexChanges(repository) : [];
-			const changedPaths = [...new Set([...(changes?.paths ?? []), ...indexed])];
-			const changedPathspecs =
-				repository.commit && changes && !changes.uncertain
-					? incrementalPathspecs(repository.sourceRoot, changedPaths)
-					: undefined;
-			if (repository.commit && changedPathspecs) {
-				await git(
-					repository.gitBinary,
-					[
-						"--git-dir",
-						repository.repository,
-						"--work-tree",
+			let retained = false;
+			try {
+				const changes = repository.version ? repository.versions.changesSince(repository.version) : undefined;
+				const indexed = repository.commit ? await sandboxIndexChanges(repository) : [];
+				const changedPaths = [...new Set([...(changes?.paths ?? []), ...indexed])];
+				const changedPathspecs =
+					repository.commit && changes && !changes.uncertain
+						? incrementalPathspecs(repository.sourceRoot, changedPaths)
+						: undefined;
+				if (repository.commit && changedPathspecs) {
+					await git(
+						repository.gitBinary,
+						[
+							"--git-dir",
+							repository.repository,
+							"--work-tree",
+							repository.sourceRoot,
+							"read-tree",
+							repository.commit,
+						],
 						repository.sourceRoot,
-						"read-tree",
-						repository.commit,
-					],
-					repository.sourceRoot,
-				);
-				if (changedPathspecs.length) {
+					);
+					if (changedPathspecs.length) {
+						await git(
+							repository.gitBinary,
+							[
+								"--git-dir",
+								repository.repository,
+								"--work-tree",
+								repository.sourceRoot,
+								"add",
+								"-f",
+								"-A",
+								"--",
+								...changedPathspecs,
+							],
+							repository.sourceRoot,
+						);
+					}
+				} else {
+					await git(
+						repository.gitBinary,
+						["--git-dir", repository.repository, "--work-tree", repository.sourceRoot, "read-tree", "--empty"],
+						repository.sourceRoot,
+					);
 					await git(
 						repository.gitBinary,
 						[
@@ -368,85 +405,68 @@ async function acquireSandboxBaseline(
 							"-f",
 							"-A",
 							"--",
-							...changedPathspecs,
+							...snapshotPathspecs(),
 						],
 						repository.sourceRoot,
 					);
 				}
-			} else {
-				await git(
-					repository.gitBinary,
-					["--git-dir", repository.repository, "--work-tree", repository.sourceRoot, "read-tree", "--empty"],
-					repository.sourceRoot,
-				);
-				await git(
-					repository.gitBinary,
-					[
-						"--git-dir",
-						repository.repository,
-						"--work-tree",
-						repository.sourceRoot,
-						"add",
-						"-f",
-						"-A",
-						"--",
-						...snapshotPathspecs(),
-					],
-					repository.sourceRoot,
-				);
-			}
-			const tree = (
-				await git(
-					repository.gitBinary,
-					["--git-dir", repository.repository, "--work-tree", repository.sourceRoot, "write-tree"],
-					repository.sourceRoot,
-				)
-			)
-				.toString("utf8")
-				.trim();
-			if (repository.commit) {
-				const previousTree = (
+				const tree = (
 					await git(
 						repository.gitBinary,
-						["--git-dir", repository.repository, "show", "-s", "--format=%T", repository.commit],
-						repository.parent,
+						["--git-dir", repository.repository, "--work-tree", repository.sourceRoot, "write-tree"],
+						repository.sourceRoot,
 					)
 				)
 					.toString("utf8")
 					.trim();
-				if (tree === previousTree) {
-					if ((await repository.versions.validate(version)).expired) continue;
-					repository.version = version;
-					return repository.commit;
+				if (repository.commit) {
+					const previousTree = (
+						await git(
+							repository.gitBinary,
+							["--git-dir", repository.repository, "show", "-s", "--format=%T", repository.commit],
+							repository.parent,
+						)
+					)
+						.toString("utf8")
+						.trim();
+					if (tree === previousTree) {
+						if ((await repository.versions.validate(version)).expired) continue;
+						replaceSandboxVersion(repository, version);
+						retained = true;
+						return repository.commit;
+					}
 				}
-			}
-			const commit = (
+				const commit = (
+					await git(
+						repository.gitBinary,
+						[
+							"--git-dir",
+							repository.repository,
+							"commit-tree",
+							tree,
+							...(repository.commit ? ["-p", repository.commit] : []),
+							"-m",
+							"speculative baseline",
+						],
+						repository.parent,
+						authorEnvironment,
+					)
+				)
+					.toString("utf8")
+					.trim();
+				if ((await repository.versions.validate(version)).expired) continue;
 				await git(
 					repository.gitBinary,
-					[
-						"--git-dir",
-						repository.repository,
-						"commit-tree",
-						tree,
-						...(repository.commit ? ["-p", repository.commit] : []),
-						"-m",
-						"speculative baseline",
-					],
+					["--git-dir", repository.repository, "update-ref", "refs/heads/baseline", commit],
 					repository.parent,
-					authorEnvironment,
-				)
-			)
-				.toString("utf8")
-				.trim();
-			if ((await repository.versions.validate(version)).expired) continue;
-			await git(
-				repository.gitBinary,
-				["--git-dir", repository.repository, "update-ref", "refs/heads/baseline", commit],
-				repository.parent,
-			);
-			repository.commit = commit;
-			repository.version = version;
-			return commit;
+				);
+				repository.commit = commit;
+				replaceSandboxVersion(repository, version);
+				retained = true;
+				return commit;
+			} finally {
+				if (!retained) version.release();
+			}
 		}
 		throw new Error("workspace changed repeatedly while preparing sandbox baseline");
 	});
@@ -491,8 +511,10 @@ function releaseSandboxRepository(repository: PooledGitRepository): void {
 	repository.idleTimer = setTimeout(() => {
 		if (repository.active > 0) return;
 		sandboxRepositories.delete(`${pathKey(repository.sourceRoot)}\0${repository.gitBinary}`);
+		repository.version?.release();
+		repository.version = undefined;
 		repository.versions.close();
-		void rm(repository.parent, { recursive: true, force: true });
+		void rm(repository.parent, { recursive: true, force: true }).catch(() => undefined);
 	}, SANDBOX_REPOSITORY_IDLE_MS);
 	repository.idleTimer.unref?.();
 }
@@ -504,9 +526,17 @@ export async function closeWorkspaceSandboxPools(): Promise<void> {
 		const repository = await item.catch(() => undefined);
 		if (!repository) continue;
 		if (repository.idleTimer) clearTimeout(repository.idleTimer);
+		repository.version?.release();
+		repository.version = undefined;
 		repository.versions.close();
 		await rm(repository.parent, { recursive: true, force: true });
 	}
+}
+
+function replaceSandboxVersion(repository: PooledGitRepository, next: ResourceVersionToken): void {
+	const previous = repository.version;
+	repository.version = next;
+	if (previous !== next) previous?.release();
 }
 
 function incrementalPathspecs(root: string, changedPaths: readonly string[]): string[] | undefined {

@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
 import { buildActionKey, patternAwareInput } from "../src/common.ts";
 import {
+	acquirePatternAwareStore,
 	applyBindings,
 	inferBindings,
 	PATTERN_AWARE_DEFAULTS,
@@ -213,6 +214,24 @@ describe("PatternAware", () => {
 		second.observe(input({ sessionID: "three", tool: "grep", input: {}, outputPaths: ["src/c.ts"] }));
 
 		expect(second.predict("three").some((item) => item.tool === "read")).toBe(true);
+	});
+
+	test("shares a workspace store only while runtime leases remain active", async () => {
+		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "pi-pattern-lease-"));
+		temporary.push(workspace);
+		const first = await acquirePatternAwareStore(workspace, settings());
+		const second = await acquirePatternAwareStore(workspace, settings());
+
+		expect(second.store).toBe(first.store);
+		await first.release();
+		const third = await acquirePatternAwareStore(workspace, settings());
+		expect(third.store).toBe(second.store);
+
+		await second.release();
+		await third.release();
+		const next = await acquirePatternAwareStore(workspace, settings());
+		expect(next.store).not.toBe(first.store);
+		await next.release();
 	});
 
 	test("discards persisted patterns from an incompatible analyzer version", async () => {

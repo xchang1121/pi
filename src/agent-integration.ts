@@ -22,16 +22,22 @@ import {
 	usageTokenCount,
 } from "./common.ts";
 import {
+	acquirePatternAwareStore,
 	asPatternAwareRuntimeContext,
-	openPatternAwareStore,
 	PATTERN_AWARE_DEFAULTS,
 	type PatternAwareSettings,
 	type PatternAwareStore,
+	type PatternAwareStoreLease,
 	patternAwareRuntimeContext,
 	patternAwareSettings,
 	projectPatternAwareObservation,
 } from "./pattern-aware.ts";
-import { captureResourceVersion, validateResourceVersion, watchResourceVersion } from "./resource-version.ts";
+import {
+	captureResourceVersion,
+	releaseResourceVersion,
+	validateResourceVersion,
+	watchResourceVersion,
+} from "./resource-version.ts";
 import type {
 	CandidatePreflight,
 	SpeculativeActionEvent,
@@ -167,7 +173,7 @@ export function installSpeculativeAction(
 	const previousSettlement = agent.settleToolCall;
 	const previousActual = agent.actualToolCall;
 	const sandboxExecutions = new WeakMap<SettleToolCallResult, SpeculativeSandboxExecution>();
-	let openedPatternStore: Promise<PatternAwareStore> | undefined;
+	let openedPatternStore: Promise<PatternAwareStoreLease> | undefined;
 	const resolveSettings = async (): Promise<SpeculativeActionSettings> => {
 		const settings = (await options.getSettings?.()) ?? {};
 		const legacyLimit = settings.maxCandidates;
@@ -207,12 +213,12 @@ export function installSpeculativeAction(
 			store.configure(settings.patternAware ?? PATTERN_AWARE_DEFAULTS);
 			return store;
 		}
-		openedPatternStore ??= openPatternAwareStore(
+		openedPatternStore ??= acquirePatternAwareStore(
 			options.cwd,
 			settings.patternAware ?? PATTERN_AWARE_DEFAULTS,
 			options.patternStateDirectory,
 		);
-		const store = await openedPatternStore;
+		const store = (await openedPatternStore).store;
 		store.configure(settings.patternAware ?? PATTERN_AWARE_DEFAULTS);
 		return store;
 	};
@@ -220,7 +226,7 @@ export function installSpeculativeAction(
 		const store = options.patternStore
 			? await options.patternStore
 			: openedPatternStore
-				? await openedPatternStore
+				? (await openedPatternStore).store
 				: undefined;
 		if (!store) return;
 		store.finishSession(sessionID);
@@ -407,6 +413,7 @@ export function installSpeculativeAction(
 				: {};
 		},
 		captureResourceVersion: ({ action }) => captureResourceVersion(action, options.cwd),
+		releaseResourceVersion,
 		isResourceExpired: ({ candidate }) => validateResourceVersion(candidate.resourceVersion),
 		watchResourceVersion: ({ candidate, onInvalidated }) =>
 			watchResourceVersion(candidate.resourceVersion, onInvalidated),
@@ -523,7 +530,7 @@ export function installSpeculativeAction(
 			store?.resolved(patternID, outcome);
 		},
 		flushPatternStore: async () => {
-			if (openedPatternStore) await (await openedPatternStore).flush();
+			if (openedPatternStore) await (await openedPatternStore).store.flush();
 			if (options.patternStore) await (await options.patternStore).flush();
 		},
 		onTurnStarted: async ({ startInput, settings }) => {
@@ -649,8 +656,18 @@ export function installSpeculativeAction(
 			if (agent.streamFunction === wrappedStream) agent.streamFunction = baseStream;
 			if (agent.settleToolCall === installedSettlement) agent.settleToolCall = previousSettlement;
 			if (agent.actualToolCall === installedActual) agent.actualToolCall = previousActual;
-			await runtime.disposeSession(sessionID);
-			await finishPatternSession();
+			try {
+				await runtime.releaseSession(sessionID);
+				await finishPatternSession();
+			} finally {
+				if (openedPatternStore) {
+					try {
+						await (await openedPatternStore).release();
+					} catch {
+						// Persistence failure must not change Agent uninstall semantics.
+					}
+				}
+			}
 		},
 	};
 }

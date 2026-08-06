@@ -40,7 +40,7 @@ export type ResourceVersionToken = {
 	readonly captureBytes: number;
 	readonly captureFiles: number;
 	readonly manager: ResourceVersionManager;
-	readonly releasePreciseWatch?: () => void;
+	readonly release: () => void;
 };
 
 type ResourceEvent = {
@@ -69,6 +69,7 @@ export class ResourceVersionManager {
 	private readonly treeContentVersions = new Map<string, number>();
 	private readonly treeEntryVersions = new Map<string, number>();
 	private readonly treeQueryVersions = new Map<string, number>();
+	private references = 0;
 	private watcher?: FSWatcher;
 	private reliable = false;
 	private ready: Promise<void> = Promise.resolve();
@@ -97,11 +98,22 @@ export class ResourceVersionManager {
 
 	async capture(dependencies: ReadonlyArray<ResourceDependency>): Promise<ResourceVersionToken> {
 		const started = performance.now();
-		await this.ready;
-		const normalized = normalizeDependencies(this.root, dependencies);
+		const reference = this.acquireReference();
+		let normalized: ReadonlyArray<ResourceDependency>;
+		try {
+			await this.ready;
+			normalized = normalizeDependencies(this.root, dependencies);
+		} catch (error) {
+			reference();
+			throw error;
+		}
 		const epoch = this.epoch;
 		if (this.reliable) {
 			const precise = this.acquirePreciseWatches(normalized);
+			const release = releaseOnce(() => {
+				precise.release();
+				reference();
+			});
 			try {
 				const quick = await Promise.all(
 					normalized.map(async (dependency) =>
@@ -119,27 +131,33 @@ export class ResourceVersionManager {
 					captureBytes: 0,
 					captureFiles: 0,
 					manager: this,
-					releasePreciseWatch: precise.release,
+					release,
 				};
 			} catch (error) {
-				precise.release();
+				release();
 				throw error;
 			}
 		}
-		const exact = await fingerprintDependencies(normalized);
-		return {
-			root: this.root,
-			dependencies: normalized,
-			epoch,
-			versions: [],
-			quick: [],
-			preciseContent: [],
-			exact: exact.fingerprints,
-			captureMs: elapsed(started),
-			captureBytes: exact.bytesRead,
-			captureFiles: exact.filesRead,
-			manager: this,
-		};
+		try {
+			const exact = await fingerprintDependencies(normalized);
+			return {
+				root: this.root,
+				dependencies: normalized,
+				epoch,
+				versions: [],
+				quick: [],
+				preciseContent: [],
+				exact: exact.fingerprints,
+				captureMs: elapsed(started),
+				captureBytes: exact.bytesRead,
+				captureFiles: exact.filesRead,
+				manager: this,
+				release: reference,
+			};
+		} catch (error) {
+			reference();
+			throw error;
+		}
 	}
 
 	async validate(token: ResourceVersionToken): Promise<ResourceValidation> {
@@ -205,7 +223,7 @@ export class ResourceVersionManager {
 			if (released) return;
 			released = true;
 			this.subscribers.delete(subscriber);
-			token.releasePreciseWatch?.();
+			token.release();
 			this.checkIdle();
 		};
 	}
@@ -221,6 +239,14 @@ export class ResourceVersionManager {
 		this.treeContentVersions.clear();
 		this.treeEntryVersions.clear();
 		this.treeQueryVersions.clear();
+	}
+
+	private acquireReference(): () => void {
+		this.references++;
+		return releaseOnce(() => {
+			this.references = Math.max(0, this.references - 1);
+			this.checkIdle();
+		});
 	}
 
 	private contentChangedSince(token: ResourceVersionToken) {
@@ -319,7 +345,7 @@ export class ResourceVersionManager {
 	}
 
 	private checkIdle() {
-		if (this.subscribers.size || this.preciseWatches.size) return;
+		if (this.references || this.subscribers.size || this.preciseWatches.size) return;
 		this.options.onIdle?.();
 	}
 }
@@ -381,6 +407,11 @@ export function watchResourceVersion(token: unknown, callback: (path: string) =>
 	return token.manager.subscribe(token, callback);
 }
 
+export function releaseResourceVersion(token: unknown): void {
+	if (!isResourceVersionToken(token)) return;
+	token.release();
+}
+
 export function isResourceVersionToken(value: unknown): value is ResourceVersionToken {
 	if (!value || typeof value !== "object") return false;
 	const token = value as Partial<ResourceVersionToken>;
@@ -390,6 +421,7 @@ export function isResourceVersionToken(value: unknown): value is ResourceVersion
 		Array.isArray(token.dependencies) &&
 		Array.isArray(token.versions) &&
 		Array.isArray(token.preciseContent) &&
+		typeof token.release === "function" &&
 		token.manager instanceof ResourceVersionManager
 	);
 }
@@ -632,6 +664,15 @@ function errorCode(error: unknown) {
 function pathKey(value: string) {
 	const normalized = path.resolve(value).replaceAll("\\", "/");
 	return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+}
+
+function releaseOnce(release: () => void): () => void {
+	let released = false;
+	return () => {
+		if (released) return;
+		released = true;
+		release();
+	};
 }
 
 class AsyncGate {
