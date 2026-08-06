@@ -439,6 +439,67 @@ describe("PatternAware", () => {
 		expect(second.snapshot().some((item) => item.targetTool === "read")).toBe(true);
 	});
 
+	test("retains inference evidence and retry state across short-lived processes", async () => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "pi-pattern-constant-pool-"));
+		temporary.push(directory);
+		const file = path.join(directory, "patterns.json");
+
+		for (const sessionID of ["one", "two", "three", "four"]) {
+			const store = new PatternAwareStore(settings({ minOccurrences: 2 }), file);
+			await store.load();
+			store.observe(input({ sessionID, tool: "inspect", input: {}, output: { kind: "path" } }));
+			store.observe(input({ sessionID, tool: "read", input: { filePath: "README.md" } }));
+			store.finishSession(sessionID);
+			await store.flush();
+		}
+
+		const restored = new PatternAwareStore(settings({ minOccurrences: 2 }), file);
+		await restored.load();
+		restored.observe(input({ sessionID: "probe", tool: "inspect", input: {}, output: { kind: "path" } }));
+		const persisted = JSON.parse(await fs.readFile(file, "utf8"));
+
+		expect(restored.predict("probe")).toContainEqual(
+			expect.objectContaining({ tool: "read", input: { filePath: "README.md" } }),
+		);
+		expect(Math.max(...persisted.pools.map((pool: { samples: unknown[] }) => pool.samples.length))).toBe(4);
+		expect(persisted.pools.some((pool: { observations?: number }) => pool.observations === 4)).toBe(true);
+	});
+
+	test("bounds restored inference retry metadata so malformed state cannot starve learning", async () => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "pi-pattern-retry-bound-"));
+		temporary.push(directory);
+		const file = path.join(directory, "patterns.json");
+		const first = new PatternAwareStore(settings({ minOccurrences: 2 }), file);
+		await first.load();
+		for (const sessionID of ["one", "two"]) {
+			first.observe(input({ sessionID, tool: "inspect", input: {}, output: { kind: "path" } }));
+			first.observe(input({ sessionID, tool: "read", input: { filePath: "README.md" } }));
+			first.finishSession(sessionID);
+		}
+		await first.flush();
+
+		const persisted = JSON.parse(await fs.readFile(file, "utf8"));
+		for (const pool of persisted.pools) {
+			pool.nextInferenceAt = Number.MAX_SAFE_INTEGER;
+			pool.inferenceBackoff = Number.MAX_SAFE_INTEGER;
+		}
+		await fs.writeFile(file, JSON.stringify(persisted));
+
+		const restored = new PatternAwareStore(settings({ minOccurrences: 2 }), file);
+		await restored.load();
+		for (let index = 3; index <= 10; index++) {
+			const sessionID = `session-${index}`;
+			restored.observe(input({ sessionID, tool: "inspect", input: {}, output: { kind: "path" } }));
+			restored.observe(input({ sessionID, tool: "read", input: { filePath: "README.md" } }));
+			restored.finishSession(sessionID);
+		}
+		restored.observe(input({ sessionID: "probe", tool: "inspect", input: {}, output: { kind: "path" } }));
+
+		expect(restored.predict("probe")).toContainEqual(
+			expect.objectContaining({ tool: "read", input: { filePath: "README.md" } }),
+		);
+	});
+
 	test("normalizes partial PatternAware settings", () => {
 		expect(patternAwareSettings({ maxContextLength: 3, maxFutureGap: 0 })).toEqual({
 			...PATTERN_AWARE_DEFAULTS,

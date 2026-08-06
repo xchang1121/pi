@@ -123,6 +123,33 @@ describe("PatternAware runtime integration", () => {
 		);
 	});
 
+	it("awaits pattern persistence before terminal finish returns", async () => {
+		let flushStarted = false;
+		let flushFinished = false;
+		let releaseFlush!: () => void;
+		const flushGate = new Promise<void>((resolve) => {
+			releaseFlush = resolve;
+		});
+		const runtime = makeSpeculativeActionRuntime(
+			adapter({
+				flushPatternStore: async () => {
+					flushStarted = true;
+					await flushGate;
+					flushFinished = true;
+				},
+			}),
+		);
+
+		await runtime.startTurn(start("turn"));
+		const finishing = runtime.finishTurn({ ...start("turn"), terminal: true });
+		await waitFor(() => flushStarted);
+		expect(flushFinished).toBe(false);
+		releaseFlush();
+		await finishing;
+
+		expect(flushFinished).toBe(true);
+	});
+
 	it("keeps a fresh resource result after its terminal pattern lease ends", async () => {
 		const outcomes: string[] = [];
 		let executions = 0;

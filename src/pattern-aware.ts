@@ -757,7 +757,7 @@ export class PatternAwareStore {
 		const invalidated = inferred !== undefined && !bindingsMatchSample(inferred, pool.samples.at(-1)!);
 		if (!inferred || invalidated) {
 			if (!invalidated && pool.observations < (pool.nextInferenceAt ?? this.settings.minOccurrences)) return;
-			inferred = inferBindingsFromSamples(pool.samples, Math.max(4, this.settings.minOccurrences * 2));
+			inferred = inferBindingsFromSamples(pool.samples, bindingEvidenceThreshold(this.settings));
 			pool.inferred = inferred;
 			if (!inferred) {
 				pool.inferenceBackoff = Math.min(8, Math.max(2, (pool.inferenceBackoff ?? 1) * 2));
@@ -958,7 +958,7 @@ export class PatternAwareStore {
 	}
 
 	private persistedPools(): ReadonlyArray<PatternPool> {
-		const sampleLimit = Math.max(1, this.settings.minOccurrences);
+		const sampleLimit = bindingEvidenceThreshold(this.settings);
 		return [...this.pools.values()]
 			.sort(
 				(left, right) =>
@@ -966,7 +966,7 @@ export class PatternAwareStore {
 					right.samples.length - left.samples.length,
 			)
 			.slice(0, this.settings.maxPatterns)
-			.map(({ inferred: _, observations: __, nextInferenceAt: ___, inferenceBackoff: ____, ...pool }) => ({
+			.map(({ inferred: _, ...pool }) => ({
 				...pool,
 				samples: pool.samples.slice(-sampleLimit),
 			}));
@@ -2172,13 +2172,27 @@ function mutablePool(value: unknown): PatternPool | undefined {
 		];
 	});
 	if (!samples.length) return;
+	const observations = isFiniteNumber(record.observations)
+		? Math.max(samples.length, Math.floor(record.observations))
+		: samples.length;
 	return {
 		key: record.key,
 		context: structuredClone(record.context) as PatternAwareEventSignature[],
 		targetTool: record.targetTool,
 		...(typeof record.targetSchemaHash === "string" ? { targetSchemaHash: record.targetSchemaHash } : {}),
 		samples,
+		observations,
+		...(isFiniteNumber(record.nextInferenceAt)
+			? { nextInferenceAt: Math.min(observations + 8, Math.max(0, Math.floor(record.nextInferenceAt))) }
+			: {}),
+		...(isFiniteNumber(record.inferenceBackoff)
+			? { inferenceBackoff: Math.min(8, Math.max(1, Math.floor(record.inferenceBackoff))) }
+			: {}),
 	};
+}
+
+function bindingEvidenceThreshold(settings: Pick<PatternAwareSettings, "minOccurrences">) {
+	return Math.max(4, settings.minOccurrences * 2);
 }
 
 function isEventSignature(value: unknown): value is PatternAwareEventSignature {
