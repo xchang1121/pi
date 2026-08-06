@@ -32,6 +32,7 @@ export type ResourceVersionToken = {
 	readonly root: string;
 	readonly dependencies: ReadonlyArray<ResourceDependency>;
 	readonly epoch: number;
+	readonly versions: ReadonlyArray<number>;
 	readonly quick: ReadonlyArray<string>;
 	readonly preciseContent: ReadonlyArray<string>;
 	readonly exact?: ReadonlyArray<string>;
@@ -65,6 +66,9 @@ export class ResourceVersionManager {
 	private readonly events: ResourceEvent[] = [];
 	private readonly subscribers = new Set<ResourceSubscriber>();
 	private readonly preciseWatches = new Map<string, { readonly watcher: FSWatcher; references: number }>();
+	private readonly treeContentVersions = new Map<string, number>();
+	private readonly treeEntryVersions = new Map<string, number>();
+	private readonly treeQueryVersions = new Map<string, number>();
 	private watcher?: FSWatcher;
 	private reliable = false;
 	private ready: Promise<void> = Promise.resolve();
@@ -108,6 +112,7 @@ export class ResourceVersionManager {
 					root: this.root,
 					dependencies: normalized,
 					epoch,
+					versions: normalized.map((dependency) => this.dependencyVersion(dependency)),
 					quick,
 					preciseContent: precise.paths,
 					captureMs: elapsed(started),
@@ -126,6 +131,7 @@ export class ResourceVersionManager {
 			root: this.root,
 			dependencies: normalized,
 			epoch,
+			versions: [],
 			quick: [],
 			preciseContent: [],
 			exact: exact.fingerprints,
@@ -143,12 +149,16 @@ export class ResourceVersionManager {
 		}
 		await watcherTurn();
 		if (this.reliable) {
+			const versions = token.dependencies.map((dependency) => this.dependencyVersion(dependency));
 			const quick = await Promise.all(
 				token.dependencies.map(async (dependency) =>
 					dependency.scope === "content" ? quickContent(dependency.path) : "",
 				),
 			);
-			const expired = this.changedSince(token) || !sameStrings(quick, token.quick);
+			const expired =
+				!sameNumbers(versions, token.versions) ||
+				this.contentChangedSince(token) ||
+				!sameStrings(quick, token.quick);
 			return {
 				expired,
 				...validationMetrics(started, 0, 0, "watcher"),
@@ -208,15 +218,19 @@ export class ResourceVersionManager {
 		this.preciseWatches.clear();
 		this.subscribers.clear();
 		this.events.length = 0;
+		this.treeContentVersions.clear();
+		this.treeEntryVersions.clear();
+		this.treeQueryVersions.clear();
 	}
 
-	private changedSince(token: ResourceVersionToken) {
+	private contentChangedSince(token: ResourceVersionToken) {
+		const dependencies = token.dependencies.filter((dependency) => dependency.scope === "content");
+		if (dependencies.length === 0) return false;
 		if (this.changesSince(token).uncertain) return true;
 		const preciseContent = new Set(token.preciseContent.map(pathKey));
 		return this.events.some(
 			(event) =>
-				event.epoch > token.epoch &&
-				token.dependencies.some((dependency) => affects(dependency, event, preciseContent)),
+				event.epoch > token.epoch && dependencies.some((dependency) => affects(dependency, event, preciseContent)),
 		);
 	}
 
@@ -225,10 +239,39 @@ export class ResourceVersionManager {
 		const event = { epoch: ++this.epoch, path: absolute, type, source };
 		this.events.push(event);
 		if (this.events.length > MAX_EVENT_HISTORY) this.events.splice(0, this.events.length - MAX_EVENT_HISTORY);
+		this.updateTreeVersions(event);
 		for (const subscriber of this.subscribers) {
 			if (subscriber.dependencies.some((dependency) => affects(dependency, event, subscriber.preciseContent))) {
 				subscriber.callback(absolute);
 			}
+		}
+	}
+
+	private dependencyVersion(dependency: ResourceDependency): number {
+		const key = pathKey(dependency.path);
+		if (dependency.scope === "tree_content") return this.treeContentVersions.get(key) ?? 0;
+		if (dependency.scope === "tree_entries") return this.treeEntryVersions.get(key) ?? 0;
+		if (dependency.scope === "tree_query") return this.treeQueryVersions.get(key) ?? 0;
+		return 0;
+	}
+
+	private updateTreeVersions(event: ResourceEvent): void {
+		if (event.type !== "unknown" && path.basename(event.path).startsWith(".pi-speculative-")) return;
+		const root = path.resolve(this.root);
+		const absolute = path.resolve(event.path);
+		if (!containsPath(root, absolute)) return;
+		const gitBoundary = event.type === "unknown" ? undefined : nestedGitBoundary(root, absolute);
+		const entries = event.type === "unknown" || event.type === "rename";
+		const query =
+			event.type === "unknown" ||
+			event.type === "rename" ||
+			(event.type === "change" && QUERY_CONTROL_FILES.has(path.basename(event.path).toLowerCase()));
+		for (let current = absolute; ; current = path.dirname(current)) {
+			const key = pathKey(current);
+			this.treeContentVersions.set(key, event.epoch);
+			if (entries) this.treeEntryVersions.set(key, event.epoch);
+			if (query) this.treeQueryVersions.set(key, event.epoch);
+			if (current === root || current === gitBoundary) break;
 		}
 	}
 
@@ -345,6 +388,7 @@ export function isResourceVersionToken(value: unknown): value is ResourceVersion
 		typeof token.root === "string" &&
 		typeof token.epoch === "number" &&
 		Array.isArray(token.dependencies) &&
+		Array.isArray(token.versions) &&
 		Array.isArray(token.preciseContent) &&
 		token.manager instanceof ResourceVersionManager
 	);
@@ -543,6 +587,23 @@ function elapsed(started: number) {
 
 function sameStrings(left: ReadonlyArray<string>, right: ReadonlyArray<string>) {
 	return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function sameNumbers(left: ReadonlyArray<number>, right: ReadonlyArray<number>) {
+	return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function containsPath(parent: string, child: string) {
+	const relative = path.relative(parent, child);
+	return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
+}
+
+function nestedGitBoundary(root: string, target: string) {
+	const relative = path.relative(root, target);
+	if (!relative || path.isAbsolute(relative)) return undefined;
+	const parts = relative.split(path.sep);
+	const index = parts.indexOf(".git");
+	return index < 0 ? undefined : path.resolve(root, ...parts.slice(0, index + 1));
 }
 
 function watcherTurn() {

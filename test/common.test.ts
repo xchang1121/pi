@@ -3,7 +3,7 @@ import {
 	actionKeyMatches,
 	buildDrafterToolCallPrompt,
 	buildPiActionKey,
-	clampMaxCandidates,
+	clampCandidateLimit,
 	DEFAULTS,
 	inferredExecution,
 } from "../src/common.ts";
@@ -26,11 +26,11 @@ describe("speculative action common", () => {
 		expect(prompt).not.toContain('"task"');
 	});
 
-	it("clamps candidate limits to the source range", () => {
-		expect(clampMaxCandidates(0)).toBe(1);
-		expect(clampMaxCandidates(4.9)).toBe(4);
-		expect(clampMaxCandidates(100)).toBe(8);
-		expect(clampMaxCandidates("4")).toBe(1);
+	it("clamps the per-turn candidate limit to the source range", () => {
+		expect(clampCandidateLimit(0)).toBe(1);
+		expect(clampCandidateLimit(4.9)).toBe(4);
+		expect(clampCandidateLimit(100)).toBe(8);
+		expect(clampCandidateLimit("4")).toBe(1);
 	});
 
 	it("canonicalizes Pi defaults and rejects paths outside the workspace", () => {
@@ -83,7 +83,8 @@ describe("speculative action common", () => {
 			candidateToolNames({
 				enabled: true,
 				mode: "predict_action_single_step",
-				maxCandidates: 4,
+				candidateLimit: 4,
+				maxConcurrentActions: 4,
 				resourceCacheMaxEntries: 8,
 				predictionTimeoutMs: 100,
 				tools: { resourceCached: ["read"], sandbox: ["bash", "write"] },

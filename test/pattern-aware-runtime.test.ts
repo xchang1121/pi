@@ -251,7 +251,7 @@ describe("PatternAware runtime integration", () => {
 		const outcomes: string[] = [];
 		const runtime = makeSpeculativeActionRuntime(
 			adapter({
-				settings: () => ({ ...settings(), maxCandidates: 2 }),
+				settings: () => ({ ...settings(), candidateLimit: 2, maxConcurrentActions: 2 }),
 				predict: (input) => ({
 					candidates:
 						input.turnID === "turn_1"
@@ -293,7 +293,7 @@ describe("PatternAware runtime integration", () => {
 		let aborted = 0;
 		const runtime = makeSpeculativeActionRuntime(
 			adapter({
-				settings: () => ({ ...settings(), maxCandidates: 1 }),
+				settings: () => ({ ...settings(), candidateLimit: 1, maxConcurrentActions: 1 }),
 				predict: (input) => ({
 					candidates:
 						input.turnID === "turn_1"
@@ -338,7 +338,12 @@ describe("PatternAware runtime integration", () => {
 		let aborted = 0;
 		const runtime = makeSpeculativeActionRuntime(
 			adapter({
-				settings: () => ({ ...settings(), maxCandidates: 2, resourceCacheMaxEntries: 1 }),
+				settings: () => ({
+					...settings(),
+					candidateLimit: 2,
+					maxConcurrentActions: 2,
+					resourceCacheMaxEntries: 1,
+				}),
 				predict: (input) => ({
 					candidates:
 						input.turnID === "turn_1"
@@ -382,7 +387,7 @@ describe("PatternAware runtime integration", () => {
 		let executions = 0;
 		const runtime = makeSpeculativeActionRuntime(
 			adapter({
-				settings: () => ({ ...settings(), maxCandidates: 2 }),
+				settings: () => ({ ...settings(), candidateLimit: 2, maxConcurrentActions: 2 }),
 				predictPatternAware: () => ({
 					candidates: [
 						preparationHint("a.ts"),
@@ -545,7 +550,7 @@ describe("PatternAware runtime integration", () => {
 		const pending = new Promise<string>(() => {});
 		const runtime = makeSpeculativeActionRuntime(
 			adapter({
-				settings: () => ({ ...settings(), maxCandidates: 1 }),
+				settings: () => ({ ...settings(), candidateLimit: 1, maxConcurrentActions: 1 }),
 				predict: (input) => ({ candidates: [scheduledCandidate(`${input.sessionID}.ts`, 10)], draftTokens: 0 }),
 				executeCandidate: () => {
 					executions++;
@@ -840,7 +845,8 @@ function settings(): SpeculativeActionSettings {
 	return {
 		enabled: true,
 		mode: "predict_action_single_step",
-		maxCandidates: 8,
+		candidateLimit: 8,
+		maxConcurrentActions: 8,
 		resourceCacheMaxEntries: 512,
 		predictionTimeoutMs: 100,
 		patternAware: PATTERN_AWARE_DEFAULTS,

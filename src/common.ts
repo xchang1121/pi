@@ -32,6 +32,9 @@ export const DEFAULTS = {
 	enabled: false,
 	mode: "predict_action_single_step" as const,
 	drafterEnabled: true,
+	candidateLimit: 8,
+	maxConcurrentActions: 8,
+	/** @deprecated Use candidateLimit and maxConcurrentActions. */
 	maxCandidates: 8,
 	resourceCacheMaxEntries: 512,
 	resourceCacheMaxBytes: 256 * 1024 * 1024,
@@ -51,9 +54,9 @@ export const FIND_DEFAULT_LIMIT = 1000;
 export function buildDrafterToolCallPrompt(
 	_definitions: readonly DrafterToolDefinition[],
 	_candidateToolNames: readonly string[] = KEYABLE_TOOLS,
-	maxCandidates = 1,
+	candidateLimit = 1,
 ): string {
-	const limit = clampMaxCandidates(maxCandidates);
+	const limit = clampCandidateLimit(candidateLimit);
 	return `Dispatch tool calls only.
 
 Rules:
@@ -67,9 +70,12 @@ Rules:
 `;
 }
 
-export function clampMaxCandidates(value: unknown): number {
+export function clampCandidateLimit(value: unknown): number {
 	return typeof value === "number" && Number.isFinite(value) ? Math.max(1, Math.min(8, Math.floor(value))) : 1;
 }
+
+/** @deprecated Use clampCandidateLimit. */
+export const clampMaxCandidates = clampCandidateLimit;
 
 export function buildActionKey(input: {
 	readonly tool: string;

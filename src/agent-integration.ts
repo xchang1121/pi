@@ -15,7 +15,7 @@ import type { ActionKey } from "./common.ts";
 import {
 	buildDrafterToolCallPrompt,
 	buildPiActionKey,
-	clampMaxCandidates,
+	clampCandidateLimit,
 	DEFAULTS,
 	inferredExecution,
 	patternAwareInput,
@@ -51,6 +51,9 @@ import type { SpeculativeAgentSandbox, SpeculativeSandboxExecution } from "./wor
 export interface SpeculativeAgentSettingsInput {
 	readonly enabled?: boolean;
 	readonly drafterEnabled?: boolean;
+	readonly candidateLimit?: number;
+	readonly maxConcurrentActions?: number;
+	/** @deprecated Use candidateLimit and maxConcurrentActions. */
 	readonly maxCandidates?: number;
 	readonly resourceCacheMaxEntries?: number;
 	readonly resourceCacheMaxBytes?: number;
@@ -167,12 +170,16 @@ export function installSpeculativeAction(
 	let openedPatternStore: Promise<PatternAwareStore> | undefined;
 	const resolveSettings = async (): Promise<SpeculativeActionSettings> => {
 		const settings = (await options.getSettings?.()) ?? {};
+		const legacyLimit = settings.maxCandidates;
 		return {
 			enabled: typeof settings.enabled === "boolean" ? settings.enabled : DEFAULTS.enabled,
 			mode: "predict_action_single_step",
 			drafterEnabled:
 				typeof settings.drafterEnabled === "boolean" ? settings.drafterEnabled : DEFAULTS.drafterEnabled,
-			maxCandidates: clampMaxCandidates(settings.maxCandidates ?? DEFAULTS.maxCandidates),
+			candidateLimit: clampCandidateLimit(settings.candidateLimit ?? legacyLimit ?? DEFAULTS.candidateLimit),
+			maxConcurrentActions: clampCandidateLimit(
+				settings.maxConcurrentActions ?? legacyLimit ?? DEFAULTS.maxConcurrentActions,
+			),
 			resourceCacheMaxEntries: normalizePositiveInteger(
 				settings.resourceCacheMaxEntries,
 				DEFAULTS.resourceCacheMaxEntries,
@@ -265,7 +272,7 @@ export function installSpeculativeAction(
 						...input.actorOptions,
 						signal,
 						temperature: 0,
-						maxTokens: Math.max(128, settings.maxCandidates * 96),
+						maxTokens: Math.max(128, (settings.candidateLimit ?? DEFAULTS.candidateLimit) * 96),
 						reasoning: undefined,
 						sessionId: `${sessionID}:speculative`,
 					};
@@ -274,7 +281,7 @@ export function installSpeculativeAction(
 				{
 					systemPrompt: [
 						input.context.systemPrompt,
-						buildDrafterToolCallPrompt(definitions, [], settings.maxCandidates),
+						buildDrafterToolCallPrompt(definitions, [], settings.candidateLimit ?? DEFAULTS.candidateLimit),
 					]
 						.filter(Boolean)
 						.join("\n\n"),

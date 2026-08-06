@@ -77,7 +77,12 @@ describe("speculative action resource versions", () => {
 		await fs.writeFile(sibling, "two\n");
 		await settleWatcher();
 
-		expect((await validateResourceVersion(token)).expired).toBe(false);
+		expect(await validateResourceVersion(token)).toMatchObject({
+			expired: false,
+			mode: "watcher",
+			bytesRead: 0,
+			filesRead: 0,
+		});
 	});
 
 	test("keeps find results for content-only writes and expires them for entry changes", async () => {

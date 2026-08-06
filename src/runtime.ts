@@ -1,5 +1,5 @@
 import type { ActionKey, DrafterToolDefinition, SpeculativeExecution } from "./common.ts";
-import { actionKeyMatches, clampMaxCandidates, DEFAULTS, inferredExecution, KEYABLE_TOOLS } from "./common.ts";
+import { actionKeyMatches, clampCandidateLimit, DEFAULTS, inferredExecution, KEYABLE_TOOLS } from "./common.ts";
 import type { PatternAwareSettings } from "./pattern-aware.ts";
 import {
 	expectedUtility,
@@ -14,7 +14,10 @@ export interface SpeculativeActionSettings {
 	readonly enabled: boolean;
 	readonly mode: "predict_action_single_step";
 	readonly drafterEnabled?: boolean;
-	readonly maxCandidates: number;
+	readonly candidateLimit?: number;
+	readonly maxConcurrentActions?: number;
+	/** @deprecated Compatibility for adapters created before the limits were split. */
+	readonly maxCandidates?: number;
 	readonly resourceCacheMaxEntries: number;
 	readonly resourceCacheMaxBytes?: number;
 	readonly predictionTimeoutMs: number;
@@ -453,6 +456,7 @@ export interface SpeculativeActionRuntime<SessionID, Output, StartInput, Consume
 	readonly consume: (input: ConsumeInput, signal?: AbortSignal) => Promise<Output | undefined>;
 	readonly actual: (input: ConsumeInput & { readonly durationMs: number; readonly output?: Output }) => Promise<void>;
 	readonly finishTurn: (input: FinishInput) => Promise<void>;
+	readonly settingsChanged: (settings: SpeculativeActionSettings) => Promise<void>;
 	readonly disposeSession: (sessionID: SessionID) => Promise<void>;
 	readonly dispose: () => Promise<void>;
 	readonly inspect: (sessionID?: SessionID) => SpeculativeRuntimeInspection;
@@ -542,6 +546,7 @@ export function makeSpeculativeActionRuntime<
 	const executionOverheadTimes = new Map<string, { count: number; averageMs: number }>();
 	const hitOverheadTimes = new Map<string, { count: number; averageMs: number }>();
 	const drafterBackoff = new Map<SessionID, { failures: number; skips: number }>();
+	let notifiedMasterEnabled: boolean | undefined;
 
 	const turnKey = (input: TurnInput<SessionID>): string => `${String(input.sessionID)}:${input.turnID}`;
 	const persistentKey = (sessionID: SessionID, key: ActionKey): string => `${String(sessionID)}:${key.key}`;
@@ -592,6 +597,10 @@ export function makeSpeculativeActionRuntime<
 	};
 	const adaptiveDrafter = (state: TurnState<SessionID, Output, StateData>): boolean =>
 		state.settings.adaptiveDrafter ?? DEFAULTS.adaptiveDrafter;
+	const candidateLimit = (settings: SpeculativeActionSettings): number =>
+		clampCandidateLimit(settings.candidateLimit ?? settings.maxCandidates ?? DEFAULTS.candidateLimit);
+	const concurrentActionLimit = (settings: SpeculativeActionSettings): number =>
+		clampCandidateLimit(settings.maxConcurrentActions ?? settings.maxCandidates ?? DEFAULTS.maxConcurrentActions);
 	const takeDrafterOpportunity = (sessionID: SessionID): boolean => {
 		const feedback = drafterBackoff.get(sessionID);
 		if (!feedback?.skips) return true;
@@ -610,7 +619,7 @@ export function makeSpeculativeActionRuntime<
 		if (feedback.failures >= 2) {
 			feedback.skips = Math.max(
 				feedback.skips,
-				Math.min(state.settings.maxCandidates, 2 ** Math.max(0, feedback.failures - 2)),
+				Math.min(candidateLimit(state.settings), 2 ** Math.max(0, feedback.failures - 2)),
 			);
 		}
 		drafterBackoff.set(state.sessionID, feedback);
@@ -1024,7 +1033,7 @@ export function makeSpeculativeActionRuntime<
 	): Promise<void> => {
 		for (const candidate of schedulerFor(state.sessionID).preemptForAuthoritative(
 			resource,
-			speculativeResourceBudget(state.settings.maxCandidates),
+			speculativeResourceBudget(concurrentActionLimit(state.settings)),
 		)) {
 			await preemptCandidate(candidate);
 		}
@@ -1043,6 +1052,18 @@ export function makeSpeculativeActionRuntime<
 		for (const candidate of candidates) await preemptCandidate(candidate, reason, "discarded");
 		drafterBackoff.delete(sessionID);
 		if (!schedulerFor(sessionID).snapshot().length) schedulers.delete(sessionID);
+	};
+
+	const settingsChanged = async (settings: SpeculativeActionSettings): Promise<void> => {
+		notifiedMasterEnabled = masterEnabled(settings);
+		if (notifiedMasterEnabled) return;
+		const sessions = new Set<SessionID>(schedulers.keys());
+		for (const state of turns.values()) sessions.add(state.sessionID);
+		for (const candidate of persistentCandidates.values()) {
+			const owner = candidateOwners.get(candidate);
+			if (owner) sessions.add(owner.sessionID);
+		}
+		await Promise.all([...sessions].map((sessionID) => disableSession(sessionID)));
 	};
 
 	const reconcilePersistentCandidates = async (state: TurnState<SessionID, Output, StateData>): Promise<void> => {
@@ -1282,7 +1303,7 @@ export function makeSpeculativeActionRuntime<
 			if (!enabled || !masterEnabled(enabled)) state.terminal = true;
 			return accepted;
 		}
-		const candidateLimit = clampMaxCandidates(state.settings.maxCandidates);
+		const turnCandidateLimit = candidateLimit(state.settings);
 		const ordered = [...drafts].sort(
 			(left, right) =>
 				(right.expectedLatencyBenefitMs ?? 0) - (left.expectedLatencyBenefitMs ?? 0) ||
@@ -1298,7 +1319,7 @@ export function makeSpeculativeActionRuntime<
 					continue;
 				}
 				const hintKey = diagnosticJson({ tool: draft.tool, input: draft.input, missing: draft.missing });
-				if (state.preparedHints.has(hintKey) || state.preparedHints.size >= candidateLimit) continue;
+				if (state.preparedHints.has(hintKey) || state.preparedHints.size >= turnCandidateLimit) continue;
 				state.preparedHints.add(hintKey);
 				if (adapter.prepareCandidate) {
 					try {
@@ -1351,7 +1372,7 @@ export function makeSpeculativeActionRuntime<
 				}
 				continue;
 			}
-			if (state.admittedCandidates >= candidateLimit) return accepted;
+			if (state.admittedCandidates >= turnCandidateLimit) return accepted;
 			const execution = draft.execution ?? inferredExecution(draft.tool);
 			if (execution !== action.execution) {
 				await publishMiss(state, "execution_mismatch", action, undefined, { draftCandidate, predictedAction });
@@ -1440,7 +1461,7 @@ export function makeSpeculativeActionRuntime<
 			const admission = schedulerFor(state.sessionID).admit(
 				candidate,
 				scheduling,
-				speculativeResourceBudget(state.settings.maxCandidates),
+				speculativeResourceBudget(concurrentActionLimit(state.settings)),
 			);
 			if (!admission.admitted) {
 				candidate.schedulerOutcome = "discarded";
@@ -1825,7 +1846,7 @@ export function makeSpeculativeActionRuntime<
 		const settings = await adapter.settings();
 		const definitions = adapter.definitions(input);
 		const candidateNames = candidateToolNames(settings);
-		if (!masterEnabled(settings)) {
+		if (!masterEnabled(settings) || notifiedMasterEnabled === false) {
 			await disableSession(input.sessionID);
 			return;
 		}
@@ -2304,7 +2325,7 @@ export function makeSpeculativeActionRuntime<
 		};
 	};
 
-	return { startTurn, consume, actual, finishTurn, disposeSession, dispose, inspect };
+	return { startTurn, consume, actual, finishTurn, settingsChanged, disposeSession, dispose, inspect };
 }
 
 export function candidateToolNames(settings: SpeculativeActionSettings): readonly string[] {

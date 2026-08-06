@@ -22,7 +22,9 @@ interface ConsumeInput extends StartInput {
 }
 
 interface HarnessOptions {
-	readonly settings?: SpeculativeActionSettings | (() => SpeculativeActionSettings);
+	readonly settings?:
+		| SpeculativeActionSettings
+		| (() => SpeculativeActionSettings | Promise<SpeculativeActionSettings>);
 	readonly predict: (input: StartInput, signal: AbortSignal) => Promise<SpeculativePrediction> | SpeculativePrediction;
 	readonly predictPatternAware?: (
 		input: StartInput,
@@ -53,7 +55,8 @@ interface HarnessOptions {
 const enabledSettings: SpeculativeActionSettings = {
 	enabled: true,
 	mode: "predict_action_single_step",
-	maxCandidates: 4,
+	candidateLimit: 4,
+	maxConcurrentActions: 4,
 	resourceCacheMaxEntries: 512,
 	predictionTimeoutMs: 250,
 	tools: { resourceCached: ["read", "grep", "find"], sandbox: [] },
@@ -468,6 +471,117 @@ describe("speculative action runtime", () => {
 		expect(harness.runtime.inspect("session").activeTurns).toBe(0);
 	});
 
+	it("interrupts predictions and executions as soon as disabled settings are notified", async () => {
+		const predictionStarted = deferred<void>();
+		const predictionAborted = deferred<void>();
+		const executionAborted = deferred<void>();
+		const harness = createHarness({
+			predict: (input, signal) => {
+				if (input.turnID !== "turn-predicting") return prediction(readCandidate("running.txt"));
+				predictionStarted.resolve(undefined);
+				return new Promise<SpeculativePrediction>((_resolve, reject) => {
+					signal.addEventListener(
+						"abort",
+						() => {
+							predictionAborted.resolve(undefined);
+							reject(new Error("aborted"));
+						},
+						{ once: true },
+					);
+				});
+			},
+			execute: (_candidate, signal) =>
+				new Promise<string>((_resolve, reject) => {
+					signal.addEventListener(
+						"abort",
+						() => {
+							executionAborted.resolve(undefined);
+							reject(new Error("aborted"));
+						},
+						{ once: true },
+					);
+				}),
+		});
+		await harness.runtime.startTurn({ sessionID: "executing", turnID: "turn-executing" });
+		await waitFor(() => harness.executions() === 1);
+		await harness.runtime.startTurn({ sessionID: "predicting", turnID: "turn-predicting" });
+		await predictionStarted.promise;
+
+		await harness.runtime.settingsChanged({ ...enabledSettings, enabled: false });
+
+		await Promise.all([predictionAborted.promise, executionAborted.promise]);
+		expect(harness.runtime.inspect()).toEqual({
+			activeTurns: 0,
+			turnCandidates: 0,
+			resourceCandidates: 0,
+			pendingPredictions: 0,
+		});
+		expect(harness.events).toContainEqual(
+			expect.objectContaining({ type: "cancelled", reason: "speculative_action_disabled" }),
+		);
+	});
+
+	it("lets a disabled-settings notification win over a stale startTurn settings read", async () => {
+		const staleSettings = deferred<SpeculativeActionSettings>();
+		let predictions = 0;
+		const harness = createHarness({
+			settings: () => staleSettings.promise,
+			predict: () => {
+				predictions++;
+				return prediction(readCandidate());
+			},
+		});
+		const starting = harness.runtime.startTurn({ sessionID: "session", turnID: "turn-stale" });
+		await Promise.resolve();
+		await harness.runtime.settingsChanged({ ...enabledSettings, enabled: false });
+		staleSettings.resolve(enabledSettings);
+		await starting;
+
+		expect(predictions).toBe(0);
+		expect(harness.runtime.inspect("session").activeTurns).toBe(0);
+	});
+
+	it("separates per-turn candidate width from per-session execution concurrency", async () => {
+		const executionsFor = async (candidateLimit: number, maxConcurrentActions: number): Promise<number> => {
+			const harness = createHarness({
+				settings: { ...enabledSettings, candidateLimit, maxConcurrentActions },
+				predict: () => prediction(readCandidate("one.txt"), readCandidate("two.txt"), readCandidate("three.txt")),
+				execute: () => new Promise<string>(() => {}),
+			});
+			await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-limits" });
+			await waitFor(() => harness.runtime.inspect().pendingPredictions === 0);
+			const executions = harness.executions();
+			await harness.runtime.disposeSession("session");
+			return executions;
+		};
+
+		expect(await executionsFor(3, 2)).toBe(2);
+		expect(await executionsFor(1, 3)).toBe(1);
+	});
+
+	it("applies the per-turn candidate limit cumulatively across PatternAware and the drafter", async () => {
+		const harness = createHarness({
+			settings: {
+				...enabledSettings,
+				candidateLimit: 2,
+				maxConcurrentActions: 4,
+				patternAware: { ...PATTERN_AWARE_DEFAULTS, enabled: true },
+			},
+			predictPatternAware: () =>
+				prediction({
+					...readCandidate("pattern.txt"),
+					source: "pattern_aware",
+					patternID: "pattern-limit",
+					horizon: 1,
+				}),
+			predict: () => prediction(readCandidate("draft-one.txt"), readCandidate("draft-two.txt")),
+		});
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-cumulative-limit" });
+		await waitFor(() => harness.runtime.inspect().pendingPredictions === 0);
+
+		expect(harness.executions()).toBe(2);
+	});
+
 	it("carries a successful resource drafter batch and expires it after a whole uncovered turn", async () => {
 		let drafterCalls = 0;
 		const harness = createHarness({
@@ -742,7 +856,7 @@ describe("speculative action runtime", () => {
 
 	it("does not charge reused candidates against the new execution limit", async () => {
 		const harness = createHarness({
-			settings: { ...enabledSettings, maxCandidates: 1 },
+			settings: { ...enabledSettings, candidateLimit: 1 },
 			predict: (input) =>
 				input.turnID === "turn-1"
 					? prediction(readCandidate("README.md"))
@@ -785,7 +899,7 @@ describe("speculative action runtime", () => {
 
 	it("applies the candidate limit after unsupported draft tools are skipped", async () => {
 		const harness = createHarness({
-			settings: { ...enabledSettings, maxCandidates: 1 },
+			settings: { ...enabledSettings, candidateLimit: 1 },
 			predict: () => prediction({ type: "tool_call", tool: "task", input: { prompt: "inspect" } }, readCandidate()),
 		});
 		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-1" });
