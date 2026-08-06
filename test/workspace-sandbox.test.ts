@@ -10,6 +10,7 @@ import {
 	closeWorkspaceSandboxPools,
 	commitSandboxExecution,
 	createWorkspaceSandbox,
+	prepareSandboxWorkspace,
 	type SpeculativeSandboxExecution,
 	withSandboxWorkspace,
 } from "../src/workspace-sandbox.ts";
@@ -457,10 +458,26 @@ describe("M4 workspace sandbox", () => {
 		}
 	});
 
-	it("allows parallel action worktrees without cross-contamination", async () => {
+	it("refreshes a warmed workspace before it is claimed after a source change", async () => {
+		const root = await mkdtemp(path.join(os.tmpdir(), "pi-spec-prewarm-refresh-test-"));
+		try {
+			await writeFile(path.join(root, "value.txt"), "before\n");
+			await prepareSandboxWorkspace(root);
+			await writeFile(path.join(root, "value.txt"), "after\n");
+
+			await withSandboxWorkspace(root, async (workspace) => {
+				expect(await readFile(path.join(workspace.sandboxRoot, "value.txt"), "utf8")).toBe("after\n");
+			});
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("allows parallel actions to claim a warmed workspace without cross-contamination", async () => {
 		const root = await mkdtemp(path.join(os.tmpdir(), "pi-spec-pool-parallel-test-"));
 		try {
 			await writeFile(path.join(root, "value.txt"), "base\n");
+			await prepareSandboxWorkspace(root);
 			const values = await Promise.all(
 				["first\n", "second\n"].map((content) =>
 					withSandboxWorkspace(root, async (workspace) => {
@@ -477,6 +494,38 @@ describe("M4 workspace sandbox", () => {
 			expect(new Set(values.map((value) => value.root)).size).toBe(2);
 			expect(values.map((value) => value.content).sort()).toEqual(["first\n", "second\n"]);
 			expect(await readFile(path.join(root, "value.txt"), "utf8")).toBe("base\n");
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects an already-cancelled workspace preparation", async () => {
+		const root = await mkdtemp(path.join(os.tmpdir(), "pi-spec-prewarm-cancelled-test-"));
+		const controller = new AbortController();
+		controller.abort(new Error("prewarm cancelled"));
+		try {
+			await expect(prepareSandboxWorkspace(root, { signal: controller.signal })).rejects.toThrow(
+				"prewarm cancelled",
+			);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("warms process isolation only when bash is among the prepared tools", async () => {
+		const root = await mkdtemp(path.join(os.tmpdir(), "pi-spec-prewarm-process-test-"));
+		let processPreparations = 0;
+		const sandbox = createWorkspaceSandbox({
+			processRunner: async () => settlement("unused"),
+			prepareProcess: async () => {
+				processPreparations++;
+			},
+		});
+		try {
+			await sandbox.prepare?.({ cwd: root, tools: ["write"] });
+			expect(processPreparations).toBe(0);
+			await sandbox.prepare?.({ cwd: root, tools: ["bash"] });
+			expect(processPreparations).toBe(1);
 		} finally {
 			await rm(root, { recursive: true, force: true });
 		}

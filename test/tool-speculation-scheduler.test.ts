@@ -20,6 +20,22 @@ describe("ToolSpeculationScheduler", () => {
 		});
 	});
 
+	test("retains a bounded actor lead estimate for scheduling diagnostics", () => {
+		const scheduler = new ToolSpeculationScheduler<object>();
+		scheduler.admit(
+			{},
+			{
+				expectedDurationMs: 100,
+				expectedLeadMs: 150,
+				expectedBenefitMs: 80,
+				resource: { class: "process", units: 1 },
+			},
+			1,
+		);
+
+		expect(scheduler.snapshot()[0]?.metadata.expectedLeadMs).toBe(100);
+	});
+
 	test("preempts lower-utility speculative work when the budget is full", () => {
 		const scheduler = new ToolSpeculationScheduler<object>();
 		const low = {};

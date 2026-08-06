@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { buildPiActionKey } from "../src/common.ts";
 import { PATTERN_AWARE_DEFAULTS } from "../src/pattern-aware.ts";
 import type {
@@ -25,7 +25,11 @@ interface HarnessOptions {
 	readonly settings?:
 		| SpeculativeActionSettings
 		| (() => SpeculativeActionSettings | Promise<SpeculativeActionSettings>);
-	readonly predict: (input: StartInput, signal: AbortSignal) => Promise<SpeculativePrediction> | SpeculativePrediction;
+	readonly predict: (
+		input: StartInput,
+		signal: AbortSignal,
+		settings: SpeculativeActionSettings,
+	) => Promise<SpeculativePrediction> | SpeculativePrediction;
 	readonly predictPatternAware?: (
 		input: StartInput,
 		signal: AbortSignal,
@@ -84,7 +88,7 @@ function createHarness(options: HarnessOptions) {
 			{ name: "bash", description: "Run a command" },
 		],
 		stateData: () => ({ cwd: "/workspace" }),
-		predict: (input, _settings, _definitions, _candidateNames, signal) => options.predict(input, signal),
+		predict: (input, settings, _definitions, _candidateNames, signal) => options.predict(input, signal, settings),
 		...(options.predictPatternAware
 			? {
 					predictPatternAware: (
@@ -209,6 +213,84 @@ describe("speculative action runtime", () => {
 		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-expire-prepare" });
 		await preparationStarted.promise;
 		await harness.runtime.finishTurn(consumeTool("turn-expire-prepare", "bash", {}));
+
+		await preparationInterrupted.promise;
+		expect(harness.executions()).toBe(0);
+	});
+
+	it("runs preparation hints without delaying the drafter", async () => {
+		const preparationStarted = deferred<void>();
+		const releasePreparation = deferred<void>();
+		let drafterCalls = 0;
+		const harness = createHarness({
+			settings: {
+				...enabledSettings,
+				patternAware: { ...PATTERN_AWARE_DEFAULTS, enabled: true },
+				tools: { resourceCached: ["read"], sandbox: ["bash"] },
+			},
+			predictPatternAware: () =>
+				prediction({
+					type: "preparation_hint",
+					tool: "bash",
+					input: {},
+					missing: [["command"]],
+					source: "pattern_aware",
+					empiricalProbability: 1,
+				}),
+			prepare: async () => {
+				preparationStarted.resolve(undefined);
+				await releasePreparation.promise;
+			},
+			predict: () => {
+				drafterCalls++;
+				return prediction();
+			},
+		});
+
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-hint-background" });
+		await preparationStarted.promise;
+		await waitFor(() => drafterCalls === 1);
+		releasePreparation.resolve(undefined);
+
+		expect(harness.executions()).toBe(0);
+	});
+
+	it("interrupts unfinished preparation hints when the turn closes", async () => {
+		const preparationStarted = deferred<void>();
+		const preparationInterrupted = deferred<void>();
+		const harness = createHarness({
+			settings: {
+				...enabledSettings,
+				patternAware: { ...PATTERN_AWARE_DEFAULTS, enabled: true },
+				tools: { resourceCached: ["read"], sandbox: ["bash"] },
+			},
+			predictPatternAware: () =>
+				prediction({
+					type: "preparation_hint",
+					tool: "bash",
+					input: {},
+					missing: [["command"]],
+					source: "pattern_aware",
+					empiricalProbability: 1,
+				}),
+			prepare: (_candidate, signal) =>
+				new Promise<void>((_resolve, reject) => {
+					preparationStarted.resolve(undefined);
+					signal.addEventListener(
+						"abort",
+						() => {
+							preparationInterrupted.resolve(undefined);
+							reject(new Error("aborted"));
+						},
+						{ once: true },
+					);
+				}),
+			predict: () => prediction(),
+		});
+
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-hint-cancel" });
+		await preparationStarted.promise;
+		await harness.runtime.finishTurn(consumeTool("turn-hint-cancel", "bash", {}));
 
 		await preparationInterrupted.promise;
 		expect(harness.executions()).toBe(0);
@@ -569,6 +651,7 @@ describe("speculative action runtime", () => {
 	});
 
 	it("applies the per-turn candidate limit cumulatively across PatternAware and the drafter", async () => {
+		let drafterCandidateLimit = 0;
 		const harness = createHarness({
 			settings: {
 				...enabledSettings,
@@ -583,12 +666,73 @@ describe("speculative action runtime", () => {
 					patternID: "pattern-limit",
 					horizon: 1,
 				}),
-			predict: () => prediction(readCandidate("draft-one.txt"), readCandidate("draft-two.txt")),
+			predict: (_input, _signal, settings) => {
+				drafterCandidateLimit = settings.candidateLimit ?? 0;
+				return prediction(readCandidate("draft-one.txt"), readCandidate("draft-two.txt"));
+			},
 		});
 		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-cumulative-limit" });
 		await waitFor(() => harness.runtime.inspect().pendingPredictions === 0);
 
 		expect(harness.executions()).toBe(2);
+		expect(drafterCandidateLimit).toBe(1);
+	});
+
+	it("learns actor lead time and prioritizes latency that can actually be hidden", async () => {
+		let now = 1_000;
+		const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => now);
+		const seedExecution = deferred<string>();
+		const executed: string[] = [];
+		const harness = createHarness({
+			settings: {
+				...enabledSettings,
+				candidateLimit: 2,
+				maxConcurrentActions: 1,
+				tools: { resourceCached: ["read"], sandbox: ["bash"] },
+			},
+			predict: (input) =>
+				input.turnID === "turn-lead-seed"
+					? prediction({ ...bashCandidate("seed"), expectedDurationMs: 100 })
+					: prediction(
+							{ ...bashCandidate("late"), expectedDurationMs: 100 },
+							{ ...readCandidate("hideable.txt"), expectedDurationMs: 90 },
+						),
+			execute: (candidate) => {
+				const input = candidate.input as Record<string, unknown>;
+				const identifier = candidate.tool === "bash" ? String(input.command) : String(input.path);
+				executed.push(`${candidate.tool}:${identifier}`);
+				return identifier === "seed" ? seedExecution.promise : candidate.tool;
+			},
+		});
+
+		try {
+			await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-lead-seed" });
+			await waitFor(() => executed.length === 1);
+			now = 1_010;
+			const seedResult = harness.runtime.consume(consumeTool("turn-lead-seed", "bash", { command: "seed" }));
+			now = 1_100;
+			seedExecution.resolve("bash");
+			expect(await seedResult).toBe("bash");
+			await harness.runtime.finishTurn(consumeTool("turn-lead-seed", "bash", {}));
+
+			now = 1_200;
+			await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-lead-rank" });
+			await waitFor(() => harness.runtime.inspect().pendingPredictions === 0);
+
+			expect(executed).toEqual(["bash:seed", "read:hideable.txt"]);
+			expect(harness.events).toContainEqual(expect.objectContaining({ type: "hit", actorLeadMs: 10 }));
+			expect(harness.events).toContainEqual(
+				expect.objectContaining({
+					type: "cancelled",
+					tool: "bash",
+					expectedLeadMs: 10,
+					reason: "scheduler_budget_exhausted",
+				}),
+			);
+		} finally {
+			await harness.runtime.releaseSession("session");
+			nowSpy.mockRestore();
+		}
 	});
 
 	it("carries a successful resource drafter batch and expires it after a whole uncovered turn", async () => {

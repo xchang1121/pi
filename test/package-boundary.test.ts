@@ -8,6 +8,7 @@ import {
 	createWorkspaceSandbox,
 	installSpeculativeAction,
 	makeSpeculativeActionRuntime,
+	prepareSandboxWorkspace,
 	releaseResourceVersion,
 } from "../src/index.ts";
 
@@ -23,6 +24,7 @@ describe("speculative action package boundary", () => {
 			captureResourceVersion,
 			releaseResourceVersion,
 			createWorkspaceSandbox,
+			prepareSandboxWorkspace,
 		]) {
 			expect(exported).toBeTypeOf("function");
 		}

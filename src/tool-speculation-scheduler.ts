@@ -12,6 +12,7 @@ export type SpeculativeResourceBudget = {
 
 export type SpeculativeSchedulingMetadata = {
 	readonly expectedDurationMs: number;
+	readonly expectedLeadMs?: number;
 	readonly expectedBenefitMs: number;
 	readonly overheadCostMs?: number;
 	readonly resource: SpeculativeResourceProfile;
@@ -161,10 +162,15 @@ export function resourceProfile(tool: string, execution: "resource_cached" | "sa
 
 function normalizeMetadata(metadata: SpeculativeSchedulingMetadata): SpeculativeSchedulingMetadata {
 	const expectedDurationMs = Math.max(0, finite(metadata.expectedDurationMs));
+	const expectedLeadMs =
+		metadata.expectedLeadMs === undefined
+			? undefined
+			: Math.min(expectedDurationMs, Math.max(0, finite(metadata.expectedLeadMs)));
 	const expectedBenefitMs = Math.min(expectedDurationMs, Math.max(0, finite(metadata.expectedBenefitMs)));
 	const overheadCostMs = Math.max(0, finite(metadata.overheadCostMs ?? 0));
 	return {
 		expectedDurationMs,
+		...(expectedLeadMs !== undefined ? { expectedLeadMs } : {}),
 		expectedBenefitMs,
 		overheadCostMs,
 		resource: { class: metadata.resource.class, units: normalizeUnits(metadata.resource.units) },

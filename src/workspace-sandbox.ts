@@ -45,6 +45,12 @@ export interface SpeculativeSandboxExecuteContext {
 export interface SpeculativeAgentSandbox {
 	/** Return true only when this instance can isolate the named tool. */
 	readonly supports: (toolName: string) => boolean;
+	/** Best-effort workspace/process warm-up used before a speculative action is concrete. */
+	readonly prepare?: (input: {
+		readonly cwd: string;
+		readonly tools: readonly string[];
+		readonly signal?: AbortSignal;
+	}) => Promise<void>;
 	/** Execute without changing the real workspace. */
 	readonly execute: (context: SpeculativeSandboxExecuteContext) => Promise<SpeculativeSandboxExecution>;
 	/** Revalidate and atomically adopt an execution, rolling back partial writes on failure. */
@@ -70,6 +76,8 @@ export interface WorkspaceSandboxOptions {
 	 * a detached worktree alone is not a process security boundary.
 	 */
 	readonly processRunner?: SandboxProcessRunner;
+	/** Optional readiness hook for process-isolated tools such as bash. */
+	readonly prepareProcess?: (input: { readonly signal?: AbortSignal }) => Promise<void>;
 	readonly shell?: string;
 	readonly gitBinary?: string;
 }
@@ -78,6 +86,11 @@ export interface SandboxWorkspaceContext {
 	readonly sourceRoot: string;
 	readonly sandboxRoot: string;
 	readonly processRoot: string;
+}
+
+export interface PrepareSandboxWorkspaceOptions {
+	readonly gitBinary?: string;
+	readonly signal?: AbortSignal;
 }
 
 interface PrivateGitWorkspace extends SandboxWorkspaceContext {
@@ -96,18 +109,40 @@ interface PooledGitRepository {
 	version?: ResourceVersionToken;
 	active: number;
 	lock: Promise<void>;
+	prepared?: Promise<PreparedGitWorkspace>;
 	idleTimer?: ReturnType<typeof setTimeout>;
+}
+
+interface PreparedGitWorkspace {
+	readonly sandboxRoot: string;
+	readonly processRoot: string;
+	readonly commit: string;
 }
 
 const SNAPSHOT_EXCLUDES = [".git", ".pi", "node_modules", "dist", ".next"] as const;
 const SANDBOX_REPOSITORY_IDLE_MS = 5 * 60 * 1000;
 const sandboxRepositories = new Map<string, Promise<PooledGitRepository>>();
+const SANDBOX_AUTHOR_ENVIRONMENT = {
+	GIT_AUTHOR_NAME: "Pi Speculative Action",
+	GIT_AUTHOR_EMAIL: "speculative-action@localhost",
+	GIT_COMMITTER_NAME: "Pi Speculative Action",
+	GIT_COMMITTER_EMAIL: "speculative-action@localhost",
+} as const;
 
 /** Create M4's private Git snapshot sandbox with transactional multi-file adoption. */
 export function createWorkspaceSandbox(options: WorkspaceSandboxOptions = {}): SpeculativeAgentSandbox {
 	return {
 		supports: (toolName) =>
 			toolName === "write" || toolName === "edit" || (toolName === "bash" && !!options.processRunner),
+		prepare: async ({ cwd, tools, signal }) => {
+			const supported = tools.filter(
+				(toolName) =>
+					toolName === "write" || toolName === "edit" || (toolName === "bash" && !!options.processRunner),
+			);
+			if (!supported.length) return;
+			await prepareSandboxWorkspace(cwd, { ...(options.gitBinary ? { gitBinary: options.gitBinary } : {}), signal });
+			if (supported.includes("bash") && options.prepareProcess) await options.prepareProcess({ signal });
+		},
 		execute: async (context) => {
 			if (context.toolName === "write" || context.toolName === "edit") {
 				return executeMutation(context, options.gitBinary);
@@ -176,6 +211,22 @@ export async function withSandboxWorkspace<T>(
 		return await run(workspace);
 	} finally {
 		await cleanupPrivateGitWorkspace(workspace);
+	}
+}
+
+export async function prepareSandboxWorkspace(
+	cwd: string,
+	options: PrepareSandboxWorkspaceOptions = {},
+): Promise<void> {
+	throwIfAborted(options.signal);
+	const sourceRoot = path.resolve(cwd);
+	await assertNoSymlinkPath(sourceRoot, sourceRoot);
+	const repository = await acquireSandboxRepository(sourceRoot, options.gitBinary ?? "git");
+	try {
+		await ensurePreparedSandbox(repository);
+		throwIfAborted(options.signal);
+	} finally {
+		releaseSandboxRepository(repository);
 	}
 }
 
@@ -261,34 +312,18 @@ async function createPrivateGitWorkspace(cwd: string, gitBinary: string): Promis
 	const sourceRoot = path.resolve(cwd);
 	await assertNoSymlinkPath(sourceRoot, sourceRoot);
 	const pool = await acquireSandboxRepository(sourceRoot, gitBinary);
-	let parent: string | undefined;
-	let sandboxRoot: string | undefined;
-	let attached = false;
-	const repository = pool.repository;
-	const authorEnvironment = {
-		GIT_AUTHOR_NAME: "Pi Speculative Action",
-		GIT_AUTHOR_EMAIL: "speculative-action@localhost",
-		GIT_COMMITTER_NAME: "Pi Speculative Action",
-		GIT_COMMITTER_EMAIL: "speculative-action@localhost",
-	};
 	try {
-		parent = await mkdtemp(path.join(pool.parent, "action-"));
-		sandboxRoot = path.join(parent, "workspace");
-		const actionParent = parent;
-		const actionRoot = sandboxRoot;
-		const commit = await acquireSandboxBaseline(pool, authorEnvironment);
-		await git(gitBinary, ["--git-dir", repository, "worktree", "add", "--detach", actionRoot, commit], actionParent);
-		attached = true;
-		return { sourceRoot, sandboxRoot: actionRoot, processRoot: actionParent, repository, gitBinary, pool };
+		const commit = await acquireSandboxBaseline(pool, SANDBOX_AUTHOR_ENVIRONMENT);
+		const workspace = (await takePreparedSandbox(pool, commit)) ?? (await attachSandboxWorkspace(pool, commit));
+		return {
+			sourceRoot,
+			sandboxRoot: workspace.sandboxRoot,
+			processRoot: workspace.processRoot,
+			repository: pool.repository,
+			gitBinary,
+			pool,
+		};
 	} catch (error) {
-		if (attached && sandboxRoot) {
-			await git(
-				gitBinary,
-				["--git-dir", repository, "worktree", "remove", "--force", sandboxRoot],
-				pool.parent,
-			).catch(() => undefined);
-		}
-		if (parent) await rm(parent, { recursive: true, force: true }).catch(() => undefined);
 		releaseSandboxRepository(pool);
 		throw error;
 	}
@@ -472,6 +507,76 @@ async function acquireSandboxBaseline(
 	});
 }
 
+async function ensurePreparedSandbox(repository: PooledGitRepository): Promise<void> {
+	const commit = await acquireSandboxBaseline(repository, SANDBOX_AUTHOR_ENVIRONMENT);
+	const existing = repository.prepared;
+	if (existing) {
+		const prepared = await existing;
+		if (prepared.commit === commit) return;
+		if (repository.prepared === existing) repository.prepared = undefined;
+		await discardPreparedSandbox(repository, prepared);
+	}
+	if (repository.prepared) {
+		await repository.prepared;
+		return;
+	}
+	const pending = attachSandboxWorkspace(repository, commit);
+	repository.prepared = pending;
+	try {
+		await pending;
+	} catch (error) {
+		if (repository.prepared === pending) repository.prepared = undefined;
+		throw error;
+	}
+}
+
+async function takePreparedSandbox(
+	repository: PooledGitRepository,
+	commit: string,
+): Promise<PreparedGitWorkspace | undefined> {
+	const pending = repository.prepared;
+	if (!pending) return undefined;
+	repository.prepared = undefined;
+	try {
+		const prepared = await pending;
+		if (prepared.commit === commit) return prepared;
+		await discardPreparedSandbox(repository, prepared);
+	} catch {
+		// A failed or stale warm-up falls back to a fresh per-action workspace.
+	}
+	return undefined;
+}
+
+async function attachSandboxWorkspace(repository: PooledGitRepository, commit: string): Promise<PreparedGitWorkspace> {
+	const processRoot = await mkdtemp(path.join(repository.parent, "action-"));
+	const sandboxRoot = path.join(processRoot, "workspace");
+	try {
+		await git(
+			repository.gitBinary,
+			["--git-dir", repository.repository, "worktree", "add", "--detach", sandboxRoot, commit],
+			processRoot,
+		);
+		return { sandboxRoot, processRoot, commit };
+	} catch (error) {
+		await git(
+			repository.gitBinary,
+			["--git-dir", repository.repository, "worktree", "remove", "--force", sandboxRoot],
+			repository.parent,
+		).catch(() => undefined);
+		await rm(processRoot, { recursive: true, force: true }).catch(() => undefined);
+		throw error;
+	}
+}
+
+async function discardPreparedSandbox(repository: PooledGitRepository, workspace: PreparedGitWorkspace): Promise<void> {
+	await git(
+		repository.gitBinary,
+		["--git-dir", repository.repository, "worktree", "remove", "--force", workspace.sandboxRoot],
+		repository.parent,
+	).catch(() => undefined);
+	await rm(workspace.processRoot, { recursive: true, force: true });
+}
+
 async function sandboxIndexChanges(repository: PooledGitRepository): Promise<string[]> {
 	const prefix = ["--git-dir", repository.repository, "--work-tree", repository.sourceRoot];
 	const [tracked, untracked] = await Promise.all([
@@ -511,10 +616,18 @@ function releaseSandboxRepository(repository: PooledGitRepository): void {
 	repository.idleTimer = setTimeout(() => {
 		if (repository.active > 0) return;
 		sandboxRepositories.delete(`${pathKey(repository.sourceRoot)}\0${repository.gitBinary}`);
-		repository.version?.release();
-		repository.version = undefined;
-		repository.versions.close();
-		void rm(repository.parent, { recursive: true, force: true }).catch(() => undefined);
+		const prepared = repository.prepared;
+		repository.prepared = undefined;
+		void (async () => {
+			if (prepared) {
+				const workspace = await prepared.catch(() => undefined);
+				if (workspace) await discardPreparedSandbox(repository, workspace).catch(() => undefined);
+			}
+			repository.version?.release();
+			repository.version = undefined;
+			repository.versions.close();
+			await rm(repository.parent, { recursive: true, force: true }).catch(() => undefined);
+		})();
 	}, SANDBOX_REPOSITORY_IDLE_MS);
 	repository.idleTimer.unref?.();
 }
@@ -526,6 +639,12 @@ export async function closeWorkspaceSandboxPools(): Promise<void> {
 		const repository = await item.catch(() => undefined);
 		if (!repository) continue;
 		if (repository.idleTimer) clearTimeout(repository.idleTimer);
+		const prepared = repository.prepared;
+		repository.prepared = undefined;
+		if (prepared) {
+			const workspace = await prepared.catch(() => undefined);
+			if (workspace) await discardPreparedSandbox(repository, workspace).catch(() => undefined);
+		}
 		repository.version?.release();
 		repository.version = undefined;
 		repository.versions.close();
@@ -537,6 +656,11 @@ function replaceSandboxVersion(repository: PooledGitRepository, next: ResourceVe
 	const previous = repository.version;
 	repository.version = next;
 	if (previous !== next) previous?.release();
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+	if (!signal?.aborted) return;
+	throw signal.reason instanceof Error ? signal.reason : new Error("sandbox preparation aborted");
 }
 
 function incrementalPathspecs(root: string, changedPaths: readonly string[]): string[] | undefined {

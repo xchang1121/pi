@@ -132,6 +132,8 @@ export interface SpeculativeCandidate {
 	readonly draftCandidate: string;
 	readonly predictedAction: string;
 	readonly startedAt: number;
+	executionStartedAt?: number;
+	actorLeadMs?: number;
 	readonly predictionLatencyMs: number;
 	readonly draftTokens: number;
 	readonly totalDraftTokens: number;
@@ -177,6 +179,7 @@ interface SpeculativeSchedulingEventFields {
 	readonly conditionalProbability?: number;
 	readonly patternDepth?: number;
 	readonly expectedDurationMs: number;
+	readonly expectedLeadMs?: number;
 	readonly expectedBenefitMs: number;
 	readonly expectedWasteMs?: number;
 	readonly overheadCostMs?: number;
@@ -197,6 +200,7 @@ interface SpeculativeSchedulingEventFields {
 	readonly commitValidationMs?: number;
 	readonly commitValidationBytes?: number;
 	readonly commitValidationFiles?: number;
+	readonly actorLeadMs?: number;
 	readonly schedulerOutcome?: SpeculativeCandidate["schedulerOutcome"];
 }
 
@@ -435,6 +439,7 @@ export interface SpeculativeActionRuntimeAdapter<
 		readonly settings: SpeculativeActionSettings;
 		readonly definitions: readonly DrafterToolDefinition[];
 		readonly candidateNames: readonly string[];
+		readonly signal?: AbortSignal;
 	}) => MaybePromise<void>;
 	readonly onTurnFinished?: (input: {
 		readonly startInput: StartInput;
@@ -547,6 +552,7 @@ export function makeSpeculativeActionRuntime<
 	const serviceTimes = new Map<string, { count: number; averageMs: number }>();
 	const executionOverheadTimes = new Map<string, { count: number; averageMs: number }>();
 	const hitOverheadTimes = new Map<string, { count: number; averageMs: number }>();
+	const actorLeadTimes = new Map<string, { count: number; averageMs: number }>();
 	const drafterBackoff = new Map<SessionID, { failures: number; skips: number }>();
 	let notifiedMasterEnabled: boolean | undefined;
 
@@ -583,6 +589,20 @@ export function makeSpeculativeActionRuntime<
 		observeAverage(executionOverheadTimes, tool, durationMs);
 	const observeHitOverhead = (tool: string, durationMs: number): void =>
 		observeAverage(hitOverheadTimes, tool, durationMs);
+	const schedulingKey = (source: PredictionLease["source"], tool: string, horizon?: number): string =>
+		`${source}:${tool}:${horizon === undefined ? "*" : Math.max(0, Math.floor(horizon))}`;
+	const observedLeadTime = (source: PredictionLease["source"], tool: string, horizon?: number): number | undefined =>
+		actorLeadTimes.get(schedulingKey(source, tool, horizon))?.averageMs ??
+		actorLeadTimes.get(schedulingKey(source, tool))?.averageMs;
+	const observeLeadTime = (
+		source: PredictionLease["source"],
+		tool: string,
+		durationMs: number,
+		horizon?: number,
+	): void => {
+		observeAverage(actorLeadTimes, schedulingKey(source, tool), durationMs);
+		if (horizon !== undefined) observeAverage(actorLeadTimes, schedulingKey(source, tool, horizon), durationMs);
+	};
 	const masterEnabled = (settings: SpeculativeActionSettings): boolean =>
 		settings.enabled && settings.mode === "predict_action_single_step";
 	const sourceEnabled = (settings: SpeculativeActionSettings, source: "drafter" | "pattern_aware"): boolean =>
@@ -652,19 +672,25 @@ export function makeSpeculativeActionRuntime<
 		}
 	};
 
-	const schedulingMetadata = (draft: SpeculativeDraftCandidate, action: ActionKey): SpeculativeSchedulingMetadata => {
+	const schedulingMetadata = (
+		draft: SpeculativeDraftCandidate,
+		action: ActionKey,
+		source: PredictionLease["source"],
+	): SpeculativeSchedulingMetadata => {
 		const empiricalProbability =
 			typeof draft.empiricalProbability === "number" && Number.isFinite(draft.empiricalProbability)
 				? Math.max(0, Math.min(1, draft.empiricalProbability))
 				: undefined;
 		const measured = serviceTimes.get(action.tool)?.averageMs;
 		const expectedDurationMs = Math.max(1, draft.expectedDurationMs ?? measured ?? 1);
+		const expectedLeadMs = observedLeadTime(source, action.tool, draft.horizon);
+		const expectedHiddenMs = Math.min(expectedDurationMs, expectedLeadMs ?? expectedDurationMs);
 		const expectedBenefitMs = Math.max(
 			0,
 			Math.min(
-				expectedDurationMs,
+				expectedHiddenMs,
 				draft.expectedLatencyBenefitMs ??
-					(empiricalProbability === undefined ? expectedDurationMs : empiricalProbability * expectedDurationMs),
+					(empiricalProbability === undefined ? expectedHiddenMs : empiricalProbability * expectedHiddenMs),
 			),
 		);
 		const base = resourceProfile(action.tool, action.execution);
@@ -673,6 +699,7 @@ export function makeSpeculativeActionRuntime<
 			(hitOverheadTimes.get(action.tool)?.averageMs ?? 0) * (empiricalProbability ?? 1);
 		return {
 			expectedDurationMs,
+			...(expectedLeadMs !== undefined ? { expectedLeadMs } : {}),
 			expectedBenefitMs,
 			overheadCostMs,
 			resource: {
@@ -680,6 +707,20 @@ export function makeSpeculativeActionRuntime<
 				units: Math.max(1, Math.floor(draft.resourceDemand ?? base.units)),
 			},
 		};
+	};
+
+	const draftPriority = (draft: SpeculativeDraftCandidate, batchSource: PredictionLease["source"]): number => {
+		const probability =
+			typeof draft.empiricalProbability === "number" && Number.isFinite(draft.empiricalProbability)
+				? Math.max(0, Math.min(1, draft.empiricalProbability))
+				: 1;
+		const duration =
+			typeof draft.expectedDurationMs === "number" && Number.isFinite(draft.expectedDurationMs)
+				? Math.max(1, draft.expectedDurationMs)
+				: (serviceTimes.get(draft.tool)?.averageMs ?? 1);
+		const source = draft.source ?? batchSource;
+		const hidden = Math.min(duration, observedLeadTime(source, draft.tool, draft.horizon) ?? duration);
+		return Math.min(hidden, draft.expectedLatencyBenefitMs ?? probability * hidden);
 	};
 
 	const emit = async (event: SpeculativeActionEvent<SessionID>): Promise<void> => {
@@ -741,6 +782,9 @@ export function makeSpeculativeActionRuntime<
 			: {}),
 		...(candidate.depth !== undefined ? { patternDepth: candidate.depth } : {}),
 		expectedDurationMs: candidate.scheduling.expectedDurationMs,
+		...(candidate.scheduling.expectedLeadMs !== undefined
+			? { expectedLeadMs: candidate.scheduling.expectedLeadMs }
+			: {}),
 		expectedBenefitMs: candidate.scheduling.expectedBenefitMs,
 		expectedWasteMs: Math.max(0, candidate.scheduling.expectedDurationMs - candidate.scheduling.expectedBenefitMs),
 		...(candidate.scheduling.overheadCostMs !== undefined
@@ -767,6 +811,7 @@ export function makeSpeculativeActionRuntime<
 		...(candidate.commitValidationFiles !== undefined
 			? { commitValidationFiles: candidate.commitValidationFiles }
 			: {}),
+		...(candidate.actorLeadMs !== undefined ? { actorLeadMs: candidate.actorLeadMs } : {}),
 		...(candidate.schedulerOutcome ? { schedulerOutcome: candidate.schedulerOutcome } : {}),
 	});
 
@@ -1281,7 +1326,7 @@ export function makeSpeculativeActionRuntime<
 			validThroughActionSeq: anchorActionSeq + horizon + 1,
 			state: "active",
 		});
-		const scheduling = schedulingMetadata(draft, candidate.key);
+		const scheduling = schedulingMetadata(draft, candidate.key, source);
 		if (expectedUtility(scheduling) > candidate.utility) {
 			candidate.empiricalProbability = draft.empiricalProbability;
 			candidate.conditionalProbability = draft.conditionalProbability;
@@ -1322,7 +1367,8 @@ export function makeSpeculativeActionRuntime<
 		const turnCandidateLimit = candidateLimit(state.settings);
 		const ordered = [...drafts].sort(
 			(left, right) =>
-				(right.expectedLatencyBenefitMs ?? 0) - (left.expectedLatencyBenefitMs ?? 0) ||
+				draftPriority(right, batchSource) - draftPriority(left, batchSource) ||
+				(right.horizon ?? 0) - (left.horizon ?? 0) ||
 				(right.empiricalProbability ?? 0) - (left.empiricalProbability ?? 0),
 		);
 		for (const [index, draft] of ordered.entries()) {
@@ -1338,17 +1384,19 @@ export function makeSpeculativeActionRuntime<
 				if (state.preparedHints.has(hintKey) || state.preparedHints.size >= turnCandidateLimit) continue;
 				state.preparedHints.add(hintKey);
 				if (adapter.prepareCandidate) {
-					try {
-						await adapter.prepareCandidate({
-							startInput: input,
-							data: state.data,
-							settings: state.settings,
-							candidate: draft,
-							signal: state.predictionController.signal,
+					void Promise.resolve()
+						.then(() =>
+							adapter.prepareCandidate?.({
+								startInput: input,
+								data: state.data,
+								settings: state.settings,
+								candidate: draft,
+								signal: state.predictionController.signal,
+							}),
+						)
+						.catch(() => {
+							// Preparation is best-effort and never executes the hinted action.
 						});
-					} catch {
-						// Preparation is best-effort and never executes the hinted action.
-					}
 				}
 				continue;
 			}
@@ -1439,7 +1487,7 @@ export function makeSpeculativeActionRuntime<
 					: {}),
 				state: "active",
 			};
-			const scheduling = schedulingMetadata(draft, action);
+			const scheduling = schedulingMetadata(draft, action, source);
 			const candidate: RuntimeCandidate<Output> = {
 				id: callID,
 				key: action,
@@ -1590,6 +1638,7 @@ export function makeSpeculativeActionRuntime<
 						throw new SpeculativeJobError(candidate.run.reason, new Error(`speculative ${candidate.run.reason}`));
 					}
 					executionStarted = Date.now();
+					candidate.executionStartedAt = executionStarted;
 					return adapter.executeCandidate({
 						startInput: input,
 						data: state.data,
@@ -1614,6 +1663,7 @@ export function makeSpeculativeActionRuntime<
 						const completedAt = Date.now();
 						const executionMs = Math.max(0, completedAt - executionStarted);
 						candidate.run = { status: "ready", completedAt, executionMs, output };
+						observeServiceTime(candidate.tool, executionMs);
 						Object.assign(candidate, adapter.candidateExecutionMetrics?.({ output, candidate }) ?? {});
 						observeExecutionOverhead(
 							candidate.key.tool,
@@ -1805,12 +1855,18 @@ export function makeSpeculativeActionRuntime<
 			const activeDrafterPlan = [...availableCandidates(state).values()].some(hasActiveSharedDrafterLease);
 			if (adaptiveDrafter(state) && activeDrafterPlan) return;
 			if (adaptiveDrafter(state) && !takeDrafterOpportunity(input.sessionID)) return;
+			const remainingCandidates = candidateLimit(state.settings) - state.admittedCandidates;
+			if (remainingCandidates <= 0) return;
+			const drafterSettings =
+				remainingCandidates === candidateLimit(state.settings)
+					? state.settings
+					: { ...state.settings, candidateLimit: remainingCandidates, maxCandidates: remainingCandidates };
 
 			state.drafterAttempted = true;
 			const predictionStarted = Date.now();
 			const prediction = await withTimeout(
 				Promise.resolve(
-					adapter.predict(input, state.settings, definitions, candidateNames, state.predictionController.signal),
+					adapter.predict(input, drafterSettings, definitions, candidateNames, state.predictionController.signal),
 				),
 				Math.max(0, state.settings.predictionTimeoutMs),
 				() => state.predictionController.abort(),
@@ -1884,7 +1940,7 @@ export function makeSpeculativeActionRuntime<
 		const existing = turns.get(turnKey(input));
 		if (existing) await finishState(existing, false);
 		try {
-			await adapter.onTurnStarted?.({ startInput: input, settings, definitions, candidateNames });
+			await adapter.onTurnStarted?.({ startInput: input, settings, definitions, candidateNames, signal });
 		} catch {
 			// Analyzer metadata must not alter actor semantics.
 		}
@@ -1925,6 +1981,7 @@ export function makeSpeculativeActionRuntime<
 	};
 
 	const consume = async (input: ConsumeInput, signal?: AbortSignal): Promise<Output | undefined> => {
+		const actorArrivedAt = Date.now();
 		const settings = await latestSettings();
 		if (!settings || !masterEnabled(settings)) {
 			await disableSession(input.sessionID);
@@ -1969,6 +2026,17 @@ export function makeSpeculativeActionRuntime<
 			}
 			if (activeDrafterPlan && !hasActiveDrafterLease(candidate)) state.drafterPlanMismatch = true;
 			await matchPredictionLeases(state, candidate, actionSequence);
+			const matchedLease =
+				candidate.leases.find(
+					(lease) =>
+						lease.state === "matched" &&
+						lease.resolvedActionSeq === actionSequence &&
+						lease.source === "pattern_aware",
+				) ??
+				candidate.leases.find((lease) => lease.state === "matched" && lease.resolvedActionSeq === actionSequence);
+			const actorLeadMs = Math.max(0, actorArrivedAt - (candidate.executionStartedAt ?? actorArrivedAt));
+			candidate.actorLeadMs = actorLeadMs;
+			observeLeadTime(matchedLease?.source ?? candidate.source, candidate.tool, actorLeadMs, matchedLease?.horizon);
 			const inFlightAtMatch = candidate.run.status === "running";
 
 			if (adapter.authorizeCandidate) {
@@ -2107,7 +2175,6 @@ export function makeSpeculativeActionRuntime<
 			const waitedMs = Math.max(0, Date.now() - waitStarted);
 			const consumeOverheadMs = Math.max(0, Date.now() - consumeStarted);
 			const executionMs = candidateExecutionMs(candidate) || Math.max(0, Date.now() - candidate.startedAt);
-			observeServiceTime(actual.tool, executionMs);
 			observeHitOverhead(actual.tool, candidate.validationMs + (candidate.commitMs ?? 0));
 			completePredictionMatch(candidate, actionSequence);
 			candidate.hits++;
@@ -2209,6 +2276,7 @@ export function makeSpeculativeActionRuntime<
 		if (state.finished) return;
 		state.finished = true;
 		state.terminal = terminal;
+		state.predictionController.abort();
 		wallTimes.set(state.sessionID, (wallTimes.get(state.sessionID) ?? 0) + Math.max(0, Date.now() - state.startedAt));
 		turns.delete(turnKey(state));
 		try {

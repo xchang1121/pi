@@ -236,6 +236,15 @@ export function installSpeculativeAction(
 			// Persistence failure must not change Agent lifecycle semantics.
 		}
 	};
+	const prepareSandbox = async (tools: readonly string[], signal?: AbortSignal): Promise<void> => {
+		const supported = tools.filter((tool) => options.sandbox?.supports(tool));
+		if (!supported.length) return;
+		await options.sandbox?.prepare?.({
+			cwd: options.cwd,
+			tools: supported,
+			...(signal ? { signal } : {}),
+		});
+	};
 
 	const projection = options.projectOutput
 		? async (input: {
@@ -517,9 +526,10 @@ export function installSpeculativeAction(
 				draftTokens: 0,
 			};
 		},
-		prepareCandidate: async ({ candidate }) => {
+		prepareCandidate: async ({ candidate, signal }) => {
 			if (candidate.execution !== "sandbox" && inferredExecution(candidate.tool) !== "sandbox") return;
 			if (!options.sandbox?.supports(candidate.tool)) throw new Error(`Sandbox unavailable for ${candidate.tool}`);
+			await prepareSandbox([candidate.tool], signal);
 		},
 		onPatternLaunched: (patternID, context) => {
 			const store = asPatternAwareRuntimeContext(context)?.store ?? (isPatternStore(context) ? context : undefined);
@@ -533,7 +543,10 @@ export function installSpeculativeAction(
 			if (openedPatternStore) await (await openedPatternStore).store.flush();
 			if (options.patternStore) await (await options.patternStore).flush();
 		},
-		onTurnStarted: async ({ startInput, settings }) => {
+		onTurnStarted: async ({ startInput, settings, signal }) => {
+			void prepareSandbox(settings.tools.sandbox, signal).catch(() => {
+				// Turn warm-up is best-effort; concrete candidate preparation retries it.
+			});
 			if (!settings.patternAware?.enabled) return;
 			const store = await resolvePatternStore(settings);
 			store.observeTurn({

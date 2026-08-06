@@ -412,6 +412,7 @@ describe("Pi Agent speculative integration", () => {
 		const root = await mkdtemp(path.join(os.tmpdir(), "pi-agent-spec-write-"));
 		try {
 			let executions = 0;
+			const preparedTools: string[][] = [];
 			const tool: WriteTool = {
 				name: "write",
 				label: "Write",
@@ -435,6 +436,14 @@ describe("Pi Agent speculative integration", () => {
 				actorDelayMs: 100,
 			});
 			const agent = new Agent({ initialState: { model: createModel(), tools: [tool] }, streamFn: streams.stream });
+			const baseSandbox = createWorkspaceSandbox();
+			const sandbox = {
+				...baseSandbox,
+				prepare: async (input: Parameters<NonNullable<typeof baseSandbox.prepare>>[0]) => {
+					preparedTools.push([...input.tools]);
+					await baseSandbox.prepare?.(input);
+				},
+			};
 			const installed = installSpeculativeAction(agent, {
 				cwd: root,
 				getSettings: () => ({
@@ -443,12 +452,13 @@ describe("Pi Agent speculative integration", () => {
 					tools: { resourceCached: [], sandbox: ["write"] },
 				}),
 				preflight: () => true,
-				sandbox: createWorkspaceSandbox(),
+				sandbox,
 			});
 
 			await agent.prompt("Create the file");
 
 			expect(executions).toBe(1);
+			expect(preparedTools.some((tools) => tools.includes("write"))).toBe(true);
 			expect(await readFile(path.join(root, "created.txt"), "utf8")).toBe("from speculation\n");
 			const result = agent.state.messages.find((message) => message.role === "toolResult");
 			expect(result?.role === "toolResult" ? result.content : undefined).toEqual([
