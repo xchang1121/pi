@@ -243,6 +243,7 @@ export type SpeculativeActionEvent<SessionID> = SpeculativeCacheSnapshot &
 		| (SpeculativeEventBase<SessionID> &
 				SpeculativeSchedulingEventFields & {
 					type: "hit";
+					readonly sources: readonly (PredictionLease["source"] | "cache")[];
 					tool: string;
 					actionKeyHash: string;
 					savedMs: number;
@@ -2280,21 +2281,20 @@ export function makeSpeculativeActionRuntime<
 			if ((candidate.commitValidationFiles ?? 0) > 0) {
 				await invalidateChangedResources(state, actual, candidate);
 			}
-			const patternLease = candidate.leases.find(
-				(lease) =>
-					lease.source === "pattern_aware" && lease.state === "hit" && lease.resolvedActionSeq === actionSequence,
+			const matchedLeases = candidate.leases.filter(
+				(lease) => lease.state === "hit" && lease.resolvedActionSeq === actionSequence,
 			);
-			const drafterLease = candidate.leases.find(
-				(lease) =>
-					lease.source === "drafter" && lease.state === "hit" && lease.resolvedActionSeq === actionSequence,
-			);
+			const patternLease = matchedLeases.find((lease) => lease.source === "pattern_aware");
+			const drafterLease = matchedLeases.find((lease) => lease.source === "drafter");
 			const eventSource: SpeculativeSchedulingEventFields["source"] = patternLease
 				? "pattern_aware"
 				: drafterLease
 					? "drafter"
 					: "cache";
+			const eventSources = [...new Set(matchedLeases.map((lease) => lease.source))];
 			await emit({
 				type: "hit",
+				sources: eventSources.length ? eventSources : ["cache"],
 				sessionID: state.sessionID,
 				turnID: state.turnID,
 				timestamp: Date.now(),

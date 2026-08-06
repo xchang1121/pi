@@ -184,6 +184,7 @@ describe("PatternAware runtime integration", () => {
 	it("deduplicates PatternAware and drafter predictions onto one execution", async () => {
 		let executions = 0;
 		let launches = 0;
+		const events: SpeculativeActionEvent<string>[] = [];
 		const runtime = makeSpeculativeActionRuntime(
 			adapter({
 				predictPatternAware: () => ({
@@ -201,6 +202,9 @@ describe("PatternAware runtime integration", () => {
 				onPatternLaunched: () => {
 					launches++;
 				},
+				onEvent: (event) => {
+					events.push(event);
+				},
 			}),
 		);
 
@@ -209,6 +213,40 @@ describe("PatternAware runtime integration", () => {
 		expect(await runtime.consume(call("turn", "read", { path: "README.md" }))).toBe("one");
 		expect(executions).toBe(1);
 		expect(launches).toBe(1);
+		expect(events).toContainEqual(
+			expect.objectContaining({
+				type: "hit",
+				source: "pattern_aware",
+				sources: ["pattern_aware", "drafter"],
+			}),
+		);
+	});
+
+	it("flushes terminal PatternAware state after prediction leases settle", async () => {
+		const lifecycle: string[] = [];
+		const runtime = makeSpeculativeActionRuntime(
+			adapter({
+				predictPatternAware: () => ({
+					candidates: [patternCandidate("read", { path: "README.md" }, "terminal-pattern", 8)],
+					draftTokens: 0,
+				}),
+				onTurnFinished: () => {
+					lifecycle.push("turn_finished");
+				},
+				onPatternResolved: (_id, outcome) => {
+					lifecycle.push(`resolved:${outcome}`);
+				},
+				flushPatternStore: () => {
+					lifecycle.push(`flush_after:${lifecycle.at(-1)}`);
+				},
+			}),
+		);
+
+		await runtime.startTurn(start("turn"));
+		await waitFor(() => runtime.inspect().resourceCandidates === 1);
+		await runtime.finishTurn({ ...start("turn"), terminal: true });
+
+		expect(lifecycle).toEqual(["turn_finished", "resolved:actor_miss", "flush_after:resolved:actor_miss"]);
 	});
 
 	it("routes lifecycle updates through each candidate store context", async () => {
