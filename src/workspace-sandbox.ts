@@ -108,6 +108,7 @@ interface PooledGitRepository {
 	commit?: string;
 	version?: ResourceVersionToken;
 	active: number;
+	readonly idleWaiters: Set<() => void>;
 	lock: Promise<void>;
 	prepared?: Promise<PreparedGitWorkspace>;
 	idleTimer?: ReturnType<typeof setTimeout>;
@@ -119,8 +120,19 @@ interface PreparedGitWorkspace {
 	readonly commit: string;
 }
 
-const SNAPSHOT_EXCLUDES = [".git", ".pi", "node_modules", "dist", ".next"] as const;
+const SNAPSHOT_EXCLUDES = [
+	".git",
+	".pi",
+	"node_modules",
+	"dist",
+	".next",
+	"__pycache__",
+	".pytest_cache",
+	".mypy_cache",
+	".ruff_cache",
+] as const;
 const SANDBOX_REPOSITORY_IDLE_MS = 5 * 60 * 1000;
+const GIT_PATHSPEC_BATCH_BYTES = 32 * 1024;
 const sandboxRepositories = new Map<string, Promise<PooledGitRepository>>();
 const SANDBOX_AUTHOR_ENVIRONMENT = {
 	GIT_AUTHOR_NAME: "Pi Speculative Action",
@@ -362,6 +374,7 @@ async function createSandboxRepository(sourceRoot: string, gitBinary: string): P
 			gitBinary,
 			versions: new ResourceVersionManager(sourceRoot),
 			active: 0,
+			idleWaiters: new Set(),
 			lock: Promise.resolve(),
 		};
 	} catch (error) {
@@ -407,21 +420,7 @@ async function acquireSandboxBaseline(
 						repository.sourceRoot,
 					);
 					if (changedPathspecs.length) {
-						await git(
-							repository.gitBinary,
-							[
-								"--git-dir",
-								repository.repository,
-								"--work-tree",
-								repository.sourceRoot,
-								"add",
-								"-f",
-								"-A",
-								"--",
-								...changedPathspecs,
-							],
-							repository.sourceRoot,
-						);
+						await stageSandboxPaths(repository, changedPathspecs);
 					}
 				} else {
 					await git(
@@ -505,6 +504,73 @@ async function acquireSandboxBaseline(
 		}
 		throw new Error("workspace changed repeatedly while preparing sandbox baseline");
 	});
+}
+
+async function stageSandboxPaths(repository: PooledGitRepository, pathspecs: readonly string[]): Promise<void> {
+	for (const batch of batchPathspecs(pathspecs)) {
+		let pending = batch;
+		for (let attempt = 0; attempt < 3 && pending.length; attempt++) {
+			const tracked = new Set(
+				parseNullList(
+					await git(
+						repository.gitBinary,
+						["--git-dir", repository.repository, "ls-files", "-z", "--"],
+						repository.sourceRoot,
+					),
+				),
+			);
+			pending = (
+				await Promise.all(
+					pending.map(async (pathspec) =>
+						tracked.has(pathspec) || (await exists(path.join(repository.sourceRoot, pathspec)))
+							? pathspec
+							: undefined,
+					),
+				)
+			).filter((pathspec): pathspec is string => pathspec !== undefined);
+			if (!pending.length) break;
+			try {
+				await git(
+					repository.gitBinary,
+					[
+						"--git-dir",
+						repository.repository,
+						"--work-tree",
+						repository.sourceRoot,
+						"add",
+						"-f",
+						"-A",
+						"--",
+						...pending,
+					],
+					repository.sourceRoot,
+				);
+				break;
+			} catch (error) {
+				if (!(error instanceof Error) || !error.message.includes("did not match any files") || attempt === 2) {
+					throw error;
+				}
+			}
+		}
+	}
+}
+
+function batchPathspecs(pathspecs: readonly string[]): string[][] {
+	const batches: string[][] = [];
+	let batch: string[] = [];
+	let bytes = 0;
+	for (const pathspec of pathspecs) {
+		const size = Buffer.byteLength(pathspec) + 1;
+		if (batch.length && bytes + size > GIT_PATHSPEC_BATCH_BYTES) {
+			batches.push(batch);
+			batch = [];
+			bytes = 0;
+		}
+		batch.push(pathspec);
+		bytes += size;
+	}
+	if (batch.length) batches.push(batch);
+	return batches;
 }
 
 async function ensurePreparedSandbox(repository: PooledGitRepository): Promise<void> {
@@ -612,6 +678,10 @@ async function withRepositoryLock<T>(repository: PooledGitRepository, run: () =>
 
 function releaseSandboxRepository(repository: PooledGitRepository): void {
 	repository.active = Math.max(0, repository.active - 1);
+	if (repository.active === 0) {
+		for (const resolve of repository.idleWaiters) resolve();
+		repository.idleWaiters.clear();
+	}
 	if (repository.active > 0 || repository.idleTimer) return;
 	repository.idleTimer = setTimeout(() => {
 		if (repository.active > 0) return;
@@ -638,6 +708,7 @@ export async function closeWorkspaceSandboxPools(): Promise<void> {
 	for (const item of pending) {
 		const repository = await item.catch(() => undefined);
 		if (!repository) continue;
+		await waitForSandboxRepositoryIdle(repository);
 		if (repository.idleTimer) clearTimeout(repository.idleTimer);
 		const prepared = repository.prepared;
 		repository.prepared = undefined;
@@ -650,6 +721,14 @@ export async function closeWorkspaceSandboxPools(): Promise<void> {
 		repository.versions.close();
 		await rm(repository.parent, { recursive: true, force: true });
 	}
+}
+
+async function waitForSandboxRepositoryIdle(repository: PooledGitRepository): Promise<void> {
+	if (repository.active === 0) return;
+	await new Promise<void>((resolve) => {
+		repository.idleWaiters.add(resolve);
+		if (repository.active === 0 && repository.idleWaiters.delete(resolve)) resolve();
+	});
 }
 
 function replaceSandboxVersion(repository: PooledGitRepository, next: ResourceVersionToken): void {
@@ -806,6 +885,16 @@ function isMissing(error: unknown): boolean {
 	return !!error && typeof error === "object" && "code" in error && error.code === "ENOENT";
 }
 
+async function exists(target: string): Promise<boolean> {
+	try {
+		await lstat(target);
+		return true;
+	} catch (error) {
+		if (isMissing(error)) return false;
+		throw error;
+	}
+}
+
 function sameOptionalBytes(left: Uint8Array | undefined, right: Uint8Array | undefined): boolean {
 	if (left === undefined || right === undefined) return left === right;
 	if (left.length !== right.length) return false;
@@ -853,7 +942,12 @@ function git(
 			},
 			(error, stdout, stderr) => {
 				if (error) {
-					reject(new Error(`${command} ${args.join(" ")} failed: ${Buffer.from(stderr).toString("utf8").trim()}`));
+					const detail = Buffer.from(stderr).toString("utf8").trim() || error.message;
+					const shown = args.slice(0, 16).join(" ");
+					const omitted = Math.max(0, args.length - 16);
+					reject(
+						new Error(`${command} ${shown}${omitted ? ` … (${omitted} args omitted)` : ""} failed: ${detail}`),
+					);
 					return;
 				}
 				resolve(Buffer.from(stdout));

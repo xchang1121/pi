@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { AgentTool, SettleToolCallResult } from "@earendil-works/pi-agent-core";
@@ -439,6 +439,46 @@ describe("M4 workspace sandbox", () => {
 		}
 	});
 
+	it("waits for active worktrees before closing the shared pool", async () => {
+		const root = await mkdtemp(path.join(os.tmpdir(), "pi-spec-pool-close-test-"));
+		let poolRoot = "";
+		let markStarted: (() => void) | undefined;
+		let releaseAction: (() => void) | undefined;
+		const started = new Promise<void>((resolve) => {
+			markStarted = resolve;
+		});
+		const actionGate = new Promise<void>((resolve) => {
+			releaseAction = resolve;
+		});
+		let execution: Promise<void> | undefined;
+		try {
+			execution = withSandboxWorkspace(root, async (workspace) => {
+				poolRoot = path.dirname(workspace.processRoot);
+				markStarted?.();
+				await actionGate;
+			});
+			await started;
+
+			let closed = false;
+			const closing = closeWorkspaceSandboxPools().then(() => {
+				closed = true;
+			});
+			await new Promise((resolve) => setTimeout(resolve, 20));
+			expect(closed).toBe(false);
+			await expect(stat(poolRoot)).resolves.toBeDefined();
+
+			releaseAction?.();
+			await execution;
+			await closing;
+			expect(closed).toBe(true);
+			await expect(stat(poolRoot)).rejects.toThrow();
+		} finally {
+			releaseAction?.();
+			await execution?.catch(() => undefined);
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
 	it("refreshes a pooled baseline even before filesystem watcher delivery", async () => {
 		const root = await mkdtemp(path.join(os.tmpdir(), "pi-spec-pool-refresh-test-"));
 		try {
@@ -453,6 +493,91 @@ describe("M4 workspace sandbox", () => {
 				expect(await readFile(path.join(workspace.sandboxRoot, "value.txt"), "utf8")).toBe("two\n");
 				expect(await readFile(path.join(workspace.sandboxRoot, "added.txt"), "utf8")).toBe("added\n");
 			});
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("batches large incremental path lists before invoking git add", async () => {
+		const root = await mkdtemp(path.join(os.tmpdir(), "pi-spec-path-batch-test-"));
+		const wrapper = path.join(root, "git-wrapper");
+		try {
+			await writeFile(
+				wrapper,
+				[
+					"#!/bin/sh",
+					"bytes=0",
+					"is_add=0",
+					'for argument in "$@"; do',
+					'  argument_bytes=$(printf %s "$argument" | wc -c)',
+					"  bytes=$((bytes + argument_bytes + 1))",
+					'  if [ "$argument" = "add" ]; then is_add=1; fi',
+					"done",
+					'if [ "$is_add" = "1" ] && [ "$bytes" -gt 49152 ]; then',
+					'  echo "oversized git add invocation: $bytes bytes" >&2',
+					"  exit 97",
+					"fi",
+					'exec git "$@"',
+				].join("\n"),
+				"utf8",
+			);
+			await chmod(wrapper, 0o700);
+			const files = Array.from(
+				{ length: 700 },
+				(_, index) => `files/path-${String(index).padStart(4, "0")}-${"deliberately-long-".repeat(4)}name.txt`,
+			);
+			await mkdir(path.join(root, "files"));
+			await Promise.all(files.map((file) => writeFile(path.join(root, file), "before\n")));
+			await prepareSandboxWorkspace(root, { gitBinary: wrapper });
+			await Promise.all(files.map((file) => writeFile(path.join(root, file), "after\n")));
+
+			await withSandboxWorkspace(
+				root,
+				async (workspace) => {
+					expect(await readFile(path.join(workspace.sandboxRoot, files.at(-1)!), "utf8")).toBe("after\n");
+				},
+				wrapper,
+			);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	}, 15_000);
+
+	it("retries incremental staging when an untracked file disappears during git add", async () => {
+		const root = await mkdtemp(path.join(os.tmpdir(), "pi-spec-transient-path-test-"));
+		const wrapper = path.join(root, "git-wrapper");
+		try {
+			await writeFile(
+				wrapper,
+				[
+					"#!/bin/sh",
+					"work_tree=",
+					"previous=",
+					"remove_transient=0",
+					'for argument in "$@"; do',
+					'  if [ "$previous" = "--work-tree" ]; then work_tree="$argument"; fi',
+					'  if [ "$argument" = "transient.tmp" ]; then remove_transient=1; fi',
+					'  previous="$argument"',
+					"done",
+					'if [ "$remove_transient" = "1" ]; then rm -f "$work_tree/transient.tmp"; fi',
+					'exec git "$@"',
+				].join("\n"),
+				"utf8",
+			);
+			await chmod(wrapper, 0o700);
+			await writeFile(path.join(root, "value.txt"), "before\n");
+			await prepareSandboxWorkspace(root, { gitBinary: wrapper });
+			await writeFile(path.join(root, "value.txt"), "after\n");
+			await writeFile(path.join(root, "transient.tmp"), "temporary\n");
+
+			await withSandboxWorkspace(
+				root,
+				async (workspace) => {
+					expect(await readFile(path.join(workspace.sandboxRoot, "value.txt"), "utf8")).toBe("after\n");
+					await expect(stat(path.join(workspace.sandboxRoot, "transient.tmp"))).rejects.toThrow();
+				},
+				wrapper,
+			);
 		} finally {
 			await rm(root, { recursive: true, force: true });
 		}
