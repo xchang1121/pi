@@ -563,6 +563,48 @@ describe("PatternAware runtime integration", () => {
 		await runtime.dispose();
 	});
 
+	it("keeps immediate template predictions while multi-step speculation is disabled", async () => {
+		const executed: string[] = [];
+		const prepared: string[] = [];
+		let continuations = 0;
+		const runtime = makeSpeculativeActionRuntime(
+			adapter({
+				settings: () => ({
+					...settings(),
+					patternAware: { ...PATTERN_AWARE_DEFAULTS, multiStepEnabled: false },
+				}),
+				predictPatternAware: () => ({
+					candidates: [
+						patternCandidate("read", { path: "immediate.ts" }, "immediate", 0),
+						patternCandidate("read", { path: "future.ts" }, "future", 1),
+						preparationHint("hint.ts"),
+					],
+					draftTokens: 0,
+				}),
+				prepareCandidate: ({ candidate }) => {
+					prepared.push(String((candidate.input as { path?: string }).path));
+				},
+				executeCandidate: ({ concrete }) => {
+					executed.push(String(concrete.path));
+					return "immediate";
+				},
+				continuePatternAware: () => {
+					continuations++;
+					return undefined;
+				},
+			}),
+		);
+
+		await runtime.startTurn(start("turn"));
+		await waitFor(() => runtime.inspect().pendingPredictions === 0);
+		await waitFor(() => executed.length === 1);
+
+		expect(executed).toEqual(["immediate.ts"]);
+		expect(prepared).toEqual(["immediate.ts"]);
+		expect(continuations).toBe(0);
+		await runtime.dispose();
+	});
+
 	it("expands a completed speculative result into a multi-step frontier", async () => {
 		const executed: string[] = [];
 		const runtime = makeSpeculativeActionRuntime(

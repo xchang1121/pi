@@ -618,6 +618,8 @@ export function makeSpeculativeActionRuntime<
 		(source === "drafter"
 			? (settings.drafterEnabled ?? DEFAULTS.drafterEnabled)
 			: (settings.patternAware?.enabled ?? false));
+	const patternMultiStepEnabled = (settings: SpeculativeActionSettings): boolean =>
+		settings.patternAware?.multiStepEnabled ?? true;
 	const latestSettings = async (): Promise<SpeculativeActionSettings | undefined> => {
 		try {
 			return await adapter.settings();
@@ -1458,6 +1460,14 @@ export function makeSpeculativeActionRuntime<
 				(right.empiricalProbability ?? 0) - (left.empiricalProbability ?? 0),
 		);
 		for (const [index, draft] of ordered.entries()) {
+			const source = draft.source ?? batchSource;
+			if (
+				source === "pattern_aware" &&
+				!patternMultiStepEnabled(enabled) &&
+				(draft.type === "preparation_hint" || (draft.horizon ?? 0) > 0 || (draft.depth ?? 1) > 1)
+			) {
+				continue;
+			}
 			if (draft.type === "preparation_hint") {
 				if (!candidateNames.includes(draft.tool)) continue;
 				if (
@@ -1507,7 +1517,6 @@ export function makeSpeculativeActionRuntime<
 				});
 				continue;
 			}
-			const source = draft.source ?? batchSource;
 			if (state.actorKeys.has(action.key)) {
 				accepted++;
 				continue;
@@ -1830,7 +1839,13 @@ export function makeSpeculativeActionRuntime<
 		parentConfirmed: boolean,
 	): Promise<void> => {
 		const settings = await latestSettings();
-		if (!settings || !sourceEnabled(settings, "pattern_aware") || !adapter.continuePatternAware || state.terminal) {
+		if (
+			!settings ||
+			!sourceEnabled(settings, "pattern_aware") ||
+			!patternMultiStepEnabled(settings) ||
+			!adapter.continuePatternAware ||
+			state.terminal
+		) {
 			return;
 		}
 		for (const lease of candidate.leases) {

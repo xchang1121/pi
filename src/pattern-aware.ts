@@ -5,6 +5,8 @@ import path from "node:path";
 
 export type PatternAwareSettings = {
 	readonly enabled: boolean;
+	/** Admit future-gap/preparation candidates and expand completed predictions into a multi-step frontier. */
+	readonly multiStepEnabled: boolean;
 	readonly maxContextLength: number;
 	readonly maxFutureGap: number;
 	readonly futureGapCoverage: number;
@@ -227,6 +229,7 @@ type TrieNode = {
 
 export const PATTERN_AWARE_DEFAULTS: PatternAwareSettings = {
 	enabled: true,
+	multiStepEnabled: true,
 	maxContextLength: 6,
 	maxFutureGap: 8,
 	futureGapCoverage: 0.9,
@@ -1030,6 +1033,10 @@ export function patternAwareSettings(value: unknown): PatternAwareSettings {
 	const record = asRecord(value);
 	return {
 		enabled: typeof record?.enabled === "boolean" ? record.enabled : PATTERN_AWARE_DEFAULTS.enabled,
+		multiStepEnabled:
+			typeof record?.multiStepEnabled === "boolean"
+				? record.multiStepEnabled
+				: PATTERN_AWARE_DEFAULTS.multiStepEnabled,
 		maxContextLength: positiveInteger(record?.maxContextLength, PATTERN_AWARE_DEFAULTS.maxContextLength),
 		maxFutureGap: nonNegativeInteger(record?.maxFutureGap, PATTERN_AWARE_DEFAULTS.maxFutureGap),
 		futureGapCoverage: probabilitySetting(record?.futureGapCoverage, PATTERN_AWARE_DEFAULTS.futureGapCoverage),
