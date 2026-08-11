@@ -2,9 +2,12 @@ import { createHash } from "node:crypto";
 import { createReadStream, type FSWatcher, watch } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
-import type { ActionKey } from "./common.ts";
-
-export type ResourceDependencyScope = "content" | "tree_entries" | "tree_query" | "tree_content";
+import {
+	type ActionKey,
+	type ActionSemanticsRegistry,
+	PI_ACTION_SEMANTICS,
+	type ResourceDependencyScope,
+} from "./action-semantics.ts";
 
 export type ResourceDependency = {
 	readonly path: string;
@@ -352,21 +355,22 @@ export class ResourceVersionManager {
 
 const managers = new Map<string, ResourceVersionManager>();
 
-export function resourceDependencies(action: ActionKey, root: string): ReadonlyArray<ResourceDependency> {
-	if (action.tool === "bash") {
-		const workdir = typeof action.input.workdir === "string" ? action.input.workdir : ".";
-		return [{ path: path.resolve(root, workdir), scope: "tree_content" }];
-	}
-	if (action.tool === "lsp" && action.input.operation !== "documentSymbol") {
+export function resourceDependencies(
+	action: ActionKey,
+	root: string,
+	actionSemantics: ActionSemanticsRegistry = PI_ACTION_SEMANTICS,
+): ReadonlyArray<ResourceDependency> {
+	const definition = actionSemantics.definition(action.tool);
+	if (!definition && action.tool === "lsp" && action.input.operation !== "documentSymbol") {
 		return [{ path: root, scope: "tree_content" }];
 	}
-	const scope: ResourceDependencyScope =
-		action.tool === "find" ? "tree_query" : action.tool === "grep" ? "tree_content" : "content";
+	const scope = definition ? definition.resourceScope : "content";
+	if (scope === undefined) return [];
 	const dependencies = action.resources.map((resource) => ({
 		path: path.resolve(root, resource),
 		scope,
 	}));
-	if (action.tool === "find") {
+	if (scope === "tree_query") {
 		for (const resource of action.resources) {
 			const base = path.resolve(root, resource);
 			const relative = path.relative(root, base);
@@ -384,8 +388,12 @@ export function resourceDependencies(action: ActionKey, root: string): ReadonlyA
 	return dependencies;
 }
 
-export function captureResourceVersion(action: ActionKey, root: string) {
-	return resourceVersionManager(root).capture(resourceDependencies(action, root));
+export function captureResourceVersion(
+	action: ActionKey,
+	root: string,
+	actionSemantics: ActionSemanticsRegistry = PI_ACTION_SEMANTICS,
+) {
+	return resourceVersionManager(root).capture(resourceDependencies(action, root, actionSemantics));
 }
 
 export function validateResourceVersion(token: unknown): Promise<ResourceValidation> {
@@ -704,10 +712,14 @@ function fingerprintIO<Value>(task: () => Promise<Value>) {
 }
 
 /** @deprecated M8 callers should retain and validate ResourceVersionToken instead. */
-export async function fingerprintActionResources(action: ActionKey, root: string): Promise<string> {
+export async function fingerprintActionResources(
+	action: ActionKey,
+	root: string,
+	actionSemantics: ActionSemanticsRegistry = PI_ACTION_SEMANTICS,
+): Promise<string> {
 	const manager = new ResourceVersionManager(path.resolve(root), { watch: false });
 	try {
-		const token = await manager.capture(resourceDependencies(action, root));
+		const token = await manager.capture(resourceDependencies(action, root, actionSemantics));
 		return JSON.stringify({ tool: action.tool, exact: token.exact ?? [], quick: token.quick });
 	} finally {
 		manager.close();

@@ -25,7 +25,7 @@ import type { PatternAwareDependency, PatternAwareResolution, PatternAwareSettin
 import type { PlanExecutionNode } from "./plan-execution-graph.ts";
 import { PlanExecutionGraph } from "./plan-execution-graph.ts";
 import type { PlanAction, PlanProposal, PlanUpdate } from "./plan-proposal.ts";
-import { PlanLedger } from "./plan-proposal.ts";
+import { PlanLedger, samePlanActionExecution } from "./plan-proposal.ts";
 import {
 	expectedUtility,
 	resourceProfile,
@@ -1114,7 +1114,7 @@ export function makeSpeculativeActionRuntime<
 			expectedHiddenMs,
 			finiteNonNegative(draft.expectedLatencyBenefitMs, defaultBenefitMs),
 		);
-		const base = resourceProfile(action.tool, action.execution);
+		const base = resourceProfile(action.execution, actionSemantics.sandboxMode(action.tool));
 		const overheadCostMs =
 			(executionOverheadTimes.get(action.tool)?.averageMs ?? 0) +
 			(hitOverheadTimes.get(action.tool)?.averageMs ?? 0) * (empiricalProbability ?? 1);
@@ -2726,7 +2726,10 @@ export function makeSpeculativeActionRuntime<
 		for (const { node } of matches) {
 			const promotion = state.planGraph.promote(node.proposalID, node.action.id);
 			if (promotion.status !== "claimed") continue;
-			await preemptForAuthoritative(state, resourceProfile(actor.tool, actor.execution));
+			await preemptForAuthoritative(
+				state,
+				resourceProfile(actor.execution, actionSemantics.sandboxMode(actor.tool)),
+			);
 			if (
 				await launchPlanNode(
 					state,
@@ -2797,12 +2800,18 @@ export function makeSpeculativeActionRuntime<
 				await publishMiss(state, "invalid_plan_update", undefined, "Plan source does not own this update.");
 				continue;
 			}
+			const proposalID = "actions" in update ? update.id : update.proposalID;
+			const previousPlan = state.plans.get(proposalID);
 			const result = state.plans.apply(update);
 			if (!result.accepted) {
 				await publishMiss(state, "invalid_plan_update", undefined, result.reason);
 				continue;
 			}
-			await removePlanActions(state, source, result.plan.id, result.removed);
+			const superseded = result.upserted.flatMap((action) => {
+				const previous = previousPlan?.actions.find((candidate) => candidate.id === action.id);
+				return previous && !samePlanActionExecution(previous, action) ? [action.id] : [];
+			});
+			await removePlanActions(state, source, result.plan.id, [...new Set([...result.removed, ...superseded])]);
 			const draftTokens = finiteMetric(update.draftTokens);
 			const totalDraftTokens = finiteMetric(tokenTotals.get(state.sessionID)) + draftTokens;
 			tokenTotals.set(state.sessionID, totalDraftTokens);
@@ -3145,7 +3154,10 @@ export function makeSpeculativeActionRuntime<
 					actualAction,
 					lookup: lookupDiagnostics(),
 				});
-				await preemptForAuthoritative(state, resourceProfile(actual.tool, actual.execution));
+				await preemptForAuthoritative(
+					state,
+					resourceProfile(actual.execution, actionSemantics.sandboxMode(actual.tool)),
+				);
 				return undefined;
 			}
 
@@ -3334,7 +3346,10 @@ export function makeSpeculativeActionRuntime<
 						};
 					}
 				}
-				await preemptForAuthoritative(state, resourceProfile(actual.tool, actual.execution));
+				await preemptForAuthoritative(
+					state,
+					resourceProfile(actual.execution, actionSemantics.sandboxMode(actual.tool)),
+				);
 				return undefined;
 			}
 

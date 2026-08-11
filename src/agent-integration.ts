@@ -157,7 +157,7 @@ export interface InstalledSpeculativeAction {
 }
 
 /**
- * Install single-step speculative pre-execution on an Agent.
+ * Install source-neutral speculative plan execution on an Agent.
  *
  * The installer wraps the actor stream to start the drafter concurrently and composes with any
  * existing settlement hook. Call `uninstall()` before discarding the Agent.
@@ -583,7 +583,7 @@ export function installSpeculativeAction(
 				: {};
 		},
 		rejectCandidateOutput: ({ output }) => (output.isError ? "tool_error_result" : undefined),
-		captureResourceVersion: ({ action }) => captureResourceVersion(action, options.cwd),
+		captureResourceVersion: ({ action }) => captureResourceVersion(action, options.cwd, actionSemantics),
 		releaseResourceVersion,
 		isResourceExpired: ({ candidate }) => validateResourceVersion(candidate.resourceVersion),
 		watchResourceVersion: ({ candidate, onInvalidated }) =>

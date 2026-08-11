@@ -1,6 +1,7 @@
 import { describe, expect, test } from "vitest";
 import {
 	expectedUtility,
+	resourceProfile,
 	type SpeculativeSchedulingMetadata,
 	speculativeResourceBudget,
 	ToolSpeculationScheduler,
@@ -97,6 +98,13 @@ describe("ToolSpeculationScheduler", () => {
 			total: 8,
 			classes: { filesystem: 8, workspace: 8, process: 8, global: 8 },
 		});
+	});
+
+	test("classifies execution resources by world semantics rather than a reserved tool name", () => {
+		expect(resourceProfile("resource_cached", "none")).toEqual({ class: "filesystem", units: 1 });
+		expect(resourceProfile("sandbox", "workspace_snapshot")).toEqual({ class: "process", units: 1 });
+		expect(resourceProfile("sandbox", "file_mutation")).toEqual({ class: "workspace", units: 1 });
+		expect(resourceProfile("sandbox", "none")).toEqual({ class: "global", units: 1 });
 	});
 });
 

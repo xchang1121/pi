@@ -3,6 +3,7 @@ import path from "node:path";
 export type SpeculativeExecution = "resource_cached" | "sandbox";
 export type ActionReuseKind = "shared_result" | "exclusive_branch";
 export type ResourceVersionPolicy = "resources" | "workspace" | "adoption";
+export type ResourceDependencyScope = "content" | "tree_entries" | "tree_query" | "tree_content";
 export type SandboxActionMode = "none" | "workspace_snapshot" | "file_mutation";
 
 export interface ReadActionRange {
@@ -73,6 +74,8 @@ export interface ActionSemanticsDefinition {
 	readonly execution: SpeculativeExecution;
 	readonly reuse: ActionReuseKind;
 	readonly resourceVersion: ResourceVersionPolicy;
+	/** Filesystem evidence required to prove that a completed action is still current. */
+	readonly resourceScope?: ResourceDependencyScope;
 	readonly sandboxMode: SandboxActionMode;
 	readonly canonicalize: (input: unknown, cwd: string) => CanonicalAction | undefined;
 	readonly projectors?: readonly ActionKeyProjector[];
@@ -128,6 +131,10 @@ export class ActionSemanticsRegistry {
 
 	resourceVersionPolicy(tool: string): ResourceVersionPolicy | undefined {
 		return this.definition(tool)?.resourceVersion;
+	}
+
+	resourceScope(tool: string): ResourceDependencyScope | undefined {
+		return this.definition(tool)?.resourceScope;
 	}
 
 	sandboxMode(tool: string): SandboxActionMode | undefined {
@@ -208,6 +215,7 @@ export const PI_ACTION_SEMANTICS = new ActionSemanticsRegistry([
 		execution: "resource_cached",
 		reuse: "shared_result",
 		resourceVersion: "resources",
+		resourceScope: "content",
 		sandboxMode: "none",
 		canonicalize: canonicalRead,
 		projectors: [READ_RANGE_ACTION_KEY_PROJECTOR],
@@ -218,6 +226,7 @@ export const PI_ACTION_SEMANTICS = new ActionSemanticsRegistry([
 		execution: "resource_cached",
 		reuse: "shared_result",
 		resourceVersion: "resources",
+		resourceScope: "tree_content",
 		sandboxMode: "none",
 		canonicalize: canonicalGrep,
 	},
@@ -227,6 +236,7 @@ export const PI_ACTION_SEMANTICS = new ActionSemanticsRegistry([
 		execution: "resource_cached",
 		reuse: "shared_result",
 		resourceVersion: "resources",
+		resourceScope: "tree_query",
 		sandboxMode: "none",
 		canonicalize: canonicalFind,
 	},
@@ -236,6 +246,7 @@ export const PI_ACTION_SEMANTICS = new ActionSemanticsRegistry([
 		execution: "sandbox",
 		reuse: "exclusive_branch",
 		resourceVersion: "workspace",
+		resourceScope: "tree_content",
 		sandboxMode: "workspace_snapshot",
 		canonicalize: canonicalBash,
 	},
@@ -558,7 +569,11 @@ function assertDefinitionCoherence(definition: ActionSemanticsDefinition): void 
 		if (definition.reuse !== "shared_result") {
 			throw new Error(`resource-cached action ${definition.tool} must use shared_result reuse`);
 		}
-		if (definition.resourceVersion !== "resources" || definition.sandboxMode !== "none") {
+		if (
+			definition.resourceVersion !== "resources" ||
+			definition.resourceScope === undefined ||
+			definition.sandboxMode !== "none"
+		) {
 			throw new Error(`resource-cached action ${definition.tool} has incoherent version or sandbox policy`);
 		}
 		return;
@@ -566,7 +581,13 @@ function assertDefinitionCoherence(definition: ActionSemanticsDefinition): void 
 	if (definition.reuse !== "exclusive_branch") {
 		throw new Error(`sandbox action ${definition.tool} must use exclusive_branch reuse`);
 	}
-	if (definition.resourceVersion === "resources" || definition.sandboxMode === "none") {
+	if (
+		(definition.resourceVersion === "workspace" &&
+			(definition.resourceScope !== "tree_content" || definition.sandboxMode !== "workspace_snapshot")) ||
+		(definition.resourceVersion === "adoption" &&
+			(definition.resourceScope !== undefined || definition.sandboxMode !== "file_mutation")) ||
+		definition.resourceVersion === "resources"
+	) {
 		throw new Error(`sandbox action ${definition.tool} has incoherent version or sandbox policy`);
 	}
 }

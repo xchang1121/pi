@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from "node:util";
 import type { SpeculativeExecution } from "./action-semantics.ts";
 
 export type PlanActionDependencyCondition = "completed" | "succeeded" | "adopted";
@@ -179,6 +180,31 @@ export function proposalAsDelta(proposal: PlanProposal): PlanDelta {
 
 export function isProposal(update: PlanUpdate): update is PlanProposal {
 	return "actions" in update;
+}
+
+/** Whether an upsert can keep using an already launched execution for this action ID. */
+export function samePlanActionExecution(left: PlanAction, right: PlanAction): boolean {
+	return (
+		left.type === right.type &&
+		left.tool === right.tool &&
+		left.execution === right.execution &&
+		isDeepStrictEqual(left.input, right.input) &&
+		isDeepStrictEqual(left.missing ?? [], right.missing ?? []) &&
+		isDeepStrictEqual(normalizedDependencies(left), normalizedDependencies(right))
+	);
+}
+
+function normalizedDependencies(action: PlanAction): ReadonlyArray<Required<PlanActionDependency>> {
+	return (action.dependsOn ?? [])
+		.map(
+			(dependency): Required<PlanActionDependency> => ({
+				actionID: dependency.actionID,
+				condition: dependency.condition ?? "completed",
+			}),
+		)
+		.sort(
+			(left, right) => left.actionID.localeCompare(right.actionID) || left.condition.localeCompare(right.condition),
+		);
 }
 
 function validateActions(

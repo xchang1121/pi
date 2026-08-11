@@ -27,12 +27,14 @@ describe("ActionSemanticsRegistry", () => {
 			execution: "resource_cached",
 			reuse: "shared_result",
 			resourceVersion: "resources",
+			resourceScope: "content",
 			sandboxMode: "none",
 		});
 		expect(PI_ACTION_SEMANTICS.definition("bash")).toMatchObject({
 			execution: "sandbox",
 			reuse: "exclusive_branch",
 			resourceVersion: "workspace",
+			resourceScope: "tree_content",
 			sandboxMode: "workspace_snapshot",
 		});
 		expect(PI_ACTION_SEMANTICS.definition("write")).toMatchObject({
@@ -41,6 +43,7 @@ describe("ActionSemanticsRegistry", () => {
 			resourceVersion: "adoption",
 			sandboxMode: "file_mutation",
 		});
+		expect(PI_ACTION_SEMANTICS.resourceScope("write")).toBeUndefined();
 		expect(isObservableSandboxAction("bash")).toBe(true);
 		expect(isAdoptableSandboxAction("write")).toBe(true);
 		expect(isAdoptableSandboxAction("edit")).toBe(true);
@@ -105,6 +108,7 @@ describe("ActionSemanticsRegistry", () => {
 		expect(registry.reuse("stat")).toBe("shared_result");
 		expect(registry.requiresRuntimeResourceVersion("stat")).toBe(true);
 		expect(registry.watchesResourceVersion("stat")).toBe(true);
+		expect(registry.resourceScope("stat")).toBe("content");
 		expect(registry.buildKey("stat", { path: "a.ts" }, "/workspace", "schema")).toMatchObject({
 			tool: "stat",
 			input: { path: "a.ts" },
@@ -154,6 +158,30 @@ describe("ActionSemanticsRegistry", () => {
 						reuse: "exclusive_branch",
 						resourceVersion: "resources",
 						sandboxMode: "file_mutation",
+					},
+				]),
+		).toThrow("incoherent version or sandbox policy");
+		expect(
+			() =>
+				new ActionSemanticsRegistry([
+					{
+						...definition,
+						tool: "missing_scope",
+						resourceScope: undefined,
+					},
+				]),
+		).toThrow("incoherent version or sandbox policy");
+		expect(
+			() =>
+				new ActionSemanticsRegistry([
+					{
+						...definition,
+						tool: "bad_process",
+						execution: "sandbox",
+						reuse: "exclusive_branch",
+						resourceVersion: "workspace",
+						resourceScope: "content",
+						sandboxMode: "workspace_snapshot",
 					},
 				]),
 		).toThrow("incoherent version or sandbox policy");
@@ -221,6 +249,7 @@ function resourceDefinition(
 		execution: "resource_cached",
 		reuse: "shared_result",
 		resourceVersion: "resources",
+		resourceScope: "content",
 		sandboxMode: "none",
 		canonicalize,
 	};

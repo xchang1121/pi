@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { type PlanAction, PlanLedger, proposalAsDelta } from "../src/plan-proposal.ts";
+import { type PlanAction, PlanLedger, proposalAsDelta, samePlanActionExecution } from "../src/plan-proposal.ts";
 
 const action = (id: string, dependsOn?: readonly string[]): PlanAction => ({
 	id,
@@ -158,5 +158,37 @@ describe("PlanLedger", () => {
 			upsert: proposal.actions,
 			draftTokens: 9,
 		});
+	});
+
+	it("distinguishes execution replacement from metadata-only plan refinement", () => {
+		const original: PlanAction = {
+			...action("child", ["parent"]),
+			empiricalProbability: 0.5,
+			expectedDurationMs: 10,
+			feedback: { revision: 1 },
+		};
+		const metadataOnly: PlanAction = {
+			...original,
+			empiricalProbability: 0.9,
+			expectedDurationMs: 30,
+			feedback: { revision: 2 },
+			dependsOn: [{ actionID: "parent", condition: "succeeded" }],
+		};
+
+		expect(samePlanActionExecution(original, metadataOnly)).toBe(true);
+		expect(
+			samePlanActionExecution(
+				{ ...original, dependsOn: [{ actionID: "parent" }] },
+				{ ...original, dependsOn: [{ actionID: "parent", condition: "completed" }] },
+			),
+		).toBe(true);
+		expect(samePlanActionExecution(original, { ...metadataOnly, input: { path: "replacement.ts" } })).toBe(false);
+		expect(samePlanActionExecution(original, { ...metadataOnly, tool: "grep" })).toBe(false);
+		expect(
+			samePlanActionExecution(original, {
+				...metadataOnly,
+				dependsOn: [{ actionID: "parent", condition: "adopted" }],
+			}),
+		).toBe(false);
 	});
 });

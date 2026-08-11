@@ -325,6 +325,83 @@ describe("speculative action runtime", () => {
 		expect(harness.events.filter((event) => event.type === "started")).toHaveLength(2);
 	});
 
+	it("invalidates an in-flight execution before reusing its action ID for a different action", async () => {
+		const oldStarted = deferred<void>();
+		const oldAborted = deferred<void>();
+		let refined = false;
+		const source: HarnessPlanSource = {
+			id: "refining-source",
+			enabled: () => true,
+			propose: () => ({
+				id: "refining-plan",
+				source: "refining-source",
+				revision: 0,
+				actions: [
+					{ id: "target", type: "tool_call", tool: "bash", input: { command: "old" } },
+					{ id: "trigger", type: "tool_call", tool: "read", input: { path: "trigger.ts" } },
+				],
+			}),
+			observe: ({ tool }) => {
+				if (tool !== "read" || refined) return undefined;
+				refined = true;
+				return {
+					proposalID: "refining-plan",
+					source: "refining-source",
+					revision: 1,
+					upsert: [{ id: "target", type: "tool_call", tool: "bash", input: { command: "new" } }],
+				};
+			},
+		};
+		const executed: string[] = [];
+		const harness = createHarness({
+			sources: [source],
+			settings: {
+				...enabledSettings,
+				tools: { resourceCached: ["read"], sandbox: ["bash"] },
+			},
+			predict: () => prediction(),
+			execute: (candidate, signal) => {
+				const identifier =
+					candidate.tool === "bash"
+						? String((candidate.input as { command: string }).command)
+						: String((candidate.input as { path: string }).path);
+				executed.push(identifier);
+				if (identifier !== "old") return `${identifier}:result`;
+				oldStarted.resolve(undefined);
+				return new Promise<string>((_resolve, reject) => {
+					const abort = () => {
+						oldAborted.resolve(undefined);
+						reject(new Error("superseded"));
+					};
+					if (signal.aborted) abort();
+					else signal.addEventListener("abort", abort, { once: true });
+				});
+			},
+		});
+
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "refine-running" });
+		await oldStarted.promise;
+		await waitFor(() => executed.includes("trigger.ts"));
+		expect(await harness.runtime.consume(consume("refine-running", { path: "trigger.ts" }))).toBe(
+			"trigger.ts:result",
+		);
+		await harness.runtime.actual({
+			...consume("refine-running", { path: "trigger.ts" }),
+			durationMs: 1,
+			output: "trigger.ts:result",
+		});
+		await oldAborted.promise;
+		await waitFor(() => executed.includes("new"));
+
+		expect(await harness.runtime.consume(consumeTool("refine-running", "bash", { command: "new" }))).toBe(
+			"new:result",
+		);
+		expect(executed).toEqual(["old", "trigger.ts", "new"]);
+		expect(harness.events).toContainEqual(
+			expect.objectContaining({ type: "cancelled", tool: "bash", reason: "plan_action_removed" }),
+		);
+	});
+
 	it("promotes an actor-requested future action without waiting for its horizon", async () => {
 		const executed: string[] = [];
 		const source: HarnessPlanSource = {
@@ -704,6 +781,7 @@ describe("speculative action runtime", () => {
 				execution: "resource_cached",
 				reuse: "shared_result",
 				resourceVersion: "resources",
+				resourceScope: "content",
 				sandboxMode: "none",
 				canonicalize: (input) => {
 					const record = asRecord(input);

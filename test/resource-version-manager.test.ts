@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
-import { buildActionKey } from "../src/common.ts";
+import { ActionSemanticsRegistry, buildActionKey, PI_ACTION_SEMANTICS } from "../src/common.ts";
 import {
 	captureResourceVersion,
 	closeResourceVersionManagers,
@@ -126,6 +126,25 @@ describe("speculative action resource versions", () => {
 		await settleWatcher();
 
 		expect((await validateResourceVersion(token)).expired).toBe(true);
+	});
+
+	test("derives custom-tool resource evidence from action semantics rather than tool names", async () => {
+		const root = await workspace();
+		const bash = PI_ACTION_SEMANTICS.definition("bash");
+		const write = PI_ACTION_SEMANTICS.definition("write");
+		if (!bash || !write) throw new Error("Pi sandbox semantics unavailable");
+		const semantics = new ActionSemanticsRegistry([
+			{ ...bash, tool: "custom_process", epoch: "test.custom-process.v1" },
+			{ ...write, tool: "custom_write", epoch: "test.custom-write.v1" },
+		]);
+		const processAction = semantics.buildKey("custom_process", { command: "echo ok" }, root);
+		const writeAction = semantics.buildKey("custom_write", { path: "out.txt", content: "ok" }, root);
+		if (!processAction || !writeAction) throw new Error("custom action key unavailable");
+
+		expect(resourceDependencies(processAction, root, semantics)).toEqual([
+			{ path: path.resolve(root), scope: "tree_content" },
+		]);
+		expect(resourceDependencies(writeAction, root, semantics)).toEqual([]);
 	});
 
 	test("tracks LSP workspace operations across files but keeps document symbols file-scoped", async () => {
