@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import { READ_RANGE_ACTION_KEY_PROJECTOR } from "../src/action-key-projection.ts";
 import {
 	type ActionKeyProjector,
+	actionKeyCovers,
 	actionKeyMatch,
 	actionKeyMatches,
 	actionKeyMismatchReason,
@@ -235,6 +236,13 @@ describe("speculative action common", () => {
 					distance: speculativeValues.length - actorValues.length,
 				};
 			},
+			canShareInFlight: (speculative, actor) => {
+				const speculativeValues = Array.isArray(speculative.input.values) ? speculative.input.values : undefined;
+				const actorValues = Array.isArray(actor.input.values) ? actor.input.values : undefined;
+				return (
+					!!speculativeValues && !!actorValues && actorValues.every((value) => speculativeValues.includes(value))
+				);
+			},
 		};
 		const speculative = buildActionKey({
 			tool: "custom",
@@ -254,6 +262,27 @@ describe("speculative action common", () => {
 			projector: "custom.subset",
 			distance: 1,
 		});
+		expect(actionKeyCovers(speculative, actor, [projector])).toBe(true);
+		const unguarded: ActionKeyProjector = {
+			id: "unguarded",
+			partition: projector.partition,
+			project: projector.project,
+		};
+		expect(actionKeyCovers(speculative, actor, [unguarded])).toBe(false);
+		expect(
+			actionKeyCovers(speculative, actor, [{ ...projector, id: "guarded", canShareInFlight: () => false }]),
+		).toBe(false);
+		expect(
+			actionKeyCovers(speculative, actor, [
+				{
+					...projector,
+					id: "throwing-guard",
+					canShareInFlight: () => {
+						throw new Error("coverage failed");
+					},
+				},
+			]),
+		).toBe(false);
 		const broken: ActionKeyProjector = {
 			id: "broken",
 			partition: () => {
@@ -286,11 +315,15 @@ describe("speculative action common", () => {
 		expect(speculative && contained ? actionKeyMatches(speculative, contained) : true).toBe(false);
 		expect(contained ? actionKeyMatches(contained, contained) : false).toBe(true);
 		expect(speculative && contained ? actionKeyMatches(speculative, contained, projectors) : false).toBe(true);
+		expect(speculative && contained ? actionKeyCovers(speculative, contained, projectors) : false).toBe(true);
 		expect(
 			speculative && needsCompleteCoverage
 				? actionKeyMatches(speculative, needsCompleteCoverage, projectors)
 				: false,
 		).toBe(true);
+		expect(
+			speculative && needsCompleteCoverage ? actionKeyCovers(speculative, needsCompleteCoverage, projectors) : true,
+		).toBe(false);
 		expect(
 			speculative && startsAfterPlannedRange
 				? actionKeyMatches(speculative, startsAfterPlannedRange, projectors)

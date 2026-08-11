@@ -991,7 +991,13 @@ describe("speculative action runtime", () => {
 
 	it("evicts unconsumed probation before an actor-validated protected result", async () => {
 		const harness = createHarness({
-			settings: { ...enabledSettings, adaptiveDrafter: false, resourceCacheMaxEntries: 2 },
+			settings: {
+				...enabledSettings,
+				adaptiveDrafter: false,
+				resourceCacheMaxEntries: 2,
+				// Keep package-suite scheduling delays from turning an eviction test into a timeout test.
+				predictionTimeoutMs: 5_000,
+			},
 			predict: (input) => {
 				if (input.turnID === "seed-protected") return prediction(readCandidate("a.txt"));
 				if (input.turnID === "seed-probation") return prediction(readCandidate("b.txt"));
@@ -1002,16 +1008,19 @@ describe("speculative action runtime", () => {
 		});
 
 		await harness.runtime.startTurn({ sessionID: "session", turnID: "seed-protected" });
-		await waitFor(() => harness.events.filter((event) => event.type === "completed").length === 1);
+		await waitFor(() => harness.events.filter((event) => event.type === "completed").length >= 1);
+		expect(harness.events.filter((event) => event.type === "completed")).toHaveLength(1);
 		expect(await harness.runtime.consume(consume("seed-protected", { path: "a.txt" }))).toBe("a.txt");
 		await harness.runtime.finishTurn(consume("seed-protected", {}));
 
 		await harness.runtime.startTurn({ sessionID: "session", turnID: "seed-probation" });
-		await waitFor(() => harness.events.filter((event) => event.type === "completed").length === 2);
+		await waitFor(() => harness.events.filter((event) => event.type === "completed").length >= 2);
+		expect(harness.events.filter((event) => event.type === "completed")).toHaveLength(2);
 		await harness.runtime.finishTurn(consume("seed-probation", {}));
 
 		await harness.runtime.startTurn({ sessionID: "session", turnID: "apply-pressure" });
-		await waitFor(() => harness.events.filter((event) => event.type === "completed").length === 3);
+		await waitFor(() => harness.events.filter((event) => event.type === "completed").length >= 3);
+		expect(harness.events.filter((event) => event.type === "completed")).toHaveLength(3);
 		await harness.runtime.finishTurn(consume("apply-pressure", {}));
 
 		await harness.runtime.startTurn({ sessionID: "session", turnID: "check-protected" });

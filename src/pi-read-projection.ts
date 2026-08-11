@@ -4,7 +4,6 @@ import {
 	READ_RANGE_ACTION_KEY_PROJECTOR,
 	READ_RANGE_COVERAGE_DETAILS_KEY,
 	type ReadRangeCoverage,
-	readRangesShareInFlight,
 } from "./action-key-projection.ts";
 import { READ_DEFAULT_LIMIT, readActionRange } from "./common.ts";
 
@@ -86,7 +85,6 @@ export const PI_READ_RANGE_PROJECTION_RULE: ActionProjectionRule<SettleToolCallR
 			isError: false,
 		};
 	},
-	canShareInFlight: readRangesShareInFlight,
 };
 
 function parseReadCoverage(value: unknown): ReadRangeCoverage | undefined {

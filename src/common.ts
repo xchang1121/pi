@@ -32,6 +32,8 @@ export interface ActionKeyProjector {
 	/** Coarse cache partition; every pair accepted by project must return the same value. */
 	readonly partition: (action: ActionKey) => string | undefined;
 	readonly project: (speculative: ActionKey, actor: ActionKey) => ProjectedActionKey | undefined;
+	/** Whether the speculative request itself covers the actor request before output coverage is known. */
+	readonly canShareInFlight?: (speculative: ActionKey, actor: ActionKey) => boolean;
 }
 
 export interface ExactActionKeyMatch {
@@ -135,16 +137,6 @@ export function buildActionKey(input: {
 		resources: input.resources,
 		execution: input.execution,
 		schemaHash,
-	};
-}
-
-/** Normalize canonical inputs before they enter PatternAware learning and continuation. */
-export function patternAwareInput(action: ActionKey): Record<string, unknown> {
-	if (action.tool !== "read") return structuredClone(action.input) as Record<string, unknown>;
-	return {
-		...structuredClone(action.input),
-		offset: READ_DEFAULT_OFFSET,
-		limit: READ_DEFAULT_LIMIT,
 	};
 }
 
@@ -275,6 +267,24 @@ export function actionKeyProjects(
 	projectors: readonly ActionKeyProjector[],
 ): boolean {
 	return actionKeyMatch(speculative, actor, projectors)?.kind === "projected";
+}
+
+/** K(a_s) covers K(a) without relying on completed-output coverage. */
+export function actionKeyCovers(
+	speculative: ActionKey,
+	actor: ActionKey,
+	projectors: readonly ActionKeyProjector[] = [],
+): boolean {
+	const match = actionKeyMatch(speculative, actor, projectors);
+	if (!match) return false;
+	if (match.kind === "exact") return true;
+	const projector = projectors.find((candidate) => candidate.id === match.projector);
+	if (!projector?.canShareInFlight) return false;
+	try {
+		return projector.canShareInFlight(speculative, actor);
+	} catch {
+		return false;
+	}
 }
 
 /** K(a_s) can satisfy K(a) exactly, or when some π maps K(a_s) to K(a). */

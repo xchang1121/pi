@@ -993,7 +993,6 @@ function patternInput(
 		turnID: `${sessionID}:turn`,
 		tool,
 		input,
-		actionKey: JSON.stringify({ tool, input }),
 		outcome: "success",
 		durationMs: 10,
 		...(outputPaths ? { outputPaths } : {}),

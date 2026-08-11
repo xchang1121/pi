@@ -19,7 +19,6 @@ import {
 	clampCandidateLimit,
 	DEFAULTS,
 	inferredExecution,
-	patternAwareInput,
 	usageTokenCount,
 } from "./common.ts";
 import {
@@ -167,6 +166,11 @@ export function installSpeculativeAction(
 	const previousSettlement = agent.settleToolCall;
 	const previousActual = agent.actualToolCall;
 	const sandboxExecutions = new WeakMap<SettleToolCallResult, SpeculativeSandboxExecution>();
+	const patternActionSemantics = {
+		actionKey: (tool: string, input: Readonly<Record<string, unknown>>, schemaHash?: string) =>
+			buildPiActionKey(tool, input, options.cwd, schemaHash),
+		projectors: options.projectionRules ?? [],
+	};
 	let openedPatternStore: Promise<PatternAwareStoreLease> | undefined;
 	const authoritativeBatches = new Map<string, Map<number, PatternAwareEventInput>>();
 	const authoritativeBatchKey = (batchSessionID: string, turnID: string) => JSON.stringify([batchSessionID, turnID]);
@@ -211,16 +215,17 @@ export function installSpeculativeAction(
 	const resolvePatternStore = async (settings: SpeculativeActionSettings): Promise<PatternAwareStore> => {
 		if (options.patternStore) {
 			const store = await options.patternStore;
-			store.configure(settings.patternAware ?? PATTERN_AWARE_DEFAULTS);
+			store.configure(settings.patternAware ?? PATTERN_AWARE_DEFAULTS, patternActionSemantics);
 			return store;
 		}
 		openedPatternStore ??= acquirePatternAwareStore(
 			options.cwd,
 			settings.patternAware ?? PATTERN_AWARE_DEFAULTS,
 			options.patternStateDirectory,
+			patternActionSemantics,
 		);
 		const store = (await openedPatternStore).store;
-		store.configure(settings.patternAware ?? PATTERN_AWARE_DEFAULTS);
+		store.configure(settings.patternAware ?? PATTERN_AWARE_DEFAULTS, patternActionSemantics);
 		return store;
 	};
 	const finishPatternSession = async (): Promise<void> => {
@@ -463,11 +468,11 @@ export function installSpeculativeAction(
 					sessionID: startInput.sessionID,
 					turnID: startInput.turnID,
 					tool: candidate.key.tool,
-					input: patternAwareInput(candidate.key),
-					actionKey: candidate.key.key,
+					input: structuredClone(candidate.key.input) as Record<string, unknown>,
 					outcome: output.isError ? "failure" : "success",
 					...observation,
 					durationMs: candidateExecutionMs(candidate),
+					schemaHash: candidate.key.schemaHash,
 					...(typeof candidate.key.input.operation === "string"
 						? { operation: candidate.key.input.operation }
 						: {}),
@@ -508,8 +513,7 @@ export function installSpeculativeAction(
 				sessionID: consumeInput.sessionID,
 				turnID: consumeInput.turnID,
 				tool,
-				input: action ? patternAwareInput(action) : concrete,
-				actionKey: action?.key ?? stableHash({ tool, input: concrete }),
+				input: action ? (structuredClone(action.input) as Record<string, unknown>) : concrete,
 				outcome: output?.isError ? "failure" : "success",
 				...observation,
 				durationMs,

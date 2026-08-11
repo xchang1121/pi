@@ -16,8 +16,6 @@ export interface ActionProjectionRule<Output> extends ActionKeyProjector {
 		readonly coverage: unknown;
 		readonly keyMatch: ProjectedActionKeyMatch;
 	}) => Output | undefined | Promise<Output | undefined>;
-	/** Directed in-flight coalescing is opt-in and independent from completed-result projection. */
-	readonly canShareInFlight?: (speculative: ActionKey, actor: ActionKey) => boolean;
 }
 
 /** In-memory-only metadata; symbol keys never leak into persisted tool-result details. */
@@ -56,6 +54,7 @@ export const READ_RANGE_ACTION_KEY_PROJECTOR: ActionKeyProjector = {
 			distance: actorRange.offset - speculativeRange.offset + Math.abs(speculativeRange.end - actorRange.end),
 		};
 	},
+	canShareInFlight: readRangesShareInFlight,
 };
 
 export function readRangesShareInFlight(speculative: ActionKey, actor: ActionKey): boolean {

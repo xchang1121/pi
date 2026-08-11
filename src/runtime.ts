@@ -1,6 +1,7 @@
 import type { ActionProjectionCoverage, ActionProjectionRule } from "./action-key-projection.ts";
 import type { ActionKey, ActionKeyMatch, DrafterToolDefinition, SpeculativeExecution } from "./common.ts";
 import {
+	actionKeyCovers,
 	actionKeyMatch,
 	actionKeyMismatchReason,
 	clampCandidateLimit,
@@ -730,10 +731,7 @@ export function makeSpeculativeActionRuntime<
 		}
 	};
 
-	const schedulingMetadata = (
-		draft: SpeculativeDraftCandidate,
-		action: ActionKey,
-	): SpeculativeSchedulingMetadata => {
+	const schedulingMetadata = (draft: SpeculativeDraftCandidate, action: ActionKey): SpeculativeSchedulingMetadata => {
 		const empiricalProbability =
 			typeof draft.empiricalProbability === "number" && Number.isFinite(draft.empiricalProbability)
 				? Math.max(0, Math.min(1, draft.empiricalProbability))
@@ -1431,7 +1429,7 @@ export function makeSpeculativeActionRuntime<
 				const rule = projectionRuleByID.get(match.projector);
 				if (!rule) continue;
 				if (candidate.run.status === "running") {
-					if (!rule.canShareInFlight?.(candidate.key, action)) continue;
+					if (!actionKeyCovers(candidate.key, action, keyProjectors)) continue;
 				} else {
 					const projection = await projectCandidateOutput(candidate, action, candidate.run.output, match);
 					if (!projection.ok) continue;
@@ -1727,7 +1725,9 @@ export function makeSpeculativeActionRuntime<
 				? persistentCandidates.insertOrGetCompatible(state.sessionID, candidate, (existing, match) => {
 						const rule = projectionRuleByID.get(match.projector);
 						return (
-							existing.run.status === "running" && rule?.canShareInFlight?.(existing.key, candidate.key) === true
+							existing.run.status === "running" &&
+							!!rule &&
+							actionKeyCovers(existing.key, candidate.key, keyProjectors)
 						);
 					})
 				: undefined;

@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { type ActionKey, type ActionKeyProjector, actionKeyCovers } from "./common.ts";
 
 export type PatternAwareSettings = {
 	readonly enabled: boolean;
@@ -31,7 +32,6 @@ export type PatternAwareEventInput = {
 	readonly turnID: string;
 	readonly tool: string;
 	readonly input: Record<string, unknown>;
-	readonly actionKey?: string;
 	readonly outcome: "success" | "failure";
 	readonly output?: unknown;
 	readonly outputPaths?: ReadonlyArray<string>;
@@ -39,6 +39,15 @@ export type PatternAwareEventInput = {
 	readonly operation?: string;
 	readonly schemaHash?: string;
 	readonly learnTarget?: boolean;
+};
+
+export type PatternAwareActionSemantics = {
+	readonly actionKey: (
+		tool: string,
+		input: Readonly<Record<string, unknown>>,
+		schemaHash?: string,
+	) => ActionKey | undefined;
+	readonly projectors?: readonly ActionKeyProjector[];
 };
 
 export type PatternAwareEvent = PatternAwareEventInput & {
@@ -299,17 +308,24 @@ export class PatternAwareStore {
 	private loaded = false;
 	private settings: PatternAwareSettings;
 	private readonly persistenceFile?: string;
+	private actionSemantics?: PatternAwareActionSemantics;
 
-	constructor(settings: PatternAwareSettings, persistenceFile?: string) {
+	constructor(
+		settings: PatternAwareSettings,
+		persistenceFile?: string,
+		actionSemantics?: PatternAwareActionSemantics,
+	) {
 		this.settings = settings;
 		this.persistenceFile = persistenceFile;
+		this.actionSemantics = actionSemantics;
 	}
 
-	configure(settings: PatternAwareSettings) {
+	configure(settings: PatternAwareSettings, actionSemantics?: PatternAwareActionSemantics) {
 		const resetInference =
 			settings.minOccurrences !== this.settings.minOccurrences ||
 			settings.maxContextLength !== this.settings.maxContextLength;
 		this.settings = settings;
+		if (actionSemantics) this.actionSemantics = actionSemantics;
 		if (resetInference) {
 			for (const pool of this.pools.values()) {
 				pool.nextInferenceAt = pool.observations ?? pool.samples.length;
@@ -350,10 +366,7 @@ export class PatternAwareStore {
 				const key = patternPoolKey(pool.context, pool.targetTool, pool.targetSchemaHash);
 				const normalized = { ...pool, key };
 				const existing = this.pools.get(key);
-				this.pools.set(
-					key,
-					existing ? mergePatternPools(existing, normalized, this.settings) : normalized,
-				);
+				this.pools.set(key, existing ? mergePatternPools(existing, normalized, this.settings) : normalized);
 				for (const sample of pool.samples) {
 					this.clock = Math.max(
 						this.clock,
@@ -527,12 +540,22 @@ export class PatternAwareStore {
 			const context = predictiveHistory.slice(-pattern.context.length);
 			for (const applied of applyBindingsPartialWeightedVariants(pattern.bindings, context)) {
 				const type = applied.missing.length ? "preparation_hint" : "tool_call";
-				const identity = stableStringify({
-					type,
-					tool: pattern.targetTool,
-					input: applied.input,
-					missing: applied.missing,
-				});
+				const action =
+					type === "tool_call"
+						? this.resolveActionKey(
+								pattern.targetTool,
+								applied.input,
+								pattern.targetSchemaHash ?? schemaHashes[pattern.targetTool],
+							)
+						: undefined;
+				const identity = action
+					? stableStringify({ type, actionKey: action.key })
+					: stableStringify({
+							type,
+							tool: pattern.targetTool,
+							input: applied.input,
+							missing: applied.missing,
+						});
 				const group = groups.get(identity) ?? [];
 				group.push({
 					pattern,
@@ -544,67 +567,66 @@ export class PatternAwareStore {
 				groups.set(identity, group);
 			}
 		}
-		const predictions = [...groups.values()]
-			.map((group) => {
-				const ordered = [...group].sort(
-					(left, right) =>
-						right.pattern.context.length - left.pattern.context.length ||
-						right.pattern.occurrences - left.pattern.occurrences,
-				);
-				const representative = ordered[0]!;
-				const horizon = learnedGroupHorizon(
+		const predictions = [...groups.values()].map((group) => {
+			const ordered = [...group].sort(
+				(left, right) =>
+					right.pattern.context.length - left.pattern.context.length ||
+					right.pattern.occurrences - left.pattern.occurrences,
+			);
+			const representative = ordered[0]!;
+			const horizon = learnedGroupHorizon(
+				ordered.map((item) => item.pattern),
+				this.settings,
+				this.clock,
+			);
+			const gapCoverage = groupGapCoverage(
+				ordered.map((item) => item.pattern),
+				horizon,
+				this.settings,
+				this.clock,
+			);
+			const controlProbability =
+				backoffProbability(
 					ordered.map((item) => item.pattern),
-					this.settings,
 					this.clock,
-				);
-				const gapCoverage = groupGapCoverage(
-					ordered.map((item) => item.pattern),
-					horizon,
-					this.settings,
-					this.clock,
-				);
-				const controlProbability =
-					backoffProbability(
-						ordered.map((item) => item.pattern),
-						this.clock,
-						this.settings.decayHalfLifeEvents,
-					) * gapCoverage;
-				const totalWeight = ordered.reduce(
+					this.settings.decayHalfLifeEvents,
+				) * gapCoverage;
+			const totalWeight = ordered.reduce(
+				(total, item) =>
+					total +
+					Math.max(1, item.pattern.occurrences) *
+						recencyWeight(item.pattern.lastSeenSequence, this.clock, this.settings.decayHalfLifeEvents),
+				0,
+			);
+			const variantProbability =
+				ordered.reduce(
 					(total, item) =>
 						total +
-						Math.max(1, item.pattern.occurrences) *
+						item.variantProbability *
+							Math.max(1, item.pattern.occurrences) *
 							recencyWeight(item.pattern.lastSeenSequence, this.clock, this.settings.decayHalfLifeEvents),
 					0,
-				);
-				const variantProbability =
-					ordered.reduce(
-						(total, item) =>
-							total +
-							item.variantProbability *
-								Math.max(1, item.pattern.occurrences) *
-								recencyWeight(item.pattern.lastSeenSequence, this.clock, this.settings.decayHalfLifeEvents),
-						0,
-					) / Math.max(1, totalWeight);
-				const expectedDurationMs =
-					ordered.reduce(
-						(total, item) =>
-							total +
-							Math.max(0, item.pattern.averageDurationMs) *
-								Math.max(1, item.pattern.occurrences) *
-								recencyWeight(item.pattern.lastSeenSequence, this.clock, this.settings.decayHalfLifeEvents),
-						0,
-					) / Math.max(1, totalWeight);
-				return {
-					ordered,
-					representative,
-					horizon,
-					gapCoverage,
-					controlProbability,
-					variantProbability,
-					rawProbability: Math.max(0, controlProbability * variantProbability),
-					expectedDurationMs,
-				};
-			});
+				) / Math.max(1, totalWeight);
+			const expectedDurationMs =
+				ordered.reduce(
+					(total, item) =>
+						total +
+						Math.max(0, item.pattern.averageDurationMs) *
+							Math.max(1, item.pattern.occurrences) *
+							recencyWeight(item.pattern.lastSeenSequence, this.clock, this.settings.decayHalfLifeEvents),
+					0,
+				) / Math.max(1, totalWeight);
+			return {
+				ordered,
+				representative,
+				horizon,
+				gapCoverage,
+				controlProbability,
+				variantProbability,
+				rawProbability: Math.max(0, controlProbability * variantProbability),
+				expectedDurationMs,
+			};
+		});
 		for (const prediction of predictions) {
 			const {
 				ordered,
@@ -743,6 +765,67 @@ export class PatternAwareStore {
 		}
 	}
 
+	private actionInputCovers(
+		speculativeTool: string,
+		speculativeInput: Readonly<Record<string, unknown>>,
+		speculativeSchemaHash: string | undefined,
+		actorTool: string,
+		actorInput: Readonly<Record<string, unknown>>,
+		actorSchemaHash: string | undefined,
+	) {
+		if (speculativeTool !== actorTool) return false;
+		const speculative = this.resolveActionKey(speculativeTool, speculativeInput, speculativeSchemaHash);
+		const actor = this.resolveActionKey(actorTool, actorInput, actorSchemaHash);
+		if (!speculative || !actor) return sameValue(speculativeInput, actorInput);
+		return actionKeyCovers(speculative, actor, this.actionSemantics?.projectors ?? []);
+	}
+
+	private resolveActionKey(tool: string, input: Readonly<Record<string, unknown>>, schemaHash: string | undefined) {
+		try {
+			return this.actionSemantics?.actionKey(tool, input, schemaHash);
+		} catch {
+			return undefined;
+		}
+	}
+
+	private bindingsCoverSample(
+		bindings: Readonly<Record<string, PatternAwareBinding>>,
+		targetTool: string,
+		targetSchemaHash: string | undefined,
+		sample: PatternSample,
+	) {
+		return applyBindingsVariants(bindings, sample.context).some((input) =>
+			this.actionInputCovers(
+				targetTool,
+				input,
+				targetSchemaHash,
+				sample.target.tool,
+				sample.target.input,
+				sample.target.schemaHash ?? targetSchemaHash,
+			),
+		);
+	}
+
+	private minimizeProjectedBindings(
+		bindings: Readonly<Record<string, PatternAwareBinding>>,
+		targetTool: string,
+		targetSchemaHash: string | undefined,
+		samples: ReadonlyArray<PatternSample>,
+	) {
+		if (!this.actionSemantics) return bindings;
+		const minimized = { ...bindings };
+		for (const key of Object.keys(bindings)) {
+			const binding = minimized[key];
+			if (!binding) continue;
+			delete minimized[key];
+			if (samples.every((sample) => this.bindingsCoverSample(minimized, targetTool, targetSchemaHash, sample))) {
+				continue;
+			}
+			minimized[key] = binding;
+		}
+		return minimized;
+	}
+
 	private learnOccurrence(context: ReadonlyArray<PatternAwareEvent>, target: PatternAwareEvent, gap: number) {
 		const signatures = context.map(signature);
 		const poolKey = patternPoolKey(signatures, target.tool, target.schemaHash);
@@ -760,10 +843,19 @@ export class PatternAwareStore {
 		this.pools.set(poolKey, pool);
 		if (pool.samples.length < this.settings.minOccurrences) return;
 		let inferred = pool.inferred;
-		const invalidated = inferred !== undefined && !bindingsMatchSample(inferred, pool.samples.at(-1)!);
+		const invalidated =
+			inferred !== undefined &&
+			!this.bindingsCoverSample(inferred, pool.targetTool, pool.targetSchemaHash, pool.samples.at(-1)!);
 		if (!inferred || invalidated) {
 			if (!invalidated && pool.observations < (pool.nextInferenceAt ?? this.settings.minOccurrences)) return;
-			inferred = inferBindingsFromSamples(pool.samples, bindingEvidenceThreshold(this.settings));
+			inferred = inferBindingsFromSamples(
+				pool.samples,
+				bindingEvidenceThreshold(this.settings),
+				this.actionSemantics !== undefined,
+			);
+			if (inferred) {
+				inferred = this.minimizeProjectedBindings(inferred, pool.targetTool, pool.targetSchemaHash, pool.samples);
+			}
 			pool.inferred = inferred;
 			if (!inferred) {
 				pool.inferenceBackoff = Math.min(8, Math.max(2, (pool.inferenceBackoff ?? 1) * 2));
@@ -773,11 +865,9 @@ export class PatternAwareStore {
 			pool.inferenceBackoff = 1;
 			pool.nextInferenceAt = pool.observations + 1;
 		}
-		const replayMatches = pool.samples.filter((sample) => {
-			return applyBindingsVariants(inferred, sample.context).some((concrete) =>
-				sameValue(concrete, sample.target.input),
-			);
-		}).length;
+		const replayMatches = pool.samples.filter((sample) =>
+			this.bindingsCoverSample(inferred, pool.targetTool, pool.targetSchemaHash, sample),
+		).length;
 		const bindingReplayProbability = replayMatches / pool.samples.length;
 		if (bindingReplayProbability < this.settings.minBindingReplayProbability) return;
 		const id = hash(
@@ -840,9 +930,15 @@ export class PatternAwareStore {
 			if (!pattern) continue;
 			const matched = events.some(
 				(event) =>
-					event.tool === pattern.targetTool &&
 					item.expectedInput !== undefined &&
-					sameValue(item.expectedInput, event.input),
+					this.actionInputCovers(
+						pattern.targetTool,
+						item.expectedInput,
+						pattern.targetSchemaHash,
+						event.tool,
+						event.input,
+						event.schemaHash,
+					),
 			);
 			if (matched) {
 				this.recordValidation(item.patternID, true);
@@ -995,11 +1091,12 @@ export async function acquirePatternAwareStore(
 	workspace: string,
 	settings: PatternAwareSettings,
 	stateDirectory?: string,
+	actionSemantics?: PatternAwareActionSemantics,
 ): Promise<PatternAwareStoreLease> {
 	const file = patternAwarePersistenceFile(workspace, stateDirectory);
 	let pooled = stores.get(file);
 	if (!pooled) {
-		const store = Promise.resolve(new PatternAwareStore(settings, file)).then(async (value) => {
+		const store = Promise.resolve(new PatternAwareStore(settings, file, actionSemantics)).then(async (value) => {
 			await value.load();
 			return value;
 		});
@@ -1010,6 +1107,7 @@ export async function acquirePatternAwareStore(
 	let store: PatternAwareStore;
 	try {
 		store = await pooled.store;
+		store.configure(settings, actionSemantics);
 	} catch (error) {
 		pooled.references--;
 		if (pooled.references === 0 && stores.get(file) === pooled) stores.delete(file);
@@ -1110,6 +1208,7 @@ export function inferBindings(
 function inferBindingsFromSamples(
 	samples: ReadonlyArray<PatternSample>,
 	constantSupport = 4,
+	allowProjectedOmissions = false,
 ): Record<string, PatternAwareBinding> | undefined {
 	const first = samples[0];
 	if (!first) return;
@@ -1150,7 +1249,10 @@ function inferBindingsFromSamples(
 		if (!selected && constant && stablePayloadConstant(samples, constantSupport)) {
 			selected = { type: "constant", value: firstTarget };
 		}
-		if (!selected) return;
+		if (!selected) {
+			if (allowProjectedOmissions) continue;
+			return;
+		}
 		bindings[encodePath(targetPath)] = selected;
 	}
 	return bindings;
@@ -1200,10 +1302,6 @@ function requiresProvenance(targetPath: PatternAwarePath, value: unknown): boole
 function stablePayloadConstant(samples: ReadonlyArray<PatternSample>, minimum: number): boolean {
 	if (samples.length < minimum) return false;
 	return new Set(samples.map((sample) => `${sample.target.sessionID}:${sample.target.turnID}`)).size >= minimum;
-}
-
-function bindingsMatchSample(bindings: Readonly<Record<string, PatternAwareBinding>>, sample: PatternSample) {
-	return applyBindingsVariants(bindings, sample.context).some((input) => sameValue(input, sample.target.input));
 }
 
 const MISSING = Symbol("missing");
@@ -2196,8 +2294,7 @@ function patternPoolKey(
 }
 
 function mergePatternPools(left: PatternPool, right: PatternPool, settings: PatternAwareSettings): PatternPool {
-	const observations =
-		(left.observations ?? left.samples.length) + (right.observations ?? right.samples.length);
+	const observations = (left.observations ?? left.samples.length) + (right.observations ?? right.samples.length);
 	const samples = [...left.samples, ...right.samples]
 		.sort((a, b) => a.target.sequence - b.target.sequence)
 		.slice(-patternPoolSampleLimit(settings));
