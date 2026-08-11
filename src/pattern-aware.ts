@@ -230,7 +230,7 @@ type PatternPool = {
 type PendingValidation = {
 	readonly patternID: string;
 	readonly triggerSequence: number;
-	readonly expectedInput?: Record<string, unknown>;
+	readonly expectedInputs: ReadonlyArray<Record<string, unknown>>;
 	remaining: number;
 };
 
@@ -928,17 +928,17 @@ export class PatternAwareStore {
 		for (const item of pending) {
 			const pattern = this.patterns.get(item.patternID);
 			if (!pattern) continue;
-			const matched = events.some(
-				(event) =>
-					item.expectedInput !== undefined &&
+			const matched = events.some((event) =>
+				item.expectedInputs.some((expectedInput) =>
 					this.actionInputCovers(
 						pattern.targetTool,
-						item.expectedInput,
+						expectedInput,
 						pattern.targetSchemaHash,
 						event.tool,
 						event.input,
 						event.schemaHash,
 					),
+				),
 			);
 			if (matched) {
 				this.recordValidation(item.patternID, true);
@@ -970,7 +970,7 @@ export class PatternAwareStore {
 			pending.push({
 				patternID: pattern.id,
 				triggerSequence,
-				expectedInput: applyBindings(pattern.bindings, context),
+				expectedInputs: applyBindingsVariants(pattern.bindings, context),
 				remaining: learnedHorizon(pattern, this.settings, this.clock),
 			});
 		}
@@ -1113,7 +1113,6 @@ export async function acquirePatternAwareStore(
 		if (pooled.references === 0 && stores.get(file) === pooled) stores.delete(file);
 		throw error;
 	}
-	store.configure(settings);
 	let released = false;
 	return {
 		store,
@@ -1174,7 +1173,13 @@ export function asPatternAwareRuntimeContext(value: unknown): PatternAwareRuntim
 	if (!(record?.store instanceof PatternAwareStore)) return;
 	const continuation = asRecord(record.continuation);
 	if (!continuation || !Array.isArray(continuation.history) || !Array.isArray(continuation.visitedPatternIDs)) return;
-	if (typeof continuation.pathProbability !== "number") return;
+	if (
+		typeof continuation.pathProbability !== "number" ||
+		!Number.isFinite(continuation.pathProbability) ||
+		continuation.pathProbability < 0 ||
+		continuation.pathProbability > 1
+	)
+		return;
 	return value as PatternAwareRuntimeContext;
 }
 
@@ -1666,6 +1671,16 @@ function structuredOutput(value: unknown): unknown {
 	if ("output" in record && asRecord(record.output)) return structuredOutput(record.output);
 	const result = asRecord(record.result);
 	if (result && "value" in result) return result.value;
+	if (
+		"details" in record &&
+		Array.isArray(record.content) &&
+		record.content.every((item) => {
+			const content = asRecord(item);
+			return !!content && typeof content.type === "string";
+		})
+	) {
+		return record.details;
+	}
 	return value;
 }
 
@@ -2191,14 +2206,27 @@ function readonlyPattern(pattern: MutablePattern): PatternAwarePattern {
 }
 
 function mutablePattern(value: PatternAwarePattern): MutablePattern | undefined {
-	if (!value || typeof value !== "object" || typeof value.id !== "string" || !Array.isArray(value.context)) return;
-	if (typeof value.targetTool !== "string" || !value.bindings || typeof value.bindings !== "object") return;
+	const record = asRecord(value);
+	const bindings = asRecord(record?.bindings);
+	if (
+		!record ||
+		typeof record.id !== "string" ||
+		!Array.isArray(record.context) ||
+		!record.context.every(isEventSignature) ||
+		typeof record.targetTool !== "string" ||
+		!bindings ||
+		!Object.entries(bindings).every(
+			([encoded, binding]) => parsePath(encoded) !== undefined && isPatternAwareBinding(binding),
+		)
+	)
+		return;
+	const safeBindings = structuredClone(bindings) as Record<string, PatternAwareBinding>;
 	return {
-		id: value.id,
-		context: value.context.map((item) => ({ ...item })),
-		targetTool: value.targetTool,
-		bindings: structuredClone(value.bindings),
-		dependencies: bindingDependencies(value.bindings),
+		id: record.id,
+		context: structuredClone(record.context) as PatternAwareEventSignature[],
+		targetTool: record.targetTool,
+		bindings: safeBindings,
+		dependencies: bindingDependencies(safeBindings),
 		...(value.targetSchemaHash ? { targetSchemaHash: value.targetSchemaHash } : {}),
 		gapCounts: { ...value.gapCounts },
 		gapLastSeen: Object.fromEntries(
@@ -2344,6 +2372,58 @@ function isEventSignature(value: unknown): value is PatternAwareEventSignature {
 	);
 }
 
+function isPatternAwareBinding(value: unknown, depth = 0): value is PatternAwareBinding {
+	if (depth > 16) return false;
+	const record = asRecord(value);
+	if (!record || typeof record.type !== "string") return false;
+	const source = () => isPatternAwareBinding(record.source, depth + 1);
+	const eventSource = () =>
+		Number.isInteger(record.relativeEvent) &&
+		(record.relativeEvent as number) < 0 &&
+		(record.field === "input" || record.field === "output" || record.field === "outputPaths") &&
+		isPatternAwarePath(record.path);
+	switch (record.type) {
+		case "constant":
+			return true;
+		case "event":
+			return eventSource();
+		case "each":
+			return eventSource() && isPatternAwarePath(record.itemPath);
+		case "transform":
+			return (
+				["dirname", "basename", "normalize_path", "trim", "lowercase", "uppercase"].includes(
+					String(record.operation),
+				) && source()
+			);
+		case "coalesce":
+			return (
+				Array.isArray(record.sources) &&
+				record.sources.length > 0 &&
+				record.sources.every((item) => isPatternAwareBinding(item, depth + 1))
+			);
+		case "template":
+			return typeof record.prefix === "string" && typeof record.suffix === "string" && source();
+		case "join":
+			return (
+				["concat", "join_path", "relative_path"].includes(String(record.operation)) &&
+				(record.separator === undefined || typeof record.separator === "string") &&
+				isPatternAwareBinding(record.left, depth + 1) &&
+				isPatternAwareBinding(record.right, depth + 1)
+			);
+		default:
+			return false;
+	}
+}
+
+function isPatternAwarePath(value: unknown): value is PatternAwarePath {
+	return (
+		Array.isArray(value) &&
+		value.every(
+			(segment) => typeof segment === "string" || (Number.isSafeInteger(segment) && (segment as number) >= 0),
+		)
+	);
+}
+
 function isPersistedEvent(value: unknown): value is PatternAwareEvent {
 	const record = asRecord(value);
 	return (
@@ -2363,8 +2443,16 @@ function encodePath(segments: PatternAwarePath) {
 }
 
 function decodePath(value: string): Array<string | number> {
-	const parsed = JSON.parse(value);
-	return Array.isArray(parsed) ? parsed : [];
+	return parsePath(value) ?? [];
+}
+
+function parsePath(value: string): Array<string | number> | undefined {
+	try {
+		const parsed: unknown = JSON.parse(value);
+		return isPatternAwarePath(parsed) ? [...parsed] : undefined;
+	} catch {
+		return undefined;
+	}
 }
 
 function sameValue(left: unknown, right: unknown) {

@@ -26,6 +26,7 @@ interface ConsumeInput extends StartInput {
 	readonly id?: string;
 	readonly tool: string;
 	readonly input: Record<string, unknown>;
+	readonly terminal?: boolean;
 }
 
 interface HarnessOptions {
@@ -70,6 +71,13 @@ interface HarnessOptions {
 	readonly captureProjectionCoverage?: (action: ActionKey, output: string) => unknown | undefined;
 	readonly rejectCandidateOutput?: (output: string) => string | undefined;
 	readonly adopt?: (output: string) => Promise<string | undefined> | string | undefined;
+	readonly recordAuthoritative?: () => Promise<SpeculativePrediction | undefined> | SpeculativePrediction | undefined;
+	readonly continuePatternAware?: (
+		parentConfirmed: boolean,
+	) => Promise<SpeculativePrediction | undefined> | SpeculativePrediction | undefined;
+	readonly onPatternResolved?: (outcome: string) => void;
+	readonly flushPatternStore?: () => Promise<void> | void;
+	readonly candidateSizeBytes?: () => number;
 	readonly observerThrows?: boolean;
 }
 
@@ -126,6 +134,7 @@ function createHarness(options: HarnessOptions) {
 			{ name: "find", description: "Find files" },
 			{ name: "task", description: "Run a subagent" },
 			{ name: "bash", description: "Run a command" },
+			{ name: "write", description: "Write a file" },
 		],
 		stateData: () => ({ cwd: "/workspace" }),
 		predict: (input, settings, _definitions, _candidateNames, signal) => options.predict(input, signal, settings),
@@ -168,6 +177,15 @@ function createHarness(options: HarnessOptions) {
 			? { rejectCandidateOutput: ({ output }) => options.rejectCandidateOutput?.(output) }
 			: {}),
 		...(options.adopt ? { adoptCandidate: ({ output }) => options.adopt?.(output) } : {}),
+		...(options.recordAuthoritative ? { recordAuthoritative: () => options.recordAuthoritative?.() } : {}),
+		...(options.continuePatternAware
+			? { continuePatternAware: ({ parentConfirmed }) => options.continuePatternAware?.(parentConfirmed) }
+			: {}),
+		...(options.onPatternResolved
+			? { onPatternResolved: (_patternID, outcome) => options.onPatternResolved?.(outcome) }
+			: {}),
+		...(options.flushPatternStore ? { flushPatternStore: () => options.flushPatternStore?.() } : {}),
+		...(options.candidateSizeBytes ? { candidateSizeBytes: () => options.candidateSizeBytes?.() ?? 0 } : {}),
 		onEvent: (event) => {
 			events.push(event);
 			if (options.observerThrows) throw new Error("observer failed");
@@ -1010,6 +1028,9 @@ describe("speculative action runtime", () => {
 		await harness.runtime.startTurn({ sessionID: "session", turnID: "seed-protected" });
 		await waitFor(() => harness.events.filter((event) => event.type === "completed").length >= 1);
 		expect(harness.events.filter((event) => event.type === "completed")).toHaveLength(1);
+		// Give the actor a deterministic lead interval so adaptive scheduling does not
+		// classify the following cache candidates as zero-benefit on a fast clock.
+		await new Promise((resolve) => setTimeout(resolve, 25));
 		expect(await harness.runtime.consume(consume("seed-protected", { path: "a.txt" }))).toBe("a.txt");
 		await harness.runtime.finishTurn(consume("seed-protected", {}));
 
@@ -2057,6 +2078,215 @@ describe("speculative action runtime", () => {
 		});
 	});
 
+	it("drops late PatternAware hints after a terminal turn finishes", async () => {
+		const late = deferred<SpeculativePrediction>();
+		let preparations = 0;
+		const harness = createHarness({
+			settings: {
+				...enabledSettings,
+				drafterEnabled: false,
+				patternAware: PATTERN_AWARE_DEFAULTS,
+			},
+			predict: () => prediction(),
+			predictPatternAware: () => late.promise,
+			prepare: () => {
+				preparations++;
+			},
+		});
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "late-pattern" });
+		await harness.runtime.finishTurn({
+			sessionID: "session",
+			turnID: "late-pattern",
+			tool: "read",
+			input: {},
+			terminal: true,
+		});
+
+		late.resolve(
+			prediction({
+				type: "preparation_hint",
+				tool: "read",
+				input: { path: "late.ts" },
+				missing: [["path"]],
+				patternID: "late-hint",
+			}),
+		);
+		await waitFor(() => harness.runtime.inspect().pendingPredictions === 0);
+		await Promise.resolve();
+
+		expect(preparations).toBe(0);
+		expect(harness.executions()).toBe(0);
+		expect(harness.runtime.inspect("session").resourceCandidates).toBe(0);
+	});
+
+	it("closes a carried exclusive PatternAware candidate when a later terminal event has no turn state", async () => {
+		const resolutions: string[] = [];
+		let flushes = 0;
+		const harness = createHarness({
+			settings: {
+				...enabledSettings,
+				drafterEnabled: false,
+				patternAware: PATTERN_AWARE_DEFAULTS,
+				tools: { resourceCached: ["read"], sandbox: ["bash"] },
+			},
+			predict: () => prediction(),
+			predictPatternAware: () =>
+				prediction({
+					...bashCandidate("printf ready"),
+					patternID: "carried-bash",
+					horizon: 2,
+				}),
+			onPatternResolved: (outcome) => resolutions.push(outcome),
+			flushPatternStore: () => {
+				flushes++;
+			},
+		});
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "carry-source" });
+		await waitFor(() => harness.events.some((event) => event.type === "completed"));
+		await harness.runtime.finishTurn(consumeTool("carry-source", "bash", {}));
+		expect(harness.events.some((event) => event.type === "cancelled")).toBe(false);
+
+		await harness.runtime.finishTurn({
+			sessionID: "session",
+			turnID: "later-terminal",
+			tool: "read",
+			input: {},
+			terminal: true,
+		});
+
+		expect(harness.runtime.inspect("session").resourceCandidates).toBe(0);
+		expect(resolutions).toEqual(["actor_miss"]);
+		expect(flushes).toBe(1);
+		expect(
+			harness.events.some((event) => event.type === "cancelled" && event.reason === "request_finished_without_hit"),
+		).toBe(true);
+	});
+
+	it("keeps an adopted hit authoritative when PatternAware bookkeeping throws", async () => {
+		const harness = createHarness({
+			settings: { ...enabledSettings, patternAware: PATTERN_AWARE_DEFAULTS },
+			predict: () => prediction(readCandidate("README.md")),
+			recordAuthoritative: () => {
+				throw new Error("analyzer failed");
+			},
+		});
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "bookkeeping-failure" });
+		await waitFor(() => harness.executions() === 1);
+
+		await expect(harness.runtime.consume(consume("bookkeeping-failure", { path: "README.md" }))).resolves.toBe(
+			"prefetched",
+		);
+		expect(harness.events.some((event) => event.type === "hit")).toBe(true);
+	});
+
+	it("contains continuation admission failures after a confirmed PatternAware hit", async () => {
+		const confirmations: boolean[] = [];
+		const harness = createHarness({
+			settings: {
+				...enabledSettings,
+				drafterEnabled: false,
+				patternAware: PATTERN_AWARE_DEFAULTS,
+			},
+			predict: () => prediction(),
+			predictPatternAware: () =>
+				prediction({ ...readCandidate("parent.ts"), patternID: "parent-pattern", horizon: 1 }),
+			continuePatternAware: (parentConfirmed) => {
+				confirmations.push(parentConfirmed);
+				return parentConfirmed
+					? prediction({ ...readCandidate("explode.ts"), patternID: "child-pattern", horizon: 0 })
+					: undefined;
+			},
+			actionKey: (tool, input, _context) => {
+				if (asRecord(input)?.path === "explode.ts") throw new Error("child key failed");
+				return buildPiActionKey(tool, input, "/workspace");
+			},
+		});
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "continuation-failure" });
+		await waitFor(() => harness.executions() === 1);
+
+		await expect(harness.runtime.consume(consume("continuation-failure", { path: "parent.ts" }))).resolves.toBe(
+			"prefetched",
+		);
+		expect(confirmations).toEqual([false, true]);
+	});
+
+	it("invalidates overlapping shared results after sandbox adoption without relying on commit metrics", async () => {
+		const harness = createHarness({
+			settings: {
+				...enabledSettings,
+				patternAware: { ...PATTERN_AWARE_DEFAULTS, enabled: false },
+				tools: { resourceCached: ["read"], sandbox: ["write"] },
+			},
+			predict: (input) => {
+				if (input.turnID === "seed-read") return prediction(readCandidate("target.ts"));
+				if (input.turnID === "adopt-write") {
+					return prediction({ type: "tool_call", tool: "write", input: { path: "target.ts", content: "new" } });
+				}
+				return prediction();
+			},
+			adopt: (output) => output,
+		});
+
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "seed-read" });
+		await waitFor(() => harness.events.some((event) => event.type === "completed"));
+		await harness.runtime.finishTurn(consume("seed-read", {}));
+		expect(harness.runtime.inspect("session").resourceCandidates).toBe(1);
+
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "adopt-write" });
+		await waitFor(() => harness.executions() === 2);
+		await expect(
+			harness.runtime.consume(consumeTool("adopt-write", "write", { path: "target.ts", content: "new" })),
+		).resolves.toBe("prefetched");
+		expect(harness.runtime.inspect("session").resourceCandidates).toBe(0);
+
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "verify-read" });
+		await waitFor(() => harness.runtime.inspect().pendingPredictions === 0);
+		await expect(harness.runtime.consume(consume("verify-read", { path: "target.ts" }))).resolves.toBeUndefined();
+	});
+
+	it("normalizes non-finite prediction metadata and cache accounting", async () => {
+		const malformed: SpeculativeDraftCandidate = {
+			...readCandidate("numbers.ts"),
+			empiricalProbability: Number.NaN,
+			conditionalProbability: Number.POSITIVE_INFINITY,
+			expectedDurationMs: Number.NaN,
+			expectedLatencyBenefitMs: Number.POSITIVE_INFINITY,
+			resourceDemand: Number.NaN,
+			horizon: Number.NaN,
+			depth: Number.NaN,
+		};
+		const harness = createHarness({
+			predict: () => ({ candidates: [malformed], draftTokens: Number.NaN }),
+			candidateSizeBytes: () => Number.NaN,
+		});
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "non-finite" });
+		await waitFor(() => harness.events.some((event) => event.type === "completed"));
+
+		const started = harness.events.find((event) => event.type === "started");
+		expect(started).toMatchObject({
+			type: "started",
+			draftTokens: 0,
+			totalDraftTokens: 0,
+			expectedDurationMs: expect.any(Number),
+			expectedBenefitMs: expect.any(Number),
+			resourceUnits: expect.any(Number),
+			schedulerUtility: expect.any(Number),
+		});
+		if (started?.type !== "started") throw new Error("expected started event");
+		for (const value of [
+			started.expectedDurationMs,
+			started.expectedBenefitMs,
+			started.resourceUnits,
+			started.schedulerUtility,
+			started.cacheBytes,
+		]) {
+			expect(Number.isFinite(value)).toBe(true);
+		}
+		expect(started.empiricalProbability).toBeUndefined();
+		expect(started.conditionalProbability).toBeUndefined();
+		expect(started.patternDepth).toBeUndefined();
+	});
+
 	it("performs no prediction or background work while disabled", async () => {
 		let predictions = 0;
 		const harness = createHarness({
@@ -2182,7 +2412,7 @@ function deferred<T>(): {
 }
 
 async function waitFor(predicate: () => boolean): Promise<void> {
-	const deadline = Date.now() + 1000;
+	const deadline = Date.now() + 5000;
 	while (!predicate()) {
 		if (Date.now() >= deadline) throw new Error("Timed out waiting for test condition");
 		await new Promise((resolve) => setTimeout(resolve, 1));

@@ -507,7 +507,6 @@ export interface SpeculativeActionRuntime<SessionID, Output, StartInput, Consume
 interface DeferredState<T> {
 	readonly promise: Promise<T>;
 	readonly resolve: (value: T) => void;
-	readonly done: () => boolean;
 }
 
 type CandidateExecution<Output> =
@@ -538,7 +537,6 @@ interface TurnState<SessionID, Output, StateData> {
 	readonly turnID: string;
 	readonly startInput: TurnInput<SessionID>;
 	readonly startedAt: number;
-	readonly ready: DeferredState<void>;
 	readonly candidates: Map<string, RuntimeCandidate<Output>>;
 	readonly data: StateData;
 	readonly settings: SpeculativeActionSettings;
@@ -561,7 +559,6 @@ interface TurnState<SessionID, Output, StateData> {
 	terminal: boolean;
 	finished: boolean;
 	noCandidateReported: boolean;
-	predictionTimedOut: boolean;
 	predictionPending: boolean;
 }
 
@@ -638,7 +635,7 @@ export function makeSpeculativeActionRuntime<
 		tool: string,
 		durationMs: number,
 	): void => {
-		const duration = Math.max(0, durationMs);
+		const duration = finiteMetric(durationMs);
 		const current = target.get(tool) ?? { count: 0, averageMs: 0 };
 		const count = current.count + 1;
 		target.set(tool, { count, averageMs: current.averageMs + (duration - current.averageMs) / count });
@@ -652,7 +649,7 @@ export function makeSpeculativeActionRuntime<
 	const observeProjectionOverhead = (tool: string, rule: string, durationMs: number): void =>
 		observeAverage(projectionOverheadTimes, `${tool}:${rule}`, durationMs);
 	const schedulingKey = (tool: string, horizon?: number): string =>
-		`${tool}:${horizon === undefined ? "*" : Math.max(0, Math.floor(horizon))}`;
+		`${tool}:${horizon === undefined ? "*" : finiteNonNegativeInteger(horizon)}`;
 	const observedLeadTime = (tool: string, horizon?: number): number | undefined =>
 		actorLeadTimes.get(schedulingKey(tool, horizon))?.averageMs ?? actorLeadTimes.get(schedulingKey(tool))?.averageMs;
 	const observeLeadTime = (tool: string, durationMs: number, horizon?: number): void => {
@@ -733,21 +730,16 @@ export function makeSpeculativeActionRuntime<
 	};
 
 	const schedulingMetadata = (draft: SpeculativeDraftCandidate, action: ActionKey): SpeculativeSchedulingMetadata => {
-		const empiricalProbability =
-			typeof draft.empiricalProbability === "number" && Number.isFinite(draft.empiricalProbability)
-				? Math.max(0, Math.min(1, draft.empiricalProbability))
-				: undefined;
+		const empiricalProbability = finiteProbability(draft.empiricalProbability);
 		const measured = serviceTimes.get(action.tool)?.averageMs;
-		const expectedDurationMs = Math.max(1, draft.expectedDurationMs ?? measured ?? 1);
+		const expectedDurationMs = finitePositive(draft.expectedDurationMs, measured ?? 1);
 		const expectedLeadMs = observedLeadTime(action.tool, draft.horizon);
 		const expectedHiddenMs = Math.min(expectedDurationMs, expectedLeadMs ?? expectedDurationMs);
-		const expectedBenefitMs = Math.max(
-			0,
-			Math.min(
-				expectedHiddenMs,
-				draft.expectedLatencyBenefitMs ??
-					(empiricalProbability === undefined ? expectedHiddenMs : empiricalProbability * expectedHiddenMs),
-			),
+		const defaultBenefitMs =
+			empiricalProbability === undefined ? expectedHiddenMs : empiricalProbability * expectedHiddenMs;
+		const expectedBenefitMs = Math.min(
+			expectedHiddenMs,
+			finiteNonNegative(draft.expectedLatencyBenefitMs, defaultBenefitMs),
 		);
 		const base = resourceProfile(action.tool, action.execution);
 		const overheadCostMs =
@@ -760,7 +752,7 @@ export function makeSpeculativeActionRuntime<
 			overheadCostMs,
 			resource: {
 				...base,
-				units: Math.max(1, Math.floor(draft.resourceDemand ?? base.units)),
+				units: finitePositiveInteger(draft.resourceDemand, base.units),
 			},
 		};
 	};
@@ -775,7 +767,7 @@ export function makeSpeculativeActionRuntime<
 				? Math.max(1, draft.expectedDurationMs)
 				: (serviceTimes.get(draft.tool)?.averageMs ?? 1);
 		const hidden = Math.min(duration, observedLeadTime(draft.tool, draft.horizon) ?? duration);
-		return Math.min(hidden, draft.expectedLatencyBenefitMs ?? probability * hidden);
+		return Math.min(hidden, finiteNonNegative(draft.expectedLatencyBenefitMs, probability * hidden));
 	};
 
 	const removeTurnAdmission = (
@@ -1482,10 +1474,9 @@ export function makeSpeculativeActionRuntime<
 			return true;
 		}
 		if (!draft.patternID) return false;
-		const empiricalProbability =
-			typeof draft.empiricalProbability === "number" && Number.isFinite(draft.empiricalProbability)
-				? Math.max(0, Math.min(1, draft.empiricalProbability))
-				: undefined;
+		const empiricalProbability = finiteProbability(draft.empiricalProbability);
+		const conditionalProbability = finiteProbability(draft.conditionalProbability);
+		const depth = finiteOptionalNonNegativeInteger(draft.depth);
 		const scheduling = schedulingMetadata(draft, candidate.key);
 		const utility = expectedUtility(scheduling);
 		const existingLease = candidate.leases.find(
@@ -1506,8 +1497,8 @@ export function makeSpeculativeActionRuntime<
 				}
 				if (candidate.empiricalProbability === undefined || empiricalProbability > candidate.empiricalProbability) {
 					candidate.empiricalProbability = empiricalProbability;
-					candidate.conditionalProbability = draft.conditionalProbability;
-					candidate.depth = draft.depth;
+					candidate.conditionalProbability = conditionalProbability;
+					candidate.depth = depth;
 				}
 			}
 			if (utilityIncreased) {
@@ -1517,7 +1508,7 @@ export function makeSpeculativeActionRuntime<
 			}
 			return true;
 		}
-		const horizon = Math.max(0, Math.floor(draft.horizon ?? 0));
+		const horizon = finiteNonNegativeInteger(draft.horizon);
 		candidate.leases.push({
 			id: `${candidate.id}:pattern:${draft.patternID}:${anchorActionSeq}`,
 			source: "pattern_aware",
@@ -1531,9 +1522,9 @@ export function makeSpeculativeActionRuntime<
 			state: "active",
 		});
 		if (utility > candidate.utility) {
-			candidate.empiricalProbability = draft.empiricalProbability;
-			candidate.conditionalProbability = draft.conditionalProbability;
-			candidate.depth = draft.depth;
+			candidate.empiricalProbability = empiricalProbability;
+			candidate.conditionalProbability = conditionalProbability;
+			candidate.depth = depth;
 			candidate.scheduling = scheduling;
 			candidate.utility = utility;
 			schedulerFor(state.sessionID).update(candidate, scheduling);
@@ -1563,7 +1554,9 @@ export function makeSpeculativeActionRuntime<
 		predictionAnchorActionSeq = state.actionSequence,
 	): Promise<number> => {
 		let accepted = 0;
+		if (state.finished || state.terminal) return accepted;
 		const enabled = await latestSettings();
+		if (state.finished || state.terminal) return accepted;
 		if (!enabled || !sourceEnabled(enabled, batchSource)) {
 			if (!enabled || !masterEnabled(enabled)) state.terminal = true;
 			return accepted;
@@ -1572,10 +1565,11 @@ export function makeSpeculativeActionRuntime<
 		const ordered = [...drafts].sort(
 			(left, right) =>
 				draftPriority(right) - draftPriority(left) ||
-				(right.horizon ?? 0) - (left.horizon ?? 0) ||
-				(right.empiricalProbability ?? 0) - (left.empiricalProbability ?? 0),
+				finiteNonNegativeInteger(right.horizon) - finiteNonNegativeInteger(left.horizon) ||
+				(finiteProbability(right.empiricalProbability) ?? 0) - (finiteProbability(left.empiricalProbability) ?? 0),
 		);
 		for (const [index, draft] of ordered.entries()) {
+			if (state.finished || state.terminal) return accepted;
 			const source = draft.source ?? batchSource;
 			if (
 				source === "pattern_aware" &&
@@ -1606,7 +1600,6 @@ export function makeSpeculativeActionRuntime<
 				}
 				continue;
 			}
-			if (state.terminal) return accepted;
 			const concrete = asConcreteInput(draft.input);
 			const draftCandidate = draftCandidateDiagnostic(draft);
 			if (!concrete) {
@@ -1660,6 +1653,10 @@ export function makeSpeculativeActionRuntime<
 				index,
 				signal: candidateController.signal,
 			});
+			if (state.finished || state.terminal) {
+				candidateController.abort();
+				return accepted;
+			}
 			if (!preflight.ok) {
 				await publishMiss(state, preflight.reason, action, preflight.detail, { draftCandidate, predictedAction });
 				continue;
@@ -1675,7 +1672,7 @@ export function makeSpeculativeActionRuntime<
 				accepted++;
 				continue;
 			}
-			if (state.terminal) {
+			if (state.finished || state.terminal) {
 				candidateController.abort();
 				return accepted;
 			}
@@ -1696,7 +1693,10 @@ export function makeSpeculativeActionRuntime<
 				}
 				continue;
 			}
-			const horizon = source === "pattern_aware" ? Math.max(0, Math.floor(draft.horizon ?? 0)) : undefined;
+			const horizon = source === "pattern_aware" ? finiteNonNegativeInteger(draft.horizon) : undefined;
+			const empiricalProbability = finiteProbability(draft.empiricalProbability);
+			const conditionalProbability = finiteProbability(draft.conditionalProbability);
+			const depth = finiteOptionalNonNegativeInteger(draft.depth);
 			const sourceLease: PredictionLease = {
 				id: `${callID}:${source}:${draft.patternID ?? state.turnID}`,
 				source,
@@ -1707,9 +1707,7 @@ export function makeSpeculativeActionRuntime<
 				...(horizon !== undefined
 					? { horizon, validThroughActionSeq: predictionAnchorActionSeq + horizon + 1 }
 					: {}),
-				...(source === "pattern_aware" && typeof draft.empiricalProbability === "number"
-					? { empiricalProbability: Math.max(0, Math.min(1, draft.empiricalProbability)) }
-					: {}),
+				...(source === "pattern_aware" && empiricalProbability !== undefined ? { empiricalProbability } : {}),
 				state: "active",
 			};
 			const scheduling = schedulingMetadata(draft, action);
@@ -1733,13 +1731,9 @@ export function makeSpeculativeActionRuntime<
 				draftTokens,
 				totalDraftTokens,
 				source,
-				...(typeof draft.empiricalProbability === "number"
-					? { empiricalProbability: Math.max(0, Math.min(1, draft.empiricalProbability)) }
-					: {}),
-				...(typeof draft.conditionalProbability === "number"
-					? { conditionalProbability: Math.max(0, Math.min(1, draft.conditionalProbability)) }
-					: {}),
-				...(typeof draft.depth === "number" ? { depth: Math.max(0, Math.floor(draft.depth)) } : {}),
+				...(empiricalProbability !== undefined ? { empiricalProbability } : {}),
+				...(conditionalProbability !== undefined ? { conditionalProbability } : {}),
+				...(depth !== undefined ? { depth } : {}),
 				...(draft.dependencies?.length ? { dependencies: draft.dependencies } : {}),
 				scheduling,
 				utility: expectedUtility(scheduling),
@@ -1771,7 +1765,12 @@ export function makeSpeculativeActionRuntime<
 			if (existing) {
 				candidateController.abort();
 				const attached = await attachPredictionLease(state, existing, draft, source, predictionAnchorActionSeq);
-				if (attached) accepted++;
+				if (attached) {
+					accepted++;
+					if (source === "pattern_aware" && existing.run.status === "ready") {
+						await continuePatternCandidate(state, input, existing, existing.run.output, false);
+					}
+				}
 				continue;
 			}
 			const admission = schedulerFor(state.sessionID).admit(
@@ -1868,7 +1867,7 @@ export function makeSpeculativeActionRuntime<
 							new Error("speculative action source disabled"),
 						);
 					}
-					if (state.terminal) {
+					if (state.finished || state.terminal) {
 						throw new SpeculativeJobError(
 							"request_finished_without_hit",
 							new Error("speculative request finished"),
@@ -1963,17 +1962,30 @@ export function makeSpeculativeActionRuntime<
 					candidate.projectionCoverage = captureProjectionCoverage(action, output);
 					candidate.run = { status: "ready", completedAt, executionMs, output };
 					observeServiceTime(candidate.tool, executionMs);
-					Object.assign(candidate, adapter.candidateExecutionMetrics?.({ output, candidate }) ?? {});
+					try {
+						const metrics = adapter.candidateExecutionMetrics?.({ output, candidate });
+						if (metrics?.sandboxSetupMs !== undefined) {
+							candidate.sandboxSetupMs = finiteMetric(metrics.sandboxSetupMs);
+						}
+						if (metrics?.changeCollectionMs !== undefined) {
+							candidate.changeCollectionMs = finiteMetric(metrics.changeCollectionMs);
+						}
+					} catch {
+						// Optional accounting must not invalidate a completed candidate.
+					}
 					observeExecutionOverhead(
 						candidate.key.tool,
 						(candidate.resourceCaptureMs ?? 0) +
 							(candidate.sandboxSetupMs ?? 0) +
 							(candidate.changeCollectionMs ?? 0),
 					);
-					candidate.estimatedBytes += Math.max(
-						0,
-						adapter.candidateSizeBytes?.({ output, candidate }) ?? estimateValueBytes(output),
-					);
+					let outputBytes = estimateValueBytes(output);
+					try {
+						outputBytes = finiteNonNegative(adapter.candidateSizeBytes?.({ output, candidate }), outputBytes);
+					} catch {
+						// Fall back to the generic estimate when custom accounting fails.
+					}
+					candidate.estimatedBytes += outputBytes;
 					schedulerFor(state.sessionID).complete(candidate);
 					for (const evicted of trimPersistentCandidates(state.sessionID, state.settings, candidate)) {
 						await preemptCandidate(evicted, "resource_cache_byte_limit", "discarded");
@@ -2009,6 +2021,7 @@ export function makeSpeculativeActionRuntime<
 			!sourceEnabled(settings, "pattern_aware") ||
 			!patternMultiStepEnabled(settings) ||
 			!adapter.continuePatternAware ||
+			state.finished ||
 			state.terminal
 		) {
 			return;
@@ -2040,18 +2053,22 @@ export function makeSpeculativeActionRuntime<
 			} catch {
 				continue;
 			}
-			if (!prediction?.candidates.length || state.terminal) continue;
-			await admitPredictions(
-				state,
-				input,
-				prediction.candidates,
-				0,
-				0,
-				tokenTotals.get(state.sessionID) ?? 0,
-				"pattern_aware",
-				candidateToolNames(settings),
-				continuationAnchorActionSeq(state, candidate),
-			);
+			if (!prediction?.candidates.length || state.finished || state.terminal) continue;
+			try {
+				await admitPredictions(
+					state,
+					input,
+					prediction.candidates,
+					0,
+					0,
+					tokenTotals.get(state.sessionID) ?? 0,
+					"pattern_aware",
+					candidateToolNames(settings),
+					continuationAnchorActionSeq(state, candidate),
+				);
+			} catch {
+				// Continuation learning is optional and must not alter actor settlement.
+			}
 		}
 	};
 
@@ -2065,36 +2082,46 @@ export function makeSpeculativeActionRuntime<
 		speculativeHit: boolean,
 		order: number,
 	): Promise<void> => {
-		const settings = await latestSettings();
-		if (!adapter.recordAuthoritative || !settings || !sourceEnabled(settings, "pattern_aware") || state.finished) {
-			return;
+		try {
+			const settings = await latestSettings();
+			if (
+				!adapter.recordAuthoritative ||
+				!settings ||
+				!sourceEnabled(settings, "pattern_aware") ||
+				state.finished ||
+				state.terminal
+			) {
+				return;
+			}
+			const concrete = asConcreteInput(actualCall.input);
+			if (!concrete) return;
+			const prediction = await adapter.recordAuthoritative({
+				startInput: state.startInput as StartInput,
+				data: state.data,
+				settings,
+				consumeInput,
+				action,
+				tool: actualCall.tool,
+				concrete,
+				output,
+				durationMs: finiteMetric(durationMs),
+				speculativeHit,
+				order,
+			});
+			if (!prediction?.candidates.length || state.finished || state.terminal) return;
+			await admitPredictions(
+				state,
+				state.startInput as StartInput,
+				prediction.candidates,
+				0,
+				0,
+				tokenTotals.get(state.sessionID) ?? 0,
+				"pattern_aware",
+				candidateToolNames(settings),
+			);
+		} catch {
+			// Analyzer bookkeeping is optional and must not alter actor settlement.
 		}
-		const concrete = asConcreteInput(actualCall.input);
-		if (!concrete) return;
-		const prediction = await adapter.recordAuthoritative({
-			startInput: state.startInput as StartInput,
-			data: state.data,
-			settings,
-			consumeInput,
-			action,
-			tool: actualCall.tool,
-			concrete,
-			output,
-			durationMs: Math.max(0, durationMs),
-			speculativeHit,
-			order,
-		});
-		if (!prediction?.candidates.length || state.finished) return;
-		await admitPredictions(
-			state,
-			state.startInput as StartInput,
-			prediction.candidates,
-			0,
-			0,
-			tokenTotals.get(state.sessionID) ?? 0,
-			"pattern_aware",
-			candidateToolNames(settings),
-		);
 	};
 
 	const runPrediction = async (
@@ -2128,8 +2155,9 @@ export function makeSpeculativeActionRuntime<
 					// Learned predictions are optional; drafter prediction remains available.
 				}
 			}
+			if (state.finished || state.terminal) return;
 			const current = await latestSettings();
-			if (!current || !sourceEnabled(current, "drafter")) return;
+			if (state.finished || state.terminal || !current || !sourceEnabled(current, "drafter")) return;
 			const activeDrafterPlan = [...availableCandidates(state).values()].some(hasActiveSharedDrafterLease);
 			if (adaptiveDrafter(state) && activeDrafterPlan) return;
 			if (adaptiveDrafter(state) && !takeDrafterOpportunity(input.sessionID)) return;
@@ -2143,9 +2171,10 @@ export function makeSpeculativeActionRuntime<
 				() => state.predictionController.abort(),
 			);
 			const predictionLatencyMs = Math.max(0, Date.now() - predictionStarted);
-			const totalDraftTokens = (tokenTotals.get(input.sessionID) ?? 0) + prediction.draftTokens;
+			const draftTokens = finiteMetric(prediction.draftTokens);
+			const totalDraftTokens = finiteMetric(tokenTotals.get(input.sessionID)) + draftTokens;
 			tokenTotals.set(input.sessionID, totalDraftTokens);
-			if (state.finished) return;
+			if (state.finished || state.terminal) return;
 			if (!prediction.candidates.length) {
 				recordDrafterFailure(state, undefined, "source_error");
 				if (!accepted) {
@@ -2159,7 +2188,7 @@ export function makeSpeculativeActionRuntime<
 				input,
 				prediction.candidates,
 				predictionLatencyMs,
-				prediction.draftTokens,
+				draftTokens,
 				totalDraftTokens,
 				"drafter",
 				candidateNames,
@@ -2176,8 +2205,7 @@ export function makeSpeculativeActionRuntime<
 				);
 			}
 		} catch (error) {
-			if (state.finished) return;
-			if (error instanceof PredictionTimeoutError) state.predictionTimedOut = true;
+			if (state.finished || state.terminal) return;
 			state.noCandidateReported = true;
 			recordDrafterFailure(state, undefined, "source_error");
 			await publishMiss(
@@ -2188,7 +2216,6 @@ export function makeSpeculativeActionRuntime<
 			);
 		} finally {
 			state.predictionPending = false;
-			state.ready.resolve(undefined);
 		}
 	};
 
@@ -2220,7 +2247,6 @@ export function makeSpeculativeActionRuntime<
 			turnID: input.turnID,
 			startInput: input,
 			startedAt: Date.now(),
-			ready: deferred<void>(),
 			candidates: new Map(),
 			data: await adapter.stateData(input),
 			settings,
@@ -2235,7 +2261,6 @@ export function makeSpeculativeActionRuntime<
 			terminal: false,
 			finished: false,
 			noCandidateReported: false,
-			predictionTimedOut: false,
 			predictionPending: true,
 		};
 		turns.set(turnKey(input), state);
@@ -2534,9 +2559,7 @@ export function makeSpeculativeActionRuntime<
 				removePersistentCandidate(state, candidate);
 				releaseCandidateResourceVersion(candidate);
 			}
-			if ((candidate.commitValidationFiles ?? 0) > 0) {
-				await invalidateChangedResources(state, actual, candidate);
-			}
+			await invalidateChangedResources(state, actual, candidate);
 			const matchedLeases = candidate.leases.filter(
 				(lease) => lease.state === "hit" && lease.resolvedActionSeq === actionSequence,
 			);
@@ -2674,15 +2697,23 @@ export function makeSpeculativeActionRuntime<
 		if (!schedulerFor(state.sessionID).snapshot().length) schedulers.delete(state.sessionID);
 	};
 
-	const finishTerminalSession = async (sessionID: SessionID): Promise<void> => {
+	const finishTerminalSession = async (sessionID: SessionID, settings: SpeculativeActionSettings): Promise<void> => {
 		const candidates = sessionPersistentCandidates(sessionID);
-		if (!candidates.length) return;
-		for (const candidate of candidates) await settlePatternLeases(candidate, "invalidated", "actor_miss");
+		const state = createDisposalState<SessionID, Output, StateData>(sessionID, settings);
+		for (const candidate of candidates) {
+			if (candidate.reuse.kind === "exclusive") {
+				await closeCandidate(state, candidate, "request_finished_without_hit", "invalidated", true);
+			} else {
+				await settlePatternLeases(candidate, "invalidated", "actor_miss");
+			}
+		}
+		if (candidates.length) await publishCache(state);
 		try {
 			await adapter.flushPatternStore?.();
 		} catch {
 			// Persistence is best-effort.
 		}
+		if (!schedulerFor(sessionID).snapshot().length) schedulers.delete(sessionID);
 	};
 
 	const abortState = async (state: TurnState<SessionID, Output, StateData>, reason: string): Promise<void> => {
@@ -2704,7 +2735,7 @@ export function makeSpeculativeActionRuntime<
 		}
 		const state = turns.get(turnKey(input));
 		if (state) await finishState(state, input.terminal === true);
-		else if (input.terminal === true) await finishTerminalSession(input.sessionID);
+		else if (input.terminal === true) await finishTerminalSession(input.sessionID, settings);
 	};
 
 	const disposeSession = async (sessionID: SessionID): Promise<void> => {
@@ -2888,7 +2919,6 @@ function createDisposalState<SessionID, Output, StateData>(
 		turnID: "<dispose>",
 		startInput: { sessionID, turnID: "<dispose>" },
 		startedAt: Date.now(),
-		ready: deferred<void>(),
 		candidates: new Map(),
 		data: undefined as StateData,
 		settings,
@@ -2903,7 +2933,6 @@ function createDisposalState<SessionID, Output, StateData>(
 		terminal: true,
 		finished: true,
 		noCandidateReported: false,
-		predictionTimedOut: false,
 		predictionPending: false,
 	};
 }
@@ -2921,7 +2950,6 @@ function deferred<T>(): DeferredState<T> {
 			complete = true;
 			resolvePromise(value);
 		},
-		done: () => complete,
 	};
 }
 
@@ -2997,6 +3025,31 @@ function resourceCaptureMetrics(value: unknown) {
 
 function finiteMetric(value: unknown): number {
 	return typeof value === "number" && Number.isFinite(value) ? Math.max(0, value) : 0;
+}
+
+function finiteNonNegative(value: unknown, fallback: number): number {
+	const safeFallback = Number.isFinite(fallback) ? Math.max(0, fallback) : 0;
+	return typeof value === "number" && Number.isFinite(value) ? Math.max(0, value) : safeFallback;
+}
+
+function finitePositive(value: unknown, fallback: number): number {
+	return Math.max(1, finiteNonNegative(value, fallback));
+}
+
+function finiteNonNegativeInteger(value: unknown): number {
+	return Math.floor(finiteMetric(value));
+}
+
+function finiteOptionalNonNegativeInteger(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) ? Math.max(0, Math.floor(value)) : undefined;
+}
+
+function finitePositiveInteger(value: unknown, fallback: number): number {
+	return Math.max(1, Math.floor(finiteNonNegative(value, fallback)));
+}
+
+function finiteProbability(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : undefined;
 }
 
 export function estimateValueBytes(value: unknown, seen = new WeakSet<object>()): number {

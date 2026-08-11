@@ -372,6 +372,37 @@ describe("PatternAware", () => {
 		expect(second.predict("three").some((item) => item.tool === "read")).toBe(true);
 	});
 
+	test("skips malformed persisted contexts, binding paths, and binding nodes", async () => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "pi-pattern-corrupt-state-"));
+		temporary.push(directory);
+		const file = path.join(directory, "patterns.json");
+		const valid = validatedGapPattern({ "0": 10 }, { id: "valid-persisted-pattern" });
+		await fs.writeFile(
+			file,
+			JSON.stringify({
+				version: 11,
+				patterns: [
+					valid,
+					{ ...valid, id: "bad-context", context: [{ tool: 7, outcome: "success" }] },
+					{ ...valid, id: "bad-target-path", bindings: { "not-json": { type: "constant", value: "x" } } },
+					{
+						...valid,
+						id: "bad-binding",
+						bindings: {
+							'["filePath"]': { type: "event", relativeEvent: -1, field: "output", path: "not-an-array" },
+						},
+					},
+				],
+				pools: [],
+			}),
+		);
+
+		const store = new PatternAwareStore(settings(), file);
+		await expect(store.load()).resolves.toBeUndefined();
+
+		expect(store.snapshot().map((pattern) => pattern.id)).toEqual(["valid-persisted-pattern"]);
+	});
+
 	test("shares a workspace store only while runtime leases remain active", async () => {
 		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "pi-pattern-lease-"));
 		temporary.push(workspace);
@@ -1060,6 +1091,41 @@ describe("PatternAware", () => {
 		expect(after?.historicalMatches).toBe(pattern.historicalMatches + 1);
 	});
 
+	test("validates any emitted binding variant instead of only the top-ranked input", () => {
+		const store = new PatternAwareStore(settings());
+		const pattern = validatedGapPattern(
+			{ "0": 10 },
+			{
+				id: "variant-feedback",
+				bindings: {
+					'["filePath"]': {
+						type: "each",
+						relativeEvent: -1,
+						field: "output",
+						path: ["results"],
+						itemPath: ["path"],
+					},
+				},
+			},
+		);
+		expect(store.registerValidatedPattern(pattern)).toBe(true);
+
+		store.observe(
+			input({
+				sessionID: "variant-probe",
+				tool: "grep",
+				input: { pattern: "TODO" },
+				output: { results: [{ path: "src/first.ts" }, { path: "src/second.ts" }] },
+			}),
+		);
+		expect(store.predict("variant-probe").filter((candidate) => candidate.tool === "read")).toHaveLength(2);
+		store.observe(input({ sessionID: "variant-probe", tool: "read", input: { filePath: "src/second.ts" } }));
+
+		const after = store.snapshot().find((item) => item.id === pattern.id);
+		expect(after?.historicalOpportunities).toBe(pattern.historicalOpportunities + 1);
+		expect(after?.historicalMatches).toBe(pattern.historicalMatches + 1);
+	});
+
 	test.each([
 		{
 			name: "reverse coverage",
@@ -1353,6 +1419,21 @@ describe("PatternAware", () => {
 			output: { results: [{ path: "C:/repo/src/b.ts", line: 4 }] },
 			outputPaths: ["C:/repo/src/b.ts"],
 		});
+		expect(
+			projectPatternAwareObservation({
+				content: [{ type: "text", text: "private display-only payload" }],
+				details: { results: [{ path: "src/c.ts", line: 5 }] },
+			}),
+		).toEqual({
+			output: { results: [{ path: "src/c.ts", line: 5 }] },
+			outputPaths: ["src/c.ts"],
+		});
+		expect(
+			projectPatternAwareObservation({
+				content: [{ type: "text", text: "private display-only payload" }],
+				details: undefined,
+			}),
+		).toEqual({});
 	});
 
 	test("records compact LLM turn metadata in the analyzer event stream", () => {

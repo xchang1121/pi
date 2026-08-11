@@ -270,12 +270,12 @@ export function installSpeculativeAction(
 				input.tools.map((tool) => ({ name: tool.name, inputSchema: tool.parameters })),
 			),
 		}),
-		predict: async (input, settings, definitions, _candidateNames, signal) => {
+		predict: async (input, settings, _definitions, candidateNames, signal) => {
 			const draftModel =
 				typeof options.draftModel === "function"
 					? await options.draftModel(input.actorModel)
 					: (options.draftModel ?? input.actorModel);
-			const draftOptions = options.getDraftOptions
+			const configuredDraftOptions = options.getDraftOptions
 				? await options.getDraftOptions({
 						actorModel: input.actorModel,
 						draftModel,
@@ -290,17 +290,19 @@ export function installSpeculativeAction(
 						reasoning: undefined,
 						sessionId: `${sessionID}:speculative`,
 					};
+			const draftOptions = { ...configuredDraftOptions, signal };
+			const enabledTools = new Set(candidateNames);
 			const stream = await baseStream(
 				draftModel,
 				{
 					systemPrompt: [
 						input.context.systemPrompt,
-						buildDrafterToolCallPrompt(definitions, [], settings.candidateLimit ?? DEFAULTS.candidateLimit),
+						buildDrafterToolCallPrompt(settings.candidateLimit ?? DEFAULTS.candidateLimit),
 					]
 						.filter(Boolean)
 						.join("\n\n"),
 					messages: input.context.messages,
-					tools: input.context.tools,
+					tools: (input.context.tools ?? []).filter((tool) => enabledTools.has(tool.name)),
 				},
 				draftOptions,
 			);

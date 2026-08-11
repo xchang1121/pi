@@ -19,14 +19,7 @@ import { candidateToolNames } from "../src/runtime.ts";
 
 describe("speculative action common", () => {
 	it("builds a tool-call-only drafter prompt without embedding unrelated schemas", () => {
-		const prompt = buildDrafterToolCallPrompt(
-			[
-				{ name: "read", description: "Read files" },
-				{ name: "task", description: "Run a subagent" },
-			],
-			["read"],
-			4,
-		);
+		const prompt = buildDrafterToolCallPrompt(4);
 
 		expect(prompt).toContain("Dispatch tool calls only");
 		expect(prompt).toContain("provider tool-call channel only");

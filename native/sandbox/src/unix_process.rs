@@ -10,13 +10,23 @@ use anyhow::{Context, Result};
 
 static ACTIVE_PROCESS_GROUP: AtomicI32 = AtomicI32::new(0);
 
+fn kill_process_group(pid: libc::pid_t) {
+    unsafe {
+        libc::kill(-pid, libc::SIGKILL);
+    }
+}
+
+fn kill_process_tree(pid: libc::pid_t) {
+    kill_process_group(pid);
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+    }
+}
+
 extern "C" fn terminate_process_group(signal: libc::c_int) {
     let pid = ACTIVE_PROCESS_GROUP.load(Ordering::Relaxed);
     if pid > 0 {
-        unsafe {
-            libc::kill(-pid, libc::SIGKILL);
-            libc::kill(pid, libc::SIGKILL);
-        }
+        kill_process_tree(pid);
     }
     unsafe { libc::_exit(128 + signal) }
 }
@@ -81,6 +91,9 @@ pub fn capture(
         return Err(io::Error::last_os_error()).context("fork failed");
     }
     if pid == 0 {
+        unsafe {
+            libc::setpgid(0, 0);
+        }
         for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
             unsafe {
                 libc::signal(signal, libc::SIG_DFL);
@@ -104,6 +117,9 @@ pub fn capture(
         libc::setpgid(pid, pid);
     }
     let outcome = collect_process(pid, pipe[0], timeout, max_output);
+    if outcome.is_err() {
+        cleanup_after_collection_error(pid);
+    }
     ACTIVE_PROCESS_GROUP.store(0, Ordering::Release);
     drop(signals);
     close(pipe[0]);
@@ -145,6 +161,9 @@ fn collect_process(
         drain_output(output_fd, &mut output, max_output, &mut truncated)?;
         let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
         if waited == pid {
+            // A successful command must not leave background descendants running
+            // after the broker reports completion.
+            kill_process_group(pid);
             break;
         }
         if waited < 0 {
@@ -152,10 +171,7 @@ fn collect_process(
         }
         if started.elapsed() >= timeout {
             timed_out = true;
-            unsafe {
-                libc::kill(-pid, libc::SIGKILL);
-                libc::kill(pid, libc::SIGKILL);
-            }
+            kill_process_tree(pid);
             cvt(
                 unsafe { libc::waitpid(pid, &mut status, 0) },
                 "waitpid timed-out sandbox process",
@@ -184,6 +200,18 @@ fn collect_process(
         timeout: timed_out,
         truncated,
     })
+}
+
+fn cleanup_after_collection_error(pid: libc::pid_t) {
+    kill_process_group(pid);
+    let mut status = 0;
+    let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+    if waited == 0 {
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+            libc::waitpid(pid, &mut status, 0);
+        }
+    }
 }
 
 fn drain_output(fd: RawFd, output: &mut Vec<u8>, max: usize, truncated: &mut bool) -> Result<bool> {
@@ -289,5 +317,33 @@ mod tests {
         append_tail(&mut output, b"5678", 6, &mut truncated);
         assert_eq!(output, b"345678");
         assert!(truncated);
+    }
+
+    #[test]
+    fn successful_parent_cannot_leave_background_descendants() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("late.txt");
+        let child_marker = marker.clone();
+
+        let outcome = capture(Duration::from_secs(2), 1024, move || {
+            let descendant = unsafe { libc::fork() };
+            if descendant < 0 {
+                return Err(io::Error::last_os_error()).context("fork descendant");
+            }
+            if descendant == 0 {
+                std::thread::sleep(Duration::from_millis(250));
+                let _ = std::fs::write(child_marker, b"leaked");
+                unsafe { libc::_exit(0) }
+            }
+            Ok(0)
+        })
+        .unwrap();
+
+        assert_eq!(outcome.exit, 0);
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(
+            !marker.exists(),
+            "background descendant survived a successful command"
+        );
     }
 }

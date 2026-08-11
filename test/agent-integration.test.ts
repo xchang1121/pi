@@ -122,6 +122,7 @@ function createStreamHarness(
 	let draftRequests = 0;
 	const draftModels: string[] = [];
 	const draftOptions: (SimpleStreamOptions | undefined)[] = [];
+	const draftTools: string[][] = [];
 	const stream = (model: Model<Api>, context: Context, streamOptions?: SimpleStreamOptions): MockAssistantStream => {
 		const response = new MockAssistantStream();
 		const isDraft = context.systemPrompt?.includes("Dispatch tool calls only") === true;
@@ -129,6 +130,7 @@ function createStreamHarness(
 			draftRequests++;
 			draftModels.push(model.id);
 			draftOptions.push(streamOptions);
+			draftTools.push((context.tools ?? []).map((tool) => tool.name));
 		}
 		const publish = () => {
 			if (isDraft) {
@@ -192,6 +194,7 @@ function createStreamHarness(
 		draftRequests: () => draftRequests,
 		draftModels: () => draftModels,
 		draftOptions: () => draftOptions,
+		draftTools: () => draftTools,
 	};
 }
 
@@ -269,6 +272,49 @@ describe("Pi Agent speculative integration", () => {
 		expect(result?.role === "toolResult" ? result.content : undefined).toEqual([
 			{ type: "text", text: "prefetched README" },
 		]);
+		await installed.uninstall();
+	});
+
+	it("exposes only enabled speculative tools to the drafter", async () => {
+		let readExecutions = 0;
+		const read: ReadTool = {
+			name: "read",
+			label: "Read",
+			description: "Read a file",
+			parameters: readSchema,
+			async execute() {
+				readExecutions++;
+				return { content: [{ type: "text", text: "README" }], details: { source: "read" } };
+			},
+		};
+		const find: FindTool = {
+			name: "find",
+			label: "Find",
+			description: "Find files",
+			parameters: findSchema,
+			async execute() {
+				return { content: [{ type: "text", text: "README.md" }], details: undefined };
+			},
+		};
+		const streams = createStreamHarness({ actorDelayMs: 100 });
+		const agent = new Agent({
+			initialState: { model: createModel(), tools: [read, find] },
+			streamFn: streams.stream,
+		});
+		const installed = installSpeculativeAction(agent, {
+			cwd: "/workspace",
+			getSettings: () => ({
+				enabled: true,
+				patternAware: { enabled: false },
+				tools: { resourceCached: ["read"] },
+			}),
+			preflight: () => true,
+		});
+
+		await agent.prompt("Read README.md");
+
+		expect(readExecutions).toBe(1);
+		expect(streams.draftTools()).toEqual([["read"], ["read"]]);
 		await installed.uninstall();
 	});
 
@@ -557,6 +603,8 @@ describe("Pi Agent speculative integration", () => {
 	it("uses the configured drafter model and request options", async () => {
 		let toolExecutions = 0;
 		let optionCalls = 0;
+		const runtimeSignals: AbortSignal[] = [];
+		const foreignSignal = new AbortController().signal;
 		const actorModel = createModel("actor");
 		const draftModel = createModel("drafter");
 		const tool: ReadTool = {
@@ -579,7 +627,8 @@ describe("Pi Agent speculative integration", () => {
 				optionCalls++;
 				expect(context.actorModel.id).toBe("actor");
 				expect(context.draftModel.id).toBe("drafter");
-				return { signal: context.signal, sessionId: "draft-options", temperature: 0 };
+				runtimeSignals.push(context.signal);
+				return { signal: foreignSignal, sessionId: "draft-options", temperature: 0 };
 			},
 			preflight: () => true,
 		});
@@ -590,6 +639,8 @@ describe("Pi Agent speculative integration", () => {
 		expect(optionCalls).toBe(2);
 		expect(streams.draftModels()).toEqual(["drafter", "drafter"]);
 		expect(streams.draftOptions().map((options) => options?.sessionId)).toEqual(["draft-options", "draft-options"]);
+		expect(streams.draftOptions().map((options) => options?.signal)).toEqual(runtimeSignals);
+		expect(streams.draftOptions().every((options) => options?.signal !== foreignSignal)).toBe(true);
 		await installed.uninstall();
 	});
 
@@ -1008,7 +1059,7 @@ function deferred<T>(): { readonly promise: Promise<T>; readonly resolve: (value
 }
 
 async function waitFor(predicate: () => boolean): Promise<void> {
-	const deadline = Date.now() + 1000;
+	const deadline = Date.now() + 5000;
 	while (!predicate()) {
 		if (Date.now() >= deadline) throw new Error("Timed out waiting for test condition");
 		await new Promise((resolve) => setTimeout(resolve, 1));

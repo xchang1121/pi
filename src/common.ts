@@ -89,11 +89,7 @@ export const READ_DEFAULT_LIMIT = 2000;
 export const GREP_DEFAULT_LIMIT = 100;
 export const FIND_DEFAULT_LIMIT = 1000;
 
-export function buildDrafterToolCallPrompt(
-	_definitions: readonly DrafterToolDefinition[],
-	_candidateToolNames: readonly string[] = KEYABLE_TOOLS,
-	candidateLimit = 1,
-): string {
+export function buildDrafterToolCallPrompt(candidateLimit = 1): string {
 	const limit = clampCandidateLimit(candidateLimit);
 	return `Dispatch tool calls only.
 
