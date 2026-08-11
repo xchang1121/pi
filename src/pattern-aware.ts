@@ -20,8 +20,6 @@ export type PatternAwareSettings = {
 	readonly minOccurrences: number;
 	/** Minimum historical replay precision required for a concrete argument mapper. */
 	readonly minBindingReplayProbability: number;
-	/** @deprecated Configuration input alias for minBindingReplayProbability. */
-	readonly minEmpiricalProbability?: number;
 	readonly maxPatterns: number;
 };
 
@@ -1244,7 +1242,7 @@ export function patternAwareSettings(value: unknown): PatternAwareSettings {
 		decayHalfLifeEvents: positiveInteger(record?.decayHalfLifeEvents, PATTERN_AWARE_DEFAULTS.decayHalfLifeEvents),
 		minOccurrences: positiveInteger(record?.minOccurrences, PATTERN_AWARE_DEFAULTS.minOccurrences),
 		minBindingReplayProbability: probabilitySetting(
-			record?.minBindingReplayProbability ?? record?.minEmpiricalProbability,
+			record?.minBindingReplayProbability,
 			PATTERN_AWARE_DEFAULTS.minBindingReplayProbability,
 		),
 		maxPatterns: positiveInteger(record?.maxPatterns, PATTERN_AWARE_DEFAULTS.maxPatterns),

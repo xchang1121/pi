@@ -96,13 +96,11 @@ interface HarnessOptions {
 	) => Promise<TestPrediction | undefined> | TestPrediction | undefined;
 	readonly patternResolved?: (outcome: string) => void;
 	readonly patternFlush?: () => Promise<void> | void;
-	readonly candidateSizeBytes?: () => number;
 	readonly observerThrows?: boolean;
 }
 
 const enabledSettings: SpeculativeActionSettings = {
 	enabled: true,
-	mode: "predict_action_single_step",
 	candidateLimit: 4,
 	maxConcurrentActions: 4,
 	resourceCacheMaxEntries: 512,
@@ -255,7 +253,6 @@ function createHarness(options: HarnessOptions) {
 		...(options.rejectCandidateOutput
 			? { rejectCandidateOutput: ({ output }) => options.rejectCandidateOutput?.(output) }
 			: {}),
-		...(options.candidateSizeBytes ? { candidateSizeBytes: () => options.candidateSizeBytes?.() ?? 0 } : {}),
 		onEvent: (event) => {
 			events.push(event);
 			if (options.observerThrows) throw new Error("observer failed");
@@ -1754,16 +1751,12 @@ describe("speculative action runtime", () => {
 
 		const started = harness.events.find((event) => event.type === "started");
 		expect(started).toMatchObject({
-			cacheEntries: 0,
 			cacheCapacity: 7,
-			cacheRunning: 0,
-			cacheCompleted: 0,
 			cacheProbation: 0,
 			cacheProtected: 0,
 			inFlightJobs: 1,
 			resultEntries: 0,
 			branchEntries: 0,
-			activeCandidates: 1,
 			turnCandidates: 0,
 			resourceCandidates: 1,
 			cacheTools: ["read"],
@@ -1777,33 +1770,15 @@ describe("speculative action runtime", () => {
 		expect(eventTypes.indexOf("cache")).toBeGreaterThan(eventTypes.indexOf("started"));
 		expect(eventTypes.indexOf("cache")).toBeLessThan(eventTypes.indexOf("hit"));
 		expect(harness.events.find((event) => event.type === "cache")).toMatchObject({
-			cacheEntries: 1,
-			cacheRunning: 0,
-			cacheCompleted: 1,
 			cacheProbation: 1,
 			cacheProtected: 0,
 			inFlightJobs: 0,
 			resultEntries: 1,
 			branchEntries: 0,
-			activeCandidates: 0,
 		});
 		expect(harness.events.find((event) => event.type === "hit")).toMatchObject({
 			cacheProbation: 0,
 			cacheProtected: 1,
-		});
-	});
-
-	it("refreshes cache telemetry when a candidate completes without an actor hit", async () => {
-		const harness = createHarness({ predict: () => prediction(readCandidate()), execute: () => "ready" });
-		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-background" });
-		await waitFor(() => harness.events.some((event) => event.type === "cache"));
-
-		expect(harness.events.some((event) => event.type === "hit")).toBe(false);
-		expect(harness.events.find((event) => event.type === "cache")).toMatchObject({
-			cacheCompleted: 1,
-			cacheRunning: 0,
-			cacheProbation: 1,
-			cacheProtected: 0,
 		});
 	});
 
@@ -1820,7 +1795,6 @@ describe("speculative action runtime", () => {
 		await waitFor(() => harness.events.some((event) => event.type === "started"));
 
 		expect(harness.events.find((event) => event.type === "started")).toMatchObject({
-			cacheEntries: 0,
 			cacheProbation: 0,
 			cacheProtected: 0,
 			inFlightJobs: 1,
@@ -1830,7 +1804,6 @@ describe("speculative action runtime", () => {
 		});
 		await waitFor(() => harness.events.some((event) => event.type === "completed"));
 		expect(harness.events.find((event) => event.type === "completed")).toMatchObject({
-			cacheEntries: 0,
 			cacheProbation: 0,
 			inFlightJobs: 0,
 			branchEntries: 1,
@@ -1856,7 +1829,6 @@ describe("speculative action runtime", () => {
 
 		const completed = harness.events.filter((event) => event.type === "completed").at(-1);
 		expect(completed).toMatchObject({
-			cacheEntries: 1,
 			resultEntries: 1,
 			branchEntries: 1,
 			inFlightJobs: 0,
@@ -1960,7 +1932,6 @@ describe("speculative action runtime", () => {
 			actionKeyHash: expect.any(String),
 			actualAction: expect.any(String),
 			actualDurationMs: 23,
-			cacheEntries: 0,
 		});
 	});
 
@@ -3100,7 +3071,6 @@ describe("speculative action runtime", () => {
 		};
 		const harness = createHarness({
 			predict: () => ({ candidates: [malformed], draftTokens: Number.NaN }),
-			candidateSizeBytes: () => Number.NaN,
 		});
 		await harness.runtime.startTurn({ sessionID: "session", turnID: "non-finite" });
 		await waitFor(() => harness.events.some((event) => event.type === "completed"));
@@ -3121,7 +3091,7 @@ describe("speculative action runtime", () => {
 			started.expectedBenefitMs,
 			started.resourceUnits,
 			started.schedulerUtility,
-			started.cacheBytes,
+			started.resultBytes,
 		]) {
 			expect(Number.isFinite(value)).toBe(true);
 		}

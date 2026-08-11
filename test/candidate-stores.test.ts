@@ -57,21 +57,27 @@ describe("ActionStore", () => {
 
 describe("ResultCache", () => {
 	it("evicts the least valuable probation entry before actor-validated results", () => {
-		const cache = new ResultCache<string, Entry>([], (item) => (item.id === "valuable" ? 100 : Number.NaN));
+		const cache = new ResultCache<string, Entry>([], (item) =>
+			item.id === "valuable" ? 100 : item.id === "shared" ? 1 : Number.NaN,
+		);
 		const shared = entry("shared", "a.ts", 1, 20, 8);
 		const valuable = entry("valuable", "b.ts", 1, 20, 8);
 		const worthless = entry("worthless", "c.ts", 1, 20, 8);
 		cache.insert("one", shared);
 		cache.insert("two", shared);
 		cache.insert("one", valuable);
-		cache.insert("one", worthless);
 		cache.recordActorHit("one", shared);
+		expect(cache.recordActorHit("one", valuable, { maxEntries: 2, maxBytes: 16, protectedFraction: 0.5 })).toEqual([
+			shared,
+		]);
+		cache.insert("one", worthless);
 
-		expect(cache.stateOf("one", shared)).toBe("protected");
+		expect(cache.stateOf("one", shared)).toBe("probation");
+		expect(cache.stateOf("one", valuable)).toBe("protected");
 		expect(cache.stateOf("two", shared)).toBe("probation");
 		expect(cache.trim("one", { maxEntries: 2, maxBytes: 16 })).toEqual([worthless]);
-		expect(cache.trim("one", { maxEntries: 1, maxBytes: 8 })).toEqual([valuable]);
-		expect(cache.values("one")).toEqual([shared]);
+		expect(cache.trim("one", { maxEntries: 1, maxBytes: 8 })).toEqual([shared]);
+		expect(cache.values("one")).toEqual([valuable]);
 		expect(cache.snapshot("one")).toEqual({
 			probationEntries: 0,
 			protectedEntries: 1,
@@ -92,7 +98,7 @@ describe("ResultCache", () => {
 		branches.insert("session", branch);
 
 		expect(jobs.delete("session", job)).toBe(true);
-		expect(results.getExact("session", result.key)).toBe(result);
+		expect(results.values("session")).toEqual([result]);
 		expect(branches.getExact("session", branch.key)).toBe(branch);
 		expect(results.trim("session", { maxEntries: 0, maxBytes: 0 })).toEqual([result]);
 		expect(branches.values("session")).toEqual([branch]);

@@ -10,12 +10,9 @@ export interface DrafterToolDefinition {
 
 export const DEFAULTS = {
 	enabled: false,
-	mode: "predict_action_single_step" as const,
 	drafterEnabled: true,
 	candidateLimit: 8,
 	maxConcurrentActions: 8,
-	/** @deprecated Use candidateLimit and maxConcurrentActions. */
-	maxCandidates: 8,
 	resourceCacheMaxEntries: 512,
 	resourceCacheMaxBytes: 256 * 1024 * 1024,
 	predictionTimeoutMs: 300_000,
@@ -44,9 +41,6 @@ Rules:
 export function clampCandidateLimit(value: unknown): number {
 	return typeof value === "number" && Number.isFinite(value) ? Math.max(1, Math.min(8, Math.floor(value))) : 1;
 }
-
-/** @deprecated Use clampCandidateLimit. */
-export const clampMaxCandidates = clampCandidateLimit;
 
 export function usageTokenCount(
 	usage:

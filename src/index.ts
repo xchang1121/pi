@@ -11,6 +11,5 @@ export * from "./plan-proposal.ts";
 export * from "./plan-state.ts";
 export * from "./resource-version.ts";
 export * from "./runtime.ts";
-export * from "./tool-cache.ts";
 export * from "./tool-speculation-scheduler.ts";
 export * from "./workspace-sandbox.ts";

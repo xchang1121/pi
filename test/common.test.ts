@@ -194,7 +194,6 @@ describe("speculative action common", () => {
 		expect(
 			candidateToolNames({
 				enabled: true,
-				mode: "predict_action_single_step",
 				candidateLimit: 4,
 				maxConcurrentActions: 4,
 				resourceCacheMaxEntries: 8,

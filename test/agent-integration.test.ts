@@ -250,7 +250,7 @@ describe("Pi Agent speculative integration", () => {
 				enabled: true,
 				predictionTimeoutMs: 1000,
 				patternAware: { enabled: false },
-				tools: { liveReadonly: ["read"] },
+				tools: { resourceCached: ["read"] },
 			}),
 			preflight: () => true,
 			onEvent: (event) => {
@@ -502,7 +502,7 @@ describe("Pi Agent speculative integration", () => {
 				enabled: true,
 				predictionTimeoutMs: 1000,
 				patternAware: { enabled: false },
-				tools: { liveReadonly: ["read"] },
+				tools: { resourceCached: ["read"] },
 			}),
 			preflight: () => true,
 			projectionRules: [PI_READ_RANGE_PROJECTION_RULE],

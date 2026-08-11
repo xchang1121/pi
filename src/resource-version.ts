@@ -710,18 +710,3 @@ const fingerprintGate = new AsyncGate(FINGERPRINT_CONCURRENCY);
 function fingerprintIO<Value>(task: () => Promise<Value>) {
 	return fingerprintGate.run(task);
 }
-
-/** @deprecated M8 callers should retain and validate ResourceVersionToken instead. */
-export async function fingerprintActionResources(
-	action: ActionKey,
-	root: string,
-	actionSemantics: ActionSemanticsRegistry = PI_ACTION_SEMANTICS,
-): Promise<string> {
-	const manager = new ResourceVersionManager(path.resolve(root), { watch: false });
-	try {
-		const token = await manager.capture(resourceDependencies(action, root, actionSemantics));
-		return JSON.stringify({ tool: action.tool, exact: token.exact ?? [], quick: token.quick });
-	} finally {
-		manager.close();
-	}
-}

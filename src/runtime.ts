@@ -31,12 +31,9 @@ import {
 
 export interface SpeculativeActionSettings {
 	readonly enabled: boolean;
-	readonly mode: "predict_action_single_step";
 	readonly drafterEnabled?: boolean;
 	readonly candidateLimit?: number;
 	readonly maxConcurrentActions?: number;
-	/** @deprecated Compatibility for adapters created before the limits were split. */
-	readonly maxCandidates?: number;
 	readonly resourceCacheMaxEntries: number;
 	readonly resourceCacheMaxBytes?: number;
 	readonly predictionTimeoutMs: number;
@@ -165,15 +162,8 @@ interface SpeculativeEventBase<SessionID> {
 }
 
 export interface SpeculativeCacheSnapshot {
-	/** @deprecated Mirrors resultEntries for event compatibility. */
-	readonly cacheEntries: number;
 	readonly cacheCapacity: number;
-	readonly cacheBytes?: number;
 	readonly cacheByteCapacity?: number;
-	/** @deprecated Running jobs are reported by inFlightJobs and never live in ResultCache. */
-	readonly cacheRunning: number;
-	/** @deprecated Mirrors resultEntries for event compatibility. */
-	readonly cacheCompleted: number;
 	readonly cacheProbation: number;
 	readonly cacheProtected: number;
 	readonly inFlightJobs: number;
@@ -181,7 +171,6 @@ export interface SpeculativeCacheSnapshot {
 	readonly resultBytes: number;
 	readonly branchEntries: number;
 	readonly branchBytes: number;
-	readonly activeCandidates: number;
 	readonly turnCandidates: number;
 	readonly resourceCandidates: number;
 	readonly cacheTools: readonly string[];
@@ -434,10 +423,6 @@ export interface SpeculativeActionRuntimeAdapter<
 		readonly index: number;
 		readonly signal: AbortSignal;
 	}) => MaybePromise<Output | WorldBranch<Output>>;
-	readonly candidateSizeBytes?: (input: {
-		readonly output: Output;
-		readonly candidate: SpeculativeCandidate;
-	}) => number;
 	readonly prepareCandidate?: (input: {
 		readonly startInput: StartInput;
 		readonly data: StateData;
@@ -705,8 +690,7 @@ export function makeSpeculativeActionRuntime<
 		observeAverage(actorLeadTimes, schedulingKey(tool), durationMs);
 		if (horizon !== undefined) observeAverage(actorLeadTimes, schedulingKey(tool, horizon), durationMs);
 	};
-	const masterEnabled = (settings: SpeculativeActionSettings): boolean =>
-		settings.enabled && settings.mode === "predict_action_single_step";
+	const masterEnabled = (settings: SpeculativeActionSettings): boolean => settings.enabled;
 	const sourceEnabled = (settings: SpeculativeActionSettings, sourceID: string): boolean => {
 		if (!masterEnabled(settings)) return false;
 		return sourcesByID.get(sourceID)?.enabled(settings) ?? false;
@@ -736,9 +720,9 @@ export function makeSpeculativeActionRuntime<
 	const adaptiveSourceBackoffEnabled = (state: TurnState<SessionID, Output, StateData>): boolean =>
 		state.settings.adaptiveDrafter ?? DEFAULTS.adaptiveDrafter;
 	const candidateLimit = (settings: SpeculativeActionSettings): number =>
-		clampCandidateLimit(settings.candidateLimit ?? settings.maxCandidates ?? DEFAULTS.candidateLimit);
+		clampCandidateLimit(settings.candidateLimit ?? DEFAULTS.candidateLimit);
 	const concurrentActionLimit = (settings: SpeculativeActionSettings): number =>
-		clampCandidateLimit(settings.maxConcurrentActions ?? settings.maxCandidates ?? DEFAULTS.maxConcurrentActions);
+		clampCandidateLimit(settings.maxConcurrentActions ?? DEFAULTS.maxConcurrentActions);
 	const takeSourceOpportunity = (sessionID: SessionID, source: string): boolean => {
 		const feedback = sourceBackoff.get(sessionID)?.get(source);
 		if (!feedback?.skips) return true;
@@ -944,12 +928,8 @@ export function makeSpeculativeActionRuntime<
 		const branchSnapshot = branches.snapshot(state.sessionID);
 		const resultBytes = cached.reduce((total, candidate) => total + candidate.estimatedBytes, 0);
 		return {
-			cacheEntries: cached.length,
 			cacheCapacity: state.settings.resourceCacheMaxEntries,
-			cacheBytes: resultBytes,
 			cacheByteCapacity: resourceCacheByteLimit(state.settings),
-			cacheRunning: 0,
-			cacheCompleted: cached.length,
 			cacheProbation: lifecycle.probationEntries,
 			cacheProtected: lifecycle.protectedEntries,
 			inFlightJobs: inFlight.length,
@@ -957,7 +937,6 @@ export function makeSpeculativeActionRuntime<
 			resultBytes,
 			branchEntries: branchSnapshot.entries,
 			branchBytes: branchSnapshot.bytes,
-			activeCandidates: inFlight.length,
 			turnCandidates: staged.length + inFlight.filter((candidate) => candidate.reuse.kind === "exclusive").length,
 			resourceCandidates: cached.length + inFlight.filter((candidate) => candidate.reuse.kind === "shared").length,
 			cacheTools: [...new Set(candidates.map((candidate) => candidate.key.tool))].sort(),
@@ -2199,12 +2178,7 @@ export function makeSpeculativeActionRuntime<
 							(candidate.sandboxSetupMs ?? 0) +
 							(candidate.changeCollectionMs ?? 0),
 					);
-					let outputBytes = estimateValueBytes(output);
-					try {
-						outputBytes = finiteNonNegative(adapter.candidateSizeBytes?.({ output, candidate }), outputBytes);
-					} catch {
-						// Fall back to the generic estimate when custom accounting fails.
-					}
+					const outputBytes = estimateValueBytes(output);
 					candidate.estimatedBytes += outputBytes + finiteMetric(worldBranch?.capturedBytes);
 					markCandidatePlanSucceeded(state, candidate);
 					const stored = storeCompletedCandidate(state, candidate);
@@ -3622,7 +3596,7 @@ function finiteProbability(value: unknown): number | undefined {
 	return typeof value === "number" && Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : undefined;
 }
 
-export function estimateValueBytes(value: unknown, seen = new WeakSet<object>()): number {
+function estimateValueBytes(value: unknown, seen = new WeakSet<object>()): number {
 	if (value === undefined || value === null) return 0;
 	if (typeof value === "string") return Buffer.byteLength(value);
 	if (typeof value === "number" || typeof value === "bigint") return 8;

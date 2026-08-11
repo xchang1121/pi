@@ -663,15 +663,6 @@ describe("PatternAware", () => {
 		});
 	});
 
-	test("migrates the legacy empirical threshold to binding replay precision", () => {
-		expect(patternAwareSettings({ minEmpiricalProbability: 0.4 })).toMatchObject({
-			minBindingReplayProbability: 0.4,
-		});
-		expect(patternAwareSettings({ minEmpiricalProbability: 0.4, minBindingReplayProbability: 0.9 })).toMatchObject({
-			minBindingReplayProbability: 0.9,
-		});
-	});
-
 	test("emits weak control-flow candidates for bounded utility admission", () => {
 		const store = new PatternAwareStore(settings({ minBindingReplayProbability: 0.75 }));
 		trainGrepRead(store, "one", "src/a.ts");

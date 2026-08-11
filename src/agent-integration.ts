@@ -57,8 +57,6 @@ export interface SpeculativeAgentSettingsInput {
 	readonly drafterEnabled?: boolean;
 	readonly candidateLimit?: number;
 	readonly maxConcurrentActions?: number;
-	/** @deprecated Use candidateLimit and maxConcurrentActions. */
-	readonly maxCandidates?: number;
 	readonly resourceCacheMaxEntries?: number;
 	readonly resourceCacheMaxBytes?: number;
 	readonly predictionTimeoutMs?: number;
@@ -66,8 +64,6 @@ export interface SpeculativeAgentSettingsInput {
 	readonly patternAware?: Partial<PatternAwareSettings>;
 	readonly tools?: {
 		readonly resourceCached?: readonly string[];
-		/** @deprecated Use resourceCached. */
-		readonly liveReadonly?: readonly string[];
 		readonly sandbox?: readonly string[];
 	};
 }
@@ -186,16 +182,12 @@ export function installSpeculativeAction(
 	};
 	const resolveSettings = async (): Promise<SpeculativeActionSettings> => {
 		const settings = (await options.getSettings?.()) ?? {};
-		const legacyLimit = settings.maxCandidates;
 		return {
 			enabled: typeof settings.enabled === "boolean" ? settings.enabled : DEFAULTS.enabled,
-			mode: "predict_action_single_step",
 			drafterEnabled:
 				typeof settings.drafterEnabled === "boolean" ? settings.drafterEnabled : DEFAULTS.drafterEnabled,
-			candidateLimit: clampCandidateLimit(settings.candidateLimit ?? legacyLimit ?? DEFAULTS.candidateLimit),
-			maxConcurrentActions: clampCandidateLimit(
-				settings.maxConcurrentActions ?? legacyLimit ?? DEFAULTS.maxConcurrentActions,
-			),
+			candidateLimit: clampCandidateLimit(settings.candidateLimit ?? DEFAULTS.candidateLimit),
+			maxConcurrentActions: clampCandidateLimit(settings.maxConcurrentActions ?? DEFAULTS.maxConcurrentActions),
 			resourceCacheMaxEntries: normalizePositiveInteger(
 				settings.resourceCacheMaxEntries,
 				DEFAULTS.resourceCacheMaxEntries,
@@ -209,10 +201,7 @@ export function installSpeculativeAction(
 				typeof settings.adaptiveDrafter === "boolean" ? settings.adaptiveDrafter : DEFAULTS.adaptiveDrafter,
 			patternAware: patternAwareSettings(settings.patternAware ?? PATTERN_AWARE_DEFAULTS),
 			tools: {
-				resourceCached: normalizeStringArray(
-					settings.tools?.resourceCached ?? settings.tools?.liveReadonly,
-					DEFAULTS.tools.resourceCached,
-				),
+				resourceCached: normalizeStringArray(settings.tools?.resourceCached, DEFAULTS.tools.resourceCached),
 				sandbox: normalizeStringArray(settings.tools?.sandbox, DEFAULTS.tools.sandbox),
 			},
 		};

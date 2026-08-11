@@ -982,7 +982,6 @@ describe("PatternAware runtime integration", () => {
 					draftTokens: 0,
 				}),
 				executeCandidate: ({ concrete }) => `${String(concrete.path)}:${"x".repeat(220)}`,
-				candidateSizeBytes: ({ output }) => output.length,
 				onEvent: (event) => {
 					events.push(event);
 				},
@@ -1153,7 +1152,6 @@ describe("PatternAware runtime integration", () => {
 							resourcesAdopted: 1,
 						},
 					}),
-				candidateSizeBytes: () => 64,
 				onEvent: (event) => {
 					events.push(event);
 				},
@@ -1489,7 +1487,6 @@ function fixtureActions(
 function settings(): SpeculativeActionSettings {
 	return {
 		enabled: true,
-		mode: "predict_action_single_step",
 		candidateLimit: 8,
 		maxConcurrentActions: 8,
 		resourceCacheMaxEntries: 512,

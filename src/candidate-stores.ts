@@ -135,13 +135,6 @@ export class ActionStore<Scope, Entry extends SizedActionStoreEntry> {
 		return evicted;
 	}
 
-	clearScope(scope: Scope): Entry[] {
-		const state = this.scopesByID.get(scope);
-		if (!state) return [];
-		this.scopesByID.delete(scope);
-		return [...state.entries.values()];
-	}
-
 	private lookupRecords(state: IndexedScope<Entry>, action: ActionKey): readonly IndexedActionStoreLookup<Entry>[] {
 		const candidates = new Set<Entry>();
 		const exact = state.entries.get(action.key);
@@ -240,10 +233,6 @@ export class ResultCache<Scope, Entry extends SizedActionStoreEntry> {
 		return { ...result, state: tiers.get(result.entry) ?? "probation" };
 	}
 
-	getExact(scope: Scope, action: ActionKey): Entry | undefined {
-		return this.index.getExact(scope, action);
-	}
-
 	lookup(scope: Scope, action: ActionKey): readonly ResultCacheLookup<Entry>[] {
 		const tiers = this.tiers.get(scope);
 		return this.index.lookup(scope, action).map((item) => ({
@@ -251,10 +240,6 @@ export class ResultCache<Scope, Entry extends SizedActionStoreEntry> {
 			match: item.match,
 			state: tiers?.get(item.entry) ?? "probation",
 		}));
-	}
-
-	matching(scope: Scope, action: ActionKey): readonly Entry[] {
-		return this.lookup(scope, action).map((item) => item.entry);
 	}
 
 	recordActorHit(scope: Scope, entry: Entry, limits?: ResultCacheLimits): readonly Entry[] {
@@ -325,12 +310,6 @@ export class ResultCache<Scope, Entry extends SizedActionStoreEntry> {
 			entries = this.index.values(scope);
 		}
 		return evicted;
-	}
-
-	clearScope(scope: Scope): Entry[] {
-		const entries = this.index.clearScope(scope);
-		this.tiers.delete(scope);
-		return entries;
 	}
 
 	private tiersFor(scope: Scope): Map<Entry, ResultCacheEntryState> {
