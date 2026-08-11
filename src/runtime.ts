@@ -22,10 +22,8 @@ import {
 	PI_ACTION_SEMANTICS,
 } from "./common.ts";
 import type { PatternAwareSettings } from "./pattern-aware.ts";
-import type { PlanExecutionNode } from "./plan-execution-graph.ts";
-import { PlanExecutionGraph } from "./plan-execution-graph.ts";
 import type { PlanAction, PlanProposal, PlanUpdate } from "./plan-proposal.ts";
-import { PlanLedger, samePlanActionExecution } from "./plan-proposal.ts";
+import { type PlanExecutionNode, PlanState } from "./plan-state.ts";
 import {
 	expectedUtility,
 	resourceProfile,
@@ -561,8 +559,7 @@ interface TurnState<SessionID, Output, StateData> {
 	readonly preparedHints: Set<string>;
 	readonly pendingActionSequences: Set<number>;
 	readonly turnAdmissions: Map<string, RuntimeCandidate<Output>>;
-	readonly plans: PlanLedger;
-	readonly planGraph: PlanExecutionGraph;
+	readonly plan: PlanState;
 	readonly sourceAttempts: Set<string>;
 	readonly sourceFeedback: Map<string, "success" | "actor_miss" | "source_error">;
 	readonly sourcePlanMismatches: Set<string>;
@@ -611,8 +608,7 @@ export function makeSpeculativeActionRuntime<
 ): SpeculativeActionRuntime<SessionID, Output, StartInput, ConsumeInput, FinishInput> {
 	const actionSemantics = adapter.actionSemantics ?? PI_ACTION_SEMANTICS;
 	const turns = new Map<string, TurnState<SessionID, Output, StateData>>();
-	const planLedgers = new Map<SessionID, PlanLedger>();
-	const planGraphs = new Map<SessionID, PlanExecutionGraph>();
+	const planStates = new Map<SessionID, PlanState>();
 	const planLaunchContexts = new Map<
 		SessionID,
 		Map<
@@ -624,18 +620,11 @@ export function makeSpeculativeActionRuntime<
 			}
 		>
 	>();
-	const planLedgerFor = (sessionID: SessionID): PlanLedger => {
-		const existing = planLedgers.get(sessionID);
+	const planStateFor = (sessionID: SessionID): PlanState => {
+		const existing = planStates.get(sessionID);
 		if (existing) return existing;
-		const created = new PlanLedger();
-		planLedgers.set(sessionID, created);
-		return created;
-	};
-	const planGraphFor = (sessionID: SessionID): PlanExecutionGraph => {
-		const existing = planGraphs.get(sessionID);
-		if (existing) return existing;
-		const created = new PlanExecutionGraph((action) => actionSemantics.execution(action.tool));
-		planGraphs.set(sessionID, created);
+		const created = new PlanState((action) => actionSemantics.execution(action.tool));
+		planStates.set(sessionID, created);
 		return created;
 	};
 	const planActionIdentity = (proposalID: string, actionID: string): string => `${proposalID}\u0000${actionID}`;
@@ -846,7 +835,7 @@ export function makeSpeculativeActionRuntime<
 	const activeAdaptivePlanSources = (
 		candidates: Iterable<RuntimeCandidate<Output>>,
 		actionSequence: number,
-		planGraph?: PlanExecutionGraph,
+		plan?: PlanState,
 	): Set<string> => {
 		const active = new Set<string>();
 		for (const candidate of candidates) {
@@ -860,7 +849,7 @@ export function makeSpeculativeActionRuntime<
 				}
 			}
 		}
-		for (const node of planGraph?.deferred() ?? []) {
+		for (const node of plan?.deferred() ?? []) {
 			if (node.expectedActionSeq >= actionSequence && sourcesByID.get(node.source)?.adaptive)
 				active.add(node.source);
 		}
@@ -1369,7 +1358,7 @@ export function makeSpeculativeActionRuntime<
 			(!preserveSuccessfulBatch || state.sourceFeedback.get(lease.source) !== "success");
 		for (const lease of candidate.leases) {
 			if (lease.state === "active" && shouldExpire(lease) && lease.proposalID && lease.actionID) {
-				state.planGraph.markFailed(lease.proposalID, lease.actionID);
+				state.plan.markFailed(lease.proposalID, lease.actionID);
 			}
 		}
 		await settlePredictionLeases(candidate, "expired", "actor_miss", shouldExpire);
@@ -1461,8 +1450,7 @@ export function makeSpeculativeActionRuntime<
 			await settleUnlaunchedPlanActions(state, "system");
 		}
 		for (const candidate of candidates) await preemptCandidate(candidate, reason, "discarded", publish);
-		planLedgers.delete(sessionID);
-		planGraphs.delete(sessionID);
+		planStates.delete(sessionID);
 		planLaunchContexts.delete(sessionID);
 		sourceBackoff.delete(sessionID);
 		if (!schedulerFor(sessionID).snapshot().length) schedulers.delete(sessionID);
@@ -1540,7 +1528,7 @@ export function makeSpeculativeActionRuntime<
 					continue;
 				}
 				if (lease.proposalID && lease.actionID) {
-					state.planGraph.markFailed(lease.proposalID, lease.actionID);
+					state.plan.markFailed(lease.proposalID, lease.actionID);
 				}
 				lease.state = "expired";
 				expired = true;
@@ -1642,7 +1630,7 @@ export function makeSpeculativeActionRuntime<
 		candidate: RuntimeCandidate<Output>,
 	): void => {
 		for (const lease of planLeaseReferences(candidate)) {
-			state.planGraph.markSucceeded(lease.proposalID!, lease.actionID!);
+			state.plan.markSucceeded(lease.proposalID!, lease.actionID!);
 		}
 	};
 	const markCandidatePlanAdopted = (
@@ -1652,7 +1640,7 @@ export function makeSpeculativeActionRuntime<
 	): void => {
 		for (const lease of planLeaseReferences(candidate)) {
 			if (lease.resolvedActionSeq === actionSequence) {
-				state.planGraph.markAdopted(lease.proposalID!, lease.actionID!, actionSequence);
+				state.plan.markAdopted(lease.proposalID!, lease.actionID!, actionSequence);
 			}
 		}
 	};
@@ -1661,7 +1649,7 @@ export function makeSpeculativeActionRuntime<
 		candidate: RuntimeCandidate<Output>,
 	): void => {
 		for (const lease of planLeaseReferences(candidate)) {
-			state.planGraph.markFailed(lease.proposalID!, lease.actionID!);
+			state.plan.markFailed(lease.proposalID!, lease.actionID!);
 		}
 	};
 	const markDraftPlanAdopted = (
@@ -1669,7 +1657,7 @@ export function makeSpeculativeActionRuntime<
 		draft: SpeculativeDraftCandidate,
 	): void => {
 		if (draft.proposalID && draft.actionID) {
-			state.planGraph.markAdopted(draft.proposalID, draft.actionID, state.actionSequence);
+			state.plan.markAdopted(draft.proposalID, draft.actionID, state.actionSequence);
 		}
 	};
 	const actorAlreadySatisfiedDraft = (
@@ -1682,7 +1670,7 @@ export function makeSpeculativeActionRuntime<
 		if (observedActionSeq === undefined) return false;
 		const expectedActionSeq =
 			draft.proposalID && draft.actionID
-				? state.planGraph.get(draft.proposalID, draft.actionID)?.expectedActionSeq
+				? state.plan.get(draft.proposalID, draft.actionID)?.expectedActionSeq
 				: undefined;
 		return observedActionSeq >= (expectedActionSeq ?? predictionAnchorActionSeq + 1);
 	};
@@ -2292,26 +2280,22 @@ export function makeSpeculativeActionRuntime<
 		...(action.dependsOn?.length ? { dependsOn: action.dependsOn } : {}),
 	});
 
-	const removePlanActions = async (
+	const retirePlanActions = async (
 		state: TurnState<SessionID, Output, StateData>,
-		source: string,
-		proposalID: string,
-		actionIDs: readonly string[],
+		nodes: readonly PlanExecutionNode[],
 	): Promise<void> => {
-		if (!actionIDs.length) return;
-		const removed = new Set(actionIDs);
-		const removedNodes = state.planGraph.remove(proposalID, actionIDs);
+		if (!nodes.length) return;
+		const retired = new Set(nodes.map((node) => planActionIdentity(node.proposalID, node.action.id)));
 		const contexts = planLaunchContexts.get(state.sessionID);
-		for (const actionID of actionIDs) contexts?.delete(planActionIdentity(proposalID, actionID));
+		for (const identity of retired) contexts?.delete(identity);
 		for (const candidate of availableCandidates(state).values()) {
 			let changed = false;
 			for (const lease of candidate.leases) {
 				if (
 					lease.state !== "active" ||
-					lease.source !== source ||
-					lease.proposalID !== proposalID ||
+					!lease.proposalID ||
 					!lease.actionID ||
-					!removed.has(lease.actionID)
+					!retired.has(planActionIdentity(lease.proposalID, lease.actionID))
 				) {
 					continue;
 				}
@@ -2323,7 +2307,7 @@ export function makeSpeculativeActionRuntime<
 				await closeCandidate(state, candidate, "plan_action_removed", "invalidated", true);
 			}
 		}
-		for (const node of removedNodes) {
+		for (const node of nodes) {
 			if (node.state === "deferred") await notifyUnlaunchedPlanResolved(node, "system");
 		}
 	};
@@ -2347,15 +2331,15 @@ export function makeSpeculativeActionRuntime<
 	};
 
 	const reportBlockedPlanActions = async (state: TurnState<SessionID, Output, StateData>): Promise<void> => {
-		for (const blocked of state.planGraph.drainBlocked()) await notifyUnlaunchedPlanResolved(blocked, "system");
+		for (const blocked of state.plan.drainBlocked()) await notifyUnlaunchedPlanResolved(blocked, "system");
 	};
 	const settleUnlaunchedPlanActions = async (
 		state: TurnState<SessionID, Output, StateData>,
 		outcome: Exclude<PlanActionResolution, "consumed">,
 	): Promise<void> => {
-		for (const node of state.planGraph.values()) {
+		for (const node of state.plan.values()) {
 			if (node.state !== "deferred" && node.state !== "launching") continue;
-			state.planGraph.markFailed(node.proposalID, node.action.id);
+			state.plan.markFailed(node.proposalID, node.action.id);
 			await notifyUnlaunchedPlanResolved(node, outcome);
 		}
 		await reportBlockedPlanActions(state);
@@ -2369,12 +2353,12 @@ export function makeSpeculativeActionRuntime<
 		mode: "speculative" | "promoted" = "speculative",
 	): Promise<boolean> => {
 		if (state.finished || state.terminal) {
-			state.planGraph.defer(node.proposalID, node.action.id);
+			state.plan.defer(node.proposalID, node.action.id);
 			return false;
 		}
 		const settings = await latestSettings();
 		if (!settings || !sourceEnabled(settings, node.source)) {
-			state.planGraph.markFailed(node.proposalID, node.action.id);
+			state.plan.markFailed(node.proposalID, node.action.id);
 			await notifyUnlaunchedPlanResolved(node, "system");
 			await reportBlockedPlanActions(state);
 			return false;
@@ -2405,7 +2389,7 @@ export function makeSpeculativeActionRuntime<
 				expectedLeadFloorMs,
 			);
 		} catch (error) {
-			state.planGraph.markFailed(node.proposalID, node.action.id);
+			state.plan.markFailed(node.proposalID, node.action.id);
 			await publishMiss(state, "plan_action_launch_failed", undefined, errorDetail(error), {
 				draftCandidate: draftCandidateDiagnostic(planActionDraft(node.proposalID, node.source, node.action)),
 			});
@@ -2413,18 +2397,18 @@ export function makeSpeculativeActionRuntime<
 			await reportBlockedPlanActions(state);
 			return false;
 		}
-		const current = state.planGraph.get(node.proposalID, node.action.id);
+		const current = state.plan.get(node.proposalID, node.action.id);
 		if (accepted > 0) {
 			if (node.action.type === "preparation_hint") {
-				state.planGraph.markSucceeded(node.proposalID, node.action.id);
+				state.plan.markSucceeded(node.proposalID, node.action.id);
 			} else if (current?.state === "launching") {
-				state.planGraph.markRunning(node.proposalID, node.action.id);
+				state.plan.markRunning(node.proposalID, node.action.id);
 			}
 			await reportBlockedPlanActions(state);
 			return true;
 		}
 		if (current?.state === "launching") {
-			state.planGraph.markFailed(node.proposalID, node.action.id);
+			state.plan.markFailed(node.proposalID, node.action.id);
 			await notifyUnlaunchedPlanResolved(node, "system");
 		}
 		await reportBlockedPlanActions(state);
@@ -2438,7 +2422,7 @@ export function makeSpeculativeActionRuntime<
 	): Promise<void> => {
 		if (state.finished || state.terminal) return;
 		const names = candidateNames ?? candidateToolNames(state.settings, actionSemantics);
-		const ready = [...state.planGraph.takeReady(state.actionSequence)].sort(
+		const ready = [...state.plan.takeReady(state.actionSequence)].sort(
 			(left, right) =>
 				draftPriority(planActionDraft(right.proposalID, right.source, right.action)) -
 					draftPriority(planActionDraft(left.proposalID, left.source, left.action)) ||
@@ -2449,7 +2433,7 @@ export function makeSpeculativeActionRuntime<
 		try {
 			for (const node of ready) {
 				if (state.finished || state.terminal) {
-					state.planGraph.defer(node.proposalID, node.action.id);
+					state.plan.defer(node.proposalID, node.action.id);
 					continue;
 				}
 				await launchPlanNode(state, input, node, names);
@@ -2473,7 +2457,7 @@ export function makeSpeculativeActionRuntime<
 		const settings = await latestSettings();
 		if (!settings || state.finished || state.terminal) return false;
 		const matches: Array<{ readonly node: PlanExecutionNode; readonly distance: number }> = [];
-		for (const node of state.planGraph.deferred()) {
+		for (const node of state.plan.deferred()) {
 			if (node.action.type !== "tool_call" || node.action.tool !== actor.tool) continue;
 			if (!sourceEnabled(settings, node.source)) continue;
 			const concrete = asConcreteInput(node.action.input);
@@ -2496,7 +2480,7 @@ export function makeSpeculativeActionRuntime<
 				left.node.action.id.localeCompare(right.node.action.id),
 		);
 		for (const { node } of matches) {
-			const promotion = state.planGraph.promote(node.proposalID, node.action.id);
+			const promotion = state.plan.promote(node.proposalID, node.action.id);
 			if (promotion.status !== "claimed") continue;
 			await preemptForAuthoritative(
 				state,
@@ -2523,11 +2507,11 @@ export function makeSpeculativeActionRuntime<
 		actionSequence: number,
 	): Promise<void> => {
 		const earliestByProposal = new Map<string, PlanExecutionNode>();
-		for (const node of state.planGraph.values()) {
+		for (const node of state.plan.values()) {
 			if (
 				node.action.type !== "tool_call" ||
 				node.expectedActionSeq > actionSequence ||
-				!state.planGraph.canAdopt(node.proposalID, node.action.id)
+				!state.plan.canAdopt(node.proposalID, node.action.id)
 			) {
 				continue;
 			}
@@ -2551,7 +2535,7 @@ export function makeSpeculativeActionRuntime<
 			}
 		}
 		for (const node of earliestByProposal.values()) {
-			state.planGraph.markAdopted(node.proposalID, node.action.id, actionSequence);
+			state.plan.markAdopted(node.proposalID, node.action.id, actionSequence);
 		}
 		await reportBlockedPlanActions(state);
 		await dispatchReadyPlanActions(state, state.startInput as StartInput);
@@ -2572,18 +2556,12 @@ export function makeSpeculativeActionRuntime<
 				await publishMiss(state, "invalid_plan_update", undefined, "Plan source does not own this update.");
 				continue;
 			}
-			const proposalID = "actions" in update ? update.id : update.proposalID;
-			const previousPlan = state.plans.get(proposalID);
-			const result = state.plans.apply(update);
+			const result = state.plan.apply(update, predictionAnchorActionSeq);
 			if (!result.accepted) {
 				await publishMiss(state, "invalid_plan_update", undefined, result.reason);
 				continue;
 			}
-			const superseded = result.upserted.flatMap((action) => {
-				const previous = previousPlan?.actions.find((candidate) => candidate.id === action.id);
-				return previous && !samePlanActionExecution(previous, action) ? [action.id] : [];
-			});
-			await removePlanActions(state, source, result.plan.id, [...new Set([...result.removed, ...superseded])]);
+			await retirePlanActions(state, result.retired);
 			const draftTokens = finiteMetric(update.draftTokens);
 			const totalDraftTokens = finiteMetric(tokenTotals.get(state.sessionID)) + draftTokens;
 			tokenTotals.set(state.sessionID, totalDraftTokens);
@@ -2596,7 +2574,6 @@ export function makeSpeculativeActionRuntime<
 					totalDraftTokens,
 				});
 			}
-			state.planGraph.upsert(result.plan, result.upserted, predictionAnchorActionSeq);
 			accepted += result.upserted.length;
 			await dispatchReadyPlanActions(state, input, candidateNames);
 		}
@@ -2832,8 +2809,7 @@ export function makeSpeculativeActionRuntime<
 			preparedHints: new Set(),
 			pendingActionSequences: new Set(),
 			turnAdmissions: new Map(),
-			plans: planLedgerFor(input.sessionID),
-			planGraph: planGraphFor(input.sessionID),
+			plan: planStateFor(input.sessionID),
 			sourceAttempts: new Set(),
 			sourceFeedback: new Map(),
 			sourcePlanMismatches: new Set(),
@@ -2889,7 +2865,7 @@ export function makeSpeculativeActionRuntime<
 			const actualAction = diagnosticAction(actualCall.tool, actualCall.input, actual);
 			if (actual) await promoteDeferredPlanAction(state, actual);
 			const candidates = [...new Set([...candidatesAtArrival, ...availableCandidates(state).values()])];
-			const activePlanSources = activeAdaptivePlanSources(candidates, actionSequence, state.planGraph);
+			const activePlanSources = activeAdaptivePlanSources(candidates, actionSequence, state.plan);
 			if (!actual) {
 				markPlanMismatches(state, activePlanSources);
 				await preemptForAuthoritative(state, { class: "global", units: 1 });
@@ -3272,8 +3248,8 @@ export function makeSpeculativeActionRuntime<
 				recordSourceFailure(state, sourceID, "actor_miss");
 			}
 		}
-		for (const node of state.planGraph.values()) {
-			if (missedPlanSources.has(node.source)) state.planGraph.markFailed(node.proposalID, node.action.id);
+		for (const node of state.plan.values()) {
+			if (missedPlanSources.has(node.source)) state.plan.markFailed(node.proposalID, node.action.id);
 		}
 		await reportBlockedPlanActions(state);
 		if (terminal) await settleUnlaunchedPlanActions(state, "actor_miss");
@@ -3298,8 +3274,7 @@ export function makeSpeculativeActionRuntime<
 		await publishCache(state);
 		if (terminal) {
 			await flushPredictionSources();
-			planLedgers.delete(state.sessionID);
-			planGraphs.delete(state.sessionID);
+			planStates.delete(state.sessionID);
 			planLaunchContexts.delete(state.sessionID);
 		}
 		candidateCatalog.detachAllFromTurn(turnKey(state));
@@ -3308,7 +3283,7 @@ export function makeSpeculativeActionRuntime<
 
 	const finishTerminalSession = async (sessionID: SessionID, settings: SpeculativeActionSettings): Promise<void> => {
 		const candidates = sessionCandidates(sessionID);
-		const state = createDisposalState<SessionID, Output, StateData>(sessionID, settings, planGraphs.get(sessionID));
+		const state = createDisposalState<SessionID, Output, StateData>(sessionID, settings, planStates.get(sessionID));
 		await settleUnlaunchedPlanActions(state, "actor_miss");
 		for (const candidate of candidates) {
 			if (candidate.reuse.kind === "exclusive") {
@@ -3319,8 +3294,7 @@ export function makeSpeculativeActionRuntime<
 		}
 		if (candidates.length) await publishCache(state);
 		await flushPredictionSources();
-		planLedgers.delete(sessionID);
-		planGraphs.delete(sessionID);
+		planStates.delete(sessionID);
 		planLaunchContexts.delete(sessionID);
 		if (!schedulerFor(sessionID).snapshot().length) schedulers.delete(sessionID);
 	};
@@ -3356,7 +3330,7 @@ export function makeSpeculativeActionRuntime<
 		const stateForEvents = createDisposalState<SessionID, Output, StateData>(
 			sessionID,
 			settings,
-			planGraphs.get(sessionID),
+			planStates.get(sessionID),
 		);
 		await settleUnlaunchedPlanActions(stateForEvents, "system");
 		for (const candidate of candidateCatalog.sessionValues(sessionID)) {
@@ -3367,8 +3341,7 @@ export function makeSpeculativeActionRuntime<
 		actionSequences.delete(sessionID);
 		schedulers.delete(sessionID);
 		sourceBackoff.delete(sessionID);
-		planLedgers.delete(sessionID);
-		planGraphs.delete(sessionID);
+		planStates.delete(sessionID);
 		planLaunchContexts.delete(sessionID);
 		await flushPredictionSources();
 	};
@@ -3384,8 +3357,7 @@ export function makeSpeculativeActionRuntime<
 		for (const sessionID of sessions) await disposeSession(sessionID);
 		schedulers.clear();
 		sourceBackoff.clear();
-		planLedgers.clear();
-		planGraphs.clear();
+		planStates.clear();
 		planLaunchContexts.clear();
 		actionSequences.clear();
 	};
@@ -3398,8 +3370,8 @@ export function makeSpeculativeActionRuntime<
 				: sessionCandidates(sessionID);
 		const planNodes =
 			sessionID === undefined
-				? [...planGraphs.values()].flatMap((graph) => graph.values())
-				: (planGraphs.get(sessionID)?.values() ?? []);
+				? [...planStates.values()].flatMap((plan) => plan.values())
+				: (planStates.get(sessionID)?.values() ?? []);
 		return {
 			activeTurns: states.length,
 			turnCandidates: candidates.filter((candidate) => candidate.reuse.kind === "exclusive").length,
@@ -3529,7 +3501,7 @@ async function isExpired<
 function createDisposalState<SessionID, Output, StateData>(
 	sessionID: SessionID,
 	settings: SpeculativeActionSettings,
-	planGraph = new PlanExecutionGraph(),
+	plan = new PlanState(),
 ): TurnState<SessionID, Output, StateData> {
 	return {
 		sessionID,
@@ -3544,8 +3516,7 @@ function createDisposalState<SessionID, Output, StateData>(
 		preparedHints: new Set(),
 		pendingActionSequences: new Set(),
 		turnAdmissions: new Map(),
-		plans: new PlanLedger(),
-		planGraph,
+		plan,
 		sourceAttempts: new Set(),
 		sourceFeedback: new Map(),
 		sourcePlanMismatches: new Set(),
