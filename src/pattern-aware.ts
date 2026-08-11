@@ -600,10 +600,6 @@ export class PatternAwareStore {
 				};
 			})
 			.filter((prediction) => prediction.controlProbability >= this.settings.minEmpiricalProbability);
-		const probabilityScale = Math.max(
-			1,
-			predictions.reduce((total, prediction) => total + prediction.rawProbability, 0),
-		);
 		for (const prediction of predictions) {
 			const {
 				ordered,
@@ -615,7 +611,11 @@ export class PatternAwareStore {
 				rawProbability,
 				expectedDurationMs,
 			} = prediction;
-			const conditionalProbability = Math.max(0, Math.min(1, rawProbability / probabilityScale));
+			// Future-gap candidates are marginal events, not mutually exclusive branches: several
+			// tools predicted from the same context may all occur within their learned horizons.
+			// Normalize only binding variants within one concrete candidate; sibling candidates
+			// retain their independently calibrated probability.
+			const conditionalProbability = Math.max(0, Math.min(1, rawProbability));
 			const empiricalProbability = Math.max(0, Math.min(1, continuation.pathProbability * conditionalProbability));
 			const nextContinuation: PatternAwareContinuation = {
 				history: predictiveHistory,

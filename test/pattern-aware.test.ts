@@ -665,7 +665,7 @@ describe("PatternAware", () => {
 		expect(paths).toContain("src/f.ts");
 	});
 
-	test("normalizes competing successors without filtering valid branches", () => {
+	test("preserves independent marginal probabilities for co-occurring successors", () => {
 		const store = new PatternAwareStore(settings());
 		expect(
 			store.registerValidatedPattern(
@@ -694,8 +694,52 @@ describe("PatternAware", () => {
 		const candidates = store.predict("probe").filter((item) => item.tool === "read");
 
 		expect(candidates).toHaveLength(2);
-		expect(candidates.reduce((sum, item) => sum + item.conditionalProbability, 0)).toBeCloseTo(1);
-		expect(candidates.every((item) => item.conditionalProbability < 0.75)).toBe(true);
+		expect(candidates.every((item) => item.conditionalProbability > 0.9)).toBe(true);
+		expect(candidates.reduce((sum, item) => sum + item.conditionalProbability, 0)).toBeGreaterThan(1);
+		expect(candidates.every((item) => item.conditionalProbability <= 1)).toBe(true);
+	});
+
+	test("does not dilute a continuation path with unrelated sibling candidates", () => {
+		const store = new PatternAwareStore(settings());
+		for (const [id, path] of [
+			["read-source", "src/source.ts"],
+			["read-test", "test/source.test.ts"],
+		] as const) {
+			expect(
+				store.registerValidatedPattern(
+					validatedGapPattern(
+						{ "0": 10 },
+						{ id, bindings: { '["path"]': { type: "constant", value: path } } },
+					),
+				),
+			).toBe(true);
+		}
+		expect(
+			store.registerValidatedPattern(
+				validatedGapPattern(
+					{ "0": 10 },
+					{
+						id: "read-bash",
+						context: [{ tool: "read", outcome: "success" }],
+						targetTool: "bash",
+						bindings: { '["command"]': { type: "constant", value: "npm test" } },
+					},
+				),
+			),
+		).toBe(true);
+
+		store.observe(input({ sessionID: "probe", tool: "grep", input: { pattern: "source" } }));
+		const source = store.predict("probe").find((item) => item.input.path === "src/source.ts");
+		expect(source?.empiricalProbability).toBeGreaterThan(0.9);
+
+		const child = store
+			.continue(
+				source!.continuation,
+				input({ sessionID: "probe", tool: "read", input: { path: "src/source.ts" } }),
+			)
+			.find((item) => item.tool === "bash");
+		expect(child?.conditionalProbability).toBeGreaterThan(0.9);
+		expect(child?.empiricalProbability).toBeGreaterThan(0.8);
 	});
 
 	test("allocates collection variants by observed actor choice frequency", () => {
