@@ -5,10 +5,10 @@ import {
 	type CandidateReuseState,
 	type CandidateRunState,
 } from "./candidate-lifecycle.ts";
+import { BranchStore, JobTable, ResultCache } from "./candidate-stores.ts";
 import type { ActionKey, ActionKeyMatch, DrafterToolDefinition, SpeculativeExecution } from "./common.ts";
 import {
 	actionKeyCovers,
-	actionKeyMatch,
 	actionKeyMismatchReason,
 	clampCandidateLimit,
 	DEFAULTS,
@@ -16,7 +16,6 @@ import {
 	KEYABLE_TOOLS,
 } from "./common.ts";
 import type { PatternAwareDependency, PatternAwareResolution, PatternAwareSettings } from "./pattern-aware.ts";
-import { ToolCache } from "./tool-cache.ts";
 import {
 	expectedUtility,
 	resourceProfile,
@@ -165,14 +164,22 @@ interface SpeculativeEventBase<SessionID> {
 }
 
 export interface SpeculativeCacheSnapshot {
+	/** @deprecated Mirrors resultEntries for event compatibility. */
 	readonly cacheEntries: number;
 	readonly cacheCapacity: number;
 	readonly cacheBytes?: number;
 	readonly cacheByteCapacity?: number;
+	/** @deprecated Running jobs are reported by inFlightJobs and never live in ResultCache. */
 	readonly cacheRunning: number;
+	/** @deprecated Mirrors resultEntries for event compatibility. */
 	readonly cacheCompleted: number;
 	readonly cacheProbation: number;
 	readonly cacheProtected: number;
+	readonly inFlightJobs: number;
+	readonly resultEntries: number;
+	readonly resultBytes: number;
+	readonly branchEntries: number;
+	readonly branchBytes: number;
 	readonly activeCandidates: number;
 	readonly turnCandidates: number;
 	readonly resourceCandidates: number;
@@ -577,7 +584,10 @@ export function makeSpeculativeActionRuntime<
 	}
 	const projectionRules = [...projectionRuleByID.values()];
 	const keyProjectors = projectionRules;
-	const persistentCandidates = new ToolCache<SessionID, RuntimeCandidate<Output>>(keyProjectors);
+	const jobs = new JobTable<SessionID, RuntimeCandidate<Output>>(keyProjectors);
+	const results = new ResultCache<SessionID, RuntimeCandidate<Output>>(keyProjectors);
+	// Exclusive branches are deliberately exact-only; projections are for shareable results.
+	const branches = new BranchStore<SessionID, RuntimeCandidate<Output>>();
 	const tokenTotals = new Map<SessionID, number>();
 	const wallTimes = new Map<SessionID, number>();
 	const actionSequences = new Map<SessionID, number>();
@@ -789,37 +799,35 @@ export function makeSpeculativeActionRuntime<
 		}
 	};
 
-	const sessionPersistentCandidates = (sessionID: SessionID): readonly RuntimeCandidate<Output>[] => {
-		return persistentCandidates.values(sessionID);
-	};
-
-	const cachedCandidates = (state: TurnState<SessionID, Output, StateData>): RuntimeCandidate<Output>[] => {
-		const candidates = new Map<string, RuntimeCandidate<Output>>();
-		for (const candidate of sessionPersistentCandidates(state.sessionID))
-			candidates.set(candidate.key.key, candidate);
-		for (const candidate of candidateCatalog.turnValues(turnKey(state))) {
-			if (candidate.run.status === "closed") continue;
-			candidates.set(candidate.key.key, candidate);
-		}
-		return [...candidates.values()];
+	const sessionCandidates = (sessionID: SessionID): readonly RuntimeCandidate<Output>[] => {
+		return [...jobs.values(sessionID), ...results.values(sessionID), ...branches.values(sessionID)];
 	};
 
 	const cacheSnapshot = (state: TurnState<SessionID, Output, StateData>): SpeculativeCacheSnapshot => {
-		const candidates = cachedCandidates(state);
-		const running = candidates.filter((candidate) => candidate.run.status === "running").length;
-		const lifecycle = persistentCandidates.snapshot(state.sessionID);
+		const inFlight = jobs.values(state.sessionID);
+		const cached = results.values(state.sessionID);
+		const staged = branches.values(state.sessionID);
+		const candidates = [...inFlight, ...cached, ...staged];
+		const lifecycle = results.snapshot(state.sessionID);
+		const branchSnapshot = branches.snapshot(state.sessionID);
+		const resultBytes = cached.reduce((total, candidate) => total + candidate.estimatedBytes, 0);
 		return {
-			cacheEntries: candidates.length,
+			cacheEntries: cached.length,
 			cacheCapacity: state.settings.resourceCacheMaxEntries,
-			cacheBytes: candidates.reduce((total, candidate) => total + candidate.estimatedBytes, 0),
+			cacheBytes: resultBytes,
 			cacheByteCapacity: resourceCacheByteLimit(state.settings),
-			cacheRunning: running,
-			cacheCompleted: candidates.length - running,
+			cacheRunning: 0,
+			cacheCompleted: cached.length,
 			cacheProbation: lifecycle.probationEntries,
 			cacheProtected: lifecycle.protectedEntries,
-			activeCandidates: running,
-			turnCandidates: candidates.filter((candidate) => candidate.reuse.kind === "exclusive").length,
-			resourceCandidates: candidates.filter((candidate) => candidate.reuse.kind === "shared").length,
+			inFlightJobs: inFlight.length,
+			resultEntries: cached.length,
+			resultBytes,
+			branchEntries: branchSnapshot.entries,
+			branchBytes: branchSnapshot.bytes,
+			activeCandidates: inFlight.length,
+			turnCandidates: staged.length + inFlight.filter((candidate) => candidate.reuse.kind === "exclusive").length,
+			resourceCandidates: cached.length + inFlight.filter((candidate) => candidate.reuse.kind === "shared").length,
 			cacheTools: [...new Set(candidates.map((candidate) => candidate.key.tool))].sort(),
 			cacheExecutions: [...new Set(candidates.map((candidate) => candidate.key.execution))].sort(),
 			observedWallMs:
@@ -974,12 +982,7 @@ export function makeSpeculativeActionRuntime<
 	const availableCandidates = (
 		state: TurnState<SessionID, Output, StateData>,
 	): Map<string, RuntimeCandidate<Output>> => {
-		const candidates = new Map(
-			candidateCatalog.turnValues(turnKey(state)).map((candidate) => [candidate.key.key, candidate]),
-		);
-		for (const candidate of sessionPersistentCandidates(state.sessionID))
-			candidates.set(candidate.key.key, candidate);
-		return candidates;
+		return new Map(sessionCandidates(state.sessionID).map((candidate) => [candidate.key.key, candidate]));
 	};
 
 	const expectedNetSavedMs = (
@@ -1009,9 +1012,16 @@ export function makeSpeculativeActionRuntime<
 	): RankedRuntimeCandidate<Output>[] => {
 		const ranked: RankedRuntimeCandidate<Output>[] = [];
 		const now = Date.now();
-		for (const candidate of availableCandidates(state).values()) {
-			const match = actionKeyMatch(candidate.key, action, keyProjectors);
-			if (!match) continue;
+		const matches = new Map<RuntimeCandidate<Output>, ActionKeyMatch>();
+		for (const lookup of [
+			...jobs.lookup(state.sessionID, action),
+			...results.lookup(state.sessionID, action),
+			...branches.lookup(state.sessionID, action),
+		]) {
+			const current = matches.get(lookup.entry);
+			if (!current || lookup.match.distance < current.distance) matches.set(lookup.entry, lookup.match);
+		}
+		for (const [candidate, match] of matches) {
 			ranked.push({ candidate, match, expectedNetSavedMs: expectedNetSavedMs(candidate, match, now) });
 		}
 		return ranked.sort((left, right) => {
@@ -1070,13 +1080,14 @@ export function makeSpeculativeActionRuntime<
 		}
 	};
 
-	const removePersistentCandidate = (
+	const removeCandidateFromStores = (
 		state: TurnState<SessionID, Output, StateData>,
 		candidate: RuntimeCandidate<Output>,
 	): boolean => {
-		const removed = persistentCandidates.delete(state.sessionID, candidate);
-		if (removed) releaseCandidateResourceVersion(candidate);
-		return removed;
+		const removedJob = jobs.delete(state.sessionID, candidate);
+		const removedResult = results.delete(state.sessionID, candidate);
+		const removedBranch = branches.delete(state.sessionID, candidate);
+		return removedJob || removedResult || removedBranch;
 	};
 
 	const releaseCandidateResourceVersion = (candidate: RuntimeCandidate<Output>): void => {
@@ -1089,25 +1100,57 @@ export function makeSpeculativeActionRuntime<
 		}
 	};
 
-	const trimPersistentCandidates = (
+	const trimCompletedCandidates = (
 		sessionID: SessionID,
 		settings: SpeculativeActionSettings,
 		protectedCandidate?: RuntimeCandidate<Output>,
 	): RuntimeCandidate<Output>[] => {
-		return persistentCandidates.trim(
-			sessionID,
-			cacheLimits(settings),
-			(candidate) => candidate !== protectedCandidate,
-		);
+		return [
+			...results.trim(sessionID, cacheLimits(settings), (candidate) => candidate !== protectedCandidate),
+			...branches.trim(
+				sessionID,
+				{ maxEntries: candidateLimit(settings), maxBytes: resourceCacheByteLimit(settings) },
+				(candidate) => candidate !== protectedCandidate,
+			),
+		];
 	};
 
-	const addPersistentCandidate = (
+	const storeCompletedCandidate = (
 		state: TurnState<SessionID, Output, StateData>,
 		candidate: RuntimeCandidate<Output>,
-	): RuntimeCandidate<Output>[] => {
-		const existing = persistentCandidates.insert(state.sessionID, candidate);
-		if (existing && existing !== candidate) return [];
-		return trimPersistentCandidates(state.sessionID, state.settings, candidate);
+	): {
+		readonly existing?: RuntimeCandidate<Output>;
+		readonly evicted: ReadonlyArray<{ readonly candidate: RuntimeCandidate<Output>; readonly reason: string }>;
+	} => {
+		jobs.delete(state.sessionID, candidate);
+		const shared = candidate.reuse.kind === "shared";
+		const existing = shared
+			? results.insert(state.sessionID, candidate)
+			: branches.insert(state.sessionID, candidate);
+		if (existing && existing !== candidate) return { existing, evicted: [] };
+		if (shared) {
+			const limits = cacheLimits(state.settings);
+			const snapshot = results.snapshot(state.sessionID);
+			const overEntryLimit = results.values(state.sessionID).length > limits.maxEntries;
+			const overByteLimit = snapshot.probationBytes + snapshot.protectedBytes > limits.maxBytes;
+			const reason = overEntryLimit && !overByteLimit ? "resource_cache_evicted" : "resource_cache_byte_limit";
+			return {
+				evicted: results
+					.trim(state.sessionID, limits, (entry) => entry !== candidate)
+					.map((entry) => ({ candidate: entry, reason })),
+			};
+		}
+		const limits = {
+			maxEntries: candidateLimit(state.settings),
+			maxBytes: resourceCacheByteLimit(state.settings),
+		};
+		const snapshot = branches.snapshot(state.sessionID);
+		const reason = snapshot.entries > limits.maxEntries ? "branch_store_evicted" : "branch_store_byte_limit";
+		return {
+			evicted: branches
+				.trim(state.sessionID, limits, (entry) => entry !== candidate)
+				.map((entry) => ({ candidate: entry, reason })),
+		};
 	};
 
 	const patternResolution = (reason: string): Exclude<PatternAwareResolution, "consumed"> => {
@@ -1200,7 +1243,7 @@ export function makeSpeculativeActionRuntime<
 		}
 		schedulerFor(state.sessionID).discard(candidate);
 		removeTurnAdmission(state, candidate);
-		removePersistentCandidate(state, candidate);
+		removeCandidateFromStores(state, candidate);
 		releaseCandidateResourceVersion(candidate);
 		candidateCatalog.retire(candidate);
 		candidate.lifecycle.settleClosed();
@@ -1278,15 +1321,15 @@ export function makeSpeculativeActionRuntime<
 		drafterBackoff.delete(sessionID);
 	};
 
-	const reconcilePersistentCandidates = async (state: TurnState<SessionID, Output, StateData>): Promise<void> => {
-		for (const candidate of sessionPersistentCandidates(state.sessionID)) {
+	const reconcileCandidateStores = async (state: TurnState<SessionID, Output, StateData>): Promise<void> => {
+		for (const candidate of sessionCandidates(state.sessionID)) {
 			const configured =
 				candidate.key.execution === "resource_cached"
 					? state.settings.tools.resourceCached.includes(candidate.tool)
 					: state.settings.tools.sandbox.includes(candidate.tool);
 			if (!configured) await preemptCandidate(candidate, "tool_disabled", "discarded");
 		}
-		for (const candidate of trimPersistentCandidates(state.sessionID, state.settings)) {
+		for (const candidate of trimCompletedCandidates(state.sessionID, state.settings)) {
 			await preemptCandidate(candidate, "resource_cache_limit_changed", "discarded");
 		}
 	};
@@ -1509,11 +1552,6 @@ export function makeSpeculativeActionRuntime<
 		} catch {
 			// Pattern feedback must not alter tool semantics.
 		}
-		if (persistentCandidates.getExact(state.sessionID, candidate.key) !== candidate) {
-			for (const evicted of addPersistentCandidate(state, candidate)) {
-				await preemptCandidate(evicted, "resource_cache_evicted", "discarded");
-			}
-		}
 		return true;
 	};
 
@@ -1735,18 +1773,15 @@ export function makeSpeculativeActionRuntime<
 				await publishCancelled(state, candidate, "candidate_budget_insufficient_expected_benefit");
 				continue;
 			}
-			const persistCandidate = candidate.reuse.kind === "shared" || source === "pattern_aware";
-			const insertion = persistCandidate
-				? persistentCandidates.insertOrGetCompatible(state.sessionID, candidate, (existing, match) => {
-						const rule = projectionRuleByID.get(match.projector);
-						return (
-							existing.run.status === "running" &&
-							!!rule &&
-							actionKeyCovers(existing.key, candidate.key, keyProjectors)
-						);
-					})
-				: undefined;
-			const existing = insertion && !insertion.inserted ? insertion.entry : undefined;
+			const insertion = jobs.insertOrGetCompatible(state.sessionID, candidate, (existing, match) => {
+				const rule = projectionRuleByID.get(match.projector);
+				return (
+					existing.run.status === "running" &&
+					!!rule &&
+					actionKeyCovers(existing.key, candidate.key, keyProjectors)
+				);
+			});
+			const existing = insertion.inserted ? undefined : insertion.entry;
 			if (existing) {
 				lifecycle.close({ reason: "compatible_candidate_already_exists" });
 				lifecycle.settleClosed();
@@ -1765,7 +1800,7 @@ export function makeSpeculativeActionRuntime<
 				speculativeResourceBudget(concurrentActionLimit(state.settings)),
 			);
 			if (!admission.admitted) {
-				if (persistCandidate) persistentCandidates.delete(state.sessionID, candidate);
+				jobs.delete(state.sessionID, candidate);
 				candidate.schedulerOutcome = "discarded";
 				lifecycle.close({ reason: `scheduler_${admission.reason}` });
 				lifecycle.settleClosed();
@@ -1775,15 +1810,9 @@ export function makeSpeculativeActionRuntime<
 			if (turnDecision.victim) state.turnAdmissions.delete(turnDecision.victim.key.key);
 			state.turnAdmissions.set(action.key, candidate);
 			candidateCatalog.register(state.sessionID, turnKey(state), candidate, state);
-			const cacheEvictions = persistCandidate
-				? trimPersistentCandidates(state.sessionID, state.settings, candidate)
-				: [];
 			for (const victim of admission.preempted) await preemptCandidate(victim);
 			if (turnDecision.victim && !admission.preempted.includes(turnDecision.victim)) {
 				await preemptCandidate(turnDecision.victim, "candidate_budget_preempted");
-			}
-			for (const evicted of cacheEvictions) {
-				await preemptCandidate(evicted, "resource_cache_evicted", "discarded");
 			}
 			accepted++;
 			if (source === "pattern_aware" && draft.patternID) {
@@ -1818,7 +1847,7 @@ export function makeSpeculativeActionRuntime<
 					if (lease.state === "matched") lease.state = "invalidated";
 				}
 				removeTurnAdmission(state, candidate);
-				removePersistentCandidate(state, candidate);
+				removeCandidateFromStores(state, candidate);
 				releaseCandidateResourceVersion(candidate);
 				candidateCatalog.retire(candidate);
 				await publishCancelled(state, candidate, classified.reason, errorDetail(classified));
@@ -1968,9 +1997,19 @@ export function makeSpeculativeActionRuntime<
 						// Fall back to the generic estimate when custom accounting fails.
 					}
 					candidate.estimatedBytes += outputBytes;
+					const stored = storeCompletedCandidate(state, candidate);
+					if (stored.existing) {
+						await rejectExecution(
+							new SpeculativeJobError(
+								"completed_store_conflict",
+								new Error("another candidate already owns the completed action"),
+							),
+						);
+						return;
+					}
 					schedulerFor(state.sessionID).complete(candidate);
-					for (const evicted of trimPersistentCandidates(state.sessionID, state.settings, candidate)) {
-						await preemptCandidate(evicted, "resource_cache_byte_limit", "discarded");
+					for (const evicted of stored.evicted) {
+						await preemptCandidate(evicted.candidate, evicted.reason, "discarded");
 					}
 					await publishCache(state);
 					await publishCompleted(state, candidate);
@@ -2210,7 +2249,7 @@ export function makeSpeculativeActionRuntime<
 			return;
 		}
 		if (!candidateNames.length) {
-			for (const candidate of sessionPersistentCandidates(input.sessionID)) {
+			for (const candidate of sessionCandidates(input.sessionID)) {
 				await preemptCandidate(candidate, "tool_disabled", "discarded");
 			}
 			return;
@@ -2245,7 +2284,7 @@ export function makeSpeculativeActionRuntime<
 			predictionPending: true,
 		};
 		turns.set(turnKey(input), state);
-		await reconcilePersistentCandidates(state);
+		await reconcileCandidateStores(state);
 		if (signal) {
 			signal.addEventListener(
 				"abort",
@@ -2523,12 +2562,12 @@ export function makeSpeculativeActionRuntime<
 			candidate.hits++;
 			candidate.authoritativeSequence = Math.max(candidate.authoritativeSequence ?? 0, actionSequence);
 			if (candidate.reuse.kind === "shared") {
-				persistentCandidates.recordActorHit(state.sessionID, candidate, cacheLimits(state.settings));
+				results.recordActorHit(state.sessionID, candidate, cacheLimits(state.settings));
 			} else {
 				candidate.lifecycle.markAdopted(executionMs);
 				schedulerFor(state.sessionID).discard(candidate);
 				removeTurnAdmission(state, candidate);
-				removePersistentCandidate(state, candidate);
+				removeCandidateFromStores(state, candidate);
 				releaseCandidateResourceVersion(candidate);
 				candidateCatalog.retire(candidate);
 			}
@@ -2672,7 +2711,7 @@ export function makeSpeculativeActionRuntime<
 	};
 
 	const finishTerminalSession = async (sessionID: SessionID, settings: SpeculativeActionSettings): Promise<void> => {
-		const candidates = sessionPersistentCandidates(sessionID);
+		const candidates = sessionCandidates(sessionID);
 		const state = createDisposalState<SessionID, Output, StateData>(sessionID, settings);
 		for (const candidate of candidates) {
 			if (candidate.reuse.kind === "exclusive") {
@@ -2750,18 +2789,14 @@ export function makeSpeculativeActionRuntime<
 
 	const inspect = (sessionID?: SessionID): SpeculativeRuntimeInspection => {
 		const states = [...turns.values()].filter((state) => sessionID === undefined || state.sessionID === sessionID);
-		const persistent =
-			sessionID === undefined ? persistentCandidates.allValues() : sessionPersistentCandidates(sessionID);
+		const candidates =
+			sessionID === undefined
+				? [...jobs.allValues(), ...results.allValues(), ...branches.allValues()]
+				: sessionCandidates(sessionID);
 		return {
 			activeTurns: states.length,
-			turnCandidates: states.reduce(
-				(count, state) =>
-					count +
-					candidateCatalog.turnValues(turnKey(state)).filter((candidate) => candidate.reuse.kind === "exclusive")
-						.length,
-				0,
-			),
-			resourceCandidates: persistent.filter((candidate) => candidate.reuse.kind === "shared").length,
+			turnCandidates: candidates.filter((candidate) => candidate.reuse.kind === "exclusive").length,
+			resourceCandidates: candidates.filter((candidate) => candidate.reuse.kind === "shared").length,
 			pendingPredictions: states.filter((state) => state.predictionPending).length,
 		};
 	};

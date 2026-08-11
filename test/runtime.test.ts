@@ -926,7 +926,7 @@ describe("speculative action runtime", () => {
 		expect(harness.executions()).toBe(1);
 	});
 
-	it("publishes running and completed cache snapshots before a hit", async () => {
+	it("publishes separate in-flight job and completed result snapshots before a hit", async () => {
 		const execution = deferred<string>();
 		const harness = createHarness({
 			settings: { ...enabledSettings, resourceCacheMaxEntries: 7 },
@@ -938,12 +938,15 @@ describe("speculative action runtime", () => {
 
 		const started = harness.events.find((event) => event.type === "started");
 		expect(started).toMatchObject({
-			cacheEntries: 1,
+			cacheEntries: 0,
 			cacheCapacity: 7,
-			cacheRunning: 1,
+			cacheRunning: 0,
 			cacheCompleted: 0,
-			cacheProbation: 1,
+			cacheProbation: 0,
 			cacheProtected: 0,
+			inFlightJobs: 1,
+			resultEntries: 0,
+			branchEntries: 0,
 			activeCandidates: 1,
 			turnCandidates: 0,
 			resourceCandidates: 1,
@@ -963,6 +966,9 @@ describe("speculative action runtime", () => {
 			cacheCompleted: 1,
 			cacheProbation: 1,
 			cacheProtected: 0,
+			inFlightJobs: 0,
+			resultEntries: 1,
+			branchEntries: 0,
 			activeCandidates: 0,
 		});
 		expect(harness.events.find((event) => event.type === "hit")).toMatchObject({
@@ -985,7 +991,7 @@ describe("speculative action runtime", () => {
 		});
 	});
 
-	it("does not report an exclusive turn candidate as cache probation", async () => {
+	it("moves an exclusive turn job into the branch store without cache probation", async () => {
 		const harness = createHarness({
 			settings: {
 				...enabledSettings,
@@ -998,13 +1004,52 @@ describe("speculative action runtime", () => {
 		await waitFor(() => harness.events.some((event) => event.type === "started"));
 
 		expect(harness.events.find((event) => event.type === "started")).toMatchObject({
-			cacheEntries: 1,
+			cacheEntries: 0,
 			cacheProbation: 0,
 			cacheProtected: 0,
+			inFlightJobs: 1,
+			branchEntries: 0,
 			turnCandidates: 1,
 			resourceCandidates: 0,
 		});
+		await waitFor(() => harness.events.some((event) => event.type === "completed"));
+		expect(harness.events.find((event) => event.type === "completed")).toMatchObject({
+			cacheEntries: 0,
+			cacheProbation: 0,
+			inFlightJobs: 0,
+			branchEntries: 1,
+			turnCandidates: 1,
+		});
 		await harness.runtime.finishTurn(consume("turn-sandbox-cache", {}));
+	});
+
+	it("keeps a completed sandbox branch independent from a capacity-one result cache", async () => {
+		const harness = createHarness({
+			settings: {
+				...enabledSettings,
+				candidateLimit: 2,
+				maxConcurrentActions: 2,
+				resourceCacheMaxEntries: 1,
+				tools: { resourceCached: ["read"], sandbox: ["bash"] },
+			},
+			predict: () => prediction(readCandidate("a.ts"), bashCandidate("echo staged")),
+			execute: (candidate) => candidate.tool,
+		});
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "separate-stores" });
+		await waitFor(() => harness.events.filter((event) => event.type === "completed").length === 2);
+
+		const completed = harness.events.filter((event) => event.type === "completed").at(-1);
+		expect(completed).toMatchObject({
+			cacheEntries: 1,
+			resultEntries: 1,
+			branchEntries: 1,
+			inFlightJobs: 0,
+			cacheProbation: 1,
+			turnCandidates: 1,
+			resourceCandidates: 1,
+		});
+		expect(harness.runtime.inspect("session")).toMatchObject({ turnCandidates: 1, resourceCandidates: 1 });
+		await harness.runtime.finishTurn(consume("separate-stores", {}));
 	});
 
 	it("evicts unconsumed probation before an actor-validated protected result", async () => {

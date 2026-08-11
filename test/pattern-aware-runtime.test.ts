@@ -449,7 +449,7 @@ describe("PatternAware runtime integration", () => {
 		await runtime.dispose();
 	});
 
-	it("interrupts an in-flight resource job when per-session LRU evicts it", async () => {
+	it("keeps in-flight jobs outside result-cache LRU pressure", async () => {
 		const events: SpeculativeActionEvent<string>[] = [];
 		let aborted = 0;
 		const runtime = makeSpeculativeActionRuntime(
@@ -494,8 +494,13 @@ describe("PatternAware runtime integration", () => {
 		await runtime.startTurn(start("turn_2"));
 		await waitFor(() => events.some((event) => event.type === "completed"));
 
+		expect(aborted).toBe(0);
+		expect(events).not.toContainEqual(
+			expect.objectContaining({ type: "cancelled", reason: "resource_cache_evicted" }),
+		);
+		expect(runtime.inspect("session").resourceCandidates).toBe(2);
+		await runtime.dispose();
 		expect(aborted).toBe(1);
-		expect(events).toContainEqual(expect.objectContaining({ type: "cancelled", reason: "resource_cache_evicted" }));
 	});
 
 	it("deduplicates and bounds preparation hints without executing them", async () => {
