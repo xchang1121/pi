@@ -496,6 +496,7 @@ describe("M4 workspace sandbox", () => {
 						input: args,
 						resources: ["../outside.txt"],
 						execution: "sandbox",
+						semanticsEpoch: "test.write.v1",
 						schemaHash: "",
 					},
 					callID: "spec-escape",

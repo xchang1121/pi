@@ -6,14 +6,19 @@ import {
 	type CandidateRunState,
 } from "./candidate-lifecycle.ts";
 import { BranchStore, JobTable, ResultCache } from "./candidate-stores.ts";
-import type { ActionKey, ActionKeyMatch, DrafterToolDefinition, SpeculativeExecution } from "./common.ts";
+import type {
+	ActionKey,
+	ActionKeyMatch,
+	ActionSemanticsRegistry,
+	DrafterToolDefinition,
+	SpeculativeExecution,
+} from "./common.ts";
 import {
 	actionKeyCovers,
 	actionKeyMismatchReason,
 	clampCandidateLimit,
 	DEFAULTS,
-	inferredExecution,
-	KEYABLE_TOOLS,
+	PI_ACTION_SEMANTICS,
 } from "./common.ts";
 import type { PatternAwareDependency, PatternAwareResolution, PatternAwareSettings } from "./pattern-aware.ts";
 import {
@@ -327,6 +332,7 @@ export interface SpeculativeActionRuntimeAdapter<
 	ConsumeInput extends TurnInput<SessionID>,
 	StateData,
 > {
+	readonly actionSemantics?: ActionSemanticsRegistry;
 	readonly settings: () => MaybePromise<SpeculativeActionSettings>;
 	readonly definitions: (input: StartInput) => readonly DrafterToolDefinition[];
 	readonly stateData: (input: StartInput) => MaybePromise<StateData>;
@@ -578,8 +584,10 @@ export function makeSpeculativeActionRuntime<
 	adapter: SpeculativeActionRuntimeAdapter<SessionID, Output, StartInput, ConsumeInput, StateData>,
 ): SpeculativeActionRuntime<SessionID, Output, StartInput, ConsumeInput, FinishInput> {
 	const turns = new Map<string, TurnState<SessionID, Output, StateData>>();
+	const actionSemantics = adapter.actionSemantics ?? PI_ACTION_SEMANTICS;
 	const projectionRuleByID = new Map<string, ActionProjectionRule<Output>>();
 	for (const rule of adapter.projectionRules ?? []) {
+		if (!actionSemantics.supportsProjector(rule.id)) continue;
 		if (!projectionRuleByID.has(rule.id)) projectionRuleByID.set(rule.id, rule);
 	}
 	const projectionRules = [...projectionRuleByID.values()];
@@ -1394,7 +1402,7 @@ export function makeSpeculativeActionRuntime<
 		for (const candidate of availableCandidates(state).values()) {
 			if (candidate === excluded || candidate.reuse.kind !== "shared") continue;
 			if (
-				action.tool !== "bash" &&
+				actionSemantics.resourceVersionPolicy(action.tool) !== "workspace" &&
 				!action.resources.some((changed) =>
 					candidate.key.resources.some((cached) => resourcePathsOverlap(changed, cached)),
 				)
@@ -1648,8 +1656,13 @@ export function makeSpeculativeActionRuntime<
 				}
 				continue;
 			}
-			const execution = draft.execution ?? inferredExecution(draft.tool);
-			if (execution !== action.execution) {
+			const execution = draft.execution ?? actionSemantics.execution(draft.tool);
+			const reuse = actionSemantics.reuse(draft.tool);
+			if (
+				!reuse ||
+				execution !== action.execution ||
+				(reuse === "shared_result") !== (action.execution === "resource_cached")
+			) {
 				await publishMiss(state, "execution_mismatch", action, undefined, { draftCandidate, predictedAction });
 				continue;
 			}
@@ -1725,7 +1738,7 @@ export function makeSpeculativeActionRuntime<
 			};
 			const scheduling = schedulingMetadata(draft, action);
 			const lifecycle = new CandidateAggregate<Output, PredictionLease>(
-				action.execution === "resource_cached" ? "shared" : "exclusive",
+				reuse === "shared_result" ? "shared" : "exclusive",
 				[sourceLease],
 				candidateController,
 			);
@@ -1890,10 +1903,7 @@ export function makeSpeculativeActionRuntime<
 							new Error("speculative request finished"),
 						);
 					}
-					if (
-						(action.execution === "resource_cached" || action.tool === "bash") &&
-						adapter.captureResourceVersion
-					) {
+					if (actionSemantics.requiresRuntimeResourceVersion(action.tool) && adapter.captureResourceVersion) {
 						try {
 							const captured = await adapter.captureResourceVersion({
 								startInput: input,
@@ -1915,7 +1925,7 @@ export function makeSpeculativeActionRuntime<
 							throw new SpeculativeJobError("resource_capture_failed", error);
 						}
 					}
-					if (action.execution === "resource_cached" && adapter.watchResourceVersion) {
+					if (actionSemantics.watchesResourceVersion(action.tool) && adapter.watchResourceVersion) {
 						let releaseWatch: (() => void) | undefined;
 						try {
 							releaseWatch = await adapter.watchResourceVersion({
@@ -2084,7 +2094,7 @@ export function makeSpeculativeActionRuntime<
 					0,
 					tokenTotals.get(state.sessionID) ?? 0,
 					"pattern_aware",
-					candidateToolNames(settings),
+					candidateToolNames(settings, actionSemantics),
 					continuationAnchorActionSeq(state, candidate),
 				);
 			} catch {
@@ -2138,7 +2148,7 @@ export function makeSpeculativeActionRuntime<
 				0,
 				tokenTotals.get(state.sessionID) ?? 0,
 				"pattern_aware",
-				candidateToolNames(settings),
+				candidateToolNames(settings, actionSemantics),
 			);
 		} catch {
 			// Analyzer bookkeeping is optional and must not alter actor settlement.
@@ -2243,7 +2253,7 @@ export function makeSpeculativeActionRuntime<
 	const startTurn = async (input: StartInput, signal?: AbortSignal): Promise<void> => {
 		const settings = await adapter.settings();
 		const definitions = adapter.definitions(input);
-		const candidateNames = candidateToolNames(settings);
+		const candidateNames = candidateToolNames(settings, actionSemantics);
 		if (!masterEnabled(settings) || notifiedMasterEnabled === false) {
 			await disableSession(input.sessionID);
 			return;
@@ -2804,12 +2814,15 @@ export function makeSpeculativeActionRuntime<
 	return { startTurn, consume, actual, finishTurn, settingsChanged, releaseSession, disposeSession, dispose, inspect };
 }
 
-export function candidateToolNames(settings: SpeculativeActionSettings): readonly string[] {
+export function candidateToolNames(
+	settings: SpeculativeActionSettings,
+	semantics: ActionSemanticsRegistry = PI_ACTION_SEMANTICS,
+): readonly string[] {
 	const resourceCached = new Set(settings.tools.resourceCached);
 	const sandbox = new Set(settings.tools.sandbox);
-	return KEYABLE_TOOLS.filter((tool) =>
-		inferredExecution(tool) === "sandbox" ? sandbox.has(tool) : resourceCached.has(tool),
-	);
+	return semantics
+		.toolNames()
+		.filter((tool) => (semantics.execution(tool) === "sandbox" ? sandbox.has(tool) : resourceCached.has(tool)));
 }
 
 export function candidateExecutionMs(candidate: SpeculativeCandidate): number {

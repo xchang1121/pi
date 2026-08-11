@@ -12,13 +12,12 @@ import type {
 import type { Api, Context, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
 import { validateToolArguments } from "@earendil-works/pi-ai";
 import type { ActionProjectionRule } from "./action-key-projection.ts";
-import type { ActionKey } from "./common.ts";
+import type { ActionKey, ActionSemanticsRegistry } from "./common.ts";
 import {
 	buildDrafterToolCallPrompt,
-	buildPiActionKey,
 	clampCandidateLimit,
 	DEFAULTS,
-	inferredExecution,
+	PI_ACTION_SEMANTICS,
 	usageTokenCount,
 } from "./common.ts";
 import {
@@ -105,6 +104,8 @@ export interface InstallSpeculativeActionOptions {
 	readonly preflight?: (
 		context: SpeculativeAgentPreflightContext,
 	) => boolean | CandidatePreflight | Promise<boolean | CandidatePreflight>;
+	/** Canonical K(a), reuse, projection, versioning, and sandbox policy for this host. */
+	readonly actionSemantics?: ActionSemanticsRegistry;
 	/** Lossless Π rules; each rule owns key relation, realized coverage, and output reconstruction. */
 	readonly projectionRules?: readonly ActionProjectionRule<SettleToolCallResult>[];
 	/** Required capability for every tool configured under tools.sandbox. */
@@ -165,11 +166,13 @@ export function installSpeculativeAction(
 	const baseStream = agent.streamFunction;
 	const previousSettlement = agent.settleToolCall;
 	const previousActual = agent.actualToolCall;
+	const actionSemantics = options.actionSemantics ?? PI_ACTION_SEMANTICS;
+	const projectionRules = (options.projectionRules ?? []).filter((rule) => actionSemantics.supportsProjector(rule.id));
 	const sandboxExecutions = new WeakMap<SettleToolCallResult, SpeculativeSandboxExecution>();
 	const patternActionSemantics = {
 		actionKey: (tool: string, input: Readonly<Record<string, unknown>>, schemaHash?: string) =>
-			buildPiActionKey(tool, input, options.cwd, schemaHash),
-		projectors: options.projectionRules ?? [],
+			actionSemantics.buildKey(tool, input, options.cwd, schemaHash),
+		projectors: projectionRules,
 	};
 	let openedPatternStore: Promise<PatternAwareStoreLease> | undefined;
 	const authoritativeBatches = new Map<string, Map<number, PatternAwareEventInput>>();
@@ -261,6 +264,7 @@ export function installSpeculativeAction(
 		AgentConsumeInput,
 		AgentStateData
 	>({
+		actionSemantics,
 		settings: resolveSettings,
 		definitions: (input) =>
 			input.tools.map((tool) => ({ name: tool.name, description: tool.description, inputSchema: tool.parameters })),
@@ -344,7 +348,7 @@ export function installSpeculativeAction(
 		actionKey: (toolName, input, context) => {
 			if (context.type === "consume") {
 				const tool = agent.state.tools.find((candidate) => candidate.name === toolName);
-				return buildPiActionKey(
+				return actionSemantics.buildKey(
 					toolName,
 					input,
 					options.cwd,
@@ -356,7 +360,7 @@ export function installSpeculativeAction(
 			const validated = validateCandidateArguments(tool, toolName, input, "spec_key");
 			return validated === undefined
 				? undefined
-				: buildPiActionKey(toolName, validated, options.cwd, context.data.schemaHashes[toolName]);
+				: actionSemantics.buildKey(toolName, validated, options.cwd, context.data.schemaHashes[toolName]);
 		},
 		actual: (input) => ({ id: input.id, tool: input.tool, input: input.args }),
 		preflightCandidate: async ({ data, tool: toolName, concrete, action, callID, signal }) => {
@@ -438,7 +442,7 @@ export function installSpeculativeAction(
 		isResourceExpired: ({ candidate }) => validateResourceVersion(candidate.resourceVersion),
 		watchResourceVersion: ({ candidate, onInvalidated }) =>
 			watchResourceVersion(candidate.resourceVersion, onInvalidated),
-		projectionRules: options.projectionRules ?? [],
+		projectionRules,
 		adoptCandidate: async ({ action, candidate, output }) => {
 			if (action.execution !== "sandbox") return output;
 			const execution = sandboxExecutions.get(output);
@@ -521,13 +525,13 @@ export function installSpeculativeAction(
 				durationMs,
 				...(typeof concrete.operation === "string" ? { operation: concrete.operation } : {}),
 				...(definition ? { schemaHash: stableHash(definition.parameters) } : {}),
-				learnTarget: candidateToolNames(settings).includes(tool),
+				learnTarget: candidateToolNames(settings, actionSemantics).includes(tool),
 			});
 			authoritativeBatches.set(key, batch);
 			return { candidates: [], draftTokens: 0 };
 		},
 		prepareCandidate: async ({ candidate, signal }) => {
-			if (candidate.execution !== "sandbox" && inferredExecution(candidate.tool) !== "sandbox") return;
+			if (candidate.execution !== "sandbox" && actionSemantics.execution(candidate.tool) !== "sandbox") return;
 			if (!options.sandbox?.supports(candidate.tool)) throw new Error(`Sandbox unavailable for ${candidate.tool}`);
 			await prepareSandbox([candidate.tool], signal);
 		},

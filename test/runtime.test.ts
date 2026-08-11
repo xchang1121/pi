@@ -5,7 +5,7 @@ import {
 	readRangesShareInFlight,
 } from "../src/action-key-projection.ts";
 import type { ActionKey, ProjectedActionKeyMatch } from "../src/common.ts";
-import { asRecord, buildPiActionKey, readActionRange } from "../src/common.ts";
+import { ActionSemanticsRegistry, asRecord, buildPiActionKey, readActionRange } from "../src/common.ts";
 import { PATTERN_AWARE_DEFAULTS } from "../src/pattern-aware.ts";
 import type {
 	CandidatePreflight,
@@ -30,6 +30,7 @@ interface ConsumeInput extends StartInput {
 }
 
 interface HarnessOptions {
+	readonly actionSemantics?: ActionSemanticsRegistry;
 	readonly settings?:
 		| SpeculativeActionSettings
 		| (() => SpeculativeActionSettings | Promise<SpeculativeActionSettings>);
@@ -126,6 +127,7 @@ function createHarness(options: HarnessOptions) {
 		ConsumeInput,
 		{ readonly cwd: string }
 	>({
+		...(options.actionSemantics ? { actionSemantics: options.actionSemantics } : {}),
 		settings: () =>
 			typeof options.settings === "function" ? options.settings() : (options.settings ?? enabledSettings),
 		definitions: () => [
@@ -215,6 +217,53 @@ function consumeTool(turnID: string, tool: string, input: Record<string, unknown
 }
 
 describe("speculative action runtime", () => {
+	it("runs a host-defined tool from one injected action-semantics definition", async () => {
+		const semantics = new ActionSemanticsRegistry([
+			{
+				tool: "stat",
+				epoch: "host.stat.v1",
+				execution: "resource_cached",
+				reuse: "shared_result",
+				resourceVersion: "resources",
+				sandboxMode: "none",
+				canonicalize: (input) => {
+					const record = asRecord(input);
+					if (!record || typeof record.path !== "string") return undefined;
+					return { input: { path: record.path }, resources: [record.path] };
+				},
+			},
+		]);
+		let captures = 0;
+		let watches = 0;
+		const harness = createHarness({
+			actionSemantics: semantics,
+			settings: {
+				...enabledSettings,
+				tools: { resourceCached: ["stat"], sandbox: [] },
+			},
+			predict: () => prediction({ type: "tool_call", tool: "stat", input: { path: "a.ts" } }),
+			actionKey: (tool, input) => semantics.buildKey(tool, input, "/workspace"),
+			captureResourceVersion: () => {
+				captures++;
+				return "stat-v1";
+			},
+			watchResourceVersion: () => {
+				watches++;
+				return () => {};
+			},
+			execute: () => "stat-result",
+		});
+
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "custom-semantics" });
+		await waitFor(() => harness.events.some((event) => event.type === "completed"));
+		expect(await harness.runtime.consume(consumeTool("custom-semantics", "stat", { path: "a.ts" }))).toBe(
+			"stat-result",
+		);
+		expect(harness.executions()).toBe(1);
+		expect(captures).toBe(1);
+		expect(watches).toBe(1);
+	});
+
 	it("adopts a matching candidate while pre-execution is still running", async () => {
 		const execution = deferred<string>();
 		const harness = createHarness({
