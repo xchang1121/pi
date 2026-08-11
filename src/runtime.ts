@@ -1,10 +1,5 @@
-import type {
-	ActionKey,
-	ActionKeyProjector,
-	DrafterToolDefinition,
-	ProjectedActionKeyMatch,
-	SpeculativeExecution,
-} from "./common.ts";
+import type { ActionProjectionCoverage, ActionProjectionRule } from "./action-key-projection.ts";
+import type { ActionKey, ActionKeyMatch, DrafterToolDefinition, SpeculativeExecution } from "./common.ts";
 import { actionKeyMatch, clampCandidateLimit, DEFAULTS, inferredExecution, KEYABLE_TOOLS } from "./common.ts";
 import type { PatternAwareDependency, PatternAwareResolution, PatternAwareSettings } from "./pattern-aware.ts";
 import { ToolCache } from "./tool-cache.ts";
@@ -130,6 +125,8 @@ export interface SpeculativeCandidate {
 	validationBytes: number;
 	validationFiles: number;
 	validationMode?: "watcher" | "exact";
+	projectionCoverage?: readonly ActionProjectionCoverage[];
+	projectionMs: number;
 	estimatedBytes: number;
 	sandboxSetupMs?: number;
 	changeCollectionMs?: number;
@@ -404,16 +401,8 @@ export interface SpeculativeActionRuntimeAdapter<
 		readonly candidate: SpeculativeCandidate;
 		readonly onInvalidated: (changedPath?: string) => void;
 	}) => MaybePromise<(() => void) | undefined>;
-	/** Key projections that define non-exact K(a) equivalence. */
-	readonly keyProjectors?: readonly ActionKeyProjector[];
-	readonly projectOutput?: (input: {
-		readonly stateData: StateData;
-		readonly consumeInput: ConsumeInput;
-		readonly action: ActionKey;
-		readonly candidate: SpeculativeCandidate;
-		readonly output: Output;
-		readonly keyMatch: ProjectedActionKeyMatch;
-	}) => MaybePromise<Output | undefined>;
+	/** Lossless projections jointly define K(a) relation, realized coverage, and output reconstruction. */
+	readonly projectionRules?: readonly ActionProjectionRule<Output>[];
 	readonly adoptCandidate?: (input: {
 		readonly stateData: StateData;
 		readonly consumeInput: ConsumeInput;
@@ -561,7 +550,12 @@ export function makeSpeculativeActionRuntime<
 	adapter: SpeculativeActionRuntimeAdapter<SessionID, Output, StartInput, ConsumeInput, StateData>,
 ): SpeculativeActionRuntime<SessionID, Output, StartInput, ConsumeInput, FinishInput> {
 	const turns = new Map<string, TurnState<SessionID, Output, StateData>>();
-	const keyProjectors = [...(adapter.keyProjectors ?? [])];
+	const projectionRuleByID = new Map<string, ActionProjectionRule<Output>>();
+	for (const rule of adapter.projectionRules ?? []) {
+		if (!projectionRuleByID.has(rule.id)) projectionRuleByID.set(rule.id, rule);
+	}
+	const projectionRules = [...projectionRuleByID.values()];
+	const keyProjectors = projectionRules;
 	const persistentCandidates = new ToolCache<SessionID, RuntimeCandidate<Output>>(keyProjectors);
 	const tokenTotals = new Map<SessionID, number>();
 	const wallTimes = new Map<SessionID, number>();
@@ -999,6 +993,46 @@ export function makeSpeculativeActionRuntime<
 		});
 	};
 
+	const captureProjectionCoverage = (action: ActionKey, output: Output): readonly ActionProjectionCoverage[] => {
+		const coverage: ActionProjectionCoverage[] = [];
+		for (const rule of projectionRules) {
+			let value: unknown;
+			try {
+				value = rule.captureCoverage(action, output);
+			} catch {
+				continue;
+			}
+			if (value !== undefined) coverage.push({ rule: rule.id, value });
+		}
+		return coverage;
+	};
+
+	const projectCandidateOutput = async (
+		candidate: RuntimeCandidate<Output>,
+		action: ActionKey,
+		output: Output,
+		match: ActionKeyMatch,
+	): Promise<{ readonly output: Output; readonly durationMs: number } | undefined> => {
+		if (match.kind === "exact") return { output, durationMs: 0 };
+		const rule = projectionRuleByID.get(match.projector);
+		const coverage = candidate.projectionCoverage?.find((item) => item.rule === match.projector)?.value;
+		if (!rule || coverage === undefined) return undefined;
+		const started = performance.now();
+		try {
+			const projected = await rule.projectOutput({
+				speculative: candidate.key,
+				actor: action,
+				output,
+				coverage,
+				keyMatch: match,
+			});
+			if (projected === undefined) return undefined;
+			return { output: projected, durationMs: Math.max(0, performance.now() - started) };
+		} catch {
+			return undefined;
+		}
+	};
+
 	const removePersistentCandidate = (
 		state: TurnState<SessionID, Output, StateData>,
 		candidate: RuntimeCandidate<Output>,
@@ -1312,7 +1346,6 @@ export function makeSpeculativeActionRuntime<
 		}
 		for (const candidate of matchingCandidates(state, actual)) {
 			if (!candidateCanMatch(candidate, actionSequence)) continue;
-			if (adapter.projectOutput === undefined && candidate.key.key !== actual.key) continue;
 			if (!claimCandidate(candidate, state.turnID)) continue;
 			touchPersistentCandidate(state, candidate);
 			return candidate;
@@ -1346,7 +1379,17 @@ export function makeSpeculativeActionRuntime<
 		for (const candidate of matchingCandidates(state, action)) {
 			if (candidate.run.status === "closed") continue;
 			if (candidate.reuse.kind === "exclusive" && candidate.reuse.state !== "available") continue;
-			if (candidate.key.key !== action.key && adapter.projectOutput === undefined) continue;
+			const match = actionKeyMatch(candidate.key, action, keyProjectors);
+			if (!match) continue;
+			if (match.kind === "projected") {
+				const rule = projectionRuleByID.get(match.projector);
+				if (!rule) continue;
+				if (candidate.run.status === "running") {
+					if (!rule.canShareInFlight?.(candidate.key, action)) continue;
+				} else if ((await projectCandidateOutput(candidate, action, candidate.run.output, match)) === undefined) {
+					continue;
+				}
+			}
 			if (await isExpired(adapter, state, undefined, action, candidate)) {
 				await expireCandidate(state, candidate, "candidate_resource_expired");
 				continue;
@@ -1609,6 +1652,7 @@ export function makeSpeculativeActionRuntime<
 					action.execution === "resource_cached" ? { kind: "shared" } : { kind: "exclusive", state: "available" },
 				run: { status: "running" },
 				validationMs: 0,
+				projectionMs: 0,
 				validationBytes: 0,
 				validationFiles: 0,
 				estimatedBytes: estimateValueBytes({ input: concrete, draftCandidate, predictedAction }),
@@ -1797,6 +1841,7 @@ export function makeSpeculativeActionRuntime<
 						}
 						const completedAt = Date.now();
 						const executionMs = Math.max(0, completedAt - executionStarted);
+						candidate.projectionCoverage = captureProjectionCoverage(action, output);
 						candidate.run = { status: "ready", completedAt, executionMs, output };
 						observeServiceTime(candidate.tool, executionMs);
 						Object.assign(candidate, adapter.candidateExecutionMetrics?.({ output, candidate }) ?? {});
@@ -2287,17 +2332,7 @@ export function makeSpeculativeActionRuntime<
 			}
 			if (candidate.key.key !== actual.key) {
 				const keyMatch = actionKeyMatch(candidate.key, actual, keyProjectors);
-				const projected =
-					keyMatch?.kind === "projected" && adapter.projectOutput
-						? await adapter.projectOutput({
-								stateData: state.data,
-								consumeInput: input,
-								action: actual,
-								candidate,
-								output,
-								keyMatch,
-							})
-						: undefined;
+				const projected = keyMatch ? await projectCandidateOutput(candidate, actual, output, keyMatch) : undefined;
 				if (projected === undefined) {
 					await expireCandidate(state, candidate, "projection_failed");
 					await publishMiss(state, "projection_failed", actual, undefined, {
@@ -2307,13 +2342,14 @@ export function makeSpeculativeActionRuntime<
 					});
 					return undefined;
 				}
-				output = projected;
+				output = projected.output;
+				candidate.projectionMs += projected.durationMs;
 			}
 
 			const waitedMs = Math.max(0, Date.now() - waitStarted);
 			const consumeOverheadMs = Math.max(0, Date.now() - consumeStarted);
 			const executionMs = candidateExecutionMs(candidate) || Math.max(0, Date.now() - candidate.startedAt);
-			observeHitOverhead(actual.tool, candidate.validationMs + (candidate.commitMs ?? 0));
+			observeHitOverhead(actual.tool, candidate.validationMs + candidate.projectionMs + (candidate.commitMs ?? 0));
 			completePredictionMatch(candidate, actionSequence);
 			candidate.hits++;
 			candidate.authoritativeSequence = Math.max(candidate.authoritativeSequence ?? 0, actionSequence);

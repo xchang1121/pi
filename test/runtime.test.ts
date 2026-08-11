@@ -1,7 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
-import { READ_RANGE_ACTION_KEY_PROJECTOR } from "../src/action-key-projection.ts";
-import type { ProjectedActionKeyMatch } from "../src/common.ts";
-import { buildPiActionKey } from "../src/common.ts";
+import {
+	type ActionProjectionRule,
+	READ_RANGE_ACTION_KEY_PROJECTOR,
+	readRangesShareInFlight,
+} from "../src/action-key-projection.ts";
+import type { ActionKey, ProjectedActionKeyMatch } from "../src/common.ts";
+import { asRecord, buildPiActionKey, readActionRange } from "../src/common.ts";
 import { PATTERN_AWARE_DEFAULTS } from "../src/pattern-aware.ts";
 import type {
 	CandidatePreflight,
@@ -59,6 +63,7 @@ interface HarnessOptions {
 		output: string,
 		keyMatch: ProjectedActionKeyMatch,
 	) => Promise<string | undefined> | string | undefined;
+	readonly captureProjectionCoverage?: (action: ActionKey, output: string) => unknown | undefined;
 	readonly adopt?: (output: string) => Promise<string | undefined> | string | undefined;
 	readonly observerThrows?: boolean;
 }
@@ -76,6 +81,30 @@ const enabledSettings: SpeculativeActionSettings = {
 function createHarness(options: HarnessOptions) {
 	const events: SpeculativeActionEvent<string>[] = [];
 	let executions = 0;
+	const projectionRules: readonly ActionProjectionRule<string>[] = options.projectOutput
+		? [
+				{
+					...READ_RANGE_ACTION_KEY_PROJECTOR,
+					captureCoverage: (action, output) =>
+						options.captureProjectionCoverage !== undefined
+							? options.captureProjectionCoverage(action, output)
+							: { end: readActionRange(action)?.end, complete: false },
+					projectOutput: ({ actor, output, coverage, keyMatch }) => {
+						const actorRange = readActionRange(actor);
+						const realized = asRecord(coverage);
+						if (!actorRange || !realized || typeof realized.end !== "number") return undefined;
+						if (
+							actorRange.offset > realized.end ||
+							(realized.complete !== true && actorRange.end > realized.end)
+						) {
+							return undefined;
+						}
+						return options.projectOutput?.(output, keyMatch);
+					},
+					canShareInFlight: readRangesShareInFlight,
+				},
+			]
+		: [];
 	const runtime = makeSpeculativeActionRuntime<
 		string,
 		string,
@@ -123,12 +152,7 @@ function createHarness(options: HarnessOptions) {
 		...(options.isResourceExpired
 			? { isResourceExpired: (input) => options.isResourceExpired?.(input) ?? false }
 			: {}),
-		...(options.projectOutput
-			? {
-					keyProjectors: [READ_RANGE_ACTION_KEY_PROJECTOR],
-					projectOutput: ({ output, keyMatch }) => options.projectOutput?.(output, keyMatch),
-				}
-			: {}),
+		projectionRules,
 		...(options.adopt ? { adoptCandidate: ({ output }) => options.adopt?.(output) } : {}),
 		onEvent: (event) => {
 			events.push(event);
@@ -1187,6 +1211,72 @@ describe("speculative action runtime", () => {
 				input: { path: "README.md", offset: 95, limit: 10 },
 			}),
 		).toBeUndefined();
+	});
+
+	it("rejects a projected hit when execution produced no coverage proof", async () => {
+		const harness = createHarness({
+			predict: () => prediction(readCandidate("README.md", 1, 100)),
+			execute: () => "lines-1-100",
+			captureProjectionCoverage: () => undefined,
+			projectOutput: (output) => `projected:${output}`,
+		});
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-no-coverage" });
+		await waitFor(() => harness.runtime.inspect().pendingPredictions === 0);
+
+		expect(
+			await harness.runtime.consume(consume("turn-no-coverage", { path: "README.md", offset: 20, limit: 10 })),
+		).toBeUndefined();
+		expect(harness.events).toContainEqual(expect.objectContaining({ type: "miss", reason: "projection_failed" }));
+	});
+
+	it("fails closed when a projection rule cannot reconstruct the actor output", async () => {
+		const harness = createHarness({
+			predict: () => prediction(readCandidate("README.md", 1, 100)),
+			execute: () => "lines-1-100",
+			projectOutput: () => undefined,
+		});
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-reconstruction-fails" });
+		await waitFor(() => harness.runtime.inspect().pendingPredictions === 0);
+
+		expect(
+			await harness.runtime.consume(
+				consume("turn-reconstruction-fails", { path: "README.md", offset: 20, limit: 10 }),
+			),
+		).toBeUndefined();
+		expect(harness.events).toContainEqual(expect.objectContaining({ type: "miss", reason: "projection_failed" }));
+	});
+
+	it("uses realized complete coverage beyond the speculative request boundary", async () => {
+		const harness = createHarness({
+			predict: () => prediction(readCandidate("README.md", 1, 100)),
+			execute: () => "complete-file",
+			captureProjectionCoverage: () => ({ end: 80, complete: true }),
+			projectOutput: (output) => `projected:${output}`,
+		});
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-complete-coverage" });
+		await waitFor(() => harness.runtime.inspect().pendingPredictions === 0);
+
+		expect(
+			await harness.runtime.consume(consume("turn-complete-coverage", { path: "README.md", offset: 1, limit: 200 })),
+		).toBe("projected:complete-file");
+		expect(harness.executions()).toBe(1);
+	});
+
+	it("does not coalesce a running read that only completed coverage could prove", async () => {
+		const release = deferred<string>();
+		const harness = createHarness({
+			predict: () => prediction(readCandidate("README.md", 1, 100), readCandidate("README.md", 1, 200)),
+			execute: () => release.promise,
+			captureProjectionCoverage: () => ({ end: 80, complete: true }),
+			projectOutput: (output) => output,
+		});
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-directed-running" });
+		await waitFor(() => harness.executions() === 2);
+		release.resolve("complete-file");
+		await waitFor(() => harness.runtime.inspect().pendingPredictions === 0);
+
+		expect(harness.executions()).toBe(2);
+		expect(harness.events.filter((event) => event.type === "started")).toHaveLength(2);
 	});
 
 	it("applies the candidate limit after unsupported draft tools are skipped", async () => {

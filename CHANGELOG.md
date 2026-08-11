@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- Replaced the separate `keyProjectors` and `projectOutput` integration hooks with unified `projectionRules`; each lossless rule now owns its key relation, realized coverage proof, output reconstruction, and directed in-flight compatibility.
+
 ### Added
 
 - Added a single-step speculative tool runtime with Pi Agent integration, conservative action keys, resource validation, lifecycle events, and running or ready result reuse.
@@ -13,6 +17,7 @@
 - Added gap-weighted and decayed PatternAware inference, suffix backoff, collection mappers, retryable persisted analyzers, multi-step frontiers, and adaptive drafter suppression.
 - Added watcher-backed resource versions with exact-validation fallback, eager invalidation, byte-bounded per-session caches, pooled Git workspaces, and phase-level runtime metrics.
 - Added an indexed per-session tool cache with atomic exact-key registration for cross-turn single-flight reuse.
+- Added production Pi `read` range projection backed by structured realized-output coverage; grep and find remain exact-key-only.
 
 ### Changed
 
@@ -22,7 +27,7 @@
 - Renamed read-only execution telemetry and settings to `resource_cached`/`resourceCached`; the Agent installer still accepts legacy `liveReadonly` input.
 - Pattern-aware and drafter predictions now deduplicate onto shared jobs, learned actions can be admitted immediately after authoritative results, and in-flight work is preempted by explicit utility and per-session cache budgets.
 - Native sandbox protocol v3 now forwards the configured shell and requires an explicit process-isolation attestation; Linux recursively enforces read-only host mounts and readiness probes verify mount isolation.
-- K(a) remains a uniform canonical action key; registered projections now define non-exact equivalence, with π_read providing deterministic tightest-range reuse.
+- K(a) remains a uniform canonical action key; registered projection rules now require both a potential key relation and validated realized-output coverage before reconstructing an actor result.
 
 ### Fixed
 

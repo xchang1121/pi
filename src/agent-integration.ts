@@ -11,8 +11,8 @@ import type {
 } from "@earendil-works/pi-agent-core";
 import type { Api, Context, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
 import { validateToolArguments } from "@earendil-works/pi-ai";
-import { READ_RANGE_ACTION_KEY_PROJECTOR } from "./action-key-projection.ts";
-import type { ActionKey, ActionKeyProjector, ProjectedActionKeyMatch } from "./common.ts";
+import type { ActionProjectionRule } from "./action-key-projection.ts";
+import type { ActionKey } from "./common.ts";
 import {
 	buildDrafterToolCallPrompt,
 	buildPiActionKey,
@@ -45,7 +45,6 @@ import type {
 	SpeculativeActionEvent,
 	SpeculativeActionRuntime,
 	SpeculativeActionSettings,
-	SpeculativeCandidate,
 	SpeculativeDraftCandidate,
 } from "./runtime.ts";
 import {
@@ -84,13 +83,6 @@ export interface SpeculativeAgentPreflightContext {
 	readonly signal: AbortSignal;
 }
 
-export interface SpeculativeAgentProjectionContext {
-	readonly action: ActionKey;
-	readonly candidate: SpeculativeCandidate;
-	readonly output: SettleToolCallResult;
-	readonly keyMatch: ProjectedActionKeyMatch;
-}
-
 export interface DraftOptionsContext {
 	readonly actorModel: Model<Api>;
 	readonly draftModel: Model<Api>;
@@ -114,12 +106,8 @@ export interface InstallSpeculativeActionOptions {
 	readonly preflight?: (
 		context: SpeculativeAgentPreflightContext,
 	) => boolean | CandidatePreflight | Promise<boolean | CandidatePreflight>;
-	/** Optional Π used to determine whether one canonical action key projects to another. */
-	readonly keyProjectors?: readonly ActionKeyProjector[];
-	/** Optional output projection for a non-exact key match. */
-	readonly projectOutput?: (
-		context: SpeculativeAgentProjectionContext,
-	) => SettleToolCallResult | undefined | Promise<SettleToolCallResult | undefined>;
+	/** Lossless Π rules; each rule owns key relation, realized coverage, and output reconstruction. */
+	readonly projectionRules?: readonly ActionProjectionRule<SettleToolCallResult>[];
 	/** Required capability for every tool configured under tools.sandbox. */
 	readonly sandbox?: SpeculativeAgentSandbox;
 	/** Optional persistence root for workspace-hashed PatternAware state. */
@@ -259,16 +247,6 @@ export function installSpeculativeAction(
 			...(signal ? { signal } : {}),
 		});
 	};
-
-	const projection = options.projectOutput
-		? async (input: {
-				action: ActionKey;
-				candidate: SpeculativeCandidate;
-				output: SettleToolCallResult;
-				keyMatch: ProjectedActionKeyMatch;
-			}): Promise<SettleToolCallResult | undefined> => options.projectOutput?.(input)
-		: undefined;
-	const keyProjectors = options.keyProjectors ?? (projection ? [READ_RANGE_ACTION_KEY_PROJECTOR] : []);
 
 	const runtime = makeSpeculativeActionRuntime<
 		string,
@@ -442,13 +420,7 @@ export function installSpeculativeAction(
 		isResourceExpired: ({ candidate }) => validateResourceVersion(candidate.resourceVersion),
 		watchResourceVersion: ({ candidate, onInvalidated }) =>
 			watchResourceVersion(candidate.resourceVersion, onInvalidated),
-		keyProjectors,
-		...(projection
-			? {
-					projectOutput: ({ action, candidate, output, keyMatch }) =>
-						projection({ action, candidate, output, keyMatch }),
-				}
-			: {}),
+		projectionRules: options.projectionRules ?? [],
 		adoptCandidate: async ({ action, candidate, output }) => {
 			if (action.execution !== "sandbox") return output;
 			const execution = sandboxExecutions.get(output);

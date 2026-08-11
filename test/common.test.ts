@@ -158,15 +158,35 @@ describe("speculative action common", () => {
 		expect(actionKeyProjectionPartitions(speculative, [broken])).toEqual([]);
 	});
 
-	it("matches a containing speculative read but not an uncovered range", () => {
+	it("matches a potentially projectable read while rejecting impossible ranges", () => {
 		const speculative = buildPiActionKey("read", { path: "src/runtime.ts", offset: 100, limit: 160 }, "/workspace");
 		const contained = buildPiActionKey("read", { path: "src/runtime.ts", offset: 220, limit: 30 }, "/workspace");
+		const needsCompleteCoverage = buildPiActionKey(
+			"read",
+			{ path: "src/runtime.ts", offset: 250, limit: 30 },
+			"/workspace",
+		);
+		const startsAfterPlannedRange = buildPiActionKey(
+			"read",
+			{ path: "src/runtime.ts", offset: 261, limit: 1 },
+			"/workspace",
+		);
 		const uncovered = buildPiActionKey("read", { path: "src/runtime.ts", offset: 80, limit: 30 }, "/workspace");
 
 		const projectors = [READ_RANGE_ACTION_KEY_PROJECTOR];
 		expect(speculative && contained ? actionKeyMatches(speculative, contained) : true).toBe(false);
 		expect(contained ? actionKeyMatches(contained, contained) : false).toBe(true);
 		expect(speculative && contained ? actionKeyMatches(speculative, contained, projectors) : false).toBe(true);
+		expect(
+			speculative && needsCompleteCoverage
+				? actionKeyMatches(speculative, needsCompleteCoverage, projectors)
+				: false,
+		).toBe(true);
+		expect(
+			speculative && startsAfterPlannedRange
+				? actionKeyMatches(speculative, startsAfterPlannedRange, projectors)
+				: true,
+		).toBe(false);
 		expect(speculative && uncovered ? actionKeyMatches(speculative, uncovered, projectors) : true).toBe(false);
 		expect(speculative && contained ? actionKeyMatch(speculative, contained, projectors) : undefined).toEqual({
 			kind: "projected",

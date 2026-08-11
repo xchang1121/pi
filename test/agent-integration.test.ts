@@ -14,8 +14,10 @@ import type {
 import { EventStream } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
+import { READ_RANGE_COVERAGE_DETAILS_KEY, type ReadRangeCoverage } from "../src/action-key-projection.ts";
 import { installSpeculativeAction, type SpeculativeAgentSettingsInput } from "../src/agent-integration.ts";
 import { PATTERN_AWARE_DEFAULTS, type PatternAwareEventInput, PatternAwareStore } from "../src/pattern-aware.ts";
+import { PI_READ_RANGE_PROJECTION_RULE } from "../src/pi-read-projection.ts";
 import type { SpeculativeActionEvent } from "../src/runtime.ts";
 import { createWorkspaceSandbox, type SpeculativeAgentSandbox } from "../src/workspace-sandbox.ts";
 
@@ -26,6 +28,13 @@ const readSchema = Type.Object({
 });
 
 type ReadTool = AgentTool<typeof readSchema, { source: string }>;
+
+interface ProjectionReadDetails {
+	readonly source: string;
+	readonly [READ_RANGE_COVERAGE_DETAILS_KEY]: ReadRangeCoverage;
+}
+
+type ProjectionReadTool = AgentTool<typeof readSchema, ProjectionReadDetails>;
 
 const writeSchema = Type.Object({ path: Type.String(), content: Type.String() });
 type WriteTool = AgentTool<typeof writeSchema, { target: string }>;
@@ -244,6 +253,63 @@ describe("Pi Agent speculative integration", () => {
 		const result = agent.state.messages.find((message) => message.role === "toolResult");
 		expect(result?.role === "toolResult" ? result.content : undefined).toEqual([
 			{ type: "text", text: "prefetched README" },
+		]);
+		await installed.uninstall();
+	});
+
+	it("projects a broad production read into the actor's exact narrow result", async () => {
+		let toolExecutions = 0;
+		const lines = Array.from({ length: 10 }, (_, index) => `line-${index + 1}`);
+		const tool: ProjectionReadTool = {
+			name: "read",
+			label: "Read",
+			description: "Read a file",
+			parameters: readSchema,
+			async execute() {
+				toolExecutions++;
+				return {
+					content: [{ type: "text", text: lines.join("\n") }],
+					details: {
+						source: "tool",
+						[READ_RANGE_COVERAGE_DETAILS_KEY]: {
+							kind: "text",
+							startLine: 1,
+							endLineExclusive: 11,
+							totalLines: 10,
+							lines,
+							maxLines: 2000,
+							maxBytes: 50 * 1024,
+							complete: true,
+						},
+					},
+				};
+			},
+		};
+		const streams = createStreamHarness({
+			actorDelayMs: 100,
+			draftOnlyFirst: true,
+			draftToolArgs: { path: "README.md", offset: 1, limit: 10 },
+			toolArgs: { path: "README.md", offset: 3, limit: 2 },
+		});
+		const agent = new Agent({ initialState: { model: createModel(), tools: [tool] }, streamFn: streams.stream });
+		const installed = installSpeculativeAction(agent, {
+			cwd: "/workspace",
+			getSettings: () => ({
+				enabled: true,
+				predictionTimeoutMs: 1000,
+				patternAware: { enabled: false },
+				tools: { liveReadonly: ["read"] },
+			}),
+			preflight: () => true,
+			projectionRules: [PI_READ_RANGE_PROJECTION_RULE],
+		});
+
+		await agent.prompt("Read lines 3-4 of README.md");
+
+		expect(toolExecutions).toBe(1);
+		const result = agent.state.messages.find((message) => message.role === "toolResult");
+		expect(result?.role === "toolResult" ? result.content : undefined).toEqual([
+			{ type: "text", text: "line-3\nline-4\n\n[6 more lines in file. Use offset=5 to continue.]" },
 		]);
 		await installed.uninstall();
 	});
