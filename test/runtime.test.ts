@@ -1,4 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
+import { READ_RANGE_ACTION_KEY_PROJECTOR } from "../src/action-key-projection.ts";
+import type { ProjectedActionKeyMatch } from "../src/common.ts";
 import { buildPiActionKey } from "../src/common.ts";
 import { PATTERN_AWARE_DEFAULTS } from "../src/pattern-aware.ts";
 import type {
@@ -53,7 +55,10 @@ interface HarnessOptions {
 		readonly consumeInput?: ConsumeInput;
 		readonly candidate: SpeculativeCandidate;
 	}) => Promise<boolean> | boolean;
-	readonly projectOutput?: (output: string) => Promise<string | undefined> | string | undefined;
+	readonly projectOutput?: (
+		output: string,
+		keyMatch: ProjectedActionKeyMatch,
+	) => Promise<string | undefined> | string | undefined;
 	readonly adopt?: (output: string) => Promise<string | undefined> | string | undefined;
 	readonly observerThrows?: boolean;
 }
@@ -118,7 +123,12 @@ function createHarness(options: HarnessOptions) {
 		...(options.isResourceExpired
 			? { isResourceExpired: (input) => options.isResourceExpired?.(input) ?? false }
 			: {}),
-		...(options.projectOutput ? { projectOutput: ({ output }) => options.projectOutput?.(output) } : {}),
+		...(options.projectOutput
+			? {
+					keyProjectors: [READ_RANGE_ACTION_KEY_PROJECTOR],
+					projectOutput: ({ output, keyMatch }) => options.projectOutput?.(output, keyMatch),
+				}
+			: {}),
 		...(options.adopt ? { adoptCandidate: ({ output }) => options.adopt?.(output) } : {}),
 		onEvent: (event) => {
 			events.push(event);
@@ -1013,11 +1023,36 @@ describe("speculative action runtime", () => {
 		expect(harness.events.filter((event) => event.type === "started")).toHaveLength(1);
 	});
 
+	it("registers one single-flight job when concurrent turns finish preflight together", async () => {
+		const releasePreflight = deferred<CandidatePreflight>();
+		let preflights = 0;
+		const harness = createHarness({
+			predict: () => prediction(readCandidate("shared-race.txt")),
+			preflight: async () => {
+				preflights++;
+				return releasePreflight.promise;
+			},
+		});
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-race-a" });
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-race-b" });
+		await waitFor(() => preflights === 2);
+		releasePreflight.resolve({ ok: true });
+		await waitFor(() => harness.runtime.inspect("session").pendingPredictions === 0);
+
+		expect(await harness.runtime.consume(consume("turn-race-b", { path: "shared-race.txt" }))).toBe("prefetched");
+		expect(harness.executions()).toBe(1);
+		expect(harness.events.filter((event) => event.type === "started")).toHaveLength(1);
+	});
+
 	it("reuses a containing read candidate from the same draft batch", async () => {
+		let projector: string | undefined;
 		const harness = createHarness({
 			predict: () => prediction(readCandidate("README.md", 1, 100), readCandidate("README.md", 1, 60)),
 			execute: () => "lines-1-100",
-			projectOutput: (output) => `projected:${output}`,
+			projectOutput: (output, keyMatch) => {
+				projector = keyMatch.projector;
+				return `projected:${output}`;
+			},
 		});
 		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-1" });
 		await waitFor(() => harness.runtime.inspect().pendingPredictions === 0);
@@ -1025,8 +1060,36 @@ describe("speculative action runtime", () => {
 		expect(await harness.runtime.consume(consume("turn-1", { path: "README.md", offset: 1, limit: 60 }))).toBe(
 			"projected:lines-1-100",
 		);
+		expect(projector).toBe("read.range");
 		expect(harness.executions()).toBe(1);
 		expect(harness.events.filter((event) => event.type === "started")).toHaveLength(1);
+	});
+
+	it("chooses the tightest cached read that contains the actor range", async () => {
+		const harness = createHarness({
+			predict: (input) => {
+				if (input.turnID === "turn-wide") return prediction(readCandidate("README.md", 1, 200));
+				if (input.turnID === "turn-tight") return prediction(readCandidate("README.md", 100, 110));
+				return prediction();
+			},
+			execute: (candidate) => {
+				const input = candidate.input as { offset: number; limit: number };
+				return `${input.offset}:${input.limit}`;
+			},
+			projectOutput: (output) => output,
+		});
+		for (const turnID of ["turn-wide", "turn-tight"]) {
+			await harness.runtime.startTurn({ sessionID: "session", turnID });
+			await waitFor(() => harness.runtime.inspect("session").pendingPredictions === 0);
+			await harness.runtime.finishTurn(consume(turnID, {}));
+		}
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-project" });
+		await waitFor(() => harness.runtime.inspect("session").pendingPredictions === 0);
+
+		expect(
+			await harness.runtime.consume(consume("turn-project", { path: "README.md", offset: 120, limit: 10 })),
+		).toBe("100:110");
+		expect(harness.executions()).toBe(2);
 	});
 
 	it("keeps containing reads separate when no safe projector is installed", async () => {

@@ -12,6 +12,7 @@
 - Added PatternAware online action-pattern learning with late-bound templates, future-gap leases, compact persistence, preparation hints, and utility-based resource scheduling.
 - Added gap-weighted and decayed PatternAware inference, suffix backoff, collection mappers, retryable persisted analyzers, multi-step frontiers, and adaptive drafter suppression.
 - Added watcher-backed resource versions with exact-validation fallback, eager invalidation, byte-bounded per-session caches, pooled Git workspaces, and phase-level runtime metrics.
+- Added an indexed per-session tool cache with atomic exact-key registration for cross-turn single-flight reuse.
 
 ### Changed
 
@@ -21,6 +22,7 @@
 - Renamed read-only execution telemetry and settings to `resource_cached`/`resourceCached`; the Agent installer still accepts legacy `liveReadonly` input.
 - Pattern-aware and drafter predictions now deduplicate onto shared jobs, learned actions can be admitted immediately after authoritative results, and in-flight work is preempted by explicit utility and per-session cache budgets.
 - Native sandbox protocol v3 now forwards the configured shell and requires an explicit process-isolation attestation; Linux recursively enforces read-only host mounts and readiness probes verify mount isolation.
+- K(a) remains a uniform canonical action key; registered projections now define non-exact equivalence, with π_read providing deterministic tightest-range reuse.
 
 ### Fixed
 

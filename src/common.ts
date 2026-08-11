@@ -2,6 +2,13 @@ import path from "node:path";
 
 export type SpeculativeExecution = "resource_cached" | "sandbox";
 
+export interface ReadActionRange {
+	readonly path: string;
+	readonly offset: number;
+	readonly limit: number;
+	readonly end: number;
+}
+
 export interface ActionKey {
 	readonly key: string;
 	readonly hash: string;
@@ -11,12 +18,32 @@ export interface ActionKey {
 	readonly execution: SpeculativeExecution;
 }
 
-export interface ReadActionRange {
-	readonly path: string;
-	readonly offset: number;
-	readonly limit: number;
-	readonly end: number;
+export interface ProjectedActionKey {
+	readonly action: ActionKey;
+	/** Information discarded by the projection; lower is a more specific match. */
+	readonly distance: number;
 }
+
+/** A partial projection π that can map one canonical K(a) into another. */
+export interface ActionKeyProjector {
+	readonly id: string;
+	/** Coarse cache partition; every pair accepted by project must return the same value. */
+	readonly partition: (action: ActionKey) => string | undefined;
+	readonly project: (speculative: ActionKey, actor: ActionKey) => ProjectedActionKey | undefined;
+}
+
+export interface ExactActionKeyMatch {
+	readonly kind: "exact";
+	readonly distance: 0;
+}
+
+export interface ProjectedActionKeyMatch {
+	readonly kind: "projected";
+	readonly distance: number;
+	readonly projector: string;
+}
+
+export type ActionKeyMatch = ExactActionKeyMatch | ProjectedActionKeyMatch;
 
 export interface DrafterToolDefinition {
 	readonly name: string;
@@ -211,27 +238,66 @@ export function buildPiActionKey(tool: string, input: unknown, cwd: string): Act
 	return undefined;
 }
 
-export function actionKeyMatches(speculative: ActionKey, actor: ActionKey): boolean {
-	return speculative.key === actor.key || actionKeyContains(speculative, actor);
+export function actionKeyMatches(
+	speculative: ActionKey,
+	actor: ActionKey,
+	projectors: readonly ActionKeyProjector[] = [],
+): boolean {
+	return actionKeyMatch(speculative, actor, projectors) !== undefined;
 }
 
-export function actionKeyContains(speculative: ActionKey, actor: ActionKey): boolean {
-	if (speculative.tool !== actor.tool) return false;
-	if (speculative.execution !== actor.execution) return false;
-	if (!sameResources(speculative.resources, actor.resources)) return false;
-	if (speculative.tool !== "read") return false;
-	const speculativeRange = readActionRange(speculative);
-	const actorRange = readActionRange(actor);
-	if (!speculativeRange || !actorRange) return false;
-	if (speculativeRange.path !== actorRange.path) return false;
-	return speculativeRange.offset <= actorRange.offset && speculativeRange.end >= actorRange.end;
+export function actionKeyProjects(
+	speculative: ActionKey,
+	actor: ActionKey,
+	projectors: readonly ActionKeyProjector[],
+): boolean {
+	return actionKeyMatch(speculative, actor, projectors)?.kind === "projected";
+}
+
+/** K(a_s) can satisfy K(a) exactly, or when some π maps K(a_s) to K(a). */
+export function actionKeyMatch(
+	speculative: ActionKey,
+	actor: ActionKey,
+	projectors: readonly ActionKeyProjector[] = [],
+): ActionKeyMatch | undefined {
+	if (speculative.key === actor.key) return { kind: "exact", distance: 0 };
+	let best: ActionKeyMatch | undefined;
+	for (const projector of projectors) {
+		let projected: ProjectedActionKey | undefined;
+		try {
+			projected = projector.project(speculative, actor);
+		} catch {
+			continue;
+		}
+		if (!projected || projected.action.key !== actor.key) continue;
+		if (!Number.isFinite(projected.distance) || projected.distance < 0) continue;
+		if (best && best.distance <= projected.distance) continue;
+		best = { kind: "projected", projector: projector.id, distance: projected.distance };
+	}
+	return best;
+}
+
+/** Projection partitions used only as a cache lookup optimization. */
+export function actionKeyProjectionPartitions(
+	action: ActionKey,
+	projectors: readonly ActionKeyProjector[],
+): readonly string[] {
+	const partitions = new Set<string>();
+	for (const projector of projectors) {
+		let partition: string | undefined;
+		try {
+			partition = projector.partition(action);
+		} catch {
+			continue;
+		}
+		if (partition !== undefined) partitions.add(JSON.stringify([projector.id, partition]));
+	}
+	return [...partitions];
 }
 
 export function readActionRange(action: ActionKey): ReadActionRange | undefined {
 	if (action.tool !== "read") return undefined;
-	const payload = actionKeyPayload(action);
-	if (!payload || payload.tool !== "read") return undefined;
-	const input = asRecord(payload.input);
+	const input = asRecord(action.input);
 	if (!input || typeof input.path !== "string") return undefined;
 	const offset = normalizeReadOffset(input.offset);
 	const limit = normalizeReadLimit(input.limit);
@@ -345,17 +411,4 @@ function fastHash(value: string): string {
 		hash = Math.imul(hash, 0x01000193);
 	}
 	return (hash >>> 0).toString(16).padStart(8, "0");
-}
-
-function actionKeyPayload(action: ActionKey): { readonly tool?: unknown; readonly input?: unknown } | undefined {
-	try {
-		return JSON.parse(action.key) as { readonly tool?: unknown; readonly input?: unknown };
-	} catch {
-		return undefined;
-	}
-}
-
-function sameResources(left: readonly string[], right: readonly string[]): boolean {
-	if (left.length !== right.length) return false;
-	return left.every((item, index) => item === right[index]);
 }

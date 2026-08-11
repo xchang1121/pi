@@ -11,7 +11,8 @@ import type {
 } from "@earendil-works/pi-agent-core";
 import type { Api, Context, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
 import { validateToolArguments } from "@earendil-works/pi-ai";
-import type { ActionKey } from "./common.ts";
+import { READ_RANGE_ACTION_KEY_PROJECTOR } from "./action-key-projection.ts";
+import type { ActionKey, ActionKeyProjector, ProjectedActionKeyMatch } from "./common.ts";
 import {
 	buildDrafterToolCallPrompt,
 	buildPiActionKey,
@@ -87,6 +88,7 @@ export interface SpeculativeAgentProjectionContext {
 	readonly action: ActionKey;
 	readonly candidate: SpeculativeCandidate;
 	readonly output: SettleToolCallResult;
+	readonly keyMatch: ProjectedActionKeyMatch;
 }
 
 export interface DraftOptionsContext {
@@ -112,7 +114,9 @@ export interface InstallSpeculativeActionOptions {
 	readonly preflight?: (
 		context: SpeculativeAgentPreflightContext,
 	) => boolean | CandidatePreflight | Promise<boolean | CandidatePreflight>;
-	/** Optional conservative projection for a containing read result. */
+	/** Optional Π used to determine whether one canonical action key projects to another. */
+	readonly keyProjectors?: readonly ActionKeyProjector[];
+	/** Optional output projection for a non-exact key match. */
 	readonly projectOutput?: (
 		context: SpeculativeAgentProjectionContext,
 	) => SettleToolCallResult | undefined | Promise<SettleToolCallResult | undefined>;
@@ -261,8 +265,10 @@ export function installSpeculativeAction(
 				action: ActionKey;
 				candidate: SpeculativeCandidate;
 				output: SettleToolCallResult;
+				keyMatch: ProjectedActionKeyMatch;
 			}): Promise<SettleToolCallResult | undefined> => options.projectOutput?.(input)
 		: undefined;
+	const keyProjectors = options.keyProjectors ?? (projection ? [READ_RANGE_ACTION_KEY_PROJECTOR] : []);
 
 	const runtime = makeSpeculativeActionRuntime<
 		string,
@@ -436,9 +442,11 @@ export function installSpeculativeAction(
 		isResourceExpired: ({ candidate }) => validateResourceVersion(candidate.resourceVersion),
 		watchResourceVersion: ({ candidate, onInvalidated }) =>
 			watchResourceVersion(candidate.resourceVersion, onInvalidated),
+		keyProjectors,
 		...(projection
 			? {
-					projectOutput: ({ action, candidate, output }) => projection({ action, candidate, output }),
+					projectOutput: ({ action, candidate, output, keyMatch }) =>
+						projection({ action, candidate, output, keyMatch }),
 				}
 			: {}),
 		adoptCandidate: async ({ action, candidate, output }) => {

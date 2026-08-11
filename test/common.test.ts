@@ -1,7 +1,12 @@
 import path from "node:path";
 import { describe, expect, it } from "vitest";
+import { READ_RANGE_ACTION_KEY_PROJECTOR } from "../src/action-key-projection.ts";
 import {
+	type ActionKeyProjector,
+	actionKeyMatch,
 	actionKeyMatches,
+	actionKeyProjectionPartitions,
+	buildActionKey,
 	buildDrafterToolCallPrompt,
 	buildPiActionKey,
 	clampCandidateLimit,
@@ -99,12 +104,89 @@ describe("speculative action common", () => {
 		expect(inferredExecution("edit")).toBe("sandbox");
 	});
 
+	it("defines equivalence through an injected projection without changing K(a)", () => {
+		const projector: ActionKeyProjector = {
+			id: "custom.subset",
+			partition: (action) =>
+				action.tool === "custom"
+					? JSON.stringify([action.execution, action.resources, action.input.namespace])
+					: undefined,
+			project: (speculative, actor) => {
+				const speculativeValues = Array.isArray(speculative.input.values) ? speculative.input.values : undefined;
+				const actorValues = Array.isArray(actor.input.values) ? actor.input.values : undefined;
+				if (!speculativeValues || !actorValues) return undefined;
+				if (!actorValues.every((value) => speculativeValues.includes(value))) return undefined;
+				return {
+					action: buildActionKey({
+						tool: speculative.tool,
+						execution: speculative.execution,
+						resources: speculative.resources,
+						input: { ...speculative.input, values: actorValues },
+					}),
+					distance: speculativeValues.length - actorValues.length,
+				};
+			},
+		};
+		const speculative = buildActionKey({
+			tool: "custom",
+			execution: "resource_cached",
+			resources: ["set"],
+			input: { namespace: "items", values: ["a", "b", "c"] },
+		});
+		const actor = buildActionKey({
+			tool: "custom",
+			execution: "resource_cached",
+			resources: ["set"],
+			input: { namespace: "items", values: ["b", "c"] },
+		});
+
+		expect(actionKeyMatch(speculative, actor, [projector])).toEqual({
+			kind: "projected",
+			projector: "custom.subset",
+			distance: 1,
+		});
+		const broken: ActionKeyProjector = {
+			id: "broken",
+			partition: () => {
+				throw new Error("partition failed");
+			},
+			project: () => {
+				throw new Error("projection failed");
+			},
+		};
+		expect(actionKeyMatch(speculative, actor, [broken])).toBeUndefined();
+		expect(actionKeyProjectionPartitions(speculative, [broken])).toEqual([]);
+	});
+
 	it("matches a containing speculative read but not an uncovered range", () => {
 		const speculative = buildPiActionKey("read", { path: "src/runtime.ts", offset: 100, limit: 160 }, "/workspace");
 		const contained = buildPiActionKey("read", { path: "src/runtime.ts", offset: 220, limit: 30 }, "/workspace");
 		const uncovered = buildPiActionKey("read", { path: "src/runtime.ts", offset: 80, limit: 30 }, "/workspace");
 
-		expect(speculative && contained ? actionKeyMatches(speculative, contained) : false).toBe(true);
-		expect(speculative && uncovered ? actionKeyMatches(speculative, uncovered) : true).toBe(false);
+		const projectors = [READ_RANGE_ACTION_KEY_PROJECTOR];
+		expect(speculative && contained ? actionKeyMatches(speculative, contained) : true).toBe(false);
+		expect(contained ? actionKeyMatches(contained, contained) : false).toBe(true);
+		expect(speculative && contained ? actionKeyMatches(speculative, contained, projectors) : false).toBe(true);
+		expect(speculative && uncovered ? actionKeyMatches(speculative, uncovered, projectors) : true).toBe(false);
+		expect(speculative && contained ? actionKeyMatch(speculative, contained, projectors) : undefined).toEqual({
+			kind: "projected",
+			projector: "read.range",
+			distance: 130,
+		});
+		expect(speculative && contained ? actionKeyProjectionPartitions(speculative, projectors) : undefined).toEqual(
+			contained ? actionKeyProjectionPartitions(contained, projectors) : undefined,
+		);
+		expect(
+			speculative && contained ? actionKeyMatches({ ...speculative, key: "opaque" }, contained, projectors) : false,
+		).toBe(true);
+		expect(
+			speculative && contained
+				? actionKeyMatches(
+						{ ...speculative, key: "opaque", input: { ...speculative.input, path: "other.ts" } },
+						contained,
+						projectors,
+					)
+				: true,
+		).toBe(false);
 	});
 });
