@@ -7,6 +7,7 @@ import {
 import type { ActionKey, ProjectedActionKeyMatch } from "../src/common.ts";
 import { ActionSemanticsRegistry, asRecord, buildPiActionKey, readActionRange } from "../src/common.ts";
 import { PATTERN_AWARE_DEFAULTS } from "../src/pattern-aware.ts";
+import type { PlanAction, PlanProposal } from "../src/plan-proposal.ts";
 import type {
 	CandidatePreflight,
 	SpeculativeActionEvent,
@@ -14,7 +15,6 @@ import type {
 	SpeculativeCandidate,
 	SpeculativeDraftCandidate,
 	SpeculativePlanSource,
-	SpeculativePrediction,
 } from "../src/runtime.ts";
 import { makeSpeculativeActionRuntime } from "../src/runtime.ts";
 
@@ -30,6 +30,18 @@ interface ConsumeInput extends StartInput {
 	readonly terminal?: boolean;
 }
 
+type HarnessPlanSource = SpeculativePlanSource<string, string, StartInput, ConsumeInput, { readonly cwd: string }>;
+
+interface TestDraftCandidate extends SpeculativeDraftCandidate {
+	readonly patternID?: string;
+	readonly patternContext?: unknown;
+}
+
+interface TestPrediction {
+	readonly candidates: readonly TestDraftCandidate[];
+	readonly draftTokens: number;
+}
+
 interface HarnessOptions {
 	readonly actionSemantics?: ActionSemanticsRegistry;
 	readonly settings?:
@@ -39,18 +51,9 @@ interface HarnessOptions {
 		input: StartInput,
 		signal: AbortSignal,
 		settings: SpeculativeActionSettings,
-	) => Promise<SpeculativePrediction> | SpeculativePrediction;
-	readonly sources?: readonly SpeculativePlanSource<
-		string,
-		string,
-		StartInput,
-		ConsumeInput,
-		{ readonly cwd: string }
-	>[];
-	readonly predictPatternAware?: (
-		input: StartInput,
-		signal: AbortSignal,
-	) => Promise<SpeculativePrediction> | SpeculativePrediction;
+	) => Promise<TestPrediction> | TestPrediction;
+	readonly sources?: readonly HarnessPlanSource[];
+	readonly patternPropose?: (input: StartInput, signal: AbortSignal) => Promise<TestPrediction> | TestPrediction;
 	readonly execute?: (candidate: SpeculativeDraftCandidate, signal: AbortSignal) => Promise<string> | string;
 	readonly preflight?: (
 		candidate: SpeculativeDraftCandidate,
@@ -80,12 +83,12 @@ interface HarnessOptions {
 	readonly captureProjectionCoverage?: (action: ActionKey, output: string) => unknown | undefined;
 	readonly rejectCandidateOutput?: (output: string) => string | undefined;
 	readonly adopt?: (output: string) => Promise<string | undefined> | string | undefined;
-	readonly recordAuthoritative?: () => Promise<SpeculativePrediction | undefined> | SpeculativePrediction | undefined;
-	readonly continuePatternAware?: (
+	readonly patternObserve?: () => Promise<TestPrediction | undefined> | TestPrediction | undefined;
+	readonly patternContinue?: (
 		parentConfirmed: boolean,
-	) => Promise<SpeculativePrediction | undefined> | SpeculativePrediction | undefined;
-	readonly onPatternResolved?: (outcome: string) => void;
-	readonly flushPatternStore?: () => Promise<void> | void;
+	) => Promise<TestPrediction | undefined> | TestPrediction | undefined;
+	readonly patternResolved?: (outcome: string) => void;
+	readonly patternFlush?: () => Promise<void> | void;
 	readonly candidateSizeBytes?: () => number;
 	readonly observerThrows?: boolean;
 }
@@ -127,6 +130,73 @@ function createHarness(options: HarnessOptions) {
 				},
 			]
 		: [];
+	const patternRevisions = new Map<string, number>();
+	let observedPatternPlans = 0;
+	const runtimeSources: HarnessPlanSource[] = [...(options.sources ?? [])];
+	if (
+		options.patternPropose ||
+		options.patternObserve ||
+		options.patternContinue ||
+		options.patternResolved ||
+		options.patternFlush
+	) {
+		runtimeSources.push({
+			id: "pattern_aware",
+			enabled: (settings) => settings.patternAware?.enabled ?? false,
+			multiStepEnabled: (settings) => settings.patternAware?.multiStepEnabled ?? true,
+			propose: async ({ startInput, signal }) => {
+				const proposalID = `test:pattern:${startInput.sessionID}:${startInput.turnID}`;
+				patternRevisions.set(proposalID, 0);
+				return testPlan(
+					proposalID,
+					"pattern_aware",
+					(await options.patternPropose?.(startInput, signal)) ?? prediction(),
+				);
+			},
+			continue: options.patternContinue
+				? async ({ proposalID, actionID, parentConfirmed }) => {
+						const predicted = await options.patternContinue?.(parentConfirmed);
+						if (!predicted?.candidates.length) return undefined;
+						const revision = (patternRevisions.get(proposalID) ?? 0) + 1;
+						patternRevisions.set(proposalID, revision);
+						return {
+							proposalID,
+							source: "pattern_aware",
+							revision,
+							upsert: testPlanActions(predicted.candidates, [{ actionID, condition: "adopted" }]),
+							draftTokens: predicted.draftTokens,
+						};
+					}
+				: undefined,
+			observe: options.patternObserve
+				? async ({ consumeInput, order }) => {
+						const predicted = await options.patternObserve?.();
+						if (!predicted?.candidates.length) return undefined;
+						return testPlan(
+							`test:pattern:observed:${consumeInput.sessionID}:${consumeInput.turnID}:${order}:${observedPatternPlans++}`,
+							"pattern_aware",
+							predicted,
+						);
+					}
+				: undefined,
+			onResolved: options.patternResolved
+				? ({ outcome }) => {
+						options.patternResolved?.(outcome);
+					}
+				: undefined,
+			flush: options.patternFlush,
+		});
+	}
+	runtimeSources.push({
+		id: "drafter",
+		enabled: (settings) => settings.drafterEnabled ?? true,
+		adaptive: true,
+		timeoutMs: (settings) => settings.predictionTimeoutMs,
+		propose: async ({ startInput, settings, signal }) => {
+			const predicted = await options.predict(startInput, signal, settings);
+			return testPlan(`test:drafter:${startInput.sessionID}:${startInput.turnID}`, "drafter", predicted);
+		},
+	});
 	const runtime = makeSpeculativeActionRuntime<
 		string,
 		string,
@@ -136,7 +206,7 @@ function createHarness(options: HarnessOptions) {
 		{ readonly cwd: string }
 	>({
 		...(options.actionSemantics ? { actionSemantics: options.actionSemantics } : {}),
-		...(options.sources ? { sources: options.sources } : {}),
+		sources: runtimeSources,
 		settings: () =>
 			typeof options.settings === "function" ? options.settings() : (options.settings ?? enabledSettings),
 		definitions: () => [
@@ -148,18 +218,6 @@ function createHarness(options: HarnessOptions) {
 			{ name: "write", description: "Write a file" },
 		],
 		stateData: () => ({ cwd: "/workspace" }),
-		predict: (input, settings, _definitions, _candidateNames, signal) => options.predict(input, signal, settings),
-		...(options.predictPatternAware
-			? {
-					predictPatternAware: (
-						input: StartInput,
-						_settings: unknown,
-						_definitions: unknown,
-						_names: unknown,
-						signal: AbortSignal,
-					) => options.predictPatternAware?.(input, signal) ?? prediction(),
-				}
-			: {}),
 		actionKey: (tool, input, context) =>
 			options.actionKey?.(tool, input, context) ?? buildPiActionKey(tool, input, "/workspace"),
 		actual: (input) => ({ id: input.id, tool: input.tool, input: input.input }),
@@ -188,14 +246,6 @@ function createHarness(options: HarnessOptions) {
 			? { rejectCandidateOutput: ({ output }) => options.rejectCandidateOutput?.(output) }
 			: {}),
 		...(options.adopt ? { adoptCandidate: ({ output }) => options.adopt?.(output) } : {}),
-		...(options.recordAuthoritative ? { recordAuthoritative: () => options.recordAuthoritative?.() } : {}),
-		...(options.continuePatternAware
-			? { continuePatternAware: ({ parentConfirmed }) => options.continuePatternAware?.(parentConfirmed) }
-			: {}),
-		...(options.onPatternResolved
-			? { onPatternResolved: (_patternID, outcome) => options.onPatternResolved?.(outcome) }
-			: {}),
-		...(options.flushPatternStore ? { flushPatternStore: () => options.flushPatternStore?.() } : {}),
 		...(options.candidateSizeBytes ? { candidateSizeBytes: () => options.candidateSizeBytes?.() ?? 0 } : {}),
 		onEvent: (event) => {
 			events.push(event);
@@ -205,8 +255,6 @@ function createHarness(options: HarnessOptions) {
 	return { runtime, events, executions: () => executions };
 }
 
-type HarnessPlanSource = NonNullable<HarnessOptions["sources"]>[number];
-
 function readCandidate(path = "README.md", offset?: number, limit?: number): SpeculativeDraftCandidate {
 	return { type: "tool_call", tool: "read", input: { path, offset, limit } };
 }
@@ -215,8 +263,46 @@ function bashCandidate(command: string): SpeculativeDraftCandidate {
 	return { type: "tool_call", tool: "bash", input: { command } };
 }
 
-function prediction(...candidates: SpeculativeDraftCandidate[]): SpeculativePrediction {
+function prediction(...candidates: TestDraftCandidate[]): TestPrediction {
 	return { candidates, draftTokens: 11 };
+}
+
+function testPlan(id: string, source: string, predicted: TestPrediction): PlanProposal {
+	return {
+		id,
+		source,
+		revision: 0,
+		actions: testPlanActions(predicted.candidates),
+		draftTokens: predicted.draftTokens,
+	};
+}
+
+function testPlanActions(
+	candidates: readonly TestDraftCandidate[],
+	dependsOn?: PlanAction["dependsOn"],
+): readonly PlanAction[] {
+	return candidates.map((candidate, index) => ({
+		id: `${candidate.patternID ?? "action"}:${index}`,
+		type: candidate.type,
+		tool: candidate.tool,
+		input: candidate.input,
+		...(candidate.missing ? { missing: candidate.missing } : {}),
+		...(candidate.execution ? { execution: candidate.execution } : {}),
+		...(candidate.diagnostic ? { diagnostic: candidate.diagnostic } : {}),
+		...(candidate.horizon !== undefined ? { horizon: candidate.horizon } : {}),
+		...(candidate.empiricalProbability !== undefined ? { empiricalProbability: candidate.empiricalProbability } : {}),
+		...(candidate.conditionalProbability !== undefined
+			? { conditionalProbability: candidate.conditionalProbability }
+			: {}),
+		...(candidate.expectedDurationMs !== undefined ? { expectedDurationMs: candidate.expectedDurationMs } : {}),
+		...(candidate.expectedLatencyBenefitMs !== undefined
+			? { expectedLatencyBenefitMs: candidate.expectedLatencyBenefitMs }
+			: {}),
+		...(candidate.resourceDemand !== undefined ? { resourceDemand: candidate.resourceDemand } : {}),
+		...(candidate.depth !== undefined ? { depth: candidate.depth } : {}),
+		...(dependsOn?.length ? { dependsOn } : candidate.dependsOn?.length ? { dependsOn: candidate.dependsOn } : {}),
+		feedback: candidate,
+	}));
 }
 
 function consume(turnID: string, input: Record<string, unknown> = { path: "README.md" }): ConsumeInput {
@@ -1005,7 +1091,7 @@ describe("speculative action runtime", () => {
 				patternAware: { ...PATTERN_AWARE_DEFAULTS, enabled: true },
 				tools: { resourceCached: ["read"], sandbox: ["bash"] },
 			},
-			predictPatternAware: () =>
+			patternPropose: () =>
 				prediction({
 					type: "preparation_hint",
 					tool: "bash",
@@ -1041,7 +1127,7 @@ describe("speculative action runtime", () => {
 				patternAware: { ...PATTERN_AWARE_DEFAULTS, enabled: true },
 				tools: { resourceCached: ["read"], sandbox: ["bash"] },
 			},
-			predictPatternAware: () =>
+			patternPropose: () =>
 				prediction({
 					type: "preparation_hint",
 					tool: "bash",
@@ -1146,7 +1232,7 @@ describe("speculative action runtime", () => {
 				patternAware: { ...PATTERN_AWARE_DEFAULTS, enabled: true },
 			},
 			predict: () => prediction(),
-			predictPatternAware: () =>
+			patternPropose: () =>
 				prediction({
 					type: "tool_call",
 					tool: "bash",
@@ -1265,7 +1351,7 @@ describe("speculative action runtime", () => {
 					drafterCalls++;
 					return prediction();
 				},
-				predictPatternAware: () =>
+				patternPropose: () =>
 					prediction({
 						type: "tool_call",
 						tool: "read",
@@ -1295,7 +1381,7 @@ describe("speculative action runtime", () => {
 				drafterCalls++;
 				return prediction(readCandidate("drafter.txt"));
 			},
-			predictPatternAware: () =>
+			patternPropose: () =>
 				prediction({
 					type: "tool_call",
 					tool: "read",
@@ -1347,7 +1433,7 @@ describe("speculative action runtime", () => {
 			predict: (input, signal) => {
 				if (input.turnID !== "turn-predicting") return prediction(readCandidate("running.txt"));
 				predictionStarted.resolve(undefined);
-				return new Promise<SpeculativePrediction>((_resolve, reject) => {
+				return new Promise<TestPrediction>((_resolve, reject) => {
 					signal.addEventListener(
 						"abort",
 						() => {
@@ -1439,7 +1525,7 @@ describe("speculative action runtime", () => {
 				maxConcurrentActions: 4,
 				patternAware: { ...PATTERN_AWARE_DEFAULTS, enabled: true },
 			},
-			predictPatternAware: () =>
+			patternPropose: () =>
 				prediction({
 					...readCandidate("pattern.txt"),
 					source: "pattern_aware",
@@ -1468,7 +1554,7 @@ describe("speculative action runtime", () => {
 				maxConcurrentActions: 2,
 				patternAware: { ...PATTERN_AWARE_DEFAULTS, enabled: true },
 			},
-			predictPatternAware: () =>
+			patternPropose: () =>
 				prediction({
 					...readCandidate("pattern.txt"),
 					source: "pattern_aware",
@@ -1512,7 +1598,7 @@ describe("speculative action runtime", () => {
 				maxConcurrentActions: 3,
 				patternAware: { ...PATTERN_AWARE_DEFAULTS, enabled: true },
 			},
-			predictPatternAware: () =>
+			patternPropose: () =>
 				prediction({
 					...readCandidate("pattern.txt"),
 					source: "pattern_aware",
@@ -1546,7 +1632,7 @@ describe("speculative action runtime", () => {
 				patternAware: { ...PATTERN_AWARE_DEFAULTS, enabled: true },
 				tools: { resourceCached: ["read"], sandbox: ["bash"] },
 			},
-			predictPatternAware: (input) =>
+			patternPropose: (input) =>
 				input.turnID === "turn-lead-seed"
 					? prediction({
 							...bashCandidate("seed"),
@@ -1862,7 +1948,7 @@ describe("speculative action runtime", () => {
 	});
 
 	it("never blocks the actor or starts a late drafter candidate after the actor call", async () => {
-		const draft = deferred<SpeculativePrediction>();
+		const draft = deferred<TestPrediction>();
 		const harness = createHarness({ predict: () => draft.promise });
 		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-1" });
 		const startedAt = Date.now();
@@ -1901,7 +1987,7 @@ describe("speculative action runtime", () => {
 		const settings = { ...enabledSettings, predictionTimeoutMs: 20 };
 		const harness = createHarness({
 			settings,
-			predict: () => new Promise<SpeculativePrediction>(() => {}),
+			predict: () => new Promise<TestPrediction>(() => {}),
 		});
 		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-1" });
 
@@ -2837,7 +2923,7 @@ describe("speculative action runtime", () => {
 	});
 
 	it("drops late PatternAware hints after a terminal turn finishes", async () => {
-		const late = deferred<SpeculativePrediction>();
+		const late = deferred<TestPrediction>();
 		let preparations = 0;
 		const harness = createHarness({
 			settings: {
@@ -2846,7 +2932,7 @@ describe("speculative action runtime", () => {
 				patternAware: PATTERN_AWARE_DEFAULTS,
 			},
 			predict: () => prediction(),
-			predictPatternAware: () => late.promise,
+			patternPropose: () => late.promise,
 			prepare: () => {
 				preparations++;
 			},
@@ -2888,14 +2974,14 @@ describe("speculative action runtime", () => {
 				tools: { resourceCached: ["read"], sandbox: ["bash"] },
 			},
 			predict: () => prediction(),
-			predictPatternAware: () =>
+			patternPropose: () =>
 				prediction({
 					...bashCandidate("printf ready"),
 					patternID: "carried-bash",
 					horizon: 0,
 				}),
-			onPatternResolved: (outcome) => resolutions.push(outcome),
-			flushPatternStore: () => {
+			patternResolved: (outcome) => resolutions.push(outcome),
+			patternFlush: () => {
 				flushes++;
 			},
 		});
@@ -2924,7 +3010,7 @@ describe("speculative action runtime", () => {
 		const harness = createHarness({
 			settings: { ...enabledSettings, patternAware: PATTERN_AWARE_DEFAULTS },
 			predict: () => prediction(readCandidate("README.md")),
-			recordAuthoritative: () => {
+			patternObserve: () => {
 				throw new Error("analyzer failed");
 			},
 		});
@@ -2946,9 +3032,8 @@ describe("speculative action runtime", () => {
 				patternAware: PATTERN_AWARE_DEFAULTS,
 			},
 			predict: () => prediction(),
-			predictPatternAware: () =>
-				prediction({ ...readCandidate("parent.ts"), patternID: "parent-pattern", horizon: 1 }),
-			continuePatternAware: (parentConfirmed) => {
+			patternPropose: () => prediction({ ...readCandidate("parent.ts"), patternID: "parent-pattern", horizon: 1 }),
+			patternContinue: (parentConfirmed) => {
 				confirmations.push(parentConfirmed);
 				return parentConfirmed
 					? prediction({ ...readCandidate("explode.ts"), patternID: "child-pattern", horizon: 0 })
@@ -3085,15 +3170,26 @@ describe("speculative action runtime", () => {
 			settings: () => ({ ...enabledSettings, patternAware: PATTERN_AWARE_DEFAULTS }),
 			definitions: () => [{ name: "read" }],
 			stateData: () => ({ cwd: "." }),
-			predict: () => prediction(),
+			sources: [
+				{
+					id: "observer",
+					enabled: () => true,
+					propose: ({ startInput }) => ({
+						id: `observer:${startInput.turnID}`,
+						source: "observer",
+						revision: 0,
+						actions: [],
+					}),
+					observe: ({ consumeInput, order }) => {
+						observed.push({ id: consumeInput.id, order });
+						return undefined;
+					},
+				},
+			],
 			actionKey: (tool, input) => buildPiActionKey(tool, input, "/workspace"),
 			actual: (input) => ({ id: input.id, tool: input.tool, input: input.input }),
 			preflightCandidate: () => ({ ok: true }),
 			executeCandidate: () => "unused",
-			recordAuthoritative: ({ consumeInput, order }) => {
-				observed.push({ id: consumeInput.id, order });
-				return prediction();
-			},
 		});
 
 		await runtime.startTurn({ sessionID: "session", turnID: "turn" });

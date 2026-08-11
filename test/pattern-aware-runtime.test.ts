@@ -1,11 +1,14 @@
 import { describe, expect, it } from "vitest";
 import { buildActionKey } from "../src/common.ts";
 import { PATTERN_AWARE_DEFAULTS } from "../src/pattern-aware.ts";
+import type { PlanAction, PlanProposal } from "../src/plan-proposal.ts";
 import type {
+	PlanActionResolution,
 	SpeculativeActionEvent,
 	SpeculativeActionRuntimeAdapter,
 	SpeculativeActionSettings,
 	SpeculativeDraftCandidate,
+	SpeculativePlanSource,
 } from "../src/runtime.ts";
 import { makeSpeculativeActionRuntime } from "../src/runtime.ts";
 
@@ -21,6 +24,54 @@ interface Consume extends Start {
 }
 
 type Adapter = SpeculativeActionRuntimeAdapter<string, string, Start, Consume, { readonly cwd: string }>;
+type PlanSource = SpeculativePlanSource<string, string, Start, Consume, { readonly cwd: string }>;
+type SourceContinueInput = Parameters<NonNullable<PlanSource["continue"]>>[0];
+type SourceObserveInput = Parameters<NonNullable<PlanSource["observe"]>>[0];
+
+interface TestDraftCandidate extends SpeculativeDraftCandidate {
+	readonly patternID?: string;
+	readonly patternContext?: unknown;
+}
+
+interface TestPrediction {
+	readonly candidates: readonly TestDraftCandidate[];
+	readonly draftTokens: number;
+}
+
+interface PatternRuntimeTestHooks {
+	readonly draftPropose?: (
+		input: Start,
+		settings: SpeculativeActionSettings,
+		definitions: readonly { readonly name: string }[],
+		candidateNames: readonly string[],
+		signal: AbortSignal,
+	) => TestPrediction | Promise<TestPrediction>;
+	readonly patternPropose?: (
+		input: Start,
+		settings: SpeculativeActionSettings,
+		definitions: readonly { readonly name: string }[],
+		candidateNames: readonly string[],
+		signal: AbortSignal,
+	) => TestPrediction | Promise<TestPrediction>;
+	readonly patternContinue?: (
+		input: SourceContinueInput & {
+			readonly patternID: string;
+			readonly patternContext: unknown;
+		},
+	) => TestPrediction | Promise<TestPrediction | undefined> | undefined;
+	readonly patternObserve?: (
+		input: SourceObserveInput,
+	) => TestPrediction | Promise<TestPrediction | undefined> | undefined;
+	readonly patternLaunched?: (patternID: string, context?: unknown) => void | Promise<void>;
+	readonly patternResolved?: (
+		patternID: string,
+		outcome: PlanActionResolution,
+		context?: unknown,
+	) => void | Promise<void>;
+	readonly patternFlush?: () => void | Promise<void>;
+}
+
+type AdapterOverrides = Partial<Adapter> & PatternRuntimeTestHooks;
 
 describe("PatternAware runtime integration", () => {
 	it("keeps a future candidate across an unrelated action and provider turn", async () => {
@@ -28,7 +79,7 @@ describe("PatternAware runtime integration", () => {
 		const outcomes: string[] = [];
 		const runtime = makeSpeculativeActionRuntime(
 			adapter({
-				predictPatternAware: (input) => ({
+				patternPropose: (input) => ({
 					candidates:
 						input.turnID === "turn_1" ? [patternCandidate("read", { path: "README.md" }, "read", 1)] : [],
 					draftTokens: 0,
@@ -37,7 +88,7 @@ describe("PatternAware runtime integration", () => {
 					executions++;
 					return "prefetched";
 				},
-				onPatternResolved: (id, outcome) => {
+				patternResolved: (id, outcome) => {
 					outcomes.push(`${id}:${outcome}`);
 				},
 			}),
@@ -63,11 +114,11 @@ describe("PatternAware runtime integration", () => {
 		const events: SpeculativeActionEvent<string>[] = [];
 		const runtime = makeSpeculativeActionRuntime(
 			adapter({
-				predictPatternAware: () => ({
+				patternPropose: () => ({
 					candidates: [patternCandidate("bash", { command: "npm test" }, "bash", 0)],
 					draftTokens: 0,
 				}),
-				onPatternResolved: (id, outcome) => {
+				patternResolved: (id, outcome) => {
 					outcomes.push(`${id}:${outcome}`);
 				},
 				onEvent: (event) => {
@@ -92,7 +143,7 @@ describe("PatternAware runtime integration", () => {
 		let aborted = 0;
 		const runtime = makeSpeculativeActionRuntime(
 			adapter({
-				predictPatternAware: () => ({
+				patternPropose: () => ({
 					candidates: [patternCandidate("bash", { command: "npm test" }, "terminal", 8)],
 					draftTokens: 0,
 				}),
@@ -107,7 +158,7 @@ describe("PatternAware runtime integration", () => {
 							{ once: true },
 						);
 					}),
-				onPatternResolved: (id, outcome) => {
+				patternResolved: (id, outcome) => {
 					outcomes.push(`${id}:${outcome}`);
 				},
 				onEvent: (event) => {
@@ -135,7 +186,7 @@ describe("PatternAware runtime integration", () => {
 		});
 		const runtime = makeSpeculativeActionRuntime(
 			adapter({
-				flushPatternStore: async () => {
+				patternFlush: async () => {
 					flushStarted = true;
 					await flushGate;
 					flushFinished = true;
@@ -158,7 +209,7 @@ describe("PatternAware runtime integration", () => {
 		let executions = 0;
 		const runtime = makeSpeculativeActionRuntime(
 			adapter({
-				predictPatternAware: (input) => ({
+				patternPropose: (input) => ({
 					candidates:
 						input.turnID === "turn_1" ? [patternCandidate("read", { path: "README.md" }, "cached", 0)] : [],
 					draftTokens: 0,
@@ -167,7 +218,7 @@ describe("PatternAware runtime integration", () => {
 					executions++;
 					return "cached";
 				},
-				onPatternResolved: (id, outcome) => {
+				patternResolved: (id, outcome) => {
 					outcomes.push(`${id}:${outcome}`);
 				},
 			}),
@@ -190,11 +241,11 @@ describe("PatternAware runtime integration", () => {
 		const events: SpeculativeActionEvent<string>[] = [];
 		const runtime = makeSpeculativeActionRuntime(
 			adapter({
-				predictPatternAware: () => ({
+				patternPropose: () => ({
 					candidates: [patternCandidate("read", { path: "README.md" }, "shared", 0)],
 					draftTokens: 0,
 				}),
-				predict: () => ({
+				draftPropose: () => ({
 					candidates: [{ type: "tool_call", tool: "read", input: { path: "README.md" } }],
 					draftTokens: 3,
 				}),
@@ -202,7 +253,7 @@ describe("PatternAware runtime integration", () => {
 					executions++;
 					return "one";
 				},
-				onPatternLaunched: () => {
+				patternLaunched: () => {
 					launches++;
 				},
 				onEvent: (event) => {
@@ -229,17 +280,17 @@ describe("PatternAware runtime integration", () => {
 		const lifecycle: string[] = [];
 		const runtime = makeSpeculativeActionRuntime(
 			adapter({
-				predictPatternAware: () => ({
+				patternPropose: () => ({
 					candidates: [patternCandidate("read", { path: "README.md" }, "terminal-pattern", 8)],
 					draftTokens: 0,
 				}),
 				onTurnFinished: () => {
 					lifecycle.push("turn_finished");
 				},
-				onPatternResolved: (_id, outcome) => {
+				patternResolved: (_id, outcome) => {
 					lifecycle.push(`resolved:${outcome}`);
 				},
-				flushPatternStore: () => {
+				patternFlush: () => {
 					lifecycle.push(`flush_after:${lifecycle.at(-1)}`);
 				},
 			}),
@@ -260,17 +311,17 @@ describe("PatternAware runtime integration", () => {
 		const resolved: Array<{ context: unknown; outcome: string }> = [];
 		const runtime = makeSpeculativeActionRuntime(
 			adapter({
-				predictPatternAware: () => ({
+				patternPropose: () => ({
 					candidates: [
 						{ ...patternCandidate("read", { path: "a.ts" }, "first", 0), patternContext: first },
 						{ ...patternCandidate("read", { path: "b.ts" }, "second", 0), patternContext: second },
 					],
 					draftTokens: 0,
 				}),
-				onPatternLaunched: (_id, context) => {
+				patternLaunched: (_id, context) => {
 					launched.push(context);
 				},
-				onPatternResolved: (_id, outcome, context) => {
+				patternResolved: (_id, outcome, context) => {
 					resolved.push({ context, outcome });
 				},
 			}),
@@ -292,7 +343,7 @@ describe("PatternAware runtime integration", () => {
 		let executions = 0;
 		const runtime = makeSpeculativeActionRuntime(
 			adapter({
-				recordAuthoritative: ({ tool, output }) =>
+				patternObserve: ({ tool, output }) =>
 					tool === "grep" && output === "src/a.ts"
 						? { candidates: [patternCandidate("read", { path: "src/a.ts" }, "grep-read", 0)], draftTokens: 0 }
 						: undefined,
@@ -321,7 +372,7 @@ describe("PatternAware runtime integration", () => {
 		const runtime = makeSpeculativeActionRuntime(
 			adapter({
 				settings: () => ({ ...settings(), candidateLimit: 2, maxConcurrentActions: 2 }),
-				predict: (input) => ({
+				draftPropose: (input) => ({
 					candidates:
 						input.turnID === "turn_1"
 							? [
@@ -331,7 +382,7 @@ describe("PatternAware runtime integration", () => {
 							: [],
 					draftTokens: 0,
 				}),
-				recordAuthoritative: ({ tool, concrete }) =>
+				patternObserve: ({ tool, concrete }) =>
 					tool === "bash" && concrete.command === "first"
 						? { candidates: [patternCandidate("bash", { command: "second" }, "second", 1)], draftTokens: 0 }
 						: undefined,
@@ -339,7 +390,7 @@ describe("PatternAware runtime integration", () => {
 					executions++;
 					return String(concrete.command);
 				},
-				onPatternResolved: (id, outcome) => {
+				patternResolved: (id, outcome) => {
 					outcomes.push(`${id}:${outcome}`);
 				},
 			}),
@@ -363,7 +414,7 @@ describe("PatternAware runtime integration", () => {
 		const runtime = makeSpeculativeActionRuntime(
 			adapter({
 				settings: () => ({ ...settings(), candidateLimit: 1, maxConcurrentActions: 1 }),
-				predict: (input) => ({
+				draftPropose: (input) => ({
 					candidates:
 						input.turnID === "turn_1"
 							? [scheduledCandidate("a.ts", 10)]
@@ -412,7 +463,7 @@ describe("PatternAware runtime integration", () => {
 					candidateLimit: 1,
 					maxConcurrentActions: 1,
 				}),
-				predictPatternAware: (input) => ({
+				patternPropose: (input) => ({
 					candidates:
 						input.turnID === "turn_1"
 							? [
@@ -437,7 +488,7 @@ describe("PatternAware runtime integration", () => {
 				}),
 				executeCandidate: ({ concrete }) =>
 					concrete.path === "a.ts" ? new Promise<string>(() => {}) : "higher utility",
-				onPatternResolved: (id, outcome) => {
+				patternResolved: (id, outcome) => {
 					outcomes.push(`${id}:${outcome}`);
 				},
 			}),
@@ -464,7 +515,7 @@ describe("PatternAware runtime integration", () => {
 					maxConcurrentActions: 2,
 					resourceCacheMaxEntries: 1,
 				}),
-				predict: (input) => ({
+				draftPropose: (input) => ({
 					candidates:
 						input.turnID === "turn_1"
 							? [scheduledCandidate("a.ts", 10)]
@@ -513,7 +564,7 @@ describe("PatternAware runtime integration", () => {
 		const runtime = makeSpeculativeActionRuntime(
 			adapter({
 				settings: () => ({ ...settings(), candidateLimit: 2, maxConcurrentActions: 2 }),
-				predictPatternAware: () => ({
+				patternPropose: () => ({
 					candidates: [
 						preparationHint("a.ts"),
 						preparationHint("a.ts"),
@@ -544,7 +595,7 @@ describe("PatternAware runtime integration", () => {
 		let executions = 0;
 		const runtime = makeSpeculativeActionRuntime(
 			adapter({
-				predictPatternAware: () => ({
+				patternPropose: () => ({
 					candidates: [patternCandidate("read", { path: "src/a.ts" }, "parent", 0)],
 					draftTokens: 0,
 				}),
@@ -552,7 +603,7 @@ describe("PatternAware runtime integration", () => {
 					executions++;
 					return "file";
 				},
-				continuePatternAware: ({ patternID }) => {
+				patternContinue: ({ patternID }) => {
 					continuations.push(patternID);
 					return patternID === "parent"
 						? {
@@ -586,7 +637,7 @@ describe("PatternAware runtime integration", () => {
 					...settings(),
 					patternAware: { ...PATTERN_AWARE_DEFAULTS, multiStepEnabled: false },
 				}),
-				predictPatternAware: () => ({
+				patternPropose: () => ({
 					candidates: [
 						patternCandidate("read", { path: "immediate.ts" }, "immediate", 0),
 						patternCandidate("read", { path: "future.ts" }, "future", 1),
@@ -601,7 +652,7 @@ describe("PatternAware runtime integration", () => {
 					executed.push(String(concrete.path));
 					return "immediate";
 				},
-				continuePatternAware: () => {
+				patternContinue: () => {
 					continuations++;
 					return undefined;
 				},
@@ -622,7 +673,7 @@ describe("PatternAware runtime integration", () => {
 		const executed: string[] = [];
 		const runtime = makeSpeculativeActionRuntime(
 			adapter({
-				predictPatternAware: () => ({
+				patternPropose: () => ({
 					candidates: [
 						{ ...patternCandidate("read", { path: "src/a.ts" }, "read", 0), patternContext: { step: 1 } },
 					],
@@ -632,7 +683,7 @@ describe("PatternAware runtime integration", () => {
 					executed.push(tool);
 					return tool === "read" ? "structured-read" : "test-output";
 				},
-				continuePatternAware: ({ candidate, output, parentConfirmed }) => {
+				patternContinue: ({ candidate, output, parentConfirmed }) => {
 					if (candidate.key.tool !== "read") return undefined;
 					expect(output).toBe("structured-read");
 					expect(parentConfirmed).toBe(false);
@@ -664,7 +715,7 @@ describe("PatternAware runtime integration", () => {
 		const runtime = makeSpeculativeActionRuntime(
 			adapter({
 				settings: () => ({ ...settings(), predictionTimeoutMs: 5_000 }),
-				predictPatternAware: () => ({
+				patternPropose: () => ({
 					candidates:
 						predictions++ === 0 ? [confidenceCandidate("parent.ts", "parent", 0.25, { confidence: 0.25 })] : [],
 					draftTokens: 0,
@@ -674,7 +725,7 @@ describe("PatternAware runtime integration", () => {
 					executions.set(path, (executions.get(path) ?? 0) + 1);
 					return `${path}:output`;
 				},
-				continuePatternAware: ({ candidate, patternContext, parentConfirmed }) => {
+				patternContinue: ({ candidate, patternContext, parentConfirmed }) => {
 					const path = String(candidate.input.path);
 					const confidence = (patternContext as { confidence?: number } | undefined)?.confidence;
 					continuations.push(`${path}:${parentConfirmed}:${candidate.empiricalProbability}:${confidence}`);
@@ -694,7 +745,7 @@ describe("PatternAware runtime integration", () => {
 					}
 					return undefined;
 				},
-				onPatternLaunched: (patternID) => {
+				patternLaunched: (patternID) => {
 					launches.push(patternID);
 				},
 			}),
@@ -745,7 +796,7 @@ describe("PatternAware runtime integration", () => {
 					maxConcurrentActions: 1,
 					predictionTimeoutMs: 5_000,
 				}),
-				predictPatternAware: () => ({
+				patternPropose: () => ({
 					candidates: predictions++ === 0 ? [confidenceCandidate("parent.ts", "parent", 0.5)] : [],
 					draftTokens: 0,
 				}),
@@ -754,7 +805,7 @@ describe("PatternAware runtime integration", () => {
 					executions.push(path);
 					return `${path}:output`;
 				},
-				continuePatternAware: ({ candidate, parentConfirmed }) => {
+				patternContinue: ({ candidate, parentConfirmed }) => {
 					if (candidate.input.path !== "parent.ts") return undefined;
 					parentConfirmations.push(parentConfirmed);
 					return {
@@ -768,7 +819,7 @@ describe("PatternAware runtime integration", () => {
 						draftTokens: 0,
 					};
 				},
-				onPatternLaunched: (patternID) => {
+				patternLaunched: (patternID) => {
 					launches.push(patternID);
 				},
 				onEvent: (event) => {
@@ -806,7 +857,7 @@ describe("PatternAware runtime integration", () => {
 		let predictions = 0;
 		const runtime = makeSpeculativeActionRuntime(
 			adapter({
-				predictPatternAware: () => ({
+				patternPropose: () => ({
 					candidates: predictions++ === 0 ? [confidenceCandidate("parent.ts", "parent", 0.4)] : [],
 					draftTokens: 0,
 				}),
@@ -815,7 +866,7 @@ describe("PatternAware runtime integration", () => {
 					executions.push(path);
 					return path === "parent.ts" ? parentOutput : "child-output";
 				},
-				continuePatternAware: ({ candidate, parentConfirmed }) => {
+				patternContinue: ({ candidate, parentConfirmed }) => {
 					if (candidate.input.path !== "parent.ts") return undefined;
 					parentConfirmations.push(parentConfirmed);
 					return {
@@ -829,7 +880,7 @@ describe("PatternAware runtime integration", () => {
 						draftTokens: 0,
 					};
 				},
-				onPatternResolved: (patternID, outcome) => {
+				patternResolved: (patternID, outcome) => {
 					outcomes.push(`${patternID}:${outcome}`);
 				},
 			}),
@@ -854,7 +905,7 @@ describe("PatternAware runtime integration", () => {
 		let predictions = 0;
 		const runtime = makeSpeculativeActionRuntime(
 			adapter({
-				predictPatternAware: () => ({
+				patternPropose: () => ({
 					candidates: predictions++ === 0 ? [confidenceCandidate("parent.ts", "parent", 0.4)] : [],
 					draftTokens: 0,
 				}),
@@ -862,7 +913,7 @@ describe("PatternAware runtime integration", () => {
 					executions.push(String(concrete.path));
 					return "output";
 				},
-				continuePatternAware: ({ candidate, parentConfirmed }) => {
+				patternContinue: ({ candidate, parentConfirmed }) => {
 					if (candidate.input.path !== "parent.ts") return undefined;
 					parentConfirmations.push(parentConfirmed);
 					return {
@@ -888,7 +939,7 @@ describe("PatternAware runtime integration", () => {
 		let aborted = 0;
 		const runtime = makeSpeculativeActionRuntime(
 			adapter({
-				predictPatternAware: () => ({
+				patternPropose: () => ({
 					candidates: [
 						{ ...patternCandidate("bash", { command: "long" }, "long", 0), patternContext: { step: 1 } },
 					],
@@ -905,7 +956,7 @@ describe("PatternAware runtime integration", () => {
 							{ once: true },
 						);
 					}),
-				continuePatternAware: () => {
+				patternContinue: () => {
 					continuations++;
 					return undefined;
 				},
@@ -925,7 +976,7 @@ describe("PatternAware runtime integration", () => {
 		const runtime = makeSpeculativeActionRuntime(
 			adapter({
 				settings: () => ({ ...settings(), resourceCacheMaxBytes: 1200 }),
-				predict: (input) => ({
+				draftPropose: (input) => ({
 					candidates: [scheduledCandidate(input.turnID === "turn_1" ? "a.ts" : "b.ts", 10)],
 					draftTokens: 0,
 				}),
@@ -956,7 +1007,7 @@ describe("PatternAware runtime integration", () => {
 		const events: SpeculativeActionEvent<string>[] = [];
 		const runtime = makeSpeculativeActionRuntime(
 			adapter({
-				predict: () => ({ candidates: [scheduledCandidate("a.ts", 10)], draftTokens: 0 }),
+				draftPropose: () => ({ candidates: [scheduledCandidate("a.ts", 10)], draftTokens: 0 }),
 				captureResourceVersion: () => ({ captureMs: 1, captureBytes: 0, captureFiles: 0 }),
 				watchResourceVersion: ({ onInvalidated }) => {
 					invalidate = onInvalidated;
@@ -985,7 +1036,10 @@ describe("PatternAware runtime integration", () => {
 		const runtime = makeSpeculativeActionRuntime(
 			adapter({
 				settings: () => ({ ...settings(), candidateLimit: 1, maxConcurrentActions: 1 }),
-				predict: (input) => ({ candidates: [scheduledCandidate(`${input.sessionID}.ts`, 10)], draftTokens: 0 }),
+				draftPropose: (input) => ({
+					candidates: [scheduledCandidate(`${input.sessionID}.ts`, 10)],
+					draftTokens: 0,
+				}),
 				executeCandidate: () => {
 					executions++;
 					return pending;
@@ -1006,7 +1060,7 @@ describe("PatternAware runtime integration", () => {
 		let requests = 0;
 		const runtime = makeSpeculativeActionRuntime(
 			adapter({
-				predict: () => {
+				draftPropose: () => {
 					requests++;
 					return { candidates: [], draftTokens: 1 };
 				},
@@ -1028,11 +1082,11 @@ describe("PatternAware runtime integration", () => {
 		const runtime = makeSpeculativeActionRuntime(
 			adapter({
 				settings: () => ({ ...settings(), adaptiveDrafter: false }),
-				predictPatternAware: () => ({
+				patternPropose: () => ({
 					candidates: [patternCandidate("read", { path: "README.md" }, "immediate", 0)],
 					draftTokens: 0,
 				}),
-				predict: () => {
+				draftPropose: () => {
 					requests++;
 					return {
 						candidates: [{ type: "tool_call", tool: "read", input: { path: "README.md" } }],
@@ -1057,8 +1111,8 @@ describe("PatternAware runtime integration", () => {
 		let requests = 0;
 		const runtime = makeSpeculativeActionRuntime(
 			adapter({
-				predictPatternAware: () => ({ candidates: [], draftTokens: 0, deferDrafter: true }),
-				predict: () => {
+				patternPropose: () => ({ candidates: [], draftTokens: 0, deferDrafter: true }),
+				draftPropose: () => {
 					requests++;
 					return { candidates: [], draftTokens: 1 };
 				},
@@ -1075,7 +1129,7 @@ describe("PatternAware runtime integration", () => {
 		const events: SpeculativeActionEvent<string>[] = [];
 		const runtime = makeSpeculativeActionRuntime(
 			adapter({
-				predict: () => ({ candidates: [scheduledCandidate("a.ts", 10)], draftTokens: 0 }),
+				draftPropose: () => ({ candidates: [scheduledCandidate("a.ts", 10)], draftTokens: 0 }),
 				captureResourceVersion: () => ({ captureMs: 2, captureBytes: 3, captureFiles: 1 }),
 				isResourceExpired: () => ({
 					expired: false,
@@ -1132,12 +1186,12 @@ describe("PatternAware runtime integration", () => {
 		let executions = 0;
 		const runtime = makeSpeculativeActionRuntime(
 			adapter({
-				predict: (input) => ({
+				draftPropose: (input) => ({
 					candidates:
 						input.turnID === "seed" ? [{ type: "tool_call", tool: "read", input: { path: "README.md" } }] : [],
 					draftTokens: 0,
 				}),
-				predictPatternAware: (input) => ({
+				patternPropose: (input) => ({
 					candidates:
 						input.turnID === "reuse"
 							? [patternCandidate("read", { path: "README.md" }, "reused_pattern", 0)]
@@ -1148,7 +1202,7 @@ describe("PatternAware runtime integration", () => {
 					executions++;
 					return "cached";
 				},
-				onPatternResolved: (id, outcome) => {
+				patternResolved: (id, outcome) => {
 					outcomes.push(`${id}:${outcome}`);
 				},
 			}),
@@ -1170,13 +1224,13 @@ describe("PatternAware runtime integration", () => {
 		const events: SpeculativeActionEvent<string>[] = [];
 		const runtime = makeSpeculativeActionRuntime(
 			adapter({
-				predictPatternAware: () => ({
+				patternPropose: () => ({
 					candidates: [patternCandidate("read", { path: "stale.txt" }, "stale_pattern", 0)],
 					draftTokens: 0,
 				}),
 				captureResourceVersion: () => "version",
 				isResourceExpired: () => true,
-				onPatternResolved: (id, outcome) => {
+				patternResolved: (id, outcome) => {
 					outcomes.push(`${id}:${outcome}`);
 				},
 				onEvent: (event) => {
@@ -1198,7 +1252,7 @@ describe("PatternAware runtime integration", () => {
 		let continuations = 0;
 		const runtime = makeSpeculativeActionRuntime(
 			adapter({
-				predictPatternAware: () => ({
+				patternPropose: () => ({
 					candidates: [patternCandidate("bash", { command: "prepare" }, "sandbox_parent", 0)],
 					draftTokens: 0,
 				}),
@@ -1207,7 +1261,7 @@ describe("PatternAware runtime integration", () => {
 					return `${tool}-result`;
 				},
 				adoptCandidate: ({ output }) => output,
-				continuePatternAware: ({ candidate, parentConfirmed }) => {
+				patternContinue: ({ candidate, parentConfirmed }) => {
 					if (candidate.tool !== "bash") return undefined;
 					expect(parentConfirmed).toBe(true);
 					continuations++;
@@ -1230,7 +1284,7 @@ describe("PatternAware runtime integration", () => {
 	it("invalidates the full bash workdir after successful sandbox adoption", async () => {
 		const runtime = makeSpeculativeActionRuntime(
 			adapter({
-				predict: () => ({
+				draftPropose: () => ({
 					candidates: [
 						{
 							type: "tool_call",
@@ -1262,18 +1316,145 @@ describe("PatternAware runtime integration", () => {
 	});
 });
 
-function adapter(overrides: Partial<Adapter> = {}): Adapter {
+function adapter(overrides: AdapterOverrides = {}): Adapter {
+	const {
+		draftPropose,
+		patternPropose,
+		patternContinue,
+		patternObserve,
+		patternLaunched,
+		patternResolved,
+		patternFlush,
+		sources: configuredSources,
+		...runtimeOverrides
+	} = overrides;
+	const sources: PlanSource[] = [...(configuredSources ?? [])];
+	const patternRevisions = new Map<string, number>();
+	let observedPlans = 0;
+	if (patternPropose || patternContinue || patternObserve || patternLaunched || patternResolved || patternFlush) {
+		sources.push({
+			id: "pattern_aware",
+			enabled: (current) => current.patternAware?.enabled ?? false,
+			multiStepEnabled: (current) => current.patternAware?.multiStepEnabled ?? true,
+			propose: async ({ startInput, settings: current, definitions, candidateNames, signal }) => {
+				const proposalID = `test:pattern:${startInput.sessionID}:${startInput.turnID}`;
+				patternRevisions.set(proposalID, 0);
+				const predicted =
+					(await patternPropose?.(startInput, current, definitions, candidateNames, signal)) ?? emptyPrediction();
+				return fixturePlan(proposalID, "pattern_aware", predicted);
+			},
+			continue: patternContinue
+				? async (input) => {
+						const draft = input.feedback as TestDraftCandidate;
+						if (!draft.patternID) return undefined;
+						const predicted = await patternContinue({
+							...input,
+							patternID: draft.patternID,
+							patternContext: draft.patternContext,
+						});
+						if (!predicted?.candidates.length) return undefined;
+						const revision = (patternRevisions.get(input.proposalID) ?? 0) + 1;
+						patternRevisions.set(input.proposalID, revision);
+						return {
+							proposalID: input.proposalID,
+							source: "pattern_aware",
+							revision,
+							upsert: fixtureActions(predicted.candidates, [{ actionID: input.actionID, condition: "adopted" }]),
+							draftTokens: predicted.draftTokens,
+						};
+					}
+				: undefined,
+			observe: patternObserve
+				? async (input) => {
+						const predicted = await patternObserve(input);
+						if (!predicted?.candidates.length) return undefined;
+						return fixturePlan(
+							`test:pattern:observed:${input.consumeInput.sessionID}:${input.consumeInput.turnID}:${input.order}:${observedPlans++}`,
+							"pattern_aware",
+							predicted,
+						);
+					}
+				: undefined,
+			onLaunched: patternLaunched
+				? ({ feedback }) => {
+						const draft = feedback as TestDraftCandidate;
+						if (draft.patternID) return patternLaunched(draft.patternID, draft.patternContext);
+					}
+				: undefined,
+			onResolved: patternResolved
+				? ({ feedback, outcome }) => {
+						const draft = feedback as TestDraftCandidate;
+						if (draft.patternID) return patternResolved(draft.patternID, outcome, draft.patternContext);
+					}
+				: undefined,
+			flush: patternFlush,
+		});
+	}
+	sources.push({
+		id: "drafter",
+		enabled: (current) => current.drafterEnabled ?? true,
+		adaptive: true,
+		timeoutMs: (current) => current.predictionTimeoutMs,
+		propose: async ({ startInput, settings: current, definitions, candidateNames, signal }) =>
+			fixturePlan(
+				`test:drafter:${startInput.sessionID}:${startInput.turnID}`,
+				"drafter",
+				(await draftPropose?.(startInput, current, definitions, candidateNames, signal)) ?? emptyPrediction(),
+			),
+	});
 	return {
 		settings,
 		definitions: () => [{ name: "read" }, { name: "grep" }, { name: "find" }, { name: "bash" }],
 		stateData: () => ({ cwd: "." }),
-		predict: () => ({ candidates: [], draftTokens: 0 }),
+		sources,
 		actionKey: (tool, input) => key(tool, input as Record<string, unknown>),
 		actual: (input) => ({ tool: input.tool, input: input.input }),
 		preflightCandidate: () => ({ ok: true }),
 		executeCandidate: () => "prefetched",
-		...overrides,
+		...runtimeOverrides,
 	};
+}
+
+function emptyPrediction(): TestPrediction {
+	return { candidates: [], draftTokens: 0 };
+}
+
+function fixturePlan(id: string, source: string, predicted: TestPrediction): PlanProposal {
+	return {
+		id,
+		source,
+		revision: 0,
+		actions: fixtureActions(predicted.candidates),
+		draftTokens: predicted.draftTokens,
+	};
+}
+
+function fixtureActions(
+	candidates: readonly TestDraftCandidate[],
+	dependsOn?: PlanAction["dependsOn"],
+): readonly PlanAction[] {
+	return candidates.map((candidate, index) => ({
+		id: `${candidate.patternID ?? "action"}:${index}`,
+		type: candidate.type,
+		tool: candidate.tool,
+		input: candidate.input,
+		...(candidate.missing ? { missing: candidate.missing } : {}),
+		...(candidate.execution ? { execution: candidate.execution } : {}),
+		...(candidate.diagnostic ? { diagnostic: candidate.diagnostic } : {}),
+		...(candidate.horizon !== undefined ? { horizon: candidate.horizon } : {}),
+		...(candidate.empiricalProbability !== undefined ? { empiricalProbability: candidate.empiricalProbability } : {}),
+		...(candidate.conditionalProbability !== undefined
+			? { conditionalProbability: candidate.conditionalProbability }
+			: {}),
+		...(candidate.expectedDurationMs !== undefined ? { expectedDurationMs: candidate.expectedDurationMs } : {}),
+		...(candidate.expectedLatencyBenefitMs !== undefined
+			? { expectedLatencyBenefitMs: candidate.expectedLatencyBenefitMs }
+			: {}),
+		...(candidate.resourceDemand !== undefined ? { resourceDemand: candidate.resourceDemand } : {}),
+		...(candidate.depth !== undefined ? { depth: candidate.depth } : {}),
+		...(dependsOn?.length ? { dependsOn } : candidate.dependsOn?.length ? { dependsOn: candidate.dependsOn } : {}),
+		feedback: candidate,
+	}));
 }
 
 function settings(): SpeculativeActionSettings {
@@ -1294,7 +1475,7 @@ function patternCandidate(
 	input: Record<string, unknown>,
 	patternID: string,
 	horizon: number,
-): SpeculativeDraftCandidate {
+): TestDraftCandidate {
 	return {
 		type: "tool_call",
 		source: "pattern_aware",
@@ -1313,7 +1494,7 @@ function confidenceCandidate(
 	patternID: string,
 	empiricalProbability: number,
 	patternContext?: unknown,
-): SpeculativeDraftCandidate {
+): TestDraftCandidate {
 	return {
 		type: "tool_call",
 		source: "pattern_aware",
@@ -1328,7 +1509,7 @@ function confidenceCandidate(
 	};
 }
 
-function scheduledCandidate(path: string, expectedLatencyBenefitMs: number): SpeculativeDraftCandidate {
+function scheduledCandidate(path: string, expectedLatencyBenefitMs: number): TestDraftCandidate {
 	return {
 		type: "tool_call",
 		tool: "read",
@@ -1338,7 +1519,7 @@ function scheduledCandidate(path: string, expectedLatencyBenefitMs: number): Spe
 	};
 }
 
-function preparationHint(path: string): SpeculativeDraftCandidate {
+function preparationHint(path: string): TestDraftCandidate {
 	return {
 		type: "preparation_hint",
 		source: "pattern_aware",

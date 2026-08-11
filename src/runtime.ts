@@ -21,7 +21,7 @@ import {
 	DEFAULTS,
 	PI_ACTION_SEMANTICS,
 } from "./common.ts";
-import type { PatternAwareDependency, PatternAwareResolution, PatternAwareSettings } from "./pattern-aware.ts";
+import type { PatternAwareSettings } from "./pattern-aware.ts";
 import type { PlanExecutionNode } from "./plan-execution-graph.ts";
 import { PlanExecutionGraph } from "./plan-execution-graph.ts";
 import type { PlanAction, PlanProposal, PlanUpdate } from "./plan-proposal.ts";
@@ -66,10 +66,6 @@ export interface SpeculativeDraftCandidate {
 	readonly actionID?: string;
 	readonly feedback?: unknown;
 	readonly dependsOn?: PlanAction["dependsOn"];
-	/** @deprecated Use feedback with a source-owned token. */
-	readonly patternID?: string;
-	/** @deprecated Use feedback with a source-owned token. */
-	readonly patternContext?: unknown;
 	readonly horizon?: number;
 	readonly empiricalProbability?: number;
 	readonly conditionalProbability?: number;
@@ -77,12 +73,6 @@ export interface SpeculativeDraftCandidate {
 	readonly expectedLatencyBenefitMs?: number;
 	readonly resourceDemand?: number;
 	readonly depth?: number;
-	readonly dependencies?: ReadonlyArray<PatternAwareDependency>;
-}
-
-export interface SpeculativePrediction {
-	readonly candidates: readonly SpeculativeDraftCandidate[];
-	readonly draftTokens: number;
 }
 
 export interface CandidatePreflightAllowed {
@@ -112,10 +102,6 @@ export interface PredictionLease {
 	readonly proposalID?: string;
 	readonly actionID?: string;
 	feedback?: unknown;
-	/** @deprecated Compatibility for the legacy PatternAware adapter. */
-	readonly patternID?: string;
-	/** @deprecated Compatibility for the legacy PatternAware adapter. */
-	patternContext?: unknown;
 	readonly providerTurnID: string;
 	readonly anchorActionSeq: number;
 	readonly horizon?: number;
@@ -168,11 +154,9 @@ export interface SpeculativeCandidate {
 	empiricalProbability?: number;
 	conditionalProbability?: number;
 	depth?: number;
-	readonly dependencies?: ReadonlyArray<PatternAwareDependency>;
 	readonly planDependencies?: PlanAction["dependsOn"];
 	scheduling: SpeculativeSchedulingMetadata;
 	utility: number;
-	readonly patternID?: string;
 	readonly leases: readonly PredictionLease[];
 	hits: number;
 	authoritativeSequence?: number;
@@ -223,7 +207,6 @@ export interface SpeculativeLookupDiagnostics {
 
 interface SpeculativeSchedulingEventFields {
 	readonly source: string;
-	readonly patternID?: string;
 	readonly futureHorizon?: number;
 	readonly empiricalProbability?: number;
 	readonly conditionalProbability?: number;
@@ -415,22 +398,6 @@ export interface SpeculativeActionRuntimeAdapter<
 	readonly settings: () => MaybePromise<SpeculativeActionSettings>;
 	readonly definitions: (input: StartInput) => readonly DrafterToolDefinition[];
 	readonly stateData: (input: StartInput) => MaybePromise<StateData>;
-	/** @deprecated Prefer sources. */
-	readonly predict?: (
-		input: StartInput,
-		settings: SpeculativeActionSettings,
-		definitions: readonly DrafterToolDefinition[],
-		candidateNames: readonly string[],
-		signal: AbortSignal,
-	) => MaybePromise<SpeculativePrediction>;
-	/** @deprecated Prefer sources. */
-	readonly predictPatternAware?: (
-		input: StartInput,
-		settings: SpeculativeActionSettings,
-		definitions: readonly DrafterToolDefinition[],
-		candidateNames: readonly string[],
-		signal: AbortSignal,
-	) => MaybePromise<SpeculativePrediction>;
 	readonly actionKey: (
 		tool: string,
 		input: unknown,
@@ -525,36 +492,6 @@ export interface SpeculativeActionRuntimeAdapter<
 		readonly candidate: SpeculativeCandidate;
 		readonly output: Output;
 	}) => MaybePromise<Output | undefined>;
-	readonly recordAuthoritative?: (input: {
-		readonly startInput: StartInput;
-		readonly data: StateData;
-		readonly settings: SpeculativeActionSettings;
-		readonly consumeInput: ConsumeInput;
-		readonly action?: ActionKey;
-		readonly tool: string;
-		readonly concrete: Record<string, unknown>;
-		readonly output?: Output;
-		readonly durationMs: number;
-		readonly speculativeHit: boolean;
-		readonly order: number;
-	}) => MaybePromise<SpeculativePrediction | undefined>;
-	readonly continuePatternAware?: (input: {
-		readonly startInput: StartInput;
-		readonly data: StateData;
-		readonly settings: SpeculativeActionSettings;
-		readonly candidate: SpeculativeCandidate;
-		readonly patternID: string;
-		readonly patternContext: unknown;
-		readonly output: Output;
-		readonly parentConfirmed: boolean;
-	}) => MaybePromise<SpeculativePrediction | undefined>;
-	readonly onPatternLaunched?: (patternID: string, context?: unknown) => MaybePromise<void>;
-	readonly onPatternResolved?: (
-		patternID: string,
-		outcome: PatternAwareResolution,
-		context?: unknown,
-	) => MaybePromise<void>;
-	readonly flushPatternStore?: () => MaybePromise<void>;
 	readonly onTurnStarted?: (input: {
 		readonly startInput: StartInput;
 		readonly settings: SpeculativeActionSettings;
@@ -703,162 +640,7 @@ export function makeSpeculativeActionRuntime<
 	};
 	const planActionIdentity = (proposalID: string, actionID: string): string => `${proposalID}\u0000${actionID}`;
 	type RuntimePlanSource = SpeculativePlanSource<SessionID, Output, StartInput, ConsumeInput, StateData>;
-	const legacyPatternRevisions = new Map<string, number>();
-	let legacyObservedProposalSequence = 0;
-	const legacyPlanAction = (
-		candidate: SpeculativeDraftCandidate,
-		id: string,
-		dependsOn?: PlanAction["dependsOn"],
-	): PlanAction => ({
-		id,
-		type: candidate.type,
-		tool: candidate.tool,
-		input: candidate.input,
-		...(candidate.missing ? { missing: candidate.missing } : {}),
-		...(candidate.execution ? { execution: candidate.execution } : {}),
-		...(candidate.diagnostic ? { diagnostic: candidate.diagnostic } : {}),
-		...(candidate.horizon !== undefined ? { horizon: candidate.horizon } : {}),
-		...(candidate.empiricalProbability !== undefined ? { empiricalProbability: candidate.empiricalProbability } : {}),
-		...(candidate.conditionalProbability !== undefined
-			? { conditionalProbability: candidate.conditionalProbability }
-			: {}),
-		...(candidate.expectedDurationMs !== undefined ? { expectedDurationMs: candidate.expectedDurationMs } : {}),
-		...(candidate.expectedLatencyBenefitMs !== undefined
-			? { expectedLatencyBenefitMs: candidate.expectedLatencyBenefitMs }
-			: {}),
-		...(candidate.resourceDemand !== undefined ? { resourceDemand: candidate.resourceDemand } : {}),
-		...(candidate.depth !== undefined ? { depth: candidate.depth } : {}),
-		...(dependsOn?.length ? { dependsOn } : {}),
-		feedback: candidate,
-	});
-	const legacyActionID = (candidate: SpeculativeDraftCandidate): string =>
-		`${candidate.patternID ?? "action"}:${fastCandidateID(diagnosticJson({ tool: candidate.tool, input: candidate.input }))}`;
-	const legacyPatternActions = (
-		candidates: readonly SpeculativeDraftCandidate[],
-		dependsOn?: PlanAction["dependsOn"],
-	): readonly PlanAction[] => {
-		const seen = new Set<string>();
-		const actions: PlanAction[] = [];
-		for (const candidate of candidates) {
-			const id = legacyActionID(candidate);
-			if (seen.has(id)) continue;
-			seen.add(id);
-			actions.push(legacyPlanAction(candidate, id, dependsOn));
-		}
-		return actions;
-	};
-	const legacySources = (): RuntimePlanSource[] => {
-		const result: RuntimePlanSource[] = [];
-		if (
-			adapter.predictPatternAware ||
-			adapter.recordAuthoritative ||
-			adapter.continuePatternAware ||
-			adapter.onPatternLaunched ||
-			adapter.onPatternResolved ||
-			adapter.flushPatternStore
-		) {
-			result.push({
-				id: "pattern_aware",
-				enabled: (settings) => settings.patternAware?.enabled ?? false,
-				multiStepEnabled: (settings) => settings.patternAware?.multiStepEnabled ?? true,
-				propose: async ({ startInput, settings, definitions, candidateNames, signal }) => {
-					const proposalID = `legacy:pattern:${String(startInput.sessionID)}:${startInput.turnID}`;
-					legacyPatternRevisions.set(proposalID, 0);
-					const prediction = adapter.predictPatternAware
-						? await adapter.predictPatternAware(startInput, settings, definitions, candidateNames, signal)
-						: { candidates: [], draftTokens: 0 };
-					return {
-						id: proposalID,
-						source: "pattern_aware",
-						revision: 0,
-						actions: legacyPatternActions(prediction.candidates),
-						draftTokens: prediction.draftTokens,
-					};
-				},
-				continue: adapter.continuePatternAware
-					? async ({
-							startInput,
-							data,
-							settings,
-							candidate,
-							proposalID,
-							actionID,
-							feedback,
-							output,
-							parentConfirmed,
-						}) => {
-							const draft = feedback as SpeculativeDraftCandidate;
-							if (!draft.patternID) return undefined;
-							const prediction = await adapter.continuePatternAware?.({
-								startInput,
-								data,
-								settings,
-								candidate,
-								patternID: draft.patternID,
-								patternContext: draft.patternContext,
-								output,
-								parentConfirmed,
-							});
-							if (!prediction?.candidates.length) return undefined;
-							const revision = (legacyPatternRevisions.get(proposalID) ?? 0) + 1;
-							legacyPatternRevisions.set(proposalID, revision);
-							return {
-								proposalID,
-								source: "pattern_aware",
-								revision,
-								upsert: legacyPatternActions(prediction.candidates, [{ actionID, condition: "adopted" }]),
-								draftTokens: prediction.draftTokens,
-							};
-						}
-					: undefined,
-				observe: adapter.recordAuthoritative
-					? async (input) => {
-							const prediction = await adapter.recordAuthoritative?.(input);
-							if (!prediction?.candidates.length) return undefined;
-							const proposalID = `legacy:pattern:observed:${String(input.consumeInput.sessionID)}:${input.consumeInput.turnID}:${input.order}:${legacyObservedProposalSequence++}`;
-							return {
-								id: proposalID,
-								source: "pattern_aware",
-								revision: 0,
-								actions: legacyPatternActions(prediction.candidates),
-								draftTokens: prediction.draftTokens,
-							};
-						}
-					: undefined,
-				onLaunched: ({ feedback }) => {
-					const draft = feedback as SpeculativeDraftCandidate;
-					if (draft.patternID) return adapter.onPatternLaunched?.(draft.patternID, draft.patternContext);
-				},
-				onResolved: ({ feedback, outcome }) => {
-					const draft = feedback as SpeculativeDraftCandidate;
-					if (draft.patternID) return adapter.onPatternResolved?.(draft.patternID, outcome, draft.patternContext);
-				},
-				flush: adapter.flushPatternStore,
-			});
-		}
-		if (adapter.predict) {
-			result.push({
-				id: "drafter",
-				enabled: (settings) => settings.drafterEnabled ?? DEFAULTS.drafterEnabled,
-				adaptive: true,
-				timeoutMs: (settings) => settings.predictionTimeoutMs,
-				propose: async ({ startInput, settings, definitions, candidateNames, signal }) => {
-					const prediction = await adapter.predict?.(startInput, settings, definitions, candidateNames, signal);
-					return {
-						id: `legacy:drafter:${String(startInput.sessionID)}:${startInput.turnID}`,
-						source: "drafter",
-						revision: 0,
-						actions: (prediction?.candidates ?? []).map((candidate, index) =>
-							legacyPlanAction(candidate, `action:${index}`),
-						),
-						draftTokens: prediction?.draftTokens ?? 0,
-					};
-				},
-			});
-		}
-		return result;
-	};
-	const sources = adapter.sources?.length ? [...adapter.sources] : legacySources();
+	const sources: readonly RuntimePlanSource[] = adapter.sources ?? [];
 	const sourcesByID = new Map<string, SpeculativePlanSource<SessionID, Output, StartInput, ConsumeInput, StateData>>();
 	for (const source of sources) {
 		const id = source.id.trim();
@@ -1218,16 +1000,13 @@ export function makeSpeculativeActionRuntime<
 		source: SpeculativeSchedulingEventFields["source"] = candidate.source,
 	): SpeculativeSchedulingEventFields => ({
 		source,
-		...(candidate.patternID ? { patternID: candidate.patternID } : {}),
 		...(candidateFutureHorizon(candidate) !== undefined ? { futureHorizon: candidateFutureHorizon(candidate) } : {}),
 		...(candidate.empiricalProbability !== undefined ? { empiricalProbability: candidate.empiricalProbability } : {}),
 		...(candidate.conditionalProbability !== undefined
 			? { conditionalProbability: candidate.conditionalProbability }
 			: {}),
 		...(candidate.depth !== undefined ? { patternDepth: candidate.depth } : {}),
-		...(candidate.dependencies?.length || candidate.planDependencies?.length
-			? { dependencyEdges: (candidate.dependencies?.length ?? 0) + (candidate.planDependencies?.length ?? 0) }
-			: {}),
+		...(candidate.planDependencies?.length ? { dependencyEdges: candidate.planDependencies.length } : {}),
 		expectedDurationMs: candidate.scheduling.expectedDurationMs,
 		...(candidate.scheduling.expectedLeadMs !== undefined
 			? { expectedLeadMs: candidate.scheduling.expectedLeadMs }
@@ -1917,7 +1696,7 @@ export function makeSpeculativeActionRuntime<
 	): Promise<boolean> => {
 		pruneResolvedLeases(candidate);
 		const proposalID = draft.proposalID ?? `${source}:${state.turnID}`;
-		const actionID = draft.actionID ?? draft.patternID ?? candidate.key.hash;
+		const actionID = draft.actionID ?? candidate.key.hash;
 		const empiricalProbability = finiteProbability(draft.empiricalProbability);
 		const conditionalProbability = finiteProbability(draft.conditionalProbability);
 		const depth = finiteOptionalNonNegativeInteger(draft.depth);
@@ -1940,7 +1719,6 @@ export function makeSpeculativeActionRuntime<
 			if (leaseProbabilityIncreased) {
 				existingLease.empiricalProbability = empiricalProbability;
 				existingLease.feedback = draft.feedback;
-				existingLease.patternContext = draft.patternContext;
 				if (existingLease.continuationExpansion !== "confirmed") {
 					existingLease.continuationExpansion = undefined;
 				}
@@ -1964,8 +1742,6 @@ export function makeSpeculativeActionRuntime<
 			proposalID,
 			actionID,
 			...(draft.feedback !== undefined ? { feedback: draft.feedback } : {}),
-			...(draft.patternID ? { patternID: draft.patternID } : {}),
-			...(draft.patternContext !== undefined ? { patternContext: draft.patternContext } : {}),
 			providerTurnID: state.turnID,
 			anchorActionSeq,
 			...(horizon !== undefined ? { horizon, validThroughActionSeq: anchorActionSeq + horizon + 1 } : {}),
@@ -2163,13 +1939,11 @@ export function makeSpeculativeActionRuntime<
 			const conditionalProbability = finiteProbability(draft.conditionalProbability);
 			const depth = finiteOptionalNonNegativeInteger(draft.depth);
 			const sourceLease: PredictionLease = {
-				id: `${callID}:${source}:${draft.patternID ?? state.turnID}`,
+				id: `${callID}:${source}:${draft.actionID ?? state.turnID}`,
 				source,
 				proposalID: draft.proposalID ?? `${source}:${state.turnID}`,
-				actionID: draft.actionID ?? draft.patternID ?? action.hash,
+				actionID: draft.actionID ?? action.hash,
 				...(draft.feedback !== undefined ? { feedback: draft.feedback } : {}),
-				...(draft.patternID ? { patternID: draft.patternID } : {}),
-				...(draft.patternContext !== undefined ? { patternContext: draft.patternContext } : {}),
 				providerTurnID: state.turnID,
 				anchorActionSeq: predictionAnchorActionSeq,
 				...(horizon !== undefined
@@ -2210,11 +1984,9 @@ export function makeSpeculativeActionRuntime<
 				...(empiricalProbability !== undefined ? { empiricalProbability } : {}),
 				...(conditionalProbability !== undefined ? { conditionalProbability } : {}),
 				...(depth !== undefined ? { depth } : {}),
-				...(draft.dependencies?.length ? { dependencies: draft.dependencies } : {}),
 				...(draft.dependsOn?.length ? { planDependencies: draft.dependsOn } : {}),
 				scheduling,
 				utility: expectedUtility(scheduling),
-				...(draft.patternID ? { patternID: draft.patternID } : {}),
 				get leases() {
 					return lifecycle.leases;
 				},
