@@ -499,8 +499,13 @@ export function installSpeculativeAction(
 			}
 			if (!tool) return undefined;
 			let invocation: AgentToolInvocation | undefined;
+			let worldFingerprint: string | undefined;
 			try {
 				invocation = await tool.resolveInvocation?.(validated as never);
+				const mode = actionSemantics.sandboxMode(toolName);
+				if (mode && mode !== "none" && options.sandbox?.fingerprint) {
+					worldFingerprint = await options.sandbox.fingerprint(mode);
+				}
 			} catch {
 				return undefined;
 			}
@@ -511,7 +516,12 @@ export function installSpeculativeAction(
 				validated,
 				options.cwd,
 				schemaHash,
-				invocation ? { fingerprint: stableHash(invocation), context: invocation } : undefined,
+				invocation || worldFingerprint
+					? {
+							fingerprint: stableHash({ invocation: invocation ?? null, world: worldFingerprint ?? null }),
+							...(invocation ? { context: invocation } : {}),
+						}
+					: undefined,
 			);
 		},
 		actual: (input) => ({ id: input.id, tool: input.tool, input: input.args }),

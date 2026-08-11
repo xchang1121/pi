@@ -5,7 +5,11 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { contains } from "./common.ts";
-import type { SandboxProcessRunner, SandboxProcessRunnerInput } from "./workspace-sandbox.ts";
+import type {
+	SandboxProcessBackend,
+	SandboxProcessBackendStatus,
+	SandboxProcessRunnerInput,
+} from "./workspace-sandbox.ts";
 
 export const NATIVE_SANDBOX_PROTOCOL_VERSION = 4;
 export const NATIVE_SANDBOX_DEFAULT_TIMEOUT_MS = 120_000;
@@ -28,11 +32,12 @@ export interface NativeSandboxBinary {
 	readonly sha256?: string;
 }
 
-export interface NativeSandboxStatus {
+export interface NativeSandboxStatus extends SandboxProcessBackendStatus {
 	readonly backend: "native" | "workspace";
 	readonly state: "ready" | "unavailable";
 	readonly source: NativeSandboxBinarySource | "none";
 	readonly detail: string;
+	readonly fingerprint?: string;
 	readonly path?: string;
 }
 
@@ -105,9 +110,37 @@ interface NativeAssetManifest {
 
 let cachedDefaultStatus: Promise<NativeSandboxStatus> | undefined;
 
-/** Return a process runner suitable for createWorkspaceSandbox({ processRunner }). */
-export function createNativeSandboxProcessRunner(options: NativeSandboxOptions = {}): SandboxProcessRunner {
-	return async (input) => settlementFromNative(await executeNativeSandbox(input, options));
+/** Native broker adapter with one private process root per speculative branch. */
+export function createNativeSandboxProcessBackend(options: NativeSandboxOptions = {}): SandboxProcessBackend {
+	return {
+		check: (input) => checkNativeSandboxRuntime({ ...options, ...input }),
+		fingerprint: async () => {
+			const status = await checkNativeSandboxRuntime(options);
+			if (status.state !== "ready" || !status.fingerprint) throw new Error(status.detail);
+			return status.fingerprint;
+		},
+		prepare: async ({ signal }) => {
+			throwIfAborted(signal);
+			const status = await checkNativeSandboxRuntime(options);
+			if (status.state !== "ready") throw new Error(status.detail);
+			throwIfAborted(signal);
+		},
+		open: async ({ parent, signal }) => {
+			throwIfAborted(signal);
+			const processRoot = await mkdtemp(path.join(parent, "action-"));
+			let closed = false;
+			return {
+				processRoot,
+				execute: async (input) => settlementFromNative(await executeNativeSandbox(input, options)),
+				close: async () => {
+					if (closed) return;
+					closed = true;
+					await rm(processRoot, { recursive: true, force: true });
+				},
+			};
+		},
+		dispose: async () => {},
+	};
 }
 
 /** Execute one command through the versioned native broker protocol. */
@@ -235,6 +268,7 @@ async function probeNativeSandbox(options: NativeSandboxOptions): Promise<Native
 			state: "ready",
 			source: binary.source,
 			detail: response.detail,
+			fingerprint: `native:${NATIVE_SANDBOX_PROTOCOL_VERSION}:${binary.sha256 ?? binary.path}`,
 			path: binary.path,
 		};
 	} catch (error) {
@@ -263,7 +297,7 @@ function unavailableStatus(
 async function requireBinary(binaryPath: string, source: NativeSandboxBinarySource): Promise<NativeSandboxBinary> {
 	const resolved = path.resolve(binaryPath);
 	if (!(await isFile(resolved))) throw new Error(`Native sandbox binary not found: ${resolved}`);
-	return { path: resolved, source };
+	return { path: resolved, source, sha256: await fileSha256(resolved) };
 }
 
 async function materializeAsset(
@@ -529,6 +563,11 @@ function errorMessage(error: unknown): string {
 
 function oneLine(value: string): string {
 	return value.replace(/\s+/g, " ").trim().slice(0, 2_000) || "unknown error";
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+	if (!signal?.aborted) return;
+	throw signal.reason instanceof Error ? signal.reason : new Error("Native sandbox operation aborted.");
 }
 
 export function invokeNativeSandbox(input: NativeSandboxInvocation): Promise<NativeSandboxInvocationResult> {

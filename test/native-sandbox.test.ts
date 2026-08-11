@@ -5,7 +5,7 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
 	checkNativeSandboxRuntime,
-	createNativeSandboxProcessRunner,
+	createNativeSandboxProcessBackend,
 	executeNativeSandbox,
 	invokeNativeSandbox,
 	NATIVE_SANDBOX_PROTOCOL_VERSION,
@@ -27,11 +27,12 @@ describe("M5 native sandbox broker", () => {
 				});
 			};
 
-			await expect(checkNativeSandboxRuntime({ binaryPath, invoker })).resolves.toEqual({
+			await expect(checkNativeSandboxRuntime({ binaryPath, invoker })).resolves.toMatchObject({
 				backend: "native",
 				state: "ready",
 				source: "explicit",
 				detail: "namespaces ready",
+				fingerprint: expect.stringMatching(/^native:4:[a-f0-9]{64}$/),
 				path: binaryPath,
 			});
 		});
@@ -192,28 +193,35 @@ describe("M5 native sandbox broker", () => {
 	it("maps exit and timeout responses to Pi settlement errors", async () => {
 		await withPlaceholderBinary(async (binaryPath) => {
 			const root = await mkdtemp(path.join(os.tmpdir(), "pi-native-settlement-"));
-			const processRoot = path.join(root, "private");
-			const cwd = path.join(processRoot, "workspace");
 			const sourceRoot = path.join(root, "source");
-			await mkdir(cwd, { recursive: true });
 			await mkdir(sourceRoot, { recursive: true });
 			try {
-				const runner = createNativeSandboxProcessRunner({
+				const failedBackend = createNativeSandboxProcessBackend({
 					binaryPath,
 					invoker: async () => invocationResult(executeResponse({ output: "bad", exit: 7 })),
 				});
-				const failed = await runner(commandInput(sourceRoot, processRoot, cwd));
+				const failedSession = await failedBackend.open({ parent: root, signal: new AbortController().signal });
+				const failedCwd = path.join(failedSession.processRoot, "workspace");
+				await mkdir(failedCwd, { recursive: true });
+				const failed = await failedSession.execute(commandInput(sourceRoot, failedSession.processRoot, failedCwd));
 				expect(failed.isError).toBe(true);
 				expect(failed.result.content).toEqual([{ type: "text", text: "bad\n\nCommand exited with code 7" }]);
+				await failedSession.close();
 
-				const timeoutRunner = createNativeSandboxProcessRunner({
+				const timeoutBackend = createNativeSandboxProcessBackend({
 					binaryPath,
 					invoker: async () =>
 						invocationResult(executeResponse({ output: "timed out metadata", exit: 1, timeout: true })),
 				});
-				const timedOut = await timeoutRunner(commandInput(sourceRoot, processRoot, cwd));
+				const timeoutSession = await timeoutBackend.open({ parent: root, signal: new AbortController().signal });
+				const timeoutCwd = path.join(timeoutSession.processRoot, "workspace");
+				await mkdir(timeoutCwd, { recursive: true });
+				const timedOut = await timeoutSession.execute(
+					commandInput(sourceRoot, timeoutSession.processRoot, timeoutCwd),
+				);
 				expect(timedOut).toMatchObject({ isError: true });
 				expect(timedOut.result.content).toEqual([{ type: "text", text: "timed out metadata" }]);
+				await timeoutSession.close();
 			} finally {
 				await rm(root, { recursive: true, force: true });
 			}

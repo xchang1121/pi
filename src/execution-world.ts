@@ -48,6 +48,8 @@ export interface ExecutionWorldPreparation {
 /** Source-independent lifecycle for isolating, sealing, and adopting speculative effects. */
 export interface ExecutionWorld<Context extends { readonly mode: ExecutionWorldMode }, Output> {
 	readonly supports: (mode: ExecutionWorldMode) => boolean;
+	/** Stable identity of the concrete isolation backend used by K(a). */
+	readonly fingerprint?: (mode: ExecutionWorldMode) => string | Promise<string>;
 	readonly prepare?: (input: ExecutionWorldPreparation) => Promise<void>;
 	readonly fork: (context: Context) => Promise<WorldBranch<Output>>;
 	readonly dispose?: () => Promise<void>;

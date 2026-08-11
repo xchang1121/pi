@@ -11,6 +11,8 @@ import {
 	commitSandboxDelta,
 	createWorkspaceSandbox,
 	prepareSandboxWorkspace,
+	type SandboxProcessBackend,
+	type SandboxProcessRunner,
 	withSandboxWorkspace,
 } from "../src/workspace-sandbox.ts";
 
@@ -223,30 +225,32 @@ describe("workspace ExecutionWorld", () => {
 			await writeFile(path.join(root, "input.txt"), "hello", "utf8");
 			await writeFile(path.join(root, "delete.txt"), "remove me", "utf8");
 			const sandbox = createWorkspaceSandbox({
-				processRunner: async ({
-					command,
-					shell,
-					shellArgs,
-					commandTransport,
-					environment,
-					cwd,
-					processRoot,
-					sourceRoot,
-					signal,
-				}) => {
-					expect(shell).toBe("/bin/bash");
-					expect(shellArgs).toEqual(["--noprofile", "-c"]);
-					expect(commandTransport).toBe("argv");
-					expect(environment).toEqual({ PATH: "/resolved/bin", PI_TEST: "visible" });
-					expect(path.dirname(cwd)).toBe(processRoot);
-					expect(sourceRoot).toBe(root);
-					expect(processRoot).not.toBe(root);
-					await runNodeScript(command, cwd, signal);
-					return {
-						result: { content: [{ type: "text", text: `sandbox cwd: ${cwd}` }], details: undefined },
-						isError: false,
-					};
-				},
+				processBackend: testProcessBackend(
+					async ({
+						command,
+						shell,
+						shellArgs,
+						commandTransport,
+						environment,
+						cwd,
+						processRoot,
+						sourceRoot,
+						signal,
+					}) => {
+						expect(shell).toBe("/bin/bash");
+						expect(shellArgs).toEqual(["--noprofile", "-c"]);
+						expect(commandTransport).toBe("argv");
+						expect(environment).toEqual({ PATH: "/resolved/bin", PI_TEST: "visible" });
+						expect(path.dirname(cwd)).toBe(processRoot);
+						expect(sourceRoot).toBe(root);
+						expect(processRoot).not.toBe(root);
+						await runNodeScript(command, cwd, signal);
+						return {
+							result: { content: [{ type: "text", text: `sandbox cwd: ${cwd}` }], details: undefined },
+							isError: false,
+						};
+					},
+				),
 			});
 			const script = [
 				"const fs = require('node:fs')",
@@ -295,7 +299,7 @@ describe("workspace ExecutionWorld", () => {
 			await writeFile(path.join(root, "build.log"), "source log\n", "utf8");
 
 			const sandbox = createWorkspaceSandbox({
-				processRunner: async ({ cwd }) => {
+				processBackend: testProcessBackend(async ({ cwd }) => {
 					expect(await readFile(path.join(cwd, "node_modules", "pkg", "index.js"), "utf8")).toBe(
 						"source dependency\n",
 					);
@@ -304,7 +308,7 @@ describe("workspace ExecutionWorld", () => {
 					await writeFile(path.join(cwd, ".pi", "result.json"), '{"result":"sandbox"}\n', "utf8");
 					await rm(path.join(cwd, "build.log"));
 					return settlement("ignored state changed");
-				},
+				}),
 			});
 			const args = { command: "unused" };
 			const execution = await sandbox.fork({
@@ -341,11 +345,11 @@ describe("workspace ExecutionWorld", () => {
 			await writeFile(path.join(root, "a.txt"), "a0", "utf8");
 			await writeFile(path.join(root, "b.txt"), "b0", "utf8");
 			const sandbox = createWorkspaceSandbox({
-				processRunner: async ({ cwd }) => {
+				processBackend: testProcessBackend(async ({ cwd }) => {
 					await writeFile(path.join(cwd, "a.txt"), "a1", "utf8");
 					await writeFile(path.join(cwd, "b.txt"), "b1", "utf8");
 					return settlement("changed two files");
-				},
+				}),
 			});
 			const args = { command: "unused" };
 			const execution = await sandbox.fork({
@@ -516,10 +520,10 @@ describe("workspace ExecutionWorld", () => {
 		const root = await mkdtemp(path.join(os.tmpdir(), "pi-spec-created-symlink-test-"));
 		try {
 			const sandbox = createWorkspaceSandbox({
-				processRunner: async ({ cwd }) => {
+				processBackend: testProcessBackend(async ({ cwd }) => {
 					await symlink("missing-target", path.join(cwd, "created-link"));
 					return settlement("created symlink");
-				},
+				}),
 			});
 			const args = { command: "unused" };
 			await expect(
@@ -545,10 +549,10 @@ describe("workspace ExecutionWorld", () => {
 		let stagedRoot = "";
 		try {
 			const sandbox = createWorkspaceSandbox({
-				processRunner: async ({ cwd }) => {
+				processBackend: testProcessBackend(async ({ cwd }) => {
 					stagedRoot = cwd;
 					throw new Error("runner failed");
-				},
+				}),
 			});
 			const args = { command: "unused" };
 			await expect(
@@ -581,12 +585,14 @@ describe("workspace ExecutionWorld", () => {
 		});
 		try {
 			const sandbox = createWorkspaceSandbox({
-				processRunner: ({ cwd, signal }) =>
-					new Promise((_resolve, reject) => {
-						stagedRoot = cwd;
-						signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
-						markStarted?.();
-					}),
+				processBackend: testProcessBackend(
+					({ cwd, signal }) =>
+						new Promise((_resolve, reject) => {
+							stagedRoot = cwd;
+							signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+							markStarted?.();
+						}),
+				),
 			});
 			const args = { command: "unused" };
 			const execution = sandbox.fork({
@@ -883,10 +889,12 @@ describe("workspace ExecutionWorld", () => {
 		const root = await mkdtemp(path.join(os.tmpdir(), "pi-spec-prewarm-process-test-"));
 		let processPreparations = 0;
 		const sandbox = createWorkspaceSandbox({
-			processRunner: async () => settlement("unused"),
-			prepareProcess: async () => {
-				processPreparations++;
-			},
+			processBackend: testProcessBackend(
+				async () => settlement("unused"),
+				async () => {
+					processPreparations++;
+				},
+			),
 		});
 		try {
 			await sandbox.prepare?.({ cwd: root, modes: ["file_mutation"] });
@@ -898,6 +906,32 @@ describe("workspace ExecutionWorld", () => {
 		}
 	});
 });
+
+function testProcessBackend(execute: SandboxProcessRunner, prepare = async () => {}): SandboxProcessBackend {
+	return {
+		check: async () => ({ backend: "test", state: "ready", source: "test", detail: "ready", fingerprint: "test:v1" }),
+		fingerprint: async () => "test:v1",
+		prepare: async ({ signal }) => {
+			if (signal?.aborted) throw signal.reason;
+			await prepare();
+		},
+		open: async ({ parent, signal }) => {
+			if (signal.aborted) throw signal.reason;
+			const processRoot = await mkdtemp(path.join(parent, "test-process-"));
+			let closed = false;
+			return {
+				processRoot,
+				execute,
+				close: async () => {
+					if (closed) return;
+					closed = true;
+					await rm(processRoot, { recursive: true, force: true });
+				},
+			};
+		},
+		dispose: async () => {},
+	};
+}
 
 function requiredAction(tool: string, args: unknown, cwd: string) {
 	const action = buildPiActionKey(tool, args, cwd);
