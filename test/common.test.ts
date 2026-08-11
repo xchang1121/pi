@@ -1,3 +1,4 @@
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
 	actionKeyMatches,
@@ -68,7 +69,11 @@ describe("speculative action common", () => {
 			"/workspace",
 		);
 
-		expect(bash).toMatchObject({ tool: "bash", execution: "sandbox", resources: ["/workspace/a"] });
+		expect(bash).toMatchObject({
+			tool: "bash",
+			execution: "sandbox",
+			resources: [path.resolve("/workspace/a").replaceAll("\\", "/")],
+		});
 		expect(bash?.key).not.toBe(otherCwd?.key);
 		expect(write).toMatchObject({ tool: "write", execution: "sandbox", resources: ["src/out.ts"] });
 		expect(write?.key).not.toBe(otherWrite?.key);

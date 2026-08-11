@@ -25,6 +25,8 @@ const editParameters = Type.Object({
 	edits: Type.Array(Type.Object({ oldText: Type.String(), newText: Type.String() })),
 });
 const bashParameters = Type.Object({ command: Type.String(), timeout: Type.Optional(Type.Number()) });
+const itWithSymlink = process.platform === "win32" ? it.skip : it;
+const itWithPosixShell = process.platform === "win32" ? it.skip : it;
 
 const writeTool: AgentTool<typeof writeParameters> = {
 	name: "write",
@@ -239,6 +241,66 @@ describe("M4 workspace sandbox", () => {
 		}
 	});
 
+	it("does not create target directories when another baseline is stale", async () => {
+		const root = await mkdtemp(path.join(os.tmpdir(), "pi-spec-validation-staging-test-"));
+		try {
+			const stale = path.join(root, "z-stale.txt");
+			const nested = path.join(root, "a-new", "created.txt");
+			await writeFile(stale, "changed", "utf8");
+			const execution: SpeculativeSandboxExecution = {
+				output: settlement("staged"),
+				sandbox: "git_worktree",
+				changes: [
+					{ root, target: nested, resource: "a-new/created.txt", after: Buffer.from("created") },
+					{
+						root,
+						target: stale,
+						resource: "z-stale.txt",
+						before: Buffer.from("original"),
+						after: Buffer.from("adopted"),
+					},
+				],
+			};
+
+			await expect(commitSandboxExecution(execution)).rejects.toThrow("resource changed before adoption");
+			await expect(stat(path.dirname(nested))).rejects.toThrow();
+			expect(await readFile(stale, "utf8")).toBe("changed");
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("serializes competing commits and accepts only one shared baseline", async () => {
+		const root = await mkdtemp(path.join(os.tmpdir(), "pi-spec-commit-lock-test-"));
+		const target = path.join(root, "value.txt");
+		try {
+			await writeFile(target, "original\n", "utf8");
+			const executions = ["first\n", "second\n"].map(
+				(content): SpeculativeSandboxExecution => ({
+					output: settlement(content.trim()),
+					sandbox: "git_worktree",
+					changes: [
+						{
+							root,
+							target,
+							resource: "value.txt",
+							before: Buffer.from("original\n"),
+							after: Buffer.from(content),
+						},
+					],
+				}),
+			);
+
+			const results = await Promise.allSettled(executions.map(commitSandboxExecution));
+
+			expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+			expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
+			expect(["first\n", "second\n"]).toContain(await readFile(target, "utf8"));
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
 	it("rolls back already applied paths when a later adoption write fails", async () => {
 		const root = await mkdtemp(path.join(os.tmpdir(), "pi-spec-rollback-test-"));
 		try {
@@ -275,7 +337,33 @@ describe("M4 workspace sandbox", () => {
 		}
 	});
 
-	it("fails closed on source symlinks before invoking a mutation tool", async () => {
+	if (process.platform !== "win32") {
+		it("preserves source permission bits that Git snapshots do not represent", async () => {
+			const root = await mkdtemp(path.join(os.tmpdir(), "pi-spec-mode-test-"));
+			const target = path.join(root, "script.sh");
+			try {
+				await writeFile(target, "#!/bin/sh\necho old\n", { mode: 0o640 });
+				const args = { path: "script.sh", edits: [{ oldText: "old", newText: "new" }] };
+				const sandbox = createWorkspaceSandbox();
+				const execution = await sandbox.execute({
+					cwd: root,
+					tool: editTool,
+					toolName: "edit",
+					args,
+					action: requiredAction("edit", args, root),
+					callID: "spec-mode",
+					signal: new AbortController().signal,
+				});
+
+				await sandbox.adopt(execution);
+				expect((await stat(target)).mode & 0o777).toBe(0o640);
+			} finally {
+				await rm(root, { recursive: true, force: true });
+			}
+		});
+	}
+
+	itWithSymlink("fails closed on source symlinks before invoking a mutation tool", async () => {
 		const root = await mkdtemp(path.join(os.tmpdir(), "pi-spec-symlink-test-"));
 		const outside = await mkdtemp(path.join(os.tmpdir(), "pi-spec-symlink-outside-"));
 		try {
@@ -299,7 +387,7 @@ describe("M4 workspace sandbox", () => {
 		}
 	});
 
-	it("rejects a symlink created inside the staged workspace", async () => {
+	itWithSymlink("rejects a symlink created inside the staged workspace", async () => {
 		const root = await mkdtemp(path.join(os.tmpdir(), "pi-spec-created-symlink-test-"));
 		try {
 			const sandbox = createWorkspaceSandbox({
@@ -498,52 +586,71 @@ describe("M4 workspace sandbox", () => {
 		}
 	});
 
-	it("batches large incremental path lists before invoking git add", async () => {
-		const root = await mkdtemp(path.join(os.tmpdir(), "pi-spec-path-batch-test-"));
-		const wrapper = path.join(root, "git-wrapper");
+	it("excludes atomic-adoption staging files from workspace snapshots", async () => {
+		const root = await mkdtemp(path.join(os.tmpdir(), "pi-spec-staging-exclusion-test-"));
 		try {
-			await writeFile(
-				wrapper,
-				[
-					"#!/bin/sh",
-					"bytes=0",
-					"is_add=0",
-					'for argument in "$@"; do',
-					'  argument_bytes=$(printf %s "$argument" | wc -c)',
-					"  bytes=$((bytes + argument_bytes + 1))",
-					'  if [ "$argument" = "add" ]; then is_add=1; fi',
-					"done",
-					'if [ "$is_add" = "1" ] && [ "$bytes" -gt 49152 ]; then',
-					'  echo "oversized git add invocation: $bytes bytes" >&2',
-					"  exit 97",
-					"fi",
-					'exec git "$@"',
-				].join("\n"),
-				"utf8",
-			);
-			await chmod(wrapper, 0o700);
-			const files = Array.from(
-				{ length: 700 },
-				(_, index) => `files/path-${String(index).padStart(4, "0")}-${"deliberately-long-".repeat(4)}name.txt`,
-			);
-			await mkdir(path.join(root, "files"));
-			await Promise.all(files.map((file) => writeFile(path.join(root, file), "before\n")));
-			await prepareSandboxWorkspace(root, { gitBinary: wrapper });
-			await Promise.all(files.map((file) => writeFile(path.join(root, file), "after\n")));
+			await writeFile(path.join(root, "value.txt"), "real\n");
+			await writeFile(path.join(root, ".pi-speculative-in-flight.tmp"), "staged\n");
 
-			await withSandboxWorkspace(
-				root,
-				async (workspace) => {
-					expect(await readFile(path.join(workspace.sandboxRoot, files.at(-1)!), "utf8")).toBe("after\n");
-				},
-				wrapper,
-			);
+			await withSandboxWorkspace(root, async (workspace) => {
+				expect(await readFile(path.join(workspace.sandboxRoot, "value.txt"), "utf8")).toBe("real\n");
+				await expect(stat(path.join(workspace.sandboxRoot, ".pi-speculative-in-flight.tmp"))).rejects.toThrow();
+			});
 		} finally {
 			await rm(root, { recursive: true, force: true });
 		}
-	}, 15_000);
+	});
 
-	it("retries incremental staging when an untracked file disappears during git add", async () => {
+	itWithPosixShell(
+		"batches large incremental path lists before invoking git add",
+		async () => {
+			const root = await mkdtemp(path.join(os.tmpdir(), "pi-spec-path-batch-test-"));
+			const wrapper = path.join(root, "git-wrapper");
+			try {
+				await writeFile(
+					wrapper,
+					[
+						"#!/bin/sh",
+						"bytes=0",
+						"is_add=0",
+						'for argument in "$@"; do',
+						'  argument_bytes=$(printf %s "$argument" | wc -c)',
+						"  bytes=$((bytes + argument_bytes + 1))",
+						'  if [ "$argument" = "add" ]; then is_add=1; fi',
+						"done",
+						'if [ "$is_add" = "1" ] && [ "$bytes" -gt 49152 ]; then',
+						'  echo "oversized git add invocation: $bytes bytes" >&2',
+						"  exit 97",
+						"fi",
+						'exec git "$@"',
+					].join("\n"),
+					"utf8",
+				);
+				await chmod(wrapper, 0o700);
+				const files = Array.from(
+					{ length: 700 },
+					(_, index) => `files/path-${String(index).padStart(4, "0")}-${"deliberately-long-".repeat(4)}name.txt`,
+				);
+				await mkdir(path.join(root, "files"));
+				await Promise.all(files.map((file) => writeFile(path.join(root, file), "before\n")));
+				await prepareSandboxWorkspace(root, { gitBinary: wrapper });
+				await Promise.all(files.map((file) => writeFile(path.join(root, file), "after\n")));
+
+				await withSandboxWorkspace(
+					root,
+					async (workspace) => {
+						expect(await readFile(path.join(workspace.sandboxRoot, files.at(-1)!), "utf8")).toBe("after\n");
+					},
+					wrapper,
+				);
+			} finally {
+				await rm(root, { recursive: true, force: true });
+			}
+		},
+		15_000,
+	);
+
+	itWithPosixShell("retries incremental staging when an untracked file disappears during git add", async () => {
 		const root = await mkdtemp(path.join(os.tmpdir(), "pi-spec-transient-path-test-"));
 		const wrapper = path.join(root, "git-wrapper");
 		try {

@@ -15,6 +15,7 @@
 
 ### Changed
 
+- Workspace adoption now serializes overlapping targets, uses staged atomic replacement, preserves file modes, and removes newly created directories during rollback.
 - Drafter candidates now reuse exact and containing-read cache entries, deduplicate in-flight work, and replace stale resource entries before execution.
 - Resource candidates now use a configurable access-ordered LRU, and sandbox failures fall back without mutating the real workspace.
 - Renamed read-only execution telemetry and settings to `resource_cached`/`resourceCached`; the Agent installer still accepts legacy `liveReadonly` input.
@@ -23,5 +24,6 @@
 
 ### Fixed
 
+- Agent uninstall now releases owned workspace sandbox pools immediately instead of retaining Windows file watchers until the idle timeout.
 - Native release manifests and smoke requests now use protocol v3 and verify the isolation attestation.
 - Shell dispatch recognizes Windows-style executable paths even when protocol tests run on a non-Windows host.

@@ -1,5 +1,7 @@
 import { execFile } from "node:child_process";
-import { lstat, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { constants as fsConstants } from "node:fs";
+import { chmod, type FileHandle, lstat, mkdir, mkdtemp, open, rename, rm, rmdir } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { AgentTool, SettleToolCallResult } from "@earendil-works/pi-agent-core";
@@ -13,6 +15,13 @@ export interface SandboxFileChange {
 	readonly resource: string;
 	readonly before?: Uint8Array;
 	readonly after?: Uint8Array;
+	readonly beforeMode?: number;
+	readonly afterMode?: number;
+}
+
+interface RegularFileState {
+	readonly content: Uint8Array;
+	readonly mode: number;
 }
 
 export interface SpeculativeSandboxExecution {
@@ -55,6 +64,8 @@ export interface SpeculativeAgentSandbox {
 	readonly execute: (context: SpeculativeSandboxExecuteContext) => Promise<SpeculativeSandboxExecution>;
 	/** Revalidate and atomically adopt an execution, rolling back partial writes on failure. */
 	readonly adopt: (execution: SpeculativeSandboxExecution) => Promise<SettleToolCallResult>;
+	/** Release pooled workspace resources owned by this sandbox instance. */
+	readonly dispose?: () => Promise<void>;
 }
 
 export interface SandboxProcessRunnerInput {
@@ -133,6 +144,7 @@ const SNAPSHOT_EXCLUDES = [
 ] as const;
 const SANDBOX_REPOSITORY_IDLE_MS = 5 * 60 * 1000;
 const GIT_PATHSPEC_BATCH_BYTES = 32 * 1024;
+const SANDBOX_STAGING_FILE_PREFIX = ".pi-speculative-";
 const sandboxRepositories = new Map<string, Promise<PooledGitRepository>>();
 const SANDBOX_AUTHOR_ENVIRONMENT = {
 	GIT_AUTHOR_NAME: "Pi Speculative Action",
@@ -143,6 +155,7 @@ const SANDBOX_AUTHOR_ENVIRONMENT = {
 
 /** Create M4's private Git snapshot sandbox with transactional multi-file adoption. */
 export function createWorkspaceSandbox(options: WorkspaceSandboxOptions = {}): SpeculativeAgentSandbox {
+	const roots = new Set<string>();
 	return {
 		supports: (toolName) =>
 			toolName === "write" || toolName === "edit" || (toolName === "bash" && !!options.processRunner),
@@ -152,10 +165,12 @@ export function createWorkspaceSandbox(options: WorkspaceSandboxOptions = {}): S
 					toolName === "write" || toolName === "edit" || (toolName === "bash" && !!options.processRunner),
 			);
 			if (!supported.length) return;
+			roots.add(path.resolve(cwd));
 			await prepareSandboxWorkspace(cwd, { ...(options.gitBinary ? { gitBinary: options.gitBinary } : {}), signal });
 			if (supported.includes("bash") && options.prepareProcess) await options.prepareProcess({ signal });
 		},
 		execute: async (context) => {
+			roots.add(path.resolve(context.cwd));
 			if (context.toolName === "write" || context.toolName === "edit") {
 				return executeMutation(context, options.gitBinary);
 			}
@@ -165,52 +180,86 @@ export function createWorkspaceSandbox(options: WorkspaceSandboxOptions = {}): S
 			throw new Error(`Sandbox does not support tool ${context.toolName}`);
 		},
 		adopt: commitSandboxExecution,
+		dispose: async () => {
+			const ownedRoots = [...roots];
+			roots.clear();
+			await closeWorkspaceSandboxPools(ownedRoots);
+		},
 	};
 }
 
 export async function commitSandboxExecution(execution: SpeculativeSandboxExecution): Promise<SettleToolCallResult> {
 	const started = performance.now();
-	const validationStarted = performance.now();
-	let bytesValidated = 0;
-	for (const change of execution.changes) {
-		const root = path.resolve(change.root);
-		const target = path.resolve(change.target);
-		if (!contains(root, target) || target === root || target !== path.resolve(root, change.resource)) {
-			throw new Error(`sandbox adoption path escapes workspace: ${change.resource}`);
-		}
-		await assertNoSymlinkPath(root, target);
-		const current = await readOptional(target);
-		bytesValidated += current?.byteLength ?? 0;
-		if (!sameOptionalBytes(current, change.before)) {
-			throw new Error(`resource changed before adoption: ${change.resource}`);
-		}
-	}
-	const validationMs = Math.max(0, performance.now() - validationStarted);
-
-	const applied: SandboxFileChange[] = [];
-	try {
-		for (const change of execution.changes) {
-			applied.push(change);
-			await applyBytes(change.target, change.after);
-		}
-	} catch (error) {
-		for (const change of applied.reverse()) {
+	const changes = deduplicateChanges(execution.changes);
+	return withTargetLocks(
+		changes.map((change) => change.target),
+		async () => {
+			const staged = new Map<SandboxFileChange, string>();
+			const baselines = new Map<SandboxFileChange, RegularFileState | undefined>();
+			const adoptionModes = new Map<SandboxFileChange, number | undefined>();
+			const applied: SandboxFileChange[] = [];
+			const createdDirectories: string[] = [];
+			let bytesValidated = 0;
+			let validationMs = 0;
+			let filesCommitted = 0;
 			try {
-				await applyBytes(change.target, change.before);
-			} catch {
-				// Continue restoring the remaining paths before surfacing the adoption failure.
+				for (const change of changes) await assertAdoptionTarget(change);
+				for (const change of changes) {
+					if (change.after !== undefined) {
+						staged.set(change, await stageAtomicWrite(change.after, change.afterMode, change.root));
+					}
+				}
+				const validationStarted = performance.now();
+				for (const change of changes) {
+					const current = await readRegularState(change.target);
+					baselines.set(change, current);
+					bytesValidated += current?.content.byteLength ?? 0;
+					if (!sameBaselineState(current, change)) {
+						throw new Error(`resource changed before adoption: ${change.resource}`);
+					}
+					adoptionModes.set(change, resolveAdoptionMode(current, change));
+				}
+				validationMs = Math.max(0, performance.now() - validationStarted);
+				for (const change of changes) {
+					await assertAdoptionTarget(change);
+					applied.push(change);
+					const temporary = staged.get(change);
+					if (temporary) {
+						createdDirectories.push(...(await createParentDirectories(change.root, change.target)));
+						await replaceFile(temporary, change.target, adoptionModes.get(change));
+						staged.delete(change);
+					} else {
+						await rm(change.target, { force: true });
+					}
+					filesCommitted++;
+				}
+			} catch (error) {
+				try {
+					await restoreChanges(applied, baselines);
+					await removeCreatedDirectories(createdDirectories);
+				} catch (rollbackError) {
+					throw new AggregateError(
+						[error, rollbackError],
+						"sandbox adoption failed and the original workspace could not be fully restored",
+						{ cause: error },
+					);
+				}
+				throw error;
+			} finally {
+				await Promise.all(
+					[...staged.values()].map((temporary) => rm(temporary, { force: true }).catch(() => undefined)),
+				);
 			}
-		}
-		throw error;
-	}
-	execution.commitMetrics = {
-		durationMs: Math.max(0, performance.now() - started),
-		validationMs,
-		bytesValidated,
-		filesValidated: execution.changes.length,
-		filesCommitted: execution.changes.length,
-	};
-	return execution.output;
+			execution.commitMetrics = {
+				durationMs: Math.max(0, performance.now() - started),
+				validationMs,
+				bytesValidated,
+				filesValidated: changes.length,
+				filesCommitted,
+			};
+			return execution.output;
+		},
+	);
 }
 
 export async function withSandboxWorkspace<T>(
@@ -702,10 +751,15 @@ function releaseSandboxRepository(repository: PooledGitRepository): void {
 	repository.idleTimer.unref?.();
 }
 
-export async function closeWorkspaceSandboxPools(): Promise<void> {
-	const pending = [...sandboxRepositories.values()];
-	sandboxRepositories.clear();
-	for (const item of pending) {
+export async function closeWorkspaceSandboxPools(roots?: readonly string[]): Promise<void> {
+	const rootKeys = roots ? new Set(roots.map(pathKey)) : undefined;
+	const pending = [...sandboxRepositories.entries()].filter(([key]) => {
+		if (!rootKeys) return true;
+		const separator = key.indexOf("\0");
+		return rootKeys.has(separator === -1 ? key : key.slice(0, separator));
+	});
+	for (const [key, item] of pending) {
+		if (sandboxRepositories.get(key) === item) sandboxRepositories.delete(key);
 		const repository = await item.catch(() => undefined);
 		if (!repository) continue;
 		await waitForSandboxRepositoryIdle(repository);
@@ -748,14 +802,26 @@ function incrementalPathspecs(root: string, changedPaths: readonly string[]): st
 		const relative = slash(path.relative(root, path.resolve(changedPath)) || ".");
 		if (relative === ".") return undefined;
 		if (relative === ".." || relative.startsWith("../") || path.isAbsolute(relative)) return undefined;
-		if (relative.split("/").some((segment) => (SNAPSHOT_EXCLUDES as readonly string[]).includes(segment))) continue;
+		if (isSnapshotExcluded(relative)) continue;
 		result.add(relative);
 	}
 	return [...result].sort();
 }
 
 function snapshotPathspecs(): string[] {
-	return [".", ...SNAPSHOT_EXCLUDES.flatMap((item) => [`:(glob,exclude)**/${item}`, `:(glob,exclude)**/${item}/**`])];
+	return [
+		".",
+		...SNAPSHOT_EXCLUDES.flatMap((item) => [`:(glob,exclude)**/${item}`, `:(glob,exclude)**/${item}/**`]),
+		`:(glob,exclude)**/${SANDBOX_STAGING_FILE_PREFIX}*.tmp`,
+	];
+}
+
+function isSnapshotExcluded(relative: string): boolean {
+	const basename = path.posix.basename(relative);
+	return (
+		relative.split("/").some((segment) => (SNAPSHOT_EXCLUDES as readonly string[]).includes(segment)) ||
+		(basename.startsWith(SANDBOX_STAGING_FILE_PREFIX) && basename.endsWith(".tmp"))
+	);
 }
 
 function pathKey(value: string): string {
@@ -814,16 +880,27 @@ async function collectSandboxChanges(workspace: PrivateGitWorkspace): Promise<re
 		}
 		await assertNoSymlinkPath(workspace.sourceRoot, target);
 		await assertNoSymlinkPath(workspace.sandboxRoot, sandboxTarget);
-		const before = await readBaselineBytes(workspace, resource);
-		const after = await readOptional(sandboxTarget);
-		if (!sameOptionalBytes(before, after)) {
-			changes.push({ root: workspace.sourceRoot, target, resource, before, after });
+		const before = await readBaselineState(workspace, resource);
+		const after = await readRegularState(sandboxTarget);
+		if (!sameOptionalState(before, after)) {
+			changes.push({
+				root: workspace.sourceRoot,
+				target,
+				resource,
+				before: before?.content,
+				after: after?.content,
+				beforeMode: before?.mode,
+				afterMode: after?.mode,
+			});
 		}
 	}
 	return changes;
 }
 
-async function readBaselineBytes(workspace: PrivateGitWorkspace, resource: string): Promise<Uint8Array | undefined> {
+async function readBaselineState(
+	workspace: PrivateGitWorkspace,
+	resource: string,
+): Promise<RegularFileState | undefined> {
 	const entry = await git(
 		workspace.gitBinary,
 		["-C", workspace.sandboxRoot, "ls-tree", "-z", "HEAD", "--", resource],
@@ -831,9 +908,19 @@ async function readBaselineBytes(workspace: PrivateGitWorkspace, resource: strin
 	);
 	if (entry.length === 0) return undefined;
 	const metadata = entry.subarray(0, entry.indexOf(0)).toString("utf8").split("\t", 1)[0];
-	const hash = metadata.split(" ")[2];
+	const [mode, kind, hash] = metadata.split(" ");
+	if ((mode !== "100644" && mode !== "100755") || kind !== "blob") {
+		throw new Error(`sandbox baseline resource is not a regular file: ${resource}`);
+	}
 	if (!hash) throw new Error(`invalid Git baseline entry: ${resource}`);
-	return git(workspace.gitBinary, ["-C", workspace.sandboxRoot, "cat-file", "blob", hash], workspace.sandboxRoot);
+	return {
+		content: await git(
+			workspace.gitBinary,
+			["-C", workspace.sandboxRoot, "cat-file", "blob", hash],
+			workspace.sandboxRoot,
+		),
+		mode: process.platform === "win32" ? 0 : mode === "100755" ? 0o755 : 0o644,
+	};
 }
 
 async function assertNoSymlinkPath(root: string, target: string): Promise<void> {
@@ -843,9 +930,13 @@ async function assertNoSymlinkPath(root: string, target: string): Promise<void> 
 		throw new Error(`sandbox path escapes workspace: ${resolvedTarget}`);
 	}
 	try {
-		if ((await lstat(resolvedRoot)).isSymbolicLink()) throw new Error("sandbox workspace root is a symlink");
+		const rootInfo = await lstat(resolvedRoot);
+		if (rootInfo.isSymbolicLink() || !rootInfo.isDirectory()) {
+			throw new Error("sandbox workspace root must be a real directory");
+		}
 	} catch (error) {
-		if (!isMissing(error)) throw error;
+		if (isMissing(error)) throw new Error(`sandbox workspace root does not exist: ${resolvedRoot}`, { cause: error });
+		throw error;
 	}
 	const relative = path.relative(resolvedRoot, resolvedTarget);
 	let current = resolvedRoot;
@@ -863,22 +954,215 @@ async function assertNoSymlinkPath(root: string, target: string): Promise<void> 
 	}
 }
 
-async function applyBytes(target: string, bytes: Uint8Array | undefined): Promise<void> {
-	if (bytes === undefined) {
-		await rm(target, { force: true });
-		return;
+async function assertAdoptionTarget(change: SandboxFileChange): Promise<void> {
+	const root = path.resolve(change.root);
+	const target = path.resolve(change.target);
+	if (!contains(root, target) || target === root || target !== path.resolve(root, change.resource)) {
+		throw new Error(`sandbox adoption path escapes workspace: ${change.resource}`);
 	}
-	await mkdir(path.dirname(target), { recursive: true });
-	await writeFile(target, bytes);
+	await assertNoSymlinkPath(root, target);
 }
 
-async function readOptional(target: string): Promise<Uint8Array | undefined> {
+async function readRegularState(target: string): Promise<RegularFileState | undefined> {
+	let handle: FileHandle;
 	try {
-		return await readFile(target);
+		const noFollow = typeof fsConstants.O_NOFOLLOW === "number" ? fsConstants.O_NOFOLLOW : 0;
+		handle = await open(target, fsConstants.O_RDONLY | noFollow);
 	} catch (error) {
 		if (isMissing(error)) return undefined;
+		if (error && typeof error === "object" && "code" in error && error.code === "ELOOP") {
+			throw new Error(`symbolic links are not adoptable sandbox resources: ${target}`, { cause: error });
+		}
 		throw error;
 	}
+	try {
+		const info = await handle.stat();
+		if (!info.isFile()) throw new Error(`sandbox resource is not a regular file: ${target}`);
+		return {
+			content: await handle.readFile(),
+			mode: process.platform === "win32" ? 0 : info.mode & 0o777,
+		};
+	} finally {
+		await handle.close();
+	}
+}
+
+function sameBaselineState(current: RegularFileState | undefined, change: SandboxFileChange): boolean {
+	if (current === undefined || change.before === undefined) {
+		return current === undefined && change.before === undefined;
+	}
+	if (!sameBytes(current.content, change.before)) return false;
+	return (
+		change.beforeMode === undefined || change.beforeMode === 0 || sameExecutableMode(current.mode, change.beforeMode)
+	);
+}
+
+function sameOptionalState(left: RegularFileState | undefined, right: RegularFileState | undefined): boolean {
+	if (!left || !right) return left === right;
+	if (!sameBytes(left.content, right.content)) return false;
+	return right.mode === 0 || sameExecutableMode(left.mode, right.mode);
+}
+
+function deduplicateChanges(changes: readonly SandboxFileChange[]): SandboxFileChange[] {
+	const result = new Map<string, SandboxFileChange>();
+	for (const change of changes) {
+		const key = pathKey(change.target);
+		const previous = result.get(key);
+		if (!previous) {
+			result.set(key, change);
+			continue;
+		}
+		if (
+			pathKey(previous.root) !== pathKey(change.root) ||
+			!sameOptionalBytes(previous.before, change.before) ||
+			(previous.beforeMode !== undefined &&
+				change.beforeMode !== undefined &&
+				!sameExecutableMode(previous.beforeMode, change.beforeMode))
+		) {
+			throw new Error(`inconsistent sandbox baseline: ${change.resource}`);
+		}
+		result.set(key, {
+			...change,
+			before: previous.before,
+			beforeMode: previous.beforeMode,
+		});
+	}
+	return [...result.values()].sort((left, right) => pathKey(left.target).localeCompare(pathKey(right.target)));
+}
+
+async function restoreChanges(
+	changes: readonly SandboxFileChange[],
+	baselines: ReadonlyMap<SandboxFileChange, RegularFileState | undefined>,
+): Promise<void> {
+	const errors: unknown[] = [];
+	for (const change of [...changes].reverse()) {
+		try {
+			await assertAdoptionTarget(change);
+			const baseline = baselines.get(change);
+			if (!baseline) await rm(change.target, { force: true });
+			else await atomicWrite(change.target, baseline.content, baseline.mode, change.root);
+		} catch (error) {
+			errors.push(error);
+		}
+	}
+	if (errors.length > 0) throw new AggregateError(errors, "failed to restore sandbox adoption changes");
+}
+
+function resolveAdoptionMode(current: RegularFileState | undefined, change: SandboxFileChange): number | undefined {
+	if (process.platform === "win32") return undefined;
+	if (change.afterMode === undefined) return current?.mode ?? 0o644;
+	if (!current || change.beforeMode === undefined) return change.afterMode;
+	if (sameExecutableMode(change.beforeMode, change.afterMode)) return current.mode;
+	return isExecutableMode(change.afterMode) ? current.mode | (change.afterMode & 0o111) : current.mode & ~0o111;
+}
+
+function sameExecutableMode(left: number, right: number): boolean {
+	return isExecutableMode(left) === isExecutableMode(right);
+}
+
+function isExecutableMode(mode: number): boolean {
+	return (mode & 0o111) !== 0;
+}
+
+async function atomicWrite(target: string, content: Uint8Array, mode: number | undefined, sourceRoot: string) {
+	const temporary = await stageAtomicWrite(content, mode, sourceRoot);
+	try {
+		await createParentDirectories(sourceRoot, target);
+		await replaceFile(temporary, target, mode);
+	} finally {
+		await rm(temporary, { force: true }).catch(() => undefined);
+	}
+}
+
+async function stageAtomicWrite(
+	content: Uint8Array,
+	mode: number | undefined,
+	stagingDirectory: string,
+): Promise<string> {
+	await mkdir(stagingDirectory, { recursive: true });
+	const temporary = path.join(stagingDirectory, `${SANDBOX_STAGING_FILE_PREFIX}${randomUUID()}.tmp`);
+	const fileMode = process.platform === "win32" ? undefined : mode;
+	const handle = await open(temporary, "wx", fileMode ?? 0o600);
+	try {
+		await handle.writeFile(content);
+		await handle.sync();
+		if (fileMode !== undefined) await handle.chmod(fileMode);
+	} catch (error) {
+		await handle.close().catch(() => undefined);
+		await rm(temporary, { force: true }).catch(() => undefined);
+		throw error;
+	} finally {
+		await handle.close().catch(() => undefined);
+	}
+	return temporary;
+}
+
+async function createParentDirectories(sourceRoot: string, target: string): Promise<string[]> {
+	const root = path.resolve(sourceRoot);
+	const parent = path.dirname(path.resolve(target));
+	const relative = path.relative(root, parent);
+	if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+		throw new Error(`sandbox adoption path escapes workspace: ${target}`);
+	}
+	const created: string[] = [];
+	let current = root;
+	for (const segment of relative.split(path.sep).filter(Boolean)) {
+		current = path.join(current, segment);
+		try {
+			await mkdir(current);
+			created.push(current);
+		} catch (error) {
+			if (!(error && typeof error === "object" && "code" in error && error.code === "EEXIST")) throw error;
+			const info = await lstat(current);
+			if (info.isSymbolicLink() || !info.isDirectory()) {
+				throw new Error(`sandbox adoption parent is not a real directory: ${current}`, { cause: error });
+			}
+		}
+	}
+	return created;
+}
+
+async function removeCreatedDirectories(directories: readonly string[]): Promise<void> {
+	for (const directory of [...new Set(directories)].sort((left, right) => right.length - left.length)) {
+		try {
+			await rmdir(directory);
+		} catch (error) {
+			const code = error && typeof error === "object" && "code" in error ? error.code : undefined;
+			if (code !== "ENOENT" && code !== "ENOTEMPTY" && code !== "EEXIST") throw error;
+		}
+	}
+}
+
+async function replaceFile(temporary: string, target: string, mode?: number): Promise<void> {
+	await rename(temporary, target);
+	if (mode !== undefined && process.platform !== "win32") await chmod(target, mode);
+}
+
+const targetLocks = new Map<string, Promise<void>>();
+
+async function withTargetLocks<T>(targets: readonly string[], run: () => Promise<T>): Promise<T> {
+	const releases: Array<() => void> = [];
+	try {
+		for (const target of [...new Set(targets.map(pathKey))].sort()) releases.push(await acquireTargetLock(target));
+		return await run();
+	} finally {
+		for (const release of releases.reverse()) release();
+	}
+}
+
+async function acquireTargetLock(key: string): Promise<() => void> {
+	const previous = targetLocks.get(key) ?? Promise.resolve();
+	let release: () => void = () => undefined;
+	const current = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	const tail = previous.then(() => current);
+	targetLocks.set(key, tail);
+	await previous;
+	return () => {
+		release();
+		if (targetLocks.get(key) === tail) targetLocks.delete(key);
+	};
 }
 
 function isMissing(error: unknown): boolean {
@@ -897,6 +1181,10 @@ async function exists(target: string): Promise<boolean> {
 
 function sameOptionalBytes(left: Uint8Array | undefined, right: Uint8Array | undefined): boolean {
 	if (left === undefined || right === undefined) return left === right;
+	return sameBytes(left, right);
+}
+
+function sameBytes(left: Uint8Array, right: Uint8Array): boolean {
 	if (left.length !== right.length) return false;
 	for (let index = 0; index < left.length; index++) if (left[index] !== right[index]) return false;
 	return true;

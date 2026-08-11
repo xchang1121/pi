@@ -690,11 +690,19 @@ export function installSpeculativeAction(
 				await runtime.releaseSession(sessionID);
 				await finishPatternSession();
 			} finally {
-				if (openedPatternStore) {
+				try {
+					if (openedPatternStore) {
+						try {
+							await (await openedPatternStore).release();
+						} catch {
+							// Persistence failure must not change Agent uninstall semantics.
+						}
+					}
+				} finally {
 					try {
-						await (await openedPatternStore).release();
+						await options.sandbox?.dispose?.();
 					} catch {
-						// Persistence failure must not change Agent uninstall semantics.
+						// Sandbox resource cleanup must not change Agent uninstall semantics.
 					}
 				}
 			}

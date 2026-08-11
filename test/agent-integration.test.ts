@@ -17,7 +17,7 @@ import { describe, expect, it } from "vitest";
 import { installSpeculativeAction, type SpeculativeAgentSettingsInput } from "../src/agent-integration.ts";
 import { PATTERN_AWARE_DEFAULTS, type PatternAwareEventInput, PatternAwareStore } from "../src/pattern-aware.ts";
 import type { SpeculativeActionEvent } from "../src/runtime.ts";
-import { createWorkspaceSandbox } from "../src/workspace-sandbox.ts";
+import { createWorkspaceSandbox, type SpeculativeAgentSandbox } from "../src/workspace-sandbox.ts";
 
 const readSchema = Type.Object({
 	path: Type.String(),
@@ -172,6 +172,31 @@ function createStreamHarness(
 }
 
 describe("Pi Agent speculative integration", () => {
+	it("disposes sandbox resources without changing uninstall semantics", async () => {
+		let disposeCalls = 0;
+		const sandbox: SpeculativeAgentSandbox = {
+			supports: () => false,
+			execute: async () => {
+				throw new Error("unused sandbox");
+			},
+			adopt: async (execution) => execution.output,
+			dispose: async () => {
+				disposeCalls++;
+				throw new Error("simulated cleanup failure");
+			},
+		};
+		const streams = createStreamHarness();
+		const agent = new Agent({ initialState: { model: createModel(), tools: [] }, streamFn: streams.stream });
+		const installed = installSpeculativeAction(agent, {
+			cwd: "/workspace",
+			sandbox,
+			getSettings: () => ({ enabled: false }),
+		});
+
+		await expect(installed.uninstall()).resolves.toBeUndefined();
+		expect(disposeCalls).toBe(1);
+	});
+
 	it("runs the drafter beside the actor and settles the real call from one pre-execution", async () => {
 		const execution = deferred<void>();
 		let toolExecutions = 0;
