@@ -46,6 +46,10 @@ interface HarnessOptions {
 		candidate: SpeculativeDraftCandidate,
 		signal: AbortSignal,
 	) => Promise<CandidatePreflight> | CandidatePreflight;
+	readonly authorize?: (
+		candidate: SpeculativeCandidate,
+		input: ConsumeInput,
+	) => Promise<CandidatePreflight> | CandidatePreflight;
 	readonly prepare?: (candidate: SpeculativeDraftCandidate, signal: AbortSignal) => Promise<void> | void;
 	readonly actionKey?: (
 		tool: string,
@@ -139,6 +143,12 @@ function createHarness(options: HarnessOptions) {
 			options.actionKey?.(tool, input, context) ?? buildPiActionKey(tool, input, "/workspace"),
 		actual: (input) => ({ id: input.id, tool: input.tool, input: input.input }),
 		preflightCandidate: ({ candidate, signal }) => options.preflight?.(candidate, signal) ?? { ok: true },
+		...(options.authorize
+			? {
+					authorizeCandidate: ({ candidate, consumeInput }) =>
+						options.authorize?.(candidate, consumeInput) ?? { ok: true },
+				}
+			: {}),
 		...(options.prepare ? { prepareCandidate: ({ candidate, signal }) => options.prepare?.(candidate, signal) } : {}),
 		executeCandidate: ({ candidate, signal }) => {
 			executions++;
@@ -957,11 +967,11 @@ describe("speculative action runtime", () => {
 		await harness.runtime.finishTurn(consume("seed-protected", {}));
 
 		await harness.runtime.startTurn({ sessionID: "session", turnID: "seed-probation" });
-		await waitFor(() => harness.runtime.inspect("session").pendingPredictions === 0);
+		await waitFor(() => harness.executions() >= 2);
 		await harness.runtime.finishTurn(consume("seed-probation", {}));
 
 		await harness.runtime.startTurn({ sessionID: "session", turnID: "apply-pressure" });
-		await waitFor(() => harness.runtime.inspect("session").pendingPredictions === 0);
+		await waitFor(() => harness.executions() >= 3);
 		await harness.runtime.finishTurn(consume("apply-pressure", {}));
 
 		await harness.runtime.startTurn({ sessionID: "session", turnID: "check-protected" });
@@ -1352,6 +1362,192 @@ describe("speculative action runtime", () => {
 		expect(harness.events.filter((event) => event.type === "started")).toHaveLength(2);
 	});
 
+	it("falls through a failed tight projection to a broader valid candidate", async () => {
+		let draftCalls = 0;
+		const projectionOrder: string[] = [];
+		const harness = createHarness({
+			predict: () =>
+				draftCalls++ === 0
+					? prediction(readCandidate("README.md", 1, 200), readCandidate("README.md", 100, 110))
+					: prediction(),
+			execute: async (candidate) => {
+				const limit = (candidate.input as { limit: number }).limit;
+				if (limit === 110) await new Promise((resolve) => setTimeout(resolve, 10));
+				return limit === 110 ? "tight-invalid" : "broad-valid";
+			},
+			projectOutput: (output) => {
+				projectionOrder.push(output);
+				return output === "tight-invalid" ? undefined : `projected:${output}`;
+			},
+		});
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-cascade-projection" });
+		await waitFor(() => harness.runtime.inspect("session").pendingPredictions === 0);
+
+		expect(
+			await harness.runtime.consume(
+				consume("turn-cascade-projection", { path: "README.md", offset: 120, limit: 10 }),
+			),
+		).toBe("projected:broad-valid");
+		expect(projectionOrder).toEqual(["tight-invalid", "broad-valid"]);
+		expect(harness.events.filter((event) => event.type === "miss")).toHaveLength(0);
+		await harness.runtime.finishTurn(consume("turn-cascade-projection", {}));
+
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-exact-after-projection" });
+		await waitFor(() => harness.runtime.inspect("session").pendingPredictions === 0);
+		expect(
+			await harness.runtime.consume(
+				consume("turn-exact-after-projection", { path: "README.md", offset: 100, limit: 110 }),
+			),
+		).toBe("tight-invalid");
+		expect(harness.executions()).toBe(2);
+	});
+
+	it("falls through a stale tight candidate to a fresh broader candidate", async () => {
+		const harness = createHarness({
+			predict: () => prediction(readCandidate("README.md", 1, 200), readCandidate("README.md", 100, 110)),
+			execute: async (candidate) => {
+				const limit = (candidate.input as { limit: number }).limit;
+				if (limit === 110) await new Promise((resolve) => setTimeout(resolve, 10));
+				return limit === 110 ? "stale-tight" : "fresh-broad";
+			},
+			captureResourceVersion: () => "v1",
+			isResourceExpired: ({ candidate }) => (candidate.input as { limit: number }).limit === 110,
+			projectOutput: (output) => `projected:${output}`,
+		});
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-cascade-stale" });
+		await waitFor(() => harness.runtime.inspect("session").pendingPredictions === 0);
+
+		expect(
+			await harness.runtime.consume(consume("turn-cascade-stale", { path: "README.md", offset: 120, limit: 10 })),
+		).toBe("projected:fresh-broad");
+		expect(harness.events.filter((event) => event.type === "hit")).toHaveLength(1);
+		expect(harness.events.filter((event) => event.type === "miss")).toHaveLength(0);
+	});
+
+	it("falls through a rejected candidate without deleting a reusable result", async () => {
+		let draftCalls = 0;
+		const harness = createHarness({
+			predict: () =>
+				draftCalls++ === 0
+					? prediction(readCandidate("README.md", 1, 200), readCandidate("README.md", 100, 110))
+					: prediction(),
+			execute: async (candidate) => {
+				const limit = (candidate.input as { limit: number }).limit;
+				if (limit === 110) await new Promise((resolve) => setTimeout(resolve, 10));
+				return limit === 110 ? "tight" : "broad";
+			},
+			authorize: (candidate, input) =>
+				(candidate.input as { limit: number }).limit === 110 && input.input.offset === 120
+					? { ok: false, reason: "candidate_permission_rejected" }
+					: { ok: true },
+			projectOutput: (output) => `projected:${output}`,
+		});
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-cascade-authorization" });
+		await waitFor(() => harness.runtime.inspect("session").pendingPredictions === 0);
+
+		expect(
+			await harness.runtime.consume(
+				consume("turn-cascade-authorization", { path: "README.md", offset: 120, limit: 10 }),
+			),
+		).toBe("projected:broad");
+		await harness.runtime.finishTurn(consume("turn-cascade-authorization", {}));
+
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-authorized-exact" });
+		await waitFor(() => harness.runtime.inspect("session").pendingPredictions === 0);
+		expect(
+			await harness.runtime.consume(
+				consume("turn-authorized-exact", { path: "README.md", offset: 100, limit: 110 }),
+			),
+		).toBe("tight");
+		expect(harness.executions()).toBe(2);
+	});
+
+	it("falls through an in-flight execution failure to a ready candidate", async () => {
+		const tightExecution = deferred<string>();
+		const harness = createHarness({
+			predict: () =>
+				prediction(readCandidate("README.md", 1, 200), {
+					...readCandidate("README.md", 100, 110),
+					expectedDurationMs: 100,
+				}),
+			execute: (candidate) =>
+				(candidate.input as { limit: number }).limit === 110 ? tightExecution.promise : "ready-broad",
+			projectOutput: (output) => `projected:${output}`,
+		});
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-cascade-execution" });
+		await waitFor(() => harness.executions() === 2);
+		const result = harness.runtime.consume(
+			consume("turn-cascade-execution", { path: "README.md", offset: 120, limit: 10 }),
+		);
+		await Promise.resolve();
+		tightExecution.reject(new Error("tight failed"));
+
+		expect(await result).toBe("projected:ready-broad");
+		expect(harness.events.filter((event) => event.type === "miss")).toHaveLength(0);
+	});
+
+	it("prefers a completed high-value candidate over a just-started tighter candidate", async () => {
+		const broadExecution = deferred<string>();
+		const tightPreflight = deferred<CandidatePreflight>();
+		const tightExecution = deferred<string>();
+		const harness = createHarness({
+			predict: () => prediction(readCandidate("README.md", 1, 200), readCandidate("README.md", 100, 110)),
+			preflight: (candidate) =>
+				(candidate.input as { limit: number }).limit === 110 ? tightPreflight.promise : { ok: true },
+			execute: (candidate) =>
+				(candidate.input as { limit: number }).limit === 110 ? tightExecution.promise : broadExecution.promise,
+			projectOutput: (output) => output,
+		});
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-rank-ready" });
+		await waitFor(() => harness.executions() === 1);
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		broadExecution.resolve("broad-ready");
+		await waitFor(() => harness.events.some((event) => event.type === "cache"));
+		tightPreflight.resolve({ ok: true });
+		await waitFor(() => harness.executions() === 2);
+
+		expect(
+			await harness.runtime.consume(consume("turn-rank-ready", { path: "README.md", offset: 120, limit: 10 })),
+		).toBe("broad-ready");
+		tightExecution.resolve("tight-late");
+	});
+
+	it("prefers a nearly completed high-value job over a cheap ready alternative", async () => {
+		const tightExecution = deferred<string>();
+		const broadPreflight = deferred<CandidatePreflight>();
+		let actorSettled = false;
+		const harness = createHarness({
+			predict: () =>
+				prediction(
+					{ ...readCandidate("README.md", 100, 110), expectedDurationMs: 100 },
+					readCandidate("README.md", 1, 200),
+				),
+			preflight: (candidate) =>
+				(candidate.input as { offset: number }).offset === 1 ? broadPreflight.promise : { ok: true },
+			execute: (candidate) =>
+				(candidate.input as { offset: number }).offset === 100 ? tightExecution.promise : "broad-ready",
+			projectOutput: (output) => output,
+		});
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-rank-running" });
+		await waitFor(() => harness.executions() === 1);
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		broadPreflight.resolve({ ok: true });
+		await waitFor(() => harness.executions() === 2);
+		await waitFor(() => harness.events.some((event) => event.type === "cache"));
+
+		const result = harness.runtime
+			.consume(consume("turn-rank-running", { path: "README.md", offset: 120, limit: 10 }))
+			.then((output) => {
+				actorSettled = true;
+				return output;
+			});
+		await new Promise((resolve) => setTimeout(resolve, 5));
+		expect(actorSettled).toBe(false);
+		tightExecution.resolve("tight-running");
+
+		expect(await result).toBe("tight-running");
+	});
+
 	it("applies the candidate limit after unsupported draft tools are skipped", async () => {
 		const harness = createHarness({
 			settings: { ...enabledSettings, candidateLimit: 1 },
@@ -1685,12 +1881,18 @@ describe("speculative action runtime", () => {
 	});
 });
 
-function deferred<T>(): { readonly promise: Promise<T>; readonly resolve: (value: T) => void } {
+function deferred<T>(): {
+	readonly promise: Promise<T>;
+	readonly resolve: (value: T) => void;
+	readonly reject: (reason: unknown) => void;
+} {
 	let resolvePromise: (value: T) => void = () => {};
-	const promise = new Promise<T>((resolve) => {
+	let rejectPromise: (reason: unknown) => void = () => {};
+	const promise = new Promise<T>((resolve, reject) => {
 		resolvePromise = resolve;
+		rejectPromise = reject;
 	});
-	return { promise, resolve: resolvePromise };
+	return { promise, resolve: resolvePromise, reject: rejectPromise };
 }
 
 async function waitFor(predicate: () => boolean): Promise<void> {

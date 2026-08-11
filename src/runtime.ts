@@ -493,6 +493,19 @@ interface RuntimeCandidate<Output> extends SpeculativeCandidate {
 	readonly controller: AbortController;
 }
 
+interface RankedRuntimeCandidate<Output> {
+	readonly candidate: RuntimeCandidate<Output>;
+	readonly match: ActionKeyMatch;
+	readonly expectedNetSavedMs: number;
+}
+
+type CandidateProjectionResult<Output> =
+	| { readonly ok: true; readonly output: Output; readonly durationMs: number }
+	| {
+			readonly ok: false;
+			readonly reason: "projection_rule_missing" | "coverage_unavailable" | "view_not_covered" | "projection_failed";
+	  };
+
 interface TurnState<SessionID, Output, StateData> {
 	readonly sessionID: SessionID;
 	readonly turnID: string;
@@ -567,6 +580,7 @@ export function makeSpeculativeActionRuntime<
 	const serviceTimes = new Map<string, { count: number; averageMs: number }>();
 	const executionOverheadTimes = new Map<string, { count: number; averageMs: number }>();
 	const hitOverheadTimes = new Map<string, { count: number; averageMs: number }>();
+	const projectionOverheadTimes = new Map<string, { count: number; averageMs: number }>();
 	const actorLeadTimes = new Map<string, { count: number; averageMs: number }>();
 	const drafterBackoff = new Map<SessionID, { actorMisses: number; sourceErrors: number; skips: number }>();
 	let notifiedMasterEnabled: boolean | undefined;
@@ -607,6 +621,8 @@ export function makeSpeculativeActionRuntime<
 		observeAverage(executionOverheadTimes, tool, durationMs);
 	const observeHitOverhead = (tool: string, durationMs: number): void =>
 		observeAverage(hitOverheadTimes, tool, durationMs);
+	const observeProjectionOverhead = (tool: string, rule: string, durationMs: number): void =>
+		observeAverage(projectionOverheadTimes, `${tool}:${rule}`, durationMs);
 	const schedulingKey = (source: PredictionLease["source"], tool: string, horizon?: number): string =>
 		`${source}:${tool}:${horizon === undefined ? "*" : Math.max(0, Math.floor(horizon))}`;
 	const observedLeadTime = (source: PredictionLease["source"], tool: string, horizon?: number): number | undefined =>
@@ -989,19 +1005,49 @@ export function makeSpeculativeActionRuntime<
 		return candidates;
 	};
 
+	const expectedNetSavedMs = (
+		candidate: RuntimeCandidate<Output>,
+		match: ActionKeyMatch,
+		now = Date.now(),
+	): number => {
+		const expectedExecutionMs =
+			candidate.run.status === "ready" ? candidate.run.executionMs : candidate.scheduling.expectedDurationMs;
+		const elapsed =
+			candidate.run.status === "running"
+				? Math.max(0, now - (candidate.executionStartedAt ?? candidate.startedAt))
+				: expectedExecutionMs;
+		const remaining = candidate.run.status === "running" ? Math.max(0, expectedExecutionMs - elapsed) : 0;
+		const projectionOverhead =
+			match.kind === "projected"
+				? (projectionOverheadTimes.get(`${candidate.tool}:${match.projector}`)?.averageMs ?? 0)
+				: 0;
+		return (
+			expectedExecutionMs - remaining - (hitOverheadTimes.get(candidate.tool)?.averageMs ?? 0) - projectionOverhead
+		);
+	};
+
 	const matchingCandidates = (
 		state: TurnState<SessionID, Output, StateData>,
 		action: ActionKey,
-	): RuntimeCandidate<Output>[] => {
-		const candidates = new Set<RuntimeCandidate<Output>>();
-		for (const candidate of state.candidates.values()) {
-			if (actionKeyMatch(candidate.key, action, keyProjectors)) candidates.add(candidate);
+	): RankedRuntimeCandidate<Output>[] => {
+		const ranked: RankedRuntimeCandidate<Output>[] = [];
+		const now = Date.now();
+		for (const candidate of new Set(availableCandidates(state).values())) {
+			const match = actionKeyMatch(candidate.key, action, keyProjectors);
+			if (!match) continue;
+			ranked.push({ candidate, match, expectedNetSavedMs: expectedNetSavedMs(candidate, match, now) });
 		}
-		for (const candidate of persistentCandidates.matching(state.sessionID, action)) candidates.add(candidate);
-		return [...candidates].sort((left, right) => {
-			const leftMatch = actionKeyMatch(left.key, action, keyProjectors);
-			const rightMatch = actionKeyMatch(right.key, action, keyProjectors);
-			return (leftMatch?.distance ?? Number.POSITIVE_INFINITY) - (rightMatch?.distance ?? Number.POSITIVE_INFINITY);
+		return ranked.sort((left, right) => {
+			const latencyDifference = right.expectedNetSavedMs - left.expectedNetSavedMs;
+			// Millisecond-scale scheduler and projection measurements are noisy. Keep
+			// semantic specificity as the tie-breaker unless the estimated saving is
+			// large enough to be meaningful.
+			if (Math.abs(latencyDifference) > 5) return latencyDifference;
+			return (
+				left.match.distance - right.match.distance ||
+				Number(right.candidate.run.status === "ready") - Number(left.candidate.run.status === "ready") ||
+				right.candidate.startedAt - left.candidate.startedAt
+			);
 		});
 	};
 
@@ -1024,11 +1070,12 @@ export function makeSpeculativeActionRuntime<
 		action: ActionKey,
 		output: Output,
 		match: ActionKeyMatch,
-	): Promise<{ readonly output: Output; readonly durationMs: number } | undefined> => {
-		if (match.kind === "exact") return { output, durationMs: 0 };
+	): Promise<CandidateProjectionResult<Output>> => {
+		if (match.kind === "exact") return { ok: true, output, durationMs: 0 };
 		const rule = projectionRuleByID.get(match.projector);
 		const coverage = candidate.projectionCoverage?.find((item) => item.rule === match.projector)?.value;
-		if (!rule || coverage === undefined) return undefined;
+		if (!rule) return { ok: false, reason: "projection_rule_missing" };
+		if (coverage === undefined) return { ok: false, reason: "coverage_unavailable" };
 		const started = performance.now();
 		try {
 			const projected = await rule.projectOutput({
@@ -1038,10 +1085,11 @@ export function makeSpeculativeActionRuntime<
 				coverage,
 				keyMatch: match,
 			});
-			if (projected === undefined) return undefined;
-			return { output: projected, durationMs: Math.max(0, performance.now() - started) };
+			const durationMs = Math.max(0, performance.now() - started);
+			if (projected === undefined) return { ok: false, reason: "view_not_covered" };
+			return { ok: true, output: projected, durationMs };
 		} catch {
-			return undefined;
+			return { ok: false, reason: "projection_failed" };
 		}
 	};
 
@@ -1339,23 +1387,6 @@ export function makeSpeculativeActionRuntime<
 		}
 	};
 
-	const findCandidate = (
-		state: TurnState<SessionID, Output, StateData>,
-		actual: ActionKey,
-		actionSequence: number,
-	): RuntimeCandidate<Output> | undefined => {
-		const exact = state.candidates.get(actual.key) ?? persistentCandidates.getExact(state.sessionID, actual);
-		if (exact && candidateCanMatch(exact, actionSequence) && claimCandidate(exact, state.turnID)) {
-			return exact;
-		}
-		for (const candidate of matchingCandidates(state, actual)) {
-			if (!candidateCanMatch(candidate, actionSequence)) continue;
-			if (!claimCandidate(candidate, state.turnID)) continue;
-			return candidate;
-		}
-		return undefined;
-	};
-
 	const candidateCanMatch = (candidate: RuntimeCandidate<Output>, actionSequence: number): boolean => {
 		if (candidate.run.status === "closed") return false;
 		if (candidate.reuse.kind === "shared") return true;
@@ -1375,27 +1406,37 @@ export function makeSpeculativeActionRuntime<
 		return true;
 	};
 
+	const releaseCandidateClaim = (candidate: RuntimeCandidate<Output>, turnID: string): void => {
+		if (
+			candidate.reuse.kind === "exclusive" &&
+			candidate.reuse.state === "claimed" &&
+			candidate.reuse.claimTurnID === turnID
+		) {
+			candidate.reuse.state = "available";
+			candidate.reuse.claimTurnID = undefined;
+		}
+	};
+
 	const findReusableCandidate = async (
 		state: TurnState<SessionID, Output, StateData>,
 		action: ActionKey,
 	): Promise<RuntimeCandidate<Output> | undefined> => {
-		for (const candidate of matchingCandidates(state, action)) {
+		for (const { candidate, match } of matchingCandidates(state, action)) {
 			if (candidate.run.status === "closed") continue;
 			if (candidate.reuse.kind === "exclusive" && candidate.reuse.state !== "available") continue;
-			const match = actionKeyMatch(candidate.key, action, keyProjectors);
-			if (!match) continue;
+			if (await isExpired(adapter, state, undefined, action, candidate)) {
+				await expireCandidate(state, candidate, "candidate_resource_expired");
+				continue;
+			}
 			if (match.kind === "projected") {
 				const rule = projectionRuleByID.get(match.projector);
 				if (!rule) continue;
 				if (candidate.run.status === "running") {
 					if (!rule.canShareInFlight?.(candidate.key, action)) continue;
-				} else if ((await projectCandidateOutput(candidate, action, candidate.run.output, match)) === undefined) {
-					continue;
+				} else {
+					const projection = await projectCandidateOutput(candidate, action, candidate.run.output, match);
+					if (!projection.ok) continue;
 				}
-			}
-			if (await isExpired(adapter, state, undefined, action, candidate)) {
-				await expireCandidate(state, candidate, "candidate_resource_expired");
-				continue;
 			}
 			return candidate;
 		}
@@ -2195,24 +2236,192 @@ export function makeSpeculativeActionRuntime<
 			}
 
 			state.actorKeys.add(actual.key);
-			const candidate = findCandidate(state, actual, actionSequence);
-			if (!candidate) {
-				const predicted = new Map(
-					[...availableCandidates(state)].filter(([, item]) => hasActiveDrafterLease(item)),
-				);
-				if (predicted.size > 0) {
-					state.drafterPlanMismatch = true;
-					state.pendingDrafterMismatch = {
-						key: actual,
+			const choices = matchingCandidates(state, actual);
+			const actualConcrete = adapter.authorizeCandidate ? asConcreteInput(actualCall.input) : undefined;
+			if (adapter.authorizeCandidate && !actualConcrete) {
+				await publishMiss(state, "invalid_tool_call_input", actual, undefined, { actualAction });
+				await preemptForAuthoritative(state, resourceProfile(actual.tool, actual.execution));
+				return undefined;
+			}
+
+			const consumeStarted = Date.now();
+			let totalWaitedMs = 0;
+			let lastFailure:
+				| {
+						readonly choice: RankedRuntimeCandidate<Output>;
+						readonly reason: string;
+						readonly detail?: string;
+				  }
+				| undefined;
+			let selected:
+				| {
+						readonly candidate: RuntimeCandidate<Output>;
+						readonly output: Output;
+						readonly projectionDurationMs: number;
+						readonly matchedDrafterPlan: boolean;
+				  }
+				| undefined;
+			const reject = (choice: RankedRuntimeCandidate<Output>, reason: string, detail?: string): void => {
+				lastFailure = { choice, reason, ...(detail ? { detail } : {}) };
+			};
+
+			for (const choice of choices) {
+				const { candidate, match } = choice;
+				if (!candidateCanMatch(candidate, actionSequence)) {
+					reject(
+						choice,
+						candidate.run.status === "closed"
+							? "candidate_closed"
+							: candidate.reuse.kind === "exclusive" && candidate.reuse.state !== "available"
+								? "candidate_claimed"
+								: "prediction_horizon_expired",
+					);
+					continue;
+				}
+				if (!claimCandidate(candidate, state.turnID)) {
+					reject(choice, "candidate_claimed");
+					continue;
+				}
+				const matchedDrafterPlan = hasActiveDrafterLease(candidate);
+				// Prediction feedback measures whether the actor requested an equivalent
+				// action, independently from whether the cached result is still usable.
+				// Preserve that boundary before freshness, authorization, and execution
+				// validation can reject this candidate and trigger the next fallback.
+				await matchPredictionLeases(state, candidate, actionSequence);
+				const inFlightAtMatch = candidate.run.status === "running";
+
+				if (adapter.authorizeCandidate && actualConcrete) {
+					let authorization: CandidatePreflight;
+					try {
+						authorization = await adapter.authorizeCandidate({
+							stateData: state.data,
+							consumeInput: input,
+							settings,
+							action: actual,
+							candidate,
+							tool: actualCall.tool,
+							concrete: actualConcrete,
+							signal,
+						});
+					} catch (error) {
+						authorization = { ok: false, reason: "authorization_failed", detail: errorDetail(error) };
+					}
+					if (!authorization.ok) {
+						releaseCandidateClaim(candidate, state.turnID);
+						reject(choice, authorization.reason, authorization.detail);
+						continue;
+					}
+				}
+
+				if (await isExpired(adapter, state, input, actual, candidate)) {
+					await expireCandidate(state, candidate, "resource_expired");
+					reject(choice, "resource_expired");
+					continue;
+				}
+				if (inFlightAtMatch) {
+					schedulerFor(state.sessionID).promote(candidate);
+					candidate.schedulerOutcome = "promoted";
+				} else {
+					candidate.schedulerOutcome = "reused";
+				}
+
+				const waitStarted = Date.now();
+				const execution = await waitForCandidate(candidate.execution.promise, signal);
+				totalWaitedMs += Math.max(0, Date.now() - waitStarted);
+				if (!execution || signal?.aborted) {
+					releaseCandidateClaim(candidate, state.turnID);
+					return undefined;
+				}
+				if (!execution.ok) {
+					const reason =
+						execution.error instanceof SpeculativeJobError
+							? execution.error.reason
+							: "candidate_execution_failed";
+					await closeCandidate(state, candidate, reason);
+					reject(choice, reason, errorDetail(execution.error));
+					continue;
+				}
+				if (inFlightAtMatch && (await isExpired(adapter, state, input, actual, candidate))) {
+					await expireCandidate(state, candidate, "resource_expired");
+					reject(choice, "resource_expired", "Resource changed before the speculative result could be consumed.");
+					continue;
+				}
+
+				let output = execution.output;
+				if (adapter.adoptCandidate) {
+					let adopted: Output | undefined;
+					let adoptionDetail: string | undefined;
+					try {
+						adopted = await adapter.adoptCandidate({
+							stateData: state.data,
+							consumeInput: input,
+							action: actual,
+							candidate,
+							output,
+						});
+					} catch (error) {
+						adopted = undefined;
+						adoptionDetail = errorDetail(error);
+					}
+					if (adopted === undefined) {
+						await expireCandidate(state, candidate, "adoption_failed");
+						reject(choice, "adoption_failed", adoptionDetail);
+						continue;
+					}
+					output = adopted;
+				}
+
+				const projection = await projectCandidateOutput(candidate, actual, output, match);
+				if (!projection.ok) {
+					releaseCandidateClaim(candidate, state.turnID);
+					reject(choice, "projection_failed", projection.reason);
+					continue;
+				}
+				candidate.projectionMs += projection.durationMs;
+				if (match.kind === "projected") {
+					observeProjectionOverhead(candidate.tool, match.projector, projection.durationMs);
+				}
+				selected = {
+					candidate,
+					output: projection.output,
+					projectionDurationMs: projection.durationMs,
+					matchedDrafterPlan,
+				};
+				break;
+			}
+
+			if (!selected) {
+				if (choices.length > 0) {
+					const diagnosticCandidate = lastFailure?.choice.candidate ?? choices[0]?.candidate;
+					await publishMiss(state, lastFailure?.reason ?? "candidate_unavailable", actual, lastFailure?.detail, {
 						actualAction,
-						predictedAction: candidatesDiagnostic(predicted),
-					};
+						...(diagnosticCandidate
+							? {
+									draftCandidate: diagnosticCandidate.draftCandidate,
+									predictedAction: diagnosticCandidate.predictedAction,
+								}
+							: {}),
+					});
+					if (activeDrafterPlan) state.drafterPlanMismatch = true;
+				} else {
+					const predicted = new Map(
+						[...availableCandidates(state)].filter(([, item]) => hasActiveDrafterLease(item)),
+					);
+					if (predicted.size > 0) {
+						state.drafterPlanMismatch = true;
+						state.pendingDrafterMismatch = {
+							key: actual,
+							actualAction,
+							predictedAction: candidatesDiagnostic(predicted),
+						};
+					}
 				}
 				await preemptForAuthoritative(state, resourceProfile(actual.tool, actual.execution));
 				return undefined;
 			}
-			if (activeDrafterPlan && !hasActiveDrafterLease(candidate)) state.drafterPlanMismatch = true;
-			await matchPredictionLeases(state, candidate, actionSequence);
+
+			const { candidate, output, projectionDurationMs, matchedDrafterPlan } = selected;
+			if (activeDrafterPlan && !matchedDrafterPlan) state.drafterPlanMismatch = true;
 			const matchedLease =
 				candidate.leases.find(
 					(lease) =>
@@ -2224,134 +2433,10 @@ export function makeSpeculativeActionRuntime<
 			const actorLeadMs = Math.max(0, actorArrivedAt - (candidate.executionStartedAt ?? actorArrivedAt));
 			candidate.actorLeadMs = actorLeadMs;
 			observeLeadTime(matchedLease?.source ?? candidate.source, candidate.tool, actorLeadMs, matchedLease?.horizon);
-			const inFlightAtMatch = candidate.run.status === "running";
 
-			if (adapter.authorizeCandidate) {
-				const actualConcrete = asConcreteInput(actualCall.input);
-				if (!actualConcrete) return undefined;
-				let authorization: CandidatePreflight;
-				try {
-					authorization = await adapter.authorizeCandidate({
-						stateData: state.data,
-						consumeInput: input,
-						settings,
-						action: actual,
-						candidate,
-						tool: actualCall.tool,
-						concrete: actualConcrete,
-						signal,
-					});
-				} catch (error) {
-					authorization = { ok: false, reason: "authorization_failed", detail: errorDetail(error) };
-				}
-				if (!authorization.ok) {
-					await expireCandidate(state, candidate, "authorization_failed");
-					await publishMiss(state, authorization.reason, actual, authorization.detail, {
-						actualAction,
-						draftCandidate: candidate.draftCandidate,
-						predictedAction: candidate.predictedAction,
-					});
-					return undefined;
-				}
-			}
-
-			const consumeStarted = Date.now();
-			if (await isExpired(adapter, state, input, actual, candidate)) {
-				await expireCandidate(state, candidate, "resource_expired");
-				await publishMiss(state, "resource_expired", actual, undefined, {
-					actualAction,
-					draftCandidate: candidate.draftCandidate,
-					predictedAction: candidate.predictedAction,
-				});
-				return undefined;
-			}
-			if (inFlightAtMatch) {
-				schedulerFor(state.sessionID).promote(candidate);
-				candidate.schedulerOutcome = "promoted";
-			} else {
-				candidate.schedulerOutcome = "reused";
-			}
-			const waitStarted = Date.now();
-			const execution = await waitForCandidate(candidate.execution.promise, signal);
-			if (!execution || signal?.aborted) return undefined;
-			if (!execution.ok) {
-				const reason =
-					execution.error instanceof SpeculativeJobError ? execution.error.reason : "candidate_execution_failed";
-				await closeCandidate(state, candidate, reason);
-				await publishMiss(state, reason, actual, errorDetail(execution.error), {
-					actualAction,
-					draftCandidate: candidate.draftCandidate,
-					predictedAction: candidate.predictedAction,
-				});
-				return undefined;
-			}
-			if (inFlightAtMatch && (await isExpired(adapter, state, input, actual, candidate))) {
-				await expireCandidate(state, candidate, "resource_expired");
-				await publishMiss(
-					state,
-					"resource_expired",
-					actual,
-					"Resource changed before the speculative result could be consumed.",
-					{
-						actualAction,
-						draftCandidate: candidate.draftCandidate,
-						predictedAction: candidate.predictedAction,
-					},
-				);
-				return undefined;
-			}
-
-			let output = execution.output;
-			if (adapter.adoptCandidate) {
-				let adopted: Output | undefined;
-				try {
-					adopted = await adapter.adoptCandidate({
-						stateData: state.data,
-						consumeInput: input,
-						action: actual,
-						candidate,
-						output,
-					});
-				} catch (error) {
-					await expireCandidate(state, candidate, "adoption_failed");
-					await publishMiss(state, "adoption_failed", actual, errorDetail(error), {
-						actualAction,
-						draftCandidate: candidate.draftCandidate,
-						predictedAction: candidate.predictedAction,
-					});
-					return undefined;
-				}
-				if (adopted === undefined) {
-					await expireCandidate(state, candidate, "adoption_failed");
-					await publishMiss(state, "adoption_failed", actual, undefined, {
-						actualAction,
-						draftCandidate: candidate.draftCandidate,
-						predictedAction: candidate.predictedAction,
-					});
-					return undefined;
-				}
-				output = adopted;
-			}
-			if (candidate.key.key !== actual.key) {
-				const keyMatch = actionKeyMatch(candidate.key, actual, keyProjectors);
-				const projected = keyMatch ? await projectCandidateOutput(candidate, actual, output, keyMatch) : undefined;
-				if (projected === undefined) {
-					await expireCandidate(state, candidate, "projection_failed");
-					await publishMiss(state, "projection_failed", actual, undefined, {
-						actualAction,
-						draftCandidate: candidate.draftCandidate,
-						predictedAction: candidate.predictedAction,
-					});
-					return undefined;
-				}
-				output = projected.output;
-				candidate.projectionMs += projected.durationMs;
-			}
-
-			const waitedMs = Math.max(0, Date.now() - waitStarted);
 			const consumeOverheadMs = Math.max(0, Date.now() - consumeStarted);
 			const executionMs = candidateExecutionMs(candidate) || Math.max(0, Date.now() - candidate.startedAt);
-			observeHitOverhead(actual.tool, candidate.validationMs + candidate.projectionMs + (candidate.commitMs ?? 0));
+			observeHitOverhead(actual.tool, candidate.validationMs + (candidate.commitMs ?? 0) + projectionDurationMs);
 			completePredictionMatch(candidate, actionSequence);
 			candidate.hits++;
 			candidate.authoritativeSequence = Math.max(candidate.authoritativeSequence ?? 0, actionSequence);
@@ -2396,7 +2481,7 @@ export function makeSpeculativeActionRuntime<
 				tool: actual.tool,
 				actionKeyHash: actual.hash,
 				savedMs: Math.max(0, executionMs - consumeOverheadMs),
-				waitedMs,
+				waitedMs: totalWaitedMs,
 				consumeOverheadMs,
 				predictionLatencyMs: candidate.predictionLatencyMs,
 				draftTokens: candidate.draftTokens,
@@ -2418,7 +2503,6 @@ export function makeSpeculativeActionRuntime<
 			await expirePatternLeasesAfterAction(state);
 		}
 	};
-
 	const actual = async (
 		input: ConsumeInput & { readonly durationMs: number; readonly output?: Output },
 	): Promise<void> => {
