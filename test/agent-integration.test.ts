@@ -550,6 +550,9 @@ describe("Pi Agent speculative integration", () => {
 			turnCandidates: 0,
 			resourceCandidates: 0,
 			pendingPredictions: 0,
+			deferredPlanActions: 0,
+			activePlanActions: 0,
+			blockedPlanActions: 0,
 		});
 		await installed.uninstall();
 	});

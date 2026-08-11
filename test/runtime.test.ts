@@ -272,7 +272,7 @@ describe("speculative action runtime", () => {
 		expect(hit).toMatchObject({ sources: ["sequence-model", "rule-engine"] });
 	});
 
-	it("applies a producer PlanDelta through the same admission path", async () => {
+	it("applies a producer PlanDelta through the same dependency-aware JIT path", async () => {
 		const continuations: boolean[] = [];
 		const source: HarnessPlanSource = {
 			id: "sequence-model",
@@ -314,11 +314,199 @@ describe("speculative action runtime", () => {
 		});
 
 		await harness.runtime.startTurn({ sessionID: "session", turnID: "delta" });
+		await waitFor(() => executed.length === 1);
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		expect(executed).toEqual(["parent.ts"]);
+		expect(await harness.runtime.consume(consume("delta", { path: "parent.ts" }))).toBe("result:parent.ts");
 		await waitFor(() => executed.length === 2);
 
 		expect(executed).toEqual(["parent.ts", "child.ts"]);
 		expect(continuations).toContain(false);
 		expect(harness.events.filter((event) => event.type === "started")).toHaveLength(2);
+	});
+
+	it("promotes an actor-requested future action without waiting for its horizon", async () => {
+		const executed: string[] = [];
+		const source: HarnessPlanSource = {
+			id: "future-sequence",
+			enabled: () => true,
+			multiStepEnabled: () => true,
+			propose: () => ({
+				id: "future-plan",
+				source: "future-sequence",
+				revision: 0,
+				actions: [
+					{
+						id: "far-read",
+						type: "tool_call",
+						tool: "read",
+						input: { path: "future.ts" },
+						horizon: 8,
+						expectedDurationMs: 25,
+					},
+				],
+			}),
+		};
+		const harness = createHarness({
+			sources: [source],
+			predict: () => prediction(),
+			execute: (candidate) => {
+				executed.push(String((candidate.input as { path?: string }).path));
+				return "promoted-output";
+			},
+		});
+
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "future-promotion" });
+		await waitFor(() => harness.runtime.inspect().pendingPredictions === 0);
+		expect(executed).toEqual([]);
+		expect(harness.runtime.inspect()).toMatchObject({ deferredPlanActions: 1, activePlanActions: 0 });
+
+		expect(await harness.runtime.consume(consume("future-promotion", { path: "future.ts" }))).toBe("promoted-output");
+		expect(executed).toEqual(["future.ts"]);
+		expect(harness.events).toContainEqual(
+			expect.objectContaining({ type: "started", tool: "read", schedulerOutcome: "promoted" }),
+		);
+	});
+
+	it("adopts only one repeated K(a) step per authoritative actor action", async () => {
+		const executed: string[] = [];
+		const source: HarnessPlanSource = {
+			id: "repeated-action-sequence",
+			enabled: () => true,
+			multiStepEnabled: () => true,
+			propose: () => ({
+				id: "repeated-action-plan",
+				source: "repeated-action-sequence",
+				revision: 0,
+				actions: [
+					{ id: "first", type: "tool_call", tool: "read", input: { path: "same.ts" } },
+					{
+						id: "second",
+						type: "tool_call",
+						tool: "read",
+						input: { path: "same.ts" },
+						dependsOn: [{ actionID: "first", condition: "adopted" }],
+					},
+					{
+						id: "third",
+						type: "tool_call",
+						tool: "read",
+						input: { path: "third.ts" },
+						dependsOn: [{ actionID: "second", condition: "adopted" }],
+					},
+				],
+			}),
+		};
+		const harness = createHarness({
+			sources: [source],
+			predict: () => prediction(),
+			execute: (candidate) => {
+				const path = String((candidate.input as { path?: string }).path);
+				executed.push(path);
+				return `${path}:output`;
+			},
+		});
+
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "repeated-action" });
+		await waitFor(() => executed.length === 1);
+		expect(await harness.runtime.consume(consume("repeated-action", { path: "same.ts" }))).toBe("same.ts:output");
+		await harness.runtime.actual({
+			...consume("repeated-action", { path: "same.ts" }),
+			durationMs: 1,
+			output: "same.ts:output",
+		});
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		expect(executed).toEqual(["same.ts"]);
+
+		expect(await harness.runtime.consume(consume("repeated-action", { path: "same.ts" }))).toBe("same.ts:output");
+		await waitFor(() => executed.includes("third.ts"));
+		expect(executed).toEqual(["same.ts", "third.ts"]);
+	});
+
+	it("captures resource freshness only when a deferred action reaches its JIT launch point", async () => {
+		let resourceVersion = "old";
+		const captured: string[] = [];
+		const executed: string[] = [];
+		const source: HarnessPlanSource = {
+			id: "fresh-sequence",
+			enabled: () => true,
+			multiStepEnabled: () => true,
+			propose: () => ({
+				id: "fresh-plan",
+				source: "fresh-sequence",
+				revision: 0,
+				actions: [{ id: "next-read", type: "tool_call", tool: "read", input: { path: "fresh.ts" }, horizon: 1 }],
+			}),
+		};
+		const harness = createHarness({
+			sources: [source],
+			predict: () => prediction(),
+			captureResourceVersion: () => {
+				captured.push(resourceVersion);
+				return resourceVersion;
+			},
+			execute: (candidate) => {
+				executed.push(String((candidate.input as { path?: string }).path));
+				return "fresh-output";
+			},
+		});
+
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "fresh-jit" });
+		await waitFor(() => harness.runtime.inspect().pendingPredictions === 0);
+		expect(captured).toEqual([]);
+		resourceVersion = "new";
+
+		expect(await harness.runtime.consume(consumeTool("fresh-jit", "find", { pattern: "*.ts" }))).toBeUndefined();
+		await waitFor(() => executed.length === 1);
+		expect(captured).toEqual(["new"]);
+		expect(await harness.runtime.consume(consume("fresh-jit", { path: "fresh.ts" }))).toBe("fresh-output");
+	});
+
+	it("blocks dependent actions and resolves their source feedback when a parent fails", async () => {
+		const executed: string[] = [];
+		const resolved: string[] = [];
+		const source: HarnessPlanSource = {
+			id: "failure-sequence",
+			enabled: () => true,
+			propose: () => ({
+				id: "failure-plan",
+				source: "failure-sequence",
+				revision: 0,
+				actions: [
+					{ id: "parent", type: "tool_call", tool: "read", input: { path: "parent.ts" }, feedback: "parent" },
+					{
+						id: "child",
+						type: "tool_call",
+						tool: "read",
+						input: { path: "child.ts" },
+						feedback: "child",
+						dependsOn: [{ actionID: "parent", condition: "succeeded" }],
+					},
+				],
+			}),
+			onResolved: ({ feedback, outcome }) => {
+				resolved.push(`${String(feedback)}:${outcome}`);
+			},
+		};
+		const harness = createHarness({
+			sources: [source],
+			predict: () => prediction(),
+			execute: (candidate) => {
+				const path = String((candidate.input as { path?: string }).path);
+				executed.push(path);
+				throw new Error("parent failed");
+			},
+		});
+
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "failed-parent" });
+		await waitFor(() => resolved.includes("child:system"));
+
+		expect(executed).toEqual(["parent.ts"]);
+		expect(resolved.sort()).toEqual(["child:system", "parent:system"]);
+		expect(harness.runtime.inspect()).toMatchObject({ activePlanActions: 0, blockedPlanActions: 1 });
+		expect(harness.events).toContainEqual(
+			expect.objectContaining({ type: "cancelled", reason: "candidate_execution_failed" }),
+		);
 	});
 
 	it("keeps a live proposal ledger across turns for confirmed continuation", async () => {
@@ -372,7 +560,8 @@ describe("speculative action runtime", () => {
 		});
 
 		await harness.runtime.startTurn({ sessionID: "session", turnID: "first" });
-		await waitFor(() => executed.length === 1);
+		await waitFor(() => harness.runtime.inspect().pendingPredictions === 0);
+		expect(executed).toEqual([]);
 		await harness.runtime.finishTurn({ sessionID: "session", turnID: "first", tool: "read", input: {} });
 		await harness.runtime.startTurn({ sessionID: "session", turnID: "second" });
 		await waitFor(() => harness.runtime.inspect().pendingPredictions === 0);
@@ -1012,6 +1201,9 @@ describe("speculative action runtime", () => {
 			turnCandidates: 0,
 			resourceCandidates: 0,
 			pendingPredictions: 0,
+			deferredPlanActions: 0,
+			activePlanActions: 0,
+			blockedPlanActions: 0,
 		});
 		expect(harness.events).toContainEqual(
 			expect.objectContaining({ type: "cancelled", reason: "speculative_action_disabled" }),
@@ -2518,7 +2710,7 @@ describe("speculative action runtime", () => {
 				prediction({
 					...bashCandidate("printf ready"),
 					patternID: "carried-bash",
-					horizon: 2,
+					horizon: 0,
 				}),
 			onPatternResolved: (outcome) => resolutions.push(outcome),
 			flushPatternStore: () => {
@@ -2586,12 +2778,16 @@ describe("speculative action runtime", () => {
 			},
 		});
 		await harness.runtime.startTurn({ sessionID: "session", turnID: "continuation-failure" });
-		await waitFor(() => harness.executions() === 1);
+		await waitFor(() => harness.runtime.inspect().pendingPredictions === 0);
+		expect(harness.executions()).toBe(0);
 
 		await expect(harness.runtime.consume(consume("continuation-failure", { path: "parent.ts" }))).resolves.toBe(
 			"prefetched",
 		);
-		expect(confirmations).toEqual([false, true]);
+		expect(confirmations).toEqual([true]);
+		expect(harness.events).toContainEqual(
+			expect.objectContaining({ type: "miss", reason: "plan_action_launch_failed" }),
+		);
 	});
 
 	it("invalidates overlapping shared results after sandbox adoption without relying on commit metrics", async () => {
@@ -2688,6 +2884,9 @@ describe("speculative action runtime", () => {
 			turnCandidates: 0,
 			resourceCandidates: 0,
 			pendingPredictions: 0,
+			deferredPlanActions: 0,
+			activePlanActions: 0,
+			blockedPlanActions: 0,
 		});
 	});
 
@@ -2777,6 +2976,9 @@ describe("speculative action runtime", () => {
 			turnCandidates: 0,
 			resourceCandidates: 0,
 			pendingPredictions: 0,
+			deferredPlanActions: 0,
+			activePlanActions: 0,
+			blockedPlanActions: 0,
 		});
 	});
 });

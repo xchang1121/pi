@@ -44,8 +44,10 @@ describe("PatternAware runtime integration", () => {
 		);
 
 		await runtime.startTurn(start("turn_1"));
-		await waitFor(() => executions === 1);
+		await waitFor(() => runtime.inspect().pendingPredictions === 0);
+		expect(executions).toBe(0);
 		expect(await runtime.consume(call("turn_1", "find", { pattern: "*" }))).toBeUndefined();
+		await waitFor(() => executions === 1);
 		await runtime.actual({ ...call("turn_1", "find", { pattern: "*" }), durationMs: 1, output: "files" });
 		await runtime.finishTurn(start("turn_1"));
 
@@ -84,7 +86,7 @@ describe("PatternAware runtime integration", () => {
 		);
 	});
 
-	it("ends future sandbox work when the actor response is terminal", async () => {
+	it("settles deferred future sandbox work without starting it when the actor response is terminal", async () => {
 		const outcomes: string[] = [];
 		const events: SpeculativeActionEvent<string>[] = [];
 		let aborted = 0;
@@ -115,14 +117,13 @@ describe("PatternAware runtime integration", () => {
 		);
 
 		await runtime.startTurn(start("turn"));
-		await waitFor(() => events.some((event) => event.type === "started"));
+		await waitFor(() => runtime.inspect().pendingPredictions === 0);
+		expect(runtime.inspect().deferredPlanActions).toBe(1);
 		await runtime.finishTurn({ ...start("turn"), terminal: true });
-		await waitFor(() => aborted === 1);
 
 		expect(outcomes).toEqual(["terminal:actor_miss"]);
-		expect(events).toContainEqual(
-			expect.objectContaining({ type: "cancelled", reason: "request_finished_without_hit" }),
-		);
+		expect(aborted).toBe(0);
+		expect(events.some((event) => event.type === "started")).toBe(false);
 	});
 
 	it("awaits pattern persistence before terminal finish returns", async () => {
@@ -159,7 +160,7 @@ describe("PatternAware runtime integration", () => {
 			adapter({
 				predictPatternAware: (input) => ({
 					candidates:
-						input.turnID === "turn_1" ? [patternCandidate("read", { path: "README.md" }, "cached", 8)] : [],
+						input.turnID === "turn_1" ? [patternCandidate("read", { path: "README.md" }, "cached", 0)] : [],
 					draftTokens: 0,
 				}),
 				executeCandidate: () => {
@@ -245,7 +246,8 @@ describe("PatternAware runtime integration", () => {
 		);
 
 		await runtime.startTurn(start("turn"));
-		await waitFor(() => runtime.inspect().resourceCandidates === 1);
+		await waitFor(() => runtime.inspect().pendingPredictions === 0);
+		expect(runtime.inspect().deferredPlanActions).toBe(1);
 		await runtime.finishTurn({ ...start("turn"), terminal: true });
 
 		expect(lifecycle).toEqual(["turn_finished", "resolved:actor_miss", "flush_after:resolved:actor_miss"]);
@@ -260,8 +262,8 @@ describe("PatternAware runtime integration", () => {
 			adapter({
 				predictPatternAware: () => ({
 					candidates: [
-						{ ...patternCandidate("read", { path: "a.ts" }, "first", 1), patternContext: first },
-						{ ...patternCandidate("read", { path: "b.ts" }, "second", 1), patternContext: second },
+						{ ...patternCandidate("read", { path: "a.ts" }, "first", 0), patternContext: first },
+						{ ...patternCandidate("read", { path: "b.ts" }, "second", 0), patternContext: second },
 					],
 					draftTokens: 0,
 				}),
@@ -415,7 +417,7 @@ describe("PatternAware runtime integration", () => {
 						input.turnID === "turn_1"
 							? [
 									{
-										...patternCandidate("read", { path: "a.ts" }, "low", 8),
+										...patternCandidate("read", { path: "a.ts" }, "low", 0),
 										expectedDurationMs: 100,
 										empiricalProbability: 0.55,
 										expectedLatencyBenefitMs: 55,
@@ -424,7 +426,7 @@ describe("PatternAware runtime integration", () => {
 							: input.turnID === "turn_2"
 								? [
 										{
-											...patternCandidate("read", { path: "b.ts" }, "high", 8),
+											...patternCandidate("read", { path: "b.ts" }, "high", 0),
 											expectedDurationMs: 100,
 											empiricalProbability: 0.95,
 											expectedLatencyBenefitMs: 95,
@@ -543,7 +545,7 @@ describe("PatternAware runtime integration", () => {
 		const runtime = makeSpeculativeActionRuntime(
 			adapter({
 				predictPatternAware: () => ({
-					candidates: [patternCandidate("read", { path: "src/a.ts" }, "parent", 2)],
+					candidates: [patternCandidate("read", { path: "src/a.ts" }, "parent", 0)],
 					draftTokens: 0,
 				}),
 				executeCandidate: () => {
@@ -554,7 +556,7 @@ describe("PatternAware runtime integration", () => {
 					continuations.push(patternID);
 					return patternID === "parent"
 						? {
-								candidates: [patternCandidate("read", { path: "src/a.ts" }, "child", 1)],
+								candidates: [patternCandidate("read", { path: "src/a.ts" }, "child", 0)],
 								draftTokens: 0,
 							}
 						: undefined;
@@ -563,10 +565,14 @@ describe("PatternAware runtime integration", () => {
 		);
 
 		await runtime.startTurn(start("turn"));
-		await waitFor(() => continuations.length === 2);
+		await waitFor(() => continuations.includes("parent"));
+		expect(executions).toBe(1);
+		expect(await runtime.consume(call("turn", "read", { path: "src/a.ts" }))).toBe("file");
+		await waitFor(() => continuations.includes("child"));
 
 		expect(executions).toBe(1);
-		expect(continuations).toEqual(["parent", "child"]);
+		expect(continuations.filter((patternID) => patternID === "parent")).toHaveLength(2);
+		expect(continuations.filter((patternID) => patternID === "child")).toHaveLength(1);
 		await runtime.dispose();
 	});
 
@@ -641,6 +647,9 @@ describe("PatternAware runtime integration", () => {
 		);
 
 		await runtime.startTurn(start("turn"));
+		await waitFor(() => executed.length === 1);
+		expect(executed).toEqual(["read"]);
+		expect(await runtime.consume(call("turn", "read", { path: "src/a.ts" }))).toBe("structured-read");
 		await waitFor(() => executed.length === 2);
 
 		expect(executed).toEqual(["read", "bash"]);
@@ -692,22 +701,22 @@ describe("PatternAware runtime integration", () => {
 		);
 
 		await runtime.startTurn(start("upgrade-chain"));
-		await waitFor(() => continuations.includes("grandchild.ts:false:0.1:0.1"));
+		await waitFor(() => continuations.includes("parent.ts:false:0.25:0.25"));
 		expect(Object.fromEntries(executions)).toEqual({
 			"parent.ts": 1,
-			"child.ts": 1,
-			"grandchild.ts": 1,
 		});
 
 		expect(await runtime.consume(call("upgrade-chain", "read", { path: "parent.ts" }))).toBe("parent.ts:output");
+		await waitFor(() => continuations.includes("child.ts:false:0.8:0.8"));
+		expect(Object.fromEntries(executions)).toEqual({ "parent.ts": 1, "child.ts": 1 });
+		expect(await runtime.consume(call("upgrade-chain", "read", { path: "child.ts" }))).toBe("child.ts:output");
 		await waitFor(() => continuations.includes("grandchild.ts:false:0.6:0.6"));
 
 		expect(continuations).toEqual([
 			"parent.ts:false:0.25:0.25",
-			"child.ts:false:0.2:0.2",
-			"grandchild.ts:false:0.1:0.1",
 			"parent.ts:true:0.25:0.25",
 			"child.ts:false:0.8:0.8",
+			"child.ts:true:0.8:0.8",
 			"grandchild.ts:false:0.6:0.6",
 		]);
 		expect(launches).toEqual(["parent", "child", "grandchild"]);
@@ -717,12 +726,12 @@ describe("PatternAware runtime integration", () => {
 			"grandchild.ts": 1,
 		});
 
-		await runtime.consume(call("upgrade-chain", "read", { path: "parent.ts" }));
-		expect(continuations.filter((item) => item.startsWith("parent.ts:true"))).toHaveLength(1);
+		await runtime.consume(call("upgrade-chain", "read", { path: "grandchild.ts" }));
+		expect(continuations.filter((item) => item.startsWith("child.ts:true"))).toHaveLength(1);
 		await runtime.dispose();
 	});
 
-	it("reconsiders a previously rejected descendant when its parent becomes authoritative", async () => {
+	it("defers a low-confidence descendant until its parent becomes authoritative", async () => {
 		const executions: string[] = [];
 		const parentConfirmations: boolean[] = [];
 		const events: SpeculativeActionEvent<string>[] = [];
@@ -769,16 +778,10 @@ describe("PatternAware runtime integration", () => {
 		);
 
 		await runtime.startTurn(start("admit-after-confirmation"));
-		await waitFor(() =>
-			events.some(
-				(event) =>
-					event.type === "cancelled" &&
-					event.tool === "grep" &&
-					event.reason === "candidate_budget_insufficient_expected_benefit",
-			),
-		);
+		await waitFor(() => parentConfirmations.includes(false));
 		expect(executions).toEqual(["parent.ts"]);
 		expect(parentConfirmations).toEqual([false]);
+		expect(events.some((event) => event.type === "cancelled" && event.tool === "grep")).toBe(false);
 
 		expect(await runtime.consume(call("admit-after-confirmation", "read", { path: "parent.ts" }))).toBe(
 			"parent.ts:output",
@@ -788,6 +791,7 @@ describe("PatternAware runtime integration", () => {
 		expect(parentConfirmations).toEqual([false, true]);
 		expect(executions).toEqual(["parent.ts", "child.ts"]);
 		expect(launches).toEqual(["parent", "child"]);
+		expect(events.some((event) => event.type === "cancelled" && event.tool === "grep")).toBe(false);
 		await runtime.dispose();
 	});
 
@@ -870,11 +874,12 @@ describe("PatternAware runtime integration", () => {
 		);
 
 		await runtime.startTurn(start("parent-miss"));
-		await waitFor(() => executions.includes("child.ts"));
+		await waitFor(() => parentConfirmations.includes(false));
 		expect(await runtime.consume(call("parent-miss", "find", { pattern: "*.ts" }))).toBeUndefined();
 
 		expect(parentConfirmations).toEqual([false]);
-		expect(executions).toEqual(["parent.ts", "child.ts"]);
+		expect(executions).toEqual(["parent.ts"]);
+		expect(runtime.inspect().blockedPlanActions).toBe(1);
 		await runtime.dispose();
 	});
 
@@ -885,7 +890,7 @@ describe("PatternAware runtime integration", () => {
 			adapter({
 				predictPatternAware: () => ({
 					candidates: [
-						{ ...patternCandidate("bash", { command: "long" }, "long", 4), patternContext: { step: 1 } },
+						{ ...patternCandidate("bash", { command: "long" }, "long", 0), patternContext: { step: 1 } },
 					],
 					draftTokens: 0,
 				}),

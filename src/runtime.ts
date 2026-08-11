@@ -15,12 +15,15 @@ import type {
 } from "./common.ts";
 import {
 	actionKeyCovers,
+	actionKeyMatch,
 	actionKeyMismatchReason,
 	clampCandidateLimit,
 	DEFAULTS,
 	PI_ACTION_SEMANTICS,
 } from "./common.ts";
 import type { PatternAwareDependency, PatternAwareResolution, PatternAwareSettings } from "./pattern-aware.ts";
+import type { PlanExecutionNode } from "./plan-execution-graph.ts";
+import { PlanExecutionGraph } from "./plan-execution-graph.ts";
 import type { PlanAction, PlanProposal, PlanUpdate } from "./plan-proposal.ts";
 import { PlanLedger } from "./plan-proposal.ts";
 import {
@@ -573,6 +576,9 @@ export interface SpeculativeRuntimeInspection {
 	readonly turnCandidates: number;
 	readonly resourceCandidates: number;
 	readonly pendingPredictions: number;
+	readonly deferredPlanActions: number;
+	readonly activePlanActions: number;
+	readonly blockedPlanActions: number;
 }
 
 export interface SpeculativeActionRuntime<SessionID, Output, StartInput, ConsumeInput, FinishInput> {
@@ -613,17 +619,19 @@ interface TurnState<SessionID, Output, StateData> {
 	readonly data: StateData;
 	readonly settings: SpeculativeActionSettings;
 	readonly predictionController: AbortController;
-	readonly actorKeys: Set<string>;
+	readonly actorActionSequences: Map<string, number>;
 	readonly actorCallSequences: Map<string, number>;
 	readonly preparedHints: Set<string>;
 	readonly pendingActionSequences: Set<number>;
 	readonly turnAdmissions: Map<string, RuntimeCandidate<Output>>;
 	readonly plans: PlanLedger;
-	readonly admittedPlanActions: Set<string>;
+	readonly planGraph: PlanExecutionGraph;
 	readonly sourceAttempts: Set<string>;
 	readonly sourceFeedback: Map<string, "success" | "actor_miss" | "source_error">;
 	readonly sourcePlanMismatches: Set<string>;
+	readonly pendingSchedulerCompletions: Set<RuntimeCandidate<Output>>;
 	actionSequence: number;
+	planDispatchDepth: number;
 	pendingPlanMismatch?: {
 		readonly sources: readonly string[];
 		readonly key: ActionKey;
@@ -666,6 +674,18 @@ export function makeSpeculativeActionRuntime<
 ): SpeculativeActionRuntime<SessionID, Output, StartInput, ConsumeInput, FinishInput> {
 	const turns = new Map<string, TurnState<SessionID, Output, StateData>>();
 	const planLedgers = new Map<SessionID, PlanLedger>();
+	const planGraphs = new Map<SessionID, PlanExecutionGraph>();
+	const planLaunchContexts = new Map<
+		SessionID,
+		Map<
+			string,
+			{
+				readonly predictionLatencyMs: number;
+				readonly draftTokens: number;
+				readonly totalDraftTokens: number;
+			}
+		>
+	>();
 	const planLedgerFor = (sessionID: SessionID): PlanLedger => {
 		const existing = planLedgers.get(sessionID);
 		if (existing) return existing;
@@ -673,6 +693,14 @@ export function makeSpeculativeActionRuntime<
 		planLedgers.set(sessionID, created);
 		return created;
 	};
+	const planGraphFor = (sessionID: SessionID): PlanExecutionGraph => {
+		const existing = planGraphs.get(sessionID);
+		if (existing) return existing;
+		const created = new PlanExecutionGraph();
+		planGraphs.set(sessionID, created);
+		return created;
+	};
+	const planActionIdentity = (proposalID: string, actionID: string): string => `${proposalID}\u0000${actionID}`;
 	const actionSemantics = adapter.actionSemantics ?? PI_ACTION_SEMANTICS;
 	type RuntimePlanSource = SpeculativePlanSource<SessionID, Output, StartInput, ConsumeInput, StateData>;
 	const legacyPatternRevisions = new Map<string, number>();
@@ -778,7 +806,7 @@ export function makeSpeculativeActionRuntime<
 								proposalID,
 								source: "pattern_aware",
 								revision,
-								upsert: legacyPatternActions(prediction.candidates, [{ actionID, condition: "succeeded" }]),
+								upsert: legacyPatternActions(prediction.candidates, [{ actionID, condition: "adopted" }]),
 								draftTokens: prediction.draftTokens,
 							};
 						}
@@ -888,6 +916,13 @@ export function makeSpeculativeActionRuntime<
 		const created = new ToolSpeculationScheduler<RuntimeCandidate<Output>>();
 		schedulers.set(sessionID, created);
 		return created;
+	};
+	const completeScheduledCandidate = (
+		state: TurnState<SessionID, Output, StateData>,
+		candidate: RuntimeCandidate<Output>,
+	): void => {
+		if (state.planDispatchDepth > 0) state.pendingSchedulerCompletions.add(candidate);
+		else schedulerFor(state.sessionID).complete(candidate);
 	};
 
 	const observeAverage = (
@@ -1029,6 +1064,7 @@ export function makeSpeculativeActionRuntime<
 	const activeAdaptivePlanSources = (
 		candidates: Iterable<RuntimeCandidate<Output>>,
 		actionSequence: number,
+		planGraph?: PlanExecutionGraph,
 	): Set<string> => {
 		const active = new Set<string>();
 		for (const candidate of candidates) {
@@ -1042,6 +1078,10 @@ export function makeSpeculativeActionRuntime<
 				}
 			}
 		}
+		for (const node of planGraph?.deferred() ?? []) {
+			if (node.expectedActionSeq >= actionSequence && sourcesByID.get(node.source)?.adaptive)
+				active.add(node.source);
+		}
 		return active;
 	};
 	const markPlanMismatches = (
@@ -1053,11 +1093,20 @@ export function makeSpeculativeActionRuntime<
 		}
 	};
 
-	const schedulingMetadata = (draft: SpeculativeDraftCandidate, action: ActionKey): SpeculativeSchedulingMetadata => {
+	const schedulingMetadata = (
+		draft: SpeculativeDraftCandidate,
+		action: ActionKey,
+		expectedLeadFloorMs = 0,
+	): SpeculativeSchedulingMetadata => {
 		const empiricalProbability = finiteProbability(draft.empiricalProbability);
 		const measured = serviceTimes.get(action.tool)?.averageMs;
 		const expectedDurationMs = finitePositive(draft.expectedDurationMs, measured ?? 1);
-		const expectedLeadMs = observedLeadTime(action.tool, draft.horizon);
+		const observedExpectedLeadMs = observedLeadTime(action.tool, draft.horizon);
+		const normalizedLeadFloorMs = finiteNonNegative(expectedLeadFloorMs, 0);
+		const expectedLeadMs =
+			observedExpectedLeadMs === undefined && normalizedLeadFloorMs === 0
+				? undefined
+				: Math.min(expectedDurationMs, Math.max(observedExpectedLeadMs ?? 0, normalizedLeadFloorMs));
 		const expectedHiddenMs = Math.min(expectedDurationMs, expectedLeadMs ?? expectedDurationMs);
 		const defaultBenefitMs =
 			empiricalProbability === undefined ? expectedHiddenMs : empiricalProbability * expectedHiddenMs;
@@ -1340,6 +1389,7 @@ export function makeSpeculativeActionRuntime<
 	const matchingCandidates = (
 		state: TurnState<SessionID, Output, StateData>,
 		action: ActionKey,
+		arrivedCandidates: readonly RuntimeCandidate<Output>[] = [],
 	): RankedRuntimeCandidate<Output>[] => {
 		const ranked: RankedRuntimeCandidate<Output>[] = [];
 		const now = Date.now();
@@ -1351,6 +1401,11 @@ export function makeSpeculativeActionRuntime<
 		]) {
 			const current = matches.get(lookup.entry);
 			if (!current || lookup.match.distance < current.distance) matches.set(lookup.entry, lookup.match);
+		}
+		for (const candidate of arrivedCandidates) {
+			if (matches.has(candidate)) continue;
+			const match = actionKeyMatch(candidate.key, action, keyProjectors);
+			if (match) matches.set(candidate, match);
 		}
 		for (const [candidate, match] of matches) {
 			ranked.push({ candidate, match, expectedNetSavedMs: expectedNetSavedMs(candidate, match, now) });
@@ -1528,14 +1583,17 @@ export function makeSpeculativeActionRuntime<
 		candidate: RuntimeCandidate<Output>,
 		preserveSuccessfulBatch = false,
 	): Promise<void> => {
-		await settlePredictionLeases(candidate, "expired", "actor_miss", (lease) => {
-			return (
-				lease.providerTurnID === state.turnID &&
-				lease.validThroughActionSeq === undefined &&
-				sourcesByID.has(lease.source) &&
-				(!preserveSuccessfulBatch || state.sourceFeedback.get(lease.source) !== "success")
-			);
-		});
+		const shouldExpire = (lease: PredictionLease): boolean =>
+			lease.providerTurnID === state.turnID &&
+			lease.validThroughActionSeq === undefined &&
+			sourcesByID.has(lease.source) &&
+			(!preserveSuccessfulBatch || state.sourceFeedback.get(lease.source) !== "success");
+		for (const lease of candidate.leases) {
+			if (lease.state === "active" && shouldExpire(lease) && lease.proposalID && lease.actionID) {
+				state.planGraph.markFailed(lease.proposalID, lease.actionID);
+			}
+		}
+		await settlePredictionLeases(candidate, "expired", "actor_miss", shouldExpire);
 	};
 
 	const pruneResolvedLeases = (candidate: RuntimeCandidate<Output>): void => {
@@ -1550,6 +1608,7 @@ export function makeSpeculativeActionRuntime<
 		publish = false,
 		schedulerOutcome: "preempted" | "discarded" = "discarded",
 	): Promise<boolean> => {
+		const wasRunning = candidate.run.status === "running";
 		const completedAt = candidateCompletedAt(candidate);
 		const executionMs = candidateExecutionMs(candidate);
 		if (
@@ -1561,6 +1620,7 @@ export function makeSpeculativeActionRuntime<
 		) {
 			return false;
 		}
+		if (wasRunning) markCandidatePlanFailed(state, candidate);
 		candidate.schedulerOutcome = schedulerOutcome;
 		await settlePredictionLeases(candidate, leaseState, planResolution(reason));
 		for (const lease of candidate.leases) {
@@ -1619,9 +1679,12 @@ export function makeSpeculativeActionRuntime<
 			state.terminal = true;
 			state.predictionController.abort();
 			turns.delete(key);
+			await settleUnlaunchedPlanActions(state, "system");
 		}
 		for (const candidate of candidates) await preemptCandidate(candidate, reason, "discarded", publish);
 		planLedgers.delete(sessionID);
+		planGraphs.delete(sessionID);
+		planLaunchContexts.delete(sessionID);
 		sourceBackoff.delete(sessionID);
 		if (!schedulerFor(sessionID).snapshot().length) schedulers.delete(sessionID);
 	};
@@ -1678,7 +1741,9 @@ export function makeSpeculativeActionRuntime<
 		candidate: RuntimeCandidate<Output>,
 		reason = "candidate_expired",
 	): Promise<void> => {
+		markCandidatePlanFailed(state, candidate);
 		await closeCandidate(state, candidate, reason);
+		await reportBlockedPlanActions(state);
 	};
 
 	const expirePredictionLeasesAfterAction = async (state: TurnState<SessionID, Output, StateData>): Promise<void> => {
@@ -1695,6 +1760,9 @@ export function makeSpeculativeActionRuntime<
 				) {
 					continue;
 				}
+				if (lease.proposalID && lease.actionID) {
+					state.planGraph.markFailed(lease.proposalID, lease.actionID);
+				}
 				lease.state = "expired";
 				expired = true;
 				await notifyLeaseResolved(lease, "actor_miss");
@@ -1703,6 +1771,7 @@ export function makeSpeculativeActionRuntime<
 				await closeCandidate(state, candidate, "prediction_horizon_expired", "expired", true);
 			}
 		}
+		await reportBlockedPlanActions(state);
 	};
 
 	const invalidateChangedResources = async (
@@ -1782,6 +1851,62 @@ export function makeSpeculativeActionRuntime<
 				lease.validThroughActionSeq !== undefined ? [lease.validThroughActionSeq] : [],
 			),
 		);
+	const planLeaseReferences = (candidate: RuntimeCandidate<Output>): readonly PredictionLease[] =>
+		candidate.leases.filter(
+			(lease) =>
+				lease.proposalID !== undefined &&
+				lease.actionID !== undefined &&
+				(lease.state === "active" || lease.state === "matched" || lease.state === "hit"),
+		);
+	const markCandidatePlanSucceeded = (
+		state: TurnState<SessionID, Output, StateData>,
+		candidate: RuntimeCandidate<Output>,
+	): void => {
+		for (const lease of planLeaseReferences(candidate)) {
+			state.planGraph.markSucceeded(lease.proposalID!, lease.actionID!);
+		}
+	};
+	const markCandidatePlanAdopted = (
+		state: TurnState<SessionID, Output, StateData>,
+		candidate: RuntimeCandidate<Output>,
+		actionSequence: number,
+	): void => {
+		for (const lease of planLeaseReferences(candidate)) {
+			if (lease.resolvedActionSeq === actionSequence) {
+				state.planGraph.markAdopted(lease.proposalID!, lease.actionID!, actionSequence);
+			}
+		}
+	};
+	const markCandidatePlanFailed = (
+		state: TurnState<SessionID, Output, StateData>,
+		candidate: RuntimeCandidate<Output>,
+	): void => {
+		for (const lease of planLeaseReferences(candidate)) {
+			state.planGraph.markFailed(lease.proposalID!, lease.actionID!);
+		}
+	};
+	const markDraftPlanAdopted = (
+		state: TurnState<SessionID, Output, StateData>,
+		draft: SpeculativeDraftCandidate,
+	): void => {
+		if (draft.proposalID && draft.actionID) {
+			state.planGraph.markAdopted(draft.proposalID, draft.actionID, state.actionSequence);
+		}
+	};
+	const actorAlreadySatisfiedDraft = (
+		state: TurnState<SessionID, Output, StateData>,
+		draft: SpeculativeDraftCandidate,
+		action: ActionKey,
+		predictionAnchorActionSeq: number,
+	): boolean => {
+		const observedActionSeq = state.actorActionSequences.get(action.key);
+		if (observedActionSeq === undefined) return false;
+		const expectedActionSeq =
+			draft.proposalID && draft.actionID
+				? state.planGraph.get(draft.proposalID, draft.actionID)?.expectedActionSeq
+				: undefined;
+		return observedActionSeq >= (expectedActionSeq ?? predictionAnchorActionSeq + 1);
+	};
 
 	const attachPredictionLease = async (
 		state: TurnState<SessionID, Output, StateData>,
@@ -1875,6 +2000,8 @@ export function makeSpeculativeActionRuntime<
 		batchSource: string,
 		candidateNames: readonly string[],
 		predictionAnchorActionSeq = state.actionSequence,
+		launchMode: "speculative" | "promoted" = "speculative",
+		expectedLeadFloorMs = 0,
 	): Promise<number> => {
 		let accepted = 0;
 		if (state.finished || state.terminal) return accepted;
@@ -1920,6 +2047,7 @@ export function makeSpeculativeActionRuntime<
 							// Preparation is best-effort and never executes the hinted action.
 						});
 				}
+				accepted++;
 				continue;
 			}
 			const concrete = asConcreteInput(draft.input);
@@ -1942,7 +2070,8 @@ export function makeSpeculativeActionRuntime<
 				});
 				continue;
 			}
-			if (state.actorKeys.has(action.key)) {
+			if (actorAlreadySatisfiedDraft(state, draft, action, predictionAnchorActionSeq)) {
+				markDraftPlanAdopted(state, draft);
 				accepted++;
 				continue;
 			}
@@ -1953,6 +2082,7 @@ export function makeSpeculativeActionRuntime<
 				if (!attached) continue;
 				accepted++;
 				if (reusable.run.status === "ready") {
+					markCandidatePlanSucceeded(state, reusable);
 					await continuePredictionCandidate(state, input, reusable, reusable.run.output, false);
 				}
 				continue;
@@ -1994,8 +2124,9 @@ export function makeSpeculativeActionRuntime<
 				if (!current || !masterEnabled(current)) state.terminal = true;
 				return accepted;
 			}
-			if (state.actorKeys.has(action.key)) {
+			if (actorAlreadySatisfiedDraft(state, draft, action, predictionAnchorActionSeq)) {
 				candidateController.abort();
+				markDraftPlanAdopted(state, draft);
 				accepted++;
 				continue;
 			}
@@ -2016,6 +2147,7 @@ export function makeSpeculativeActionRuntime<
 				if (!attached) continue;
 				accepted++;
 				if (postflightReusable.run.status === "ready") {
+					markCandidatePlanSucceeded(state, postflightReusable);
 					await continuePredictionCandidate(
 						state,
 						input,
@@ -2046,7 +2178,7 @@ export function makeSpeculativeActionRuntime<
 				...(empiricalProbability !== undefined ? { empiricalProbability } : {}),
 				state: "active",
 			};
-			const scheduling = schedulingMetadata(draft, action);
+			const scheduling = schedulingMetadata(draft, action, expectedLeadFloorMs);
 			const lifecycle = new CandidateAggregate<Output, PredictionLease>(
 				reuse === "shared_result" ? "shared" : "exclusive",
 				[sourceLease],
@@ -2089,7 +2221,10 @@ export function makeSpeculativeActionRuntime<
 				lifecycle,
 				hits: 0,
 			};
-			const turnDecision = turnAdmission(state, action.key, candidate.utility);
+			const turnDecision =
+				launchMode === "promoted"
+					? ({ admitted: true } as const)
+					: turnAdmission(state, action.key, candidate.utility);
 			if (!turnDecision.admitted) {
 				candidate.schedulerOutcome = "discarded";
 				lifecycle.close({ reason: "candidate_budget_insufficient_expected_benefit" });
@@ -2118,24 +2253,30 @@ export function makeSpeculativeActionRuntime<
 				}
 				continue;
 			}
-			const admission = schedulerFor(state.sessionID).admit(
-				candidate,
-				scheduling,
-				speculativeResourceBudget(concurrentActionLimit(state.settings)),
-			);
-			if (!admission.admitted) {
-				jobs.delete(state.sessionID, candidate);
-				candidate.schedulerOutcome = "discarded";
-				lifecycle.close({ reason: `scheduler_${admission.reason}` });
-				lifecycle.settleClosed();
-				await publishCancelled(state, candidate, `scheduler_${admission.reason}`);
-				continue;
+			let schedulerVictims: readonly RuntimeCandidate<Output>[] = [];
+			if (launchMode === "speculative") {
+				const admission = schedulerFor(state.sessionID).admit(
+					candidate,
+					scheduling,
+					speculativeResourceBudget(concurrentActionLimit(state.settings)),
+				);
+				if (!admission.admitted) {
+					jobs.delete(state.sessionID, candidate);
+					candidate.schedulerOutcome = "discarded";
+					lifecycle.close({ reason: `scheduler_${admission.reason}` });
+					lifecycle.settleClosed();
+					await publishCancelled(state, candidate, `scheduler_${admission.reason}`);
+					continue;
+				}
+				schedulerVictims = admission.preempted;
+			} else {
+				candidate.schedulerOutcome = "promoted";
 			}
 			if (turnDecision.victim) state.turnAdmissions.delete(turnDecision.victim.key.key);
 			state.turnAdmissions.set(action.key, candidate);
 			candidateCatalog.register(state.sessionID, turnKey(state), candidate, state);
-			for (const victim of admission.preempted) await preemptCandidate(victim);
-			if (turnDecision.victim && !admission.preempted.includes(turnDecision.victim)) {
+			for (const victim of schedulerVictims) await preemptCandidate(victim);
+			if (turnDecision.victim && !schedulerVictims.includes(turnDecision.victim)) {
 				await preemptCandidate(turnDecision.victim, "candidate_budget_preempted");
 			}
 			accepted++;
@@ -2158,6 +2299,7 @@ export function makeSpeculativeActionRuntime<
 				});
 				schedulerFor(state.sessionID).discard(candidate);
 				candidate.schedulerOutcome = "discarded";
+				markCandidatePlanFailed(state, candidate);
 				if (adaptiveSourceBackoffEnabled(state)) {
 					for (const sourceID of new Set(candidate.leases.map((lease) => lease.source))) {
 						if (sourcesByID.get(sourceID)?.adaptive) recordSourceFailure(state, sourceID, "source_error");
@@ -2174,6 +2316,8 @@ export function makeSpeculativeActionRuntime<
 				await publishCancelled(state, candidate, classified.reason, errorDetail(classified));
 				await publishCache(state);
 				candidate.lifecycle.settleClosed();
+				await reportBlockedPlanActions(state);
+				await dispatchReadyPlanActions(state, input);
 			};
 			void Promise.resolve()
 				.then(async () => {
@@ -2315,6 +2459,7 @@ export function makeSpeculativeActionRuntime<
 						// Fall back to the generic estimate when custom accounting fails.
 					}
 					candidate.estimatedBytes += outputBytes;
+					markCandidatePlanSucceeded(state, candidate);
 					const stored = storeCompletedCandidate(state, candidate);
 					if (stored.existing) {
 						await rejectExecution(
@@ -2325,13 +2470,14 @@ export function makeSpeculativeActionRuntime<
 						);
 						return;
 					}
-					schedulerFor(state.sessionID).complete(candidate);
+					completeScheduledCandidate(state, candidate);
 					for (const evicted of stored.evicted) {
 						await preemptCandidate(evicted.candidate, evicted.reason, "discarded");
 					}
 					await publishCache(state);
 					await publishCompleted(state, candidate);
 					if (!candidate.lifecycle.settleReady()) return;
+					await dispatchReadyPlanActions(state, input);
 					if (action.execution !== "sandbox") {
 						await continuePredictionCandidate(
 							state,
@@ -2382,6 +2528,9 @@ export function makeSpeculativeActionRuntime<
 	): Promise<void> => {
 		if (!actionIDs.length) return;
 		const removed = new Set(actionIDs);
+		const removedNodes = state.planGraph.remove(proposalID, actionIDs);
+		const contexts = planLaunchContexts.get(state.sessionID);
+		for (const actionID of actionIDs) contexts?.delete(planActionIdentity(proposalID, actionID));
 		for (const candidate of availableCandidates(state).values()) {
 			let changed = false;
 			for (const lease of candidate.leases) {
@@ -2402,6 +2551,235 @@ export function makeSpeculativeActionRuntime<
 				await closeCandidate(state, candidate, "plan_action_removed", "invalidated", true);
 			}
 		}
+		for (const node of removedNodes) {
+			if (node.state === "deferred") await notifyUnlaunchedPlanResolved(node, "system");
+		}
+	};
+
+	const notifyUnlaunchedPlanResolved = async (
+		node: PlanExecutionNode,
+		outcome: Exclude<PlanActionResolution, "consumed">,
+	): Promise<void> => {
+		const source = sourcesByID.get(node.source);
+		if (!source?.onResolved) return;
+		try {
+			await source.onResolved({
+				proposalID: node.proposalID,
+				actionID: node.action.id,
+				feedback: node.action.feedback,
+				outcome,
+			});
+		} catch {
+			// Producer feedback must not alter scheduler semantics.
+		}
+	};
+
+	const reportBlockedPlanActions = async (state: TurnState<SessionID, Output, StateData>): Promise<void> => {
+		for (const blocked of state.planGraph.drainBlocked()) await notifyUnlaunchedPlanResolved(blocked, "system");
+	};
+	const settleUnlaunchedPlanActions = async (
+		state: TurnState<SessionID, Output, StateData>,
+		outcome: Exclude<PlanActionResolution, "consumed">,
+	): Promise<void> => {
+		for (const node of state.planGraph.values()) {
+			if (node.state !== "deferred" && node.state !== "launching") continue;
+			state.planGraph.markFailed(node.proposalID, node.action.id);
+			await notifyUnlaunchedPlanResolved(node, outcome);
+		}
+		await reportBlockedPlanActions(state);
+	};
+
+	const launchPlanNode = async (
+		state: TurnState<SessionID, Output, StateData>,
+		input: StartInput,
+		node: PlanExecutionNode,
+		candidateNames: readonly string[],
+		mode: "speculative" | "promoted" = "speculative",
+	): Promise<boolean> => {
+		if (state.finished || state.terminal) {
+			state.planGraph.defer(node.proposalID, node.action.id);
+			return false;
+		}
+		const settings = await latestSettings();
+		if (!settings || !sourceEnabled(settings, node.source)) {
+			state.planGraph.markFailed(node.proposalID, node.action.id);
+			await notifyUnlaunchedPlanResolved(node, "system");
+			await reportBlockedPlanActions(state);
+			return false;
+		}
+		const context = planLaunchContexts.get(state.sessionID)?.get(planActionIdentity(node.proposalID, node.action.id));
+		const actionHorizon = finiteNonNegativeInteger(node.action.horizon);
+		const effectiveAnchor = Math.max(0, node.expectedActionSeq - actionHorizon - 1);
+		const expectedLeadFloorMs =
+			mode === "speculative" &&
+			node.action.type === "tool_call" &&
+			node.expectedActionSeq > state.actionSequence &&
+			(actionHorizon > 0 || (node.action.dependsOn?.length ?? 0) > 0)
+				? finitePositive(node.action.expectedDurationMs, serviceTimes.get(node.action.tool)?.averageMs ?? 1)
+				: 0;
+		let accepted: number;
+		try {
+			accepted = await admitPredictions(
+				state,
+				input,
+				[planActionDraft(node.proposalID, node.source, node.action)],
+				context?.predictionLatencyMs ?? 0,
+				context?.draftTokens ?? 0,
+				context?.totalDraftTokens ?? tokenTotals.get(state.sessionID) ?? 0,
+				node.source,
+				candidateNames,
+				effectiveAnchor,
+				mode,
+				expectedLeadFloorMs,
+			);
+		} catch (error) {
+			state.planGraph.markFailed(node.proposalID, node.action.id);
+			await publishMiss(state, "plan_action_launch_failed", undefined, errorDetail(error), {
+				draftCandidate: draftCandidateDiagnostic(planActionDraft(node.proposalID, node.source, node.action)),
+			});
+			await notifyUnlaunchedPlanResolved(node, "system");
+			await reportBlockedPlanActions(state);
+			return false;
+		}
+		const current = state.planGraph.get(node.proposalID, node.action.id);
+		if (accepted > 0) {
+			if (node.action.type === "preparation_hint") {
+				state.planGraph.markSucceeded(node.proposalID, node.action.id);
+			} else if (current?.state === "launching") {
+				state.planGraph.markRunning(node.proposalID, node.action.id);
+			}
+			await reportBlockedPlanActions(state);
+			return true;
+		}
+		if (current?.state === "launching") {
+			state.planGraph.markFailed(node.proposalID, node.action.id);
+			await notifyUnlaunchedPlanResolved(node, "system");
+		}
+		await reportBlockedPlanActions(state);
+		return false;
+	};
+
+	const dispatchReadyPlanActions = async (
+		state: TurnState<SessionID, Output, StateData>,
+		input: StartInput = state.startInput as StartInput,
+		candidateNames?: readonly string[],
+	): Promise<void> => {
+		if (state.finished || state.terminal) return;
+		const names = candidateNames ?? candidateToolNames(state.settings, actionSemantics);
+		const ready = [...state.planGraph.takeReady(state.actionSequence)].sort(
+			(left, right) =>
+				draftPriority(planActionDraft(right.proposalID, right.source, right.action)) -
+					draftPriority(planActionDraft(left.proposalID, left.source, left.action)) ||
+				left.expectedActionSeq - right.expectedActionSeq ||
+				left.action.id.localeCompare(right.action.id),
+		);
+		state.planDispatchDepth++;
+		try {
+			for (const node of ready) {
+				if (state.finished || state.terminal) {
+					state.planGraph.defer(node.proposalID, node.action.id);
+					continue;
+				}
+				await launchPlanNode(state, input, node, names);
+			}
+		} finally {
+			state.planDispatchDepth--;
+			if (state.planDispatchDepth === 0) {
+				for (const candidate of state.pendingSchedulerCompletions) {
+					schedulerFor(state.sessionID).complete(candidate);
+				}
+				state.pendingSchedulerCompletions.clear();
+			}
+		}
+		await reportBlockedPlanActions(state);
+	};
+
+	const promoteDeferredPlanAction = async (
+		state: TurnState<SessionID, Output, StateData>,
+		actor: ActionKey,
+	): Promise<boolean> => {
+		const settings = await latestSettings();
+		if (!settings || state.finished || state.terminal) return false;
+		const matches: Array<{ readonly node: PlanExecutionNode; readonly distance: number }> = [];
+		for (const node of state.planGraph.deferred()) {
+			if (node.action.type !== "tool_call" || node.action.tool !== actor.tool) continue;
+			if (!sourceEnabled(settings, node.source)) continue;
+			const concrete = asConcreteInput(node.action.input);
+			if (!concrete) continue;
+			const key = await adapter.actionKey(node.action.tool, concrete, {
+				type: "start",
+				startInput: state.startInput as StartInput,
+				data: state.data,
+			});
+			if (!key) continue;
+			const match = actionKeyMatch(key, actor, keyProjectors);
+			if (!match || (match.kind === "projected" && !actionKeyCovers(key, actor, keyProjectors))) continue;
+			matches.push({ node, distance: match.distance });
+		}
+		matches.sort(
+			(left, right) =>
+				left.distance - right.distance ||
+				left.node.expectedActionSeq - right.node.expectedActionSeq ||
+				left.node.proposalID.localeCompare(right.node.proposalID) ||
+				left.node.action.id.localeCompare(right.node.action.id),
+		);
+		for (const { node } of matches) {
+			const promotion = state.planGraph.promote(node.proposalID, node.action.id);
+			if (promotion.status !== "claimed") continue;
+			await preemptForAuthoritative(state, resourceProfile(actor.tool, actor.execution));
+			if (
+				await launchPlanNode(
+					state,
+					state.startInput as StartInput,
+					promotion.node,
+					candidateToolNames(settings, actionSemantics),
+					"promoted",
+				)
+			) {
+				return true;
+			}
+		}
+		return false;
+	};
+
+	const adoptObservedPlanActions = async (
+		state: TurnState<SessionID, Output, StateData>,
+		actor: ActionKey,
+		actionSequence: number,
+	): Promise<void> => {
+		const earliestByProposal = new Map<string, PlanExecutionNode>();
+		for (const node of state.planGraph.values()) {
+			if (
+				node.action.type !== "tool_call" ||
+				node.expectedActionSeq > actionSequence ||
+				!state.planGraph.canAdopt(node.proposalID, node.action.id)
+			) {
+				continue;
+			}
+			if (node.action.tool !== actor.tool) continue;
+			const concrete = asConcreteInput(node.action.input);
+			if (!concrete) continue;
+			const key = await adapter.actionKey(node.action.tool, concrete, {
+				type: "start",
+				startInput: state.startInput as StartInput,
+				data: state.data,
+			});
+			if (!key || !actionKeyCovers(key, actor, keyProjectors)) continue;
+			const current = earliestByProposal.get(node.proposalID);
+			if (
+				!current ||
+				node.expectedActionSeq < current.expectedActionSeq ||
+				(node.expectedActionSeq === current.expectedActionSeq &&
+					node.action.id.localeCompare(current.action.id) < 0)
+			) {
+				earliestByProposal.set(node.proposalID, node);
+			}
+		}
+		for (const node of earliestByProposal.values()) {
+			state.planGraph.markAdopted(node.proposalID, node.action.id, actionSequence);
+		}
+		await reportBlockedPlanActions(state);
+		await dispatchReadyPlanActions(state, state.startInput as StartInput);
 	};
 
 	const admitPlanUpdates = async (
@@ -2428,23 +2806,18 @@ export function makeSpeculativeActionRuntime<
 			const draftTokens = finiteMetric(update.draftTokens);
 			const totalDraftTokens = finiteMetric(tokenTotals.get(state.sessionID)) + draftTokens;
 			tokenTotals.set(state.sessionID, totalDraftTokens);
-			const actions = result.upserted.filter((action) => {
-				const key = `${result.plan.id}:${action.id}:${result.plan.revision}`;
-				if (state.admittedPlanActions.has(key)) return false;
-				state.admittedPlanActions.add(key);
-				return true;
-			});
-			accepted += await admitPredictions(
-				state,
-				input,
-				actions.map((action) => planActionDraft(result.plan.id, source, action)),
-				predictionLatencyMs,
-				draftTokens,
-				totalDraftTokens,
-				source,
-				candidateNames,
-				predictionAnchorActionSeq,
-			);
+			const contexts = planLaunchContexts.get(state.sessionID) ?? new Map();
+			planLaunchContexts.set(state.sessionID, contexts);
+			for (const action of result.upserted) {
+				contexts.set(planActionIdentity(result.plan.id, action.id), {
+					predictionLatencyMs,
+					draftTokens,
+					totalDraftTokens,
+				});
+			}
+			state.planGraph.upsert(result.plan, result.upserted, predictionAnchorActionSeq);
+			accepted += result.upserted.length;
+			await dispatchReadyPlanActions(state, input, candidateNames);
 		}
 		return accepted;
 	};
@@ -2560,6 +2933,7 @@ export function makeSpeculativeActionRuntime<
 		state: TurnState<SessionID, Output, StateData>,
 	): Promise<void> => {
 		let accepted = 0;
+		const predictionAnchorActionSeq = state.actionSequence;
 		try {
 			for (const source of sources) {
 				if (state.finished || state.terminal) return;
@@ -2611,6 +2985,7 @@ export function makeSpeculativeActionRuntime<
 						proposals,
 						Math.max(0, Date.now() - predictionStarted),
 						candidateNames,
+						predictionAnchorActionSeq,
 					);
 					accepted += sourceAccepted;
 					if (source.adaptive && adaptiveSourceBackoffEnabled(state) && sourceAccepted === 0) {
@@ -2671,17 +3046,19 @@ export function makeSpeculativeActionRuntime<
 			data: await adapter.stateData(input),
 			settings,
 			predictionController: new AbortController(),
-			actorKeys: new Set(),
+			actorActionSequences: new Map(),
 			actorCallSequences: new Map(),
 			preparedHints: new Set(),
 			pendingActionSequences: new Set(),
 			turnAdmissions: new Map(),
 			plans: planLedgerFor(input.sessionID),
-			admittedPlanActions: new Set(),
+			planGraph: planGraphFor(input.sessionID),
 			sourceAttempts: new Set(),
 			sourceFeedback: new Map(),
 			sourcePlanMismatches: new Set(),
+			pendingSchedulerCompletions: new Set(),
 			actionSequence: actionSequences.get(input.sessionID) ?? 0,
+			planDispatchDepth: 0,
 			terminal: false,
 			finished: false,
 			noCandidateReported: false,
@@ -2689,6 +3066,7 @@ export function makeSpeculativeActionRuntime<
 		};
 		turns.set(turnKey(input), state);
 		await reconcileCandidateStores(state);
+		await dispatchReadyPlanActions(state, input, candidateNames);
 		if (signal) {
 			signal.addEventListener(
 				"abort",
@@ -2703,13 +3081,19 @@ export function makeSpeculativeActionRuntime<
 
 	const consume = async (input: ConsumeInput, signal?: AbortSignal): Promise<Output | undefined> => {
 		const actorArrivedAt = Date.now();
+		const state = turns.get(turnKey(input));
+		if (!state || signal?.aborted) return undefined;
+		// Capture the jobs visible when the actor arrived. A fast validation
+		// failure may retire a job while settings or K(a) are still resolving;
+		// retaining the reference lets the actor receive the precise rejection
+		// instead of an indistinguishable empty-cache miss.
+		const candidatesAtArrival = [...availableCandidates(state).values()];
 		const settings = await latestSettings();
 		if (!settings || !masterEnabled(settings)) {
 			await disableSession(input.sessionID);
 			return undefined;
 		}
-		const state = turns.get(turnKey(input));
-		if (!state || signal?.aborted) return undefined;
+		if (state.finished || signal?.aborted) return undefined;
 		const actionSequence = (actionSequences.get(state.sessionID) ?? state.actionSequence) + 1;
 		actionSequences.set(state.sessionID, actionSequence);
 		state.actionSequence = Math.max(state.actionSequence, actionSequence);
@@ -2722,16 +3106,20 @@ export function makeSpeculativeActionRuntime<
 				consumeInput: input,
 			});
 			const actualAction = diagnosticAction(actualCall.tool, actualCall.input, actual);
-			const candidates = [...availableCandidates(state).values()];
-			const activePlanSources = activeAdaptivePlanSources(candidates, actionSequence);
+			if (actual) await promoteDeferredPlanAction(state, actual);
+			const candidates = [...new Set([...candidatesAtArrival, ...availableCandidates(state).values()])];
+			const activePlanSources = activeAdaptivePlanSources(candidates, actionSequence, state.planGraph);
 			if (!actual) {
 				markPlanMismatches(state, activePlanSources);
 				await preemptForAuthoritative(state, { class: "global", units: 1 });
 				return undefined;
 			}
 
-			state.actorKeys.add(actual.key);
-			const choices = matchingCandidates(state, actual);
+			state.actorActionSequences.set(
+				actual.key,
+				Math.max(state.actorActionSequences.get(actual.key) ?? 0, actionSequence),
+			);
+			const choices = matchingCandidates(state, actual, candidatesAtArrival);
 			const compatibleCandidates = new Set(choices.map((choice) => choice.candidate));
 			const rejectionCounts = new Map<string, number>();
 			const recordRejection = (reason: string, count = 1): void => {
@@ -2794,7 +3182,7 @@ export function makeSpeculativeActionRuntime<
 					reject(
 						choice,
 						candidate.run.status === "closed"
-							? "candidate_closed"
+							? candidate.run.reason
 							: candidate.reuse.kind === "exclusive" && candidate.reuse.state !== "available"
 								? "candidate_claimed"
 								: "prediction_horizon_expired",
@@ -2966,6 +3354,7 @@ export function makeSpeculativeActionRuntime<
 			const executionMs = candidateExecutionMs(candidate) || Math.max(0, Date.now() - candidate.startedAt);
 			observeHitOverhead(actual.tool, candidate.validationMs + (candidate.commitMs ?? 0) + projectionDurationMs);
 			completePredictionMatch(candidate, actionSequence);
+			markCandidatePlanAdopted(state, candidate, actionSequence);
 			candidate.hits++;
 			candidate.authoritativeSequence = Math.max(candidate.authoritativeSequence ?? 0, actionSequence);
 			if (candidate.reuse.kind === "shared") {
@@ -3008,10 +3397,14 @@ export function makeSpeculativeActionRuntime<
 			await recordAndPredict(state, input, actualCall, actual, output, executionMs, true, actionSequence);
 			if (actualCall.id) state.actorCallSequences.delete(actualCall.id);
 			await continuePredictionCandidate(state, state.startInput as StartInput, candidate, output, true);
+			// Let the source revise deferred descendants with confirmed confidence
+			// before the now-adopted dependency releases them to the scheduler.
+			await dispatchReadyPlanActions(state, state.startInput as StartInput);
 			return output;
 		} finally {
 			state.pendingActionSequences.delete(actionSequence);
 			await expirePredictionLeasesAfterAction(state);
+			await dispatchReadyPlanActions(state, state.startInput as StartInput);
 		}
 	};
 	const actual = async (
@@ -3045,7 +3438,10 @@ export function makeSpeculativeActionRuntime<
 			actualDurationMs: durationMs,
 			...cacheSnapshot(state),
 		});
-		if (key) await invalidateChangedResources(state, key);
+		if (key) {
+			await invalidateChangedResources(state, key);
+			await adoptObservedPlanActions(state, key, actionSequence);
+		}
 		await recordAndPredict(state, input, actualCall, key, input.output, durationMs, false, actionSequence);
 		if (actualCall.id) state.actorCallSequences.delete(actualCall.id);
 	};
@@ -3089,6 +3485,11 @@ export function makeSpeculativeActionRuntime<
 				recordSourceFailure(state, sourceID, "actor_miss");
 			}
 		}
+		for (const node of state.planGraph.values()) {
+			if (missedPlanSources.has(node.source)) state.planGraph.markFailed(node.proposalID, node.action.id);
+		}
+		await reportBlockedPlanActions(state);
+		if (terminal) await settleUnlaunchedPlanActions(state, "actor_miss");
 		for (const candidate of availableCandidates(state).values()) {
 			if (candidate.run.status === "closed") continue;
 			if (missedPlanSources.size > 0) {
@@ -3111,6 +3512,8 @@ export function makeSpeculativeActionRuntime<
 		if (terminal) {
 			await flushPredictionSources();
 			planLedgers.delete(state.sessionID);
+			planGraphs.delete(state.sessionID);
+			planLaunchContexts.delete(state.sessionID);
 		}
 		candidateCatalog.detachAllFromTurn(turnKey(state));
 		if (!schedulerFor(state.sessionID).snapshot().length) schedulers.delete(state.sessionID);
@@ -3118,7 +3521,8 @@ export function makeSpeculativeActionRuntime<
 
 	const finishTerminalSession = async (sessionID: SessionID, settings: SpeculativeActionSettings): Promise<void> => {
 		const candidates = sessionCandidates(sessionID);
-		const state = createDisposalState<SessionID, Output, StateData>(sessionID, settings);
+		const state = createDisposalState<SessionID, Output, StateData>(sessionID, settings, planGraphs.get(sessionID));
+		await settleUnlaunchedPlanActions(state, "actor_miss");
 		for (const candidate of candidates) {
 			if (candidate.reuse.kind === "exclusive") {
 				await closeCandidate(state, candidate, "request_finished_without_hit", "invalidated", true);
@@ -3129,6 +3533,8 @@ export function makeSpeculativeActionRuntime<
 		if (candidates.length) await publishCache(state);
 		await flushPredictionSources();
 		planLedgers.delete(sessionID);
+		planGraphs.delete(sessionID);
+		planLaunchContexts.delete(sessionID);
 		if (!schedulerFor(sessionID).snapshot().length) schedulers.delete(sessionID);
 	};
 
@@ -3160,7 +3566,12 @@ export function makeSpeculativeActionRuntime<
 			await abortState(state, "session_disposed");
 		}
 		const settings = await adapter.settings();
-		const stateForEvents = createDisposalState<SessionID, Output, StateData>(sessionID, settings);
+		const stateForEvents = createDisposalState<SessionID, Output, StateData>(
+			sessionID,
+			settings,
+			planGraphs.get(sessionID),
+		);
+		await settleUnlaunchedPlanActions(stateForEvents, "system");
 		for (const candidate of candidateCatalog.sessionValues(sessionID)) {
 			await closeCandidate(stateForEvents, candidate, "session_disposed", "invalidated", true);
 		}
@@ -3170,6 +3581,8 @@ export function makeSpeculativeActionRuntime<
 		schedulers.delete(sessionID);
 		sourceBackoff.delete(sessionID);
 		planLedgers.delete(sessionID);
+		planGraphs.delete(sessionID);
+		planLaunchContexts.delete(sessionID);
 		await flushPredictionSources();
 	};
 
@@ -3185,6 +3598,8 @@ export function makeSpeculativeActionRuntime<
 		schedulers.clear();
 		sourceBackoff.clear();
 		planLedgers.clear();
+		planGraphs.clear();
+		planLaunchContexts.clear();
 		actionSequences.clear();
 	};
 
@@ -3194,11 +3609,18 @@ export function makeSpeculativeActionRuntime<
 			sessionID === undefined
 				? [...jobs.allValues(), ...results.allValues(), ...branches.allValues()]
 				: sessionCandidates(sessionID);
+		const planNodes =
+			sessionID === undefined
+				? [...planGraphs.values()].flatMap((graph) => graph.values())
+				: (planGraphs.get(sessionID)?.values() ?? []);
 		return {
 			activeTurns: states.length,
 			turnCandidates: candidates.filter((candidate) => candidate.reuse.kind === "exclusive").length,
 			resourceCandidates: candidates.filter((candidate) => candidate.reuse.kind === "shared").length,
 			pendingPredictions: states.filter((state) => state.predictionPending).length,
+			deferredPlanActions: planNodes.filter((node) => node.state === "deferred").length,
+			activePlanActions: planNodes.filter((node) => node.state === "launching" || node.state === "running").length,
+			blockedPlanActions: planNodes.filter((node) => node.state === "blocked").length,
 		};
 	};
 
@@ -3320,6 +3742,7 @@ async function isExpired<
 function createDisposalState<SessionID, Output, StateData>(
 	sessionID: SessionID,
 	settings: SpeculativeActionSettings,
+	planGraph = new PlanExecutionGraph(),
 ): TurnState<SessionID, Output, StateData> {
 	return {
 		sessionID,
@@ -3329,17 +3752,19 @@ function createDisposalState<SessionID, Output, StateData>(
 		data: undefined as StateData,
 		settings,
 		predictionController: new AbortController(),
-		actorKeys: new Set(),
+		actorActionSequences: new Map(),
 		actorCallSequences: new Map(),
 		preparedHints: new Set(),
 		pendingActionSequences: new Set(),
 		turnAdmissions: new Map(),
 		plans: new PlanLedger(),
-		admittedPlanActions: new Set(),
+		planGraph,
 		sourceAttempts: new Set(),
 		sourceFeedback: new Map(),
 		sourcePlanMismatches: new Set(),
+		pendingSchedulerCompletions: new Set(),
 		actionSequence: 0,
+		planDispatchDepth: 0,
 		terminal: true,
 		finished: true,
 		noCandidateReported: false,
