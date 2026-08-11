@@ -435,10 +435,9 @@ describe("Pi Agent speculative integration", () => {
 							startLine: 1,
 							endLineExclusive: 11,
 							totalLines: 10,
-							lines,
+							payloadTextLength: lines.join("\n").length,
 							maxLines: 2000,
 							maxBytes: 50 * 1024,
-							complete: true,
 						},
 					},
 				};

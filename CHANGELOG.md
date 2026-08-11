@@ -24,6 +24,7 @@
 
 ### Changed
 
+- Read projection now reuses the shared agent-core truncation implementation and compact, in-memory coverage descriptors; projected single-flight reuse also requires explicit opt-in.
 - Workspace adoption now serializes overlapping targets, uses staged atomic replacement, preserves file modes, and removes newly created directories during rollback.
 - Drafter candidates now reuse exact and containing-read cache entries, deduplicate in-flight work, and replace stale resource entries before execution.
 - Resource candidates now use a configurable access-ordered LRU, and sandbox failures fall back without mutating the real workspace.

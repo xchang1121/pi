@@ -953,6 +953,28 @@ describe("speculative action runtime", () => {
 		});
 	});
 
+	it("does not report an exclusive turn candidate as cache probation", async () => {
+		const harness = createHarness({
+			settings: {
+				...enabledSettings,
+				tools: { resourceCached: ["read"], sandbox: ["bash"] },
+			},
+			predict: () => prediction(bashCandidate("echo ready")),
+			execute: () => "ready",
+		});
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-sandbox-cache" });
+		await waitFor(() => harness.events.some((event) => event.type === "started"));
+
+		expect(harness.events.find((event) => event.type === "started")).toMatchObject({
+			cacheEntries: 1,
+			cacheProbation: 0,
+			cacheProtected: 0,
+			turnCandidates: 1,
+			resourceCandidates: 0,
+		});
+		await harness.runtime.finishTurn(consume("turn-sandbox-cache", {}));
+	});
+
 	it("evicts unconsumed probation before an actor-validated protected result", async () => {
 		const harness = createHarness({
 			settings: { ...enabledSettings, adaptiveDrafter: false, resourceCacheMaxEntries: 2 },
@@ -1644,7 +1666,7 @@ describe("speculative action runtime", () => {
 				rejections: [
 					{ reason: "different_core", count: 1 },
 					{ reason: "different_tool", count: 1 },
-					{ reason: "view_not_covered", count: 1 },
+					{ reason: "projection_not_applicable", count: 1 },
 				],
 			},
 		});

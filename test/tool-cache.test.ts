@@ -101,6 +101,21 @@ describe("ToolCache probation/protected lifecycle", () => {
 		expect(narrowFirst.values("session")).toEqual([narrow, broad]);
 	});
 
+	it("requires explicit opt-in before coalescing a projected insertion", () => {
+		const cache = new ToolCache<string, Entry>([READ_RANGE_ACTION_KEY_PROJECTOR]);
+		const broad = entry("broad", "a.txt", 1, 200);
+		const narrow = entry("narrow", "a.txt", 100, 10);
+		cache.insertOrGetCompatible("session", broad);
+
+		expect(cache.insertOrGetCompatible("session", narrow)).toEqual({
+			entry: narrow,
+			inserted: true,
+			match: { kind: "exact", distance: 0 },
+			state: "probation",
+		});
+		expect(cache.values("session")).toEqual([broad, narrow]);
+	});
+
 	it("keeps a projected request separate when lifecycle compatibility rejects every source", () => {
 		const cache = new ToolCache<string, Entry>([READ_RANGE_ACTION_KEY_PROJECTOR]);
 		const broad = entry("broad", "a.txt", 1, 200);

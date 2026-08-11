@@ -843,8 +843,8 @@ export function makeSpeculativeActionRuntime<
 		}
 	};
 
-	const sessionPersistentCandidates = (sessionID: SessionID): RuntimeCandidate<Output>[] => {
-		return [...persistentCandidates.values(sessionID)];
+	const sessionPersistentCandidates = (sessionID: SessionID): readonly RuntimeCandidate<Output>[] => {
+		return persistentCandidates.values(sessionID);
 	};
 
 	const cachedCandidates = (state: TurnState<SessionID, Output, StateData>): RuntimeCandidate<Output>[] => {
@@ -861,9 +861,7 @@ export function makeSpeculativeActionRuntime<
 	const cacheSnapshot = (state: TurnState<SessionID, Output, StateData>): SpeculativeCacheSnapshot => {
 		const candidates = cachedCandidates(state);
 		const running = candidates.filter((candidate) => candidate.run.status === "running").length;
-		const protectedEntries = candidates.filter(
-			(candidate) => persistentCandidates.stateOf(state.sessionID, candidate) === "protected",
-		).length;
+		const lifecycle = persistentCandidates.snapshot(state.sessionID);
 		return {
 			cacheEntries: candidates.length,
 			cacheCapacity: state.settings.resourceCacheMaxEntries,
@@ -871,8 +869,8 @@ export function makeSpeculativeActionRuntime<
 			cacheByteCapacity: resourceCacheByteLimit(state.settings),
 			cacheRunning: running,
 			cacheCompleted: candidates.length - running,
-			cacheProbation: candidates.length - protectedEntries,
-			cacheProtected: protectedEntries,
+			cacheProbation: lifecycle.probationEntries,
+			cacheProtected: lifecycle.protectedEntries,
 			activeCandidates: running,
 			turnCandidates: candidates.filter((candidate) => candidate.reuse.kind === "exclusive").length,
 			resourceCandidates: candidates.filter((candidate) => candidate.reuse.kind === "shared").length,
@@ -1063,7 +1061,7 @@ export function makeSpeculativeActionRuntime<
 	): RankedRuntimeCandidate<Output>[] => {
 		const ranked: RankedRuntimeCandidate<Output>[] = [];
 		const now = Date.now();
-		for (const candidate of new Set(availableCandidates(state).values())) {
+		for (const candidate of availableCandidates(state).values()) {
 			const match = actionKeyMatch(candidate.key, action, keyProjectors);
 			if (!match) continue;
 			ranked.push({ candidate, match, expectedNetSavedMs: expectedNetSavedMs(candidate, match, now) });
@@ -2280,7 +2278,7 @@ export function makeSpeculativeActionRuntime<
 				consumeInput: input,
 			});
 			const actualAction = diagnosticAction(actualCall.tool, actualCall.input, actual);
-			const candidates = [...new Set(availableCandidates(state).values())];
+			const candidates = [...availableCandidates(state).values()];
 			const activeDrafterPlan = candidates.some(hasActiveDrafterLease);
 			if (!actual) {
 				if (activeDrafterPlan) state.drafterPlanMismatch = true;
@@ -2290,12 +2288,14 @@ export function makeSpeculativeActionRuntime<
 
 			state.actorKeys.add(actual.key);
 			const choices = matchingCandidates(state, actual);
+			const compatibleCandidates = new Set(choices.map((choice) => choice.candidate));
 			const rejectionCounts = new Map<string, number>();
 			const recordRejection = (reason: string, count = 1): void => {
 				if (count <= 0) return;
 				rejectionCounts.set(reason, (rejectionCounts.get(reason) ?? 0) + count);
 			};
 			for (const candidate of candidates) {
+				if (compatibleCandidates.has(candidate)) continue;
 				const reason = actionKeyMismatchReason(candidate.key, actual, keyProjectors);
 				if (reason) recordRejection(reason);
 			}

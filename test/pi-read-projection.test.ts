@@ -28,10 +28,9 @@ function coverage(
 		startLine,
 		endLineExclusive: startLine + lines.length,
 		totalLines,
-		lines,
+		payloadTextLength: lines.join("\n").length,
 		maxLines: options.maxLines ?? 2000,
 		maxBytes: options.maxBytes ?? 50 * 1024,
-		complete: startLine + lines.length === totalLines + 1,
 	};
 }
 
@@ -43,6 +42,14 @@ function settlement(snapshot?: unknown, text = "speculative output", isError = f
 		},
 		isError,
 	};
+}
+
+function coveredSettlement(
+	lines: readonly string[],
+	options: Parameters<typeof coverage>[1] = {},
+	isError = false,
+): SettleToolCallResult {
+	return settlement(coverage(lines, options), lines.join("\n"), isError);
 }
 
 async function project(
@@ -74,7 +81,7 @@ describe("Pi read range projection", () => {
 		const projected = await project(
 			readKey("notes.txt", 1, 10),
 			readKey("notes.txt", 3, 2),
-			settlement(coverage(lines, { totalLines: 20 })),
+			coveredSettlement(lines, { totalLines: 20 }),
 		);
 
 		expect(outputText(projected)).toBe("line-3\nline-4\n\n[16 more lines in file. Use offset=5 to continue.]");
@@ -83,8 +90,7 @@ describe("Pi read range projection", () => {
 				[READ_RANGE_COVERAGE_DETAILS_KEY]: expect.objectContaining({
 					startLine: 3,
 					endLineExclusive: 5,
-					lines: ["line-3", "line-4"],
-					complete: false,
+					payloadTextLength: "line-3\nline-4".length,
 				}),
 			}),
 		);
@@ -94,7 +100,7 @@ describe("Pi read range projection", () => {
 		const projected = await project(
 			readKey("notes.txt", 1, 2),
 			readKey("notes.txt", 3),
-			settlement(coverage(["one", "two", "three", "four", "five"])),
+			coveredSettlement(["one", "two", "three", "four", "five"]),
 		);
 
 		expect(outputText(projected)).toBe("three\nfour\nfive");
@@ -104,7 +110,7 @@ describe("Pi read range projection", () => {
 		const projected = await project(
 			readKey("notes.txt", 1, 5),
 			readKey("notes.txt", 2, 0),
-			settlement(coverage(["one", "two", "three", "four", "five"])),
+			coveredSettlement(["one", "two", "three", "four", "five"]),
 		);
 
 		expect(outputText(projected)).toBe("\n\n[4 more lines in file. Use offset=2 to continue.]");
@@ -114,7 +120,7 @@ describe("Pi read range projection", () => {
 		const projected = await project(
 			readKey("notes.txt", 1, 10),
 			readKey("notes.txt", 2, 20),
-			settlement(coverage(["one", "two", "three", "four", "five"])),
+			coveredSettlement(["one", "two", "three", "four", "five"]),
 		);
 
 		expect(outputText(projected)).toBe("two\nthree\nfour\nfive");
@@ -124,17 +130,17 @@ describe("Pi read range projection", () => {
 		const projected = await project(
 			readKey("notes.txt", 1, 4),
 			readKey("notes.txt", 3, 3),
-			settlement(coverage(["one", "two", "three", "four"], { totalLines: 10 })),
+			coveredSettlement(["one", "two", "three", "four"], { totalLines: 10 }),
 		);
 
 		expect(projected).toBeUndefined();
 	});
 
-	it("preserves CRLF bytes represented in structured lines", async () => {
+	it("preserves CRLF bytes from the existing output payload", async () => {
 		const projected = await project(
 			readKey("windows.txt", 1, 3),
 			readKey("windows.txt", 2, 2),
-			settlement(coverage(["one\r", "two\r", "three"])),
+			coveredSettlement(["one\r", "two\r", "three"]),
 		);
 
 		expect(outputText(projected)).toBe("two\r\nthree");
@@ -144,7 +150,7 @@ describe("Pi read range projection", () => {
 		const projected = await project(
 			readKey("long.txt", 1, 5),
 			readKey("long.txt", 1, 4),
-			settlement(coverage(["one", "two", "three", "four", "five"], { maxLines: 2 })),
+			coveredSettlement(["one", "two", "three", "four", "five"], { maxLines: 2 }),
 		);
 
 		expect(outputText(projected)).toBe("one\ntwo\n\n[Showing lines 1-2 of 5. Use offset=3 to continue.]");
@@ -153,7 +159,7 @@ describe("Pi read range projection", () => {
 				truncation: expect.objectContaining({ truncated: true, truncatedBy: "lines", outputLines: 2 }),
 				[READ_RANGE_COVERAGE_DETAILS_KEY]: expect.objectContaining({
 					endLineExclusive: 3,
-					lines: ["one", "two"],
+					payloadTextLength: "one\ntwo".length,
 				}),
 			}),
 		);
@@ -163,7 +169,7 @@ describe("Pi read range projection", () => {
 		const narrowed = await project(
 			readKey("bytes.txt", 1, 4),
 			readKey("bytes.txt", 1, 3),
-			settlement(coverage(["aa", "bb", "cc"], { maxBytes: 5 })),
+			coveredSettlement(["aa", "bb", "cc"], { maxBytes: 5 }),
 		);
 		expect(outputText(narrowed)).toBe("aa\nbb\n\n[Showing lines 1-2 of 3 (5B limit). Use offset=3 to continue.]");
 	});
@@ -172,7 +178,7 @@ describe("Pi read range projection", () => {
 		const projected = await project(
 			readKey("bytes.txt", 1, 3),
 			readKey("bytes.txt", 1, 2),
-			settlement(coverage(["abcdef", "x", "y"], { maxBytes: 5 })),
+			coveredSettlement(["abcdef", "x", "y"], { maxBytes: 5 }),
 		);
 
 		expect(projected).toBeUndefined();
@@ -180,8 +186,8 @@ describe("Pi read range projection", () => {
 
 	it.each([
 		["mismatched end", { ...coverage(["one", "two"]), endLineExclusive: 9 }],
-		["non-string line", { ...coverage(["one", "two"]), lines: ["one", 2] }],
-		["false completeness at EOF", { ...coverage(["one", "two"]), complete: false }],
+		["negative payload length", { ...coverage(["one", "two"]), payloadTextLength: -1 }],
+		["end before start", { ...coverage(["one", "two"]), endLineExclusive: 0 }],
 		["non-positive byte limit", { ...coverage(["one", "two"]), maxBytes: 0 }],
 		["fractional start", { ...coverage(["one", "two"]), startLine: 1.5 }],
 	])("rejects malformed coverage: %s", (_label, malformed) => {
@@ -189,18 +195,23 @@ describe("Pi read range projection", () => {
 		expect(PI_READ_RANGE_PROJECTION_RULE.captureCoverage(readKey("notes.txt", 1, 2), output)).toBeUndefined();
 	});
 
+	it("rejects coverage whose descriptor exceeds the existing output payload", async () => {
+		const snapshot = coverage(["one", "two"]);
+		expect(
+			await project(readKey("notes.txt", 1, 2), readKey("notes.txt", 2, 1), settlement(snapshot, "one")),
+		).toBeUndefined();
+	});
+
 	it("does not capture missing coverage, tool errors, or non-read outputs", () => {
 		const read = readKey("notes.txt", 1, 2);
 		const grep = buildPiActionKey("grep", { pattern: "TODO", path: "." }, cwd);
 		expect(PI_READ_RANGE_PROJECTION_RULE.captureCoverage(read, settlement())).toBeUndefined();
 		expect(
-			PI_READ_RANGE_PROJECTION_RULE.captureCoverage(read, settlement(coverage(["one", "two"]), "error", true)),
+			PI_READ_RANGE_PROJECTION_RULE.captureCoverage(read, coveredSettlement(["one", "two"], {}, true)),
 		).toBeUndefined();
 		expect(grep).toBeDefined();
 		if (grep) {
-			expect(
-				PI_READ_RANGE_PROJECTION_RULE.captureCoverage(grep, settlement(coverage(["one", "two"]))),
-			).toBeUndefined();
+			expect(PI_READ_RANGE_PROJECTION_RULE.captureCoverage(grep, coveredSettlement(["one", "two"]))).toBeUndefined();
 		}
 	});
 

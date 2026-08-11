@@ -20,18 +20,19 @@ export interface ActionProjectionRule<Output> extends ActionKeyProjector {
 	readonly canShareInFlight?: (speculative: ActionKey, actor: ActionKey) => boolean;
 }
 
-export const READ_RANGE_COVERAGE_DETAILS_KEY = "speculativeReadRange";
+/** In-memory-only metadata; symbol keys never leak into persisted tool-result details. */
+export const READ_RANGE_COVERAGE_DETAILS_KEY: unique symbol = Symbol("pi.speculative.readRange");
 
-/** Structured text payload emitted by Pi's read tool; line numbers are 1-indexed and end-exclusive. */
+/** Compact descriptor for the text prefix already present in Pi's read output. */
 export interface ReadRangeCoverage {
 	readonly kind: "text";
 	readonly startLine: number;
 	readonly endLineExclusive: number;
 	readonly totalLines: number;
-	readonly lines: readonly string[];
+	/** UTF-16 length of the file payload before any continuation notice. */
+	readonly payloadTextLength: number;
 	readonly maxLines: number;
 	readonly maxBytes: number;
-	readonly complete: boolean;
 }
 
 /** π_read narrows a cached read action to the actor's requested interval. */

@@ -52,7 +52,7 @@ export type ActionKeyMismatchReason =
 	| "different_execution"
 	| "different_schema"
 	| "different_core"
-	| "view_not_covered";
+	| "projection_not_applicable";
 
 export interface DrafterToolDefinition {
 	readonly name: string;
@@ -313,7 +313,7 @@ export function actionKeyMismatchReason(
 
 	const speculativePartitions = new Set(actionKeyProjectionPartitions(speculative, projectors));
 	if (actionKeyProjectionPartitions(actor, projectors).some((partition) => speculativePartitions.has(partition))) {
-		return "view_not_covered";
+		return "projection_not_applicable";
 	}
 	return "different_core";
 }

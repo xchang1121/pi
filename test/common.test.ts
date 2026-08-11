@@ -178,7 +178,9 @@ describe("speculative action common", () => {
 
 		expect(broad && narrow ? actionKeyMismatchReason(broad, narrow, projectors) : "missing").toBeUndefined();
 		expect(narrow ? actionKeyMismatchReason(narrow, narrow, projectors) : "missing").toBeUndefined();
-		expect(broad && narrow ? actionKeyMismatchReason(narrow, broad, projectors) : "missing").toBe("view_not_covered");
+		expect(broad && narrow ? actionKeyMismatchReason(narrow, broad, projectors) : "missing").toBe(
+			"projection_not_applicable",
+		);
 		expect(broad && narrow ? actionKeyMismatchReason(narrow, broad) : "missing").toBe("different_core");
 		expect(broad && otherPath ? actionKeyMismatchReason(broad, otherPath, projectors) : "missing").toBe(
 			"different_core",

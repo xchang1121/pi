@@ -72,7 +72,7 @@ export class ToolCache<Scope, Entry extends ToolCacheEntry> {
 	insertOrGetCompatible(
 		scope: Scope,
 		entry: Entry,
-		canReuseProjected: (existing: Entry, match: ProjectedActionKeyMatch) => boolean = () => true,
+		canReuseProjected: (existing: Entry, match: ProjectedActionKeyMatch) => boolean = () => false,
 	): ToolCacheInsertResult<Entry> {
 		const state = this.ensureScope(scope);
 		const exact = state.entries.get(entry.key.key);
