@@ -325,6 +325,110 @@ describe("speculative action runtime", () => {
 		expect(harness.events.filter((event) => event.type === "started")).toHaveLength(2);
 	});
 
+	it("keeps arbitrary bash descendants deferred until the actor adopts the sandbox branch", async () => {
+		const command = 'npm test -- --runInBand && echo "$CI"';
+		const source: HarnessPlanSource = {
+			id: "sandbox-sequence",
+			enabled: () => true,
+			multiStepEnabled: () => true,
+			propose: () => ({
+				id: "sandbox-plan",
+				source: "sandbox-sequence",
+				revision: 0,
+				actions: [
+					{ id: "parent", type: "tool_call", tool: "bash", input: { command } },
+					{
+						id: "child",
+						type: "tool_call",
+						tool: "read",
+						input: { path: "after-bash.ts" },
+						dependsOn: [{ actionID: "parent", condition: "succeeded" }],
+					},
+				],
+			}),
+		};
+		const executed: string[] = [];
+		const adopted: string[] = [];
+		const harness = createHarness({
+			sources: [source],
+			settings: {
+				...enabledSettings,
+				tools: { resourceCached: ["read"], sandbox: ["bash"] },
+			},
+			predict: () => prediction(),
+			execute: (candidate) => {
+				const value =
+					candidate.tool === "bash"
+						? String((candidate.input as { command: string }).command)
+						: String((candidate.input as { path: string }).path);
+				executed.push(`${candidate.tool}:${value}`);
+				return `${candidate.tool}:result`;
+			},
+			adopt: (output) => {
+				adopted.push(output);
+				return output;
+			},
+		});
+
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "sandbox-barrier" });
+		await waitFor(() => executed.length === 1);
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		expect(executed).toEqual([`bash:${command}`]);
+
+		expect(await harness.runtime.consume(consumeTool("sandbox-barrier", "bash", { command }))).toBe("bash:result");
+		await waitFor(() => executed.length === 2);
+
+		expect(adopted).toEqual(["bash:result"]);
+		expect(executed).toEqual([`bash:${command}`, "read:after-bash.ts"]);
+	});
+
+	it("blocks a sandbox descendant when branch adoption fails", async () => {
+		const source: HarnessPlanSource = {
+			id: "failed-adoption-sequence",
+			enabled: () => true,
+			propose: () => ({
+				id: "failed-adoption-plan",
+				source: "failed-adoption-sequence",
+				revision: 0,
+				actions: [
+					{ id: "parent", type: "tool_call", tool: "bash", input: { command: "prepare" } },
+					{
+						id: "child",
+						type: "tool_call",
+						tool: "read",
+						input: { path: "must-not-run.ts" },
+						dependsOn: [{ actionID: "parent", condition: "completed" }],
+					},
+				],
+			}),
+		};
+		const executed: string[] = [];
+		const harness = createHarness({
+			sources: [source],
+			settings: {
+				...enabledSettings,
+				tools: { resourceCached: ["read"], sandbox: ["bash"] },
+			},
+			predict: () => prediction(),
+			execute: (candidate) => {
+				executed.push(candidate.tool);
+				return "sandbox-output";
+			},
+			adopt: () => undefined,
+		});
+
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "failed-adoption" });
+		await waitFor(() => executed.length === 1);
+		expect(
+			await harness.runtime.consume(consumeTool("failed-adoption", "bash", { command: "prepare" })),
+		).toBeUndefined();
+		await new Promise((resolve) => setTimeout(resolve, 10));
+
+		expect(executed).toEqual(["bash"]);
+		expect(harness.runtime.inspect()).toMatchObject({ activePlanActions: 0, blockedPlanActions: 1 });
+		expect(harness.events).toContainEqual(expect.objectContaining({ type: "miss", reason: "adoption_failed" }));
+	});
+
 	it("invalidates an in-flight execution before reusing its action ID for a different action", async () => {
 		const oldStarted = deferred<void>();
 		const oldAborted = deferred<void>();

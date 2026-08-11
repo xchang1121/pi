@@ -70,6 +70,47 @@ describe("PlanExecutionGraph", () => {
 		expect(graph.promote("plan", "child").status).toBe("claimed");
 	});
 
+	it("raises every sandbox dependency to an adoption barrier", () => {
+		const graph = new PlanExecutionGraph((candidate) => (candidate.tool === "bash" ? "sandbox" : "resource_cached"));
+		const parent: PlanAction = {
+			id: "parent",
+			type: "tool_call",
+			tool: "bash",
+			input: { command: 'npm test && echo "$CI"' },
+		};
+		const afterSuccess = action("after-success", undefined, [{ actionID: "parent", condition: "succeeded" }]);
+		const afterCompletion = action("after-completion", undefined, [{ actionID: "parent", condition: "completed" }]);
+		graph.upsert(plan([parent, afterSuccess, afterCompletion]), [parent, afterSuccess, afterCompletion], 0);
+
+		expect(graph.takeReady(0).map(id)).toEqual(["parent"]);
+		graph.markRunning("plan", "parent");
+		graph.markSucceeded("plan", "parent");
+		expect(graph.takeReady(1)).toEqual([]);
+		expect(graph.promote("plan", "after-success")).toEqual({ status: "waiting" });
+		expect(graph.promote("plan", "after-completion")).toEqual({ status: "waiting" });
+
+		graph.markAdopted("plan", "parent", 1);
+		expect(graph.takeReady(1).map(id)).toEqual(["after-completion", "after-success"]);
+	});
+
+	it("blocks sandbox descendants after failure even when the source requested completed", () => {
+		const graph = new PlanExecutionGraph((candidate) => (candidate.tool === "bash" ? "sandbox" : "resource_cached"));
+		const parent: PlanAction = {
+			id: "parent",
+			type: "tool_call",
+			tool: "bash",
+			input: { command: "arbitrary-command" },
+		};
+		const child = action("child", undefined, [{ actionID: "parent", condition: "completed" }]);
+		graph.upsert(plan([parent, child]), [parent, child], 0);
+
+		graph.takeReady(0);
+		graph.markFailed("plan", "parent");
+
+		expect(graph.drainBlocked().map(id)).toEqual(["child"]);
+		expect(graph.takeReady(1)).toEqual([]);
+	});
+
 	it("exposes adoption eligibility without bypassing dependency conditions", () => {
 		const graph = new PlanExecutionGraph();
 		const parent = action("parent");

@@ -1,3 +1,4 @@
+import type { SpeculativeExecution } from "./action-semantics.ts";
 import type { MaterializedPlan, PlanAction, PlanActionDependencyCondition } from "./plan-proposal.ts";
 
 export type PlanExecutionState = "deferred" | "launching" | "running" | "succeeded" | "adopted" | "failed" | "blocked";
@@ -42,6 +43,13 @@ type MutableNode = {
  */
 export class PlanExecutionGraph {
 	private readonly plans = new Map<string, Map<string, MutableNode>>();
+	private readonly actionExecution: (action: PlanAction) => SpeculativeExecution | undefined;
+
+	constructor(
+		actionExecution: (action: PlanAction) => SpeculativeExecution | undefined = (action) => action.execution,
+	) {
+		this.actionExecution = actionExecution;
+	}
 
 	upsert(
 		plan: MaterializedPlan,
@@ -230,7 +238,9 @@ export class PlanExecutionGraph {
 		if (!nodes) return false;
 		return (node.action.dependsOn ?? []).every((dependency) => {
 			const parent = nodes.get(dependency.actionID);
-			return parent ? conditionSatisfied(parent.state, dependency.condition) : false;
+			return parent
+				? conditionSatisfied(parent.state, this.dependencyCondition(parent.action, dependency.condition))
+				: false;
 		});
 	}
 
@@ -244,13 +254,23 @@ export class PlanExecutionGraph {
 				if (node.state !== "deferred") continue;
 				const impossible = (node.action.dependsOn ?? []).some((dependency) => {
 					const parent = nodes.get(dependency.actionID);
-					return !parent || conditionImpossible(parent.state, dependency.condition);
+					return (
+						!parent ||
+						conditionImpossible(parent.state, this.dependencyCondition(parent.action, dependency.condition))
+					);
 				});
 				if (!impossible) continue;
 				node.state = "blocked";
 				changed = true;
 			}
 		}
+	}
+
+	private dependencyCondition(
+		parent: PlanAction,
+		declared: PlanActionDependencyCondition | undefined,
+	): PlanActionDependencyCondition | undefined {
+		return this.actionExecution(parent) === "sandbox" ? "adopted" : declared;
 	}
 }
 

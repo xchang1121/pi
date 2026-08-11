@@ -672,6 +672,7 @@ export function makeSpeculativeActionRuntime<
 >(
 	adapter: SpeculativeActionRuntimeAdapter<SessionID, Output, StartInput, ConsumeInput, StateData>,
 ): SpeculativeActionRuntime<SessionID, Output, StartInput, ConsumeInput, FinishInput> {
+	const actionSemantics = adapter.actionSemantics ?? PI_ACTION_SEMANTICS;
 	const turns = new Map<string, TurnState<SessionID, Output, StateData>>();
 	const planLedgers = new Map<SessionID, PlanLedger>();
 	const planGraphs = new Map<SessionID, PlanExecutionGraph>();
@@ -696,12 +697,11 @@ export function makeSpeculativeActionRuntime<
 	const planGraphFor = (sessionID: SessionID): PlanExecutionGraph => {
 		const existing = planGraphs.get(sessionID);
 		if (existing) return existing;
-		const created = new PlanExecutionGraph();
+		const created = new PlanExecutionGraph((action) => actionSemantics.execution(action.tool));
 		planGraphs.set(sessionID, created);
 		return created;
 	};
 	const planActionIdentity = (proposalID: string, actionID: string): string => `${proposalID}\u0000${actionID}`;
-	const actionSemantics = adapter.actionSemantics ?? PI_ACTION_SEMANTICS;
 	type RuntimePlanSource = SpeculativePlanSource<SessionID, Output, StartInput, ConsumeInput, StateData>;
 	const legacyPatternRevisions = new Map<string, number>();
 	let legacyObservedProposalSequence = 0;
