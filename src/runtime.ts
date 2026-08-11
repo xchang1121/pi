@@ -16,6 +16,7 @@ import {
 	DEFAULTS,
 	PI_ACTION_SEMANTICS,
 } from "./common.ts";
+import type { WorldBranch } from "./execution-world.ts";
 import type { PatternAwareSettings } from "./pattern-aware.ts";
 import type { PlanAction, PlanProposal, PlanUpdate } from "./plan-proposal.ts";
 import { type PlanExecutionNode, PlanState } from "./plan-state.ts";
@@ -80,6 +81,7 @@ export interface CandidatePreflightRejected {
 
 export type CandidatePreflight = CandidatePreflightAllowed | CandidatePreflightRejected;
 
+/** A sandbox execution returns its output and promotable effects as one owned result. */
 export interface ResourceValidationResult {
 	readonly expired: boolean;
 	readonly reason?: string;
@@ -431,15 +433,11 @@ export interface SpeculativeActionRuntimeAdapter<
 		readonly callID: string;
 		readonly index: number;
 		readonly signal: AbortSignal;
-	}) => MaybePromise<Output>;
+	}) => MaybePromise<Output | WorldBranch<Output>>;
 	readonly candidateSizeBytes?: (input: {
 		readonly output: Output;
 		readonly candidate: SpeculativeCandidate;
 	}) => number;
-	readonly candidateExecutionMetrics?: (input: {
-		readonly output: Output;
-		readonly candidate: SpeculativeCandidate;
-	}) => Partial<Pick<SpeculativeCandidate, "sandboxSetupMs" | "changeCollectionMs">>;
 	readonly prepareCandidate?: (input: {
 		readonly startInput: StartInput;
 		readonly data: StateData;
@@ -478,13 +476,6 @@ export interface SpeculativeActionRuntimeAdapter<
 		readonly output: Output;
 		readonly candidate: SpeculativeCandidate;
 	}) => string | undefined;
-	readonly adoptCandidate?: (input: {
-		readonly stateData: StateData;
-		readonly consumeInput: ConsumeInput;
-		readonly action: ActionKey;
-		readonly candidate: SpeculativeCandidate;
-		readonly output: Output;
-	}) => MaybePromise<Output | undefined>;
 	readonly onTurnStarted?: (input: {
 		readonly startInput: StartInput;
 		readonly settings: SpeculativeActionSettings;
@@ -526,6 +517,7 @@ export interface SpeculativeActionRuntime<SessionID, Output, StartInput, Consume
 interface RuntimeCandidate<Output> extends SpeculativeCandidate {
 	readonly run: SpeculativeJobRun<Output>;
 	readonly lifecycle: CandidateAggregate<Output, PredictionLease>;
+	worldBranch?: WorldBranch<Output>;
 }
 
 interface RankedRuntimeCandidate<Output> {
@@ -2164,8 +2156,20 @@ export function makeSpeculativeActionRuntime<
 						signal: candidateController.signal,
 					});
 				})
-				.then(async (output) => {
+				.then(async (execution) => {
 					if (candidate.run.status === "closed") return;
+					const worldBranch = asWorldBranch(execution);
+					if (action.execution === "sandbox" && !worldBranch) {
+						await rejectExecution(
+							new SpeculativeJobError(
+								"world_branch_missing",
+								new Error("sandbox execution returned no world branch"),
+							),
+						);
+						return;
+					}
+					const output = worldBranch ? worldBranch.output : (execution as Output);
+					candidate.worldBranch = worldBranch;
 					const completedAt = Date.now();
 					const executionMs = Math.max(0, completedAt - executionStarted);
 					let outputRejection: string | undefined;
@@ -2183,16 +2187,11 @@ export function makeSpeculativeActionRuntime<
 					candidate.projectionCoverage = captureProjectionCoverage(action, output);
 					if (!candidate.lifecycle.markReady(output, completedAt, executionMs)) return;
 					observeServiceTime(candidate.tool, executionMs);
-					try {
-						const metrics = adapter.candidateExecutionMetrics?.({ output, candidate });
-						if (metrics?.sandboxSetupMs !== undefined) {
-							candidate.sandboxSetupMs = finiteMetric(metrics.sandboxSetupMs);
-						}
-						if (metrics?.changeCollectionMs !== undefined) {
-							candidate.changeCollectionMs = finiteMetric(metrics.changeCollectionMs);
-						}
-					} catch {
-						// Optional accounting must not invalidate a completed candidate.
+					if (worldBranch?.executionMetrics.setupMs !== undefined) {
+						candidate.sandboxSetupMs = finiteMetric(worldBranch.executionMetrics.setupMs);
+					}
+					if (worldBranch?.executionMetrics.captureMs !== undefined) {
+						candidate.changeCollectionMs = finiteMetric(worldBranch.executionMetrics.captureMs);
 					}
 					observeExecutionOverhead(
 						candidate.key.tool,
@@ -2206,7 +2205,7 @@ export function makeSpeculativeActionRuntime<
 					} catch {
 						// Fall back to the generic estimate when custom accounting fails.
 					}
-					candidate.estimatedBytes += outputBytes;
+					candidate.estimatedBytes += outputBytes + finiteMetric(worldBranch?.capturedBytes);
 					markCandidatePlanSucceeded(state, candidate);
 					const stored = storeCompletedCandidate(state, candidate);
 					if (stored.existing) {
@@ -3007,27 +3006,23 @@ export function makeSpeculativeActionRuntime<
 				}
 
 				let output = execution.output;
-				if (adapter.adoptCandidate) {
-					let adopted: Output | undefined;
+				if (candidate.worldBranch) {
 					let adoptionDetail: string | undefined;
 					try {
-						adopted = await adapter.adoptCandidate({
-							stateData: state.data,
-							consumeInput: input,
-							action: actual,
-							candidate,
-							output,
-						});
+						const started = performance.now();
+						output = await candidate.worldBranch.adopt();
+						candidate.commitMs =
+							candidate.worldBranch.adoptionMetrics?.durationMs ?? Math.max(0, performance.now() - started);
+						candidate.commitValidationMs = candidate.worldBranch.adoptionMetrics?.validationMs;
+						candidate.commitValidationFiles = candidate.worldBranch.adoptionMetrics?.resourcesValidated;
+						candidate.commitValidationBytes = candidate.worldBranch.adoptionMetrics?.bytesValidated;
+						candidate.changedResources = [...candidate.worldBranch.resources];
 					} catch (error) {
-						adopted = undefined;
 						adoptionDetail = errorDetail(error);
-					}
-					if (adopted === undefined) {
 						await expireCandidate(state, candidate, "adoption_failed");
 						reject(choice, "adoption_failed", adoptionDetail);
 						continue;
 					}
-					output = adopted;
 				}
 
 				const projection = await projectCandidateOutput(candidate, actual, output, match);
@@ -3550,6 +3545,12 @@ function asConcreteInput(value: unknown): Record<string, unknown> | undefined {
 	if (value === undefined || value === null) return {};
 	if (typeof value === "object" && !Array.isArray(value)) return value as Record<string, unknown>;
 	return undefined;
+}
+
+function asWorldBranch<Output>(value: Output | WorldBranch<Output>): WorldBranch<Output> | undefined {
+	return value !== null && typeof value === "object" && "adopt" in value && "output" in value
+		? (value as WorldBranch<Output>)
+		: undefined;
 }
 
 function candidatesDiagnostic<Output>(candidates: Map<string, RuntimeCandidate<Output>>): string {

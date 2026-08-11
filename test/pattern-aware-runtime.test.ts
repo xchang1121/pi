@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { buildActionKey } from "../src/common.ts";
+import type { WorldBranch } from "../src/execution-world.ts";
 import { PATTERN_AWARE_DEFAULTS } from "../src/pattern-aware.ts";
 import type { PlanAction, PlanProposal } from "../src/plan-proposal.ts";
 import type {
@@ -388,7 +389,7 @@ describe("PatternAware runtime integration", () => {
 						: undefined,
 				executeCandidate: ({ concrete }) => {
 					executions++;
-					return String(concrete.command);
+					return worldExecution(String(concrete.command));
 				},
 				patternResolved: (id, outcome) => {
 					outcomes.push(`${id}:${outcome}`);
@@ -681,7 +682,7 @@ describe("PatternAware runtime integration", () => {
 				}),
 				executeCandidate: ({ tool }) => {
 					executed.push(tool);
-					return tool === "read" ? "structured-read" : "test-output";
+					return tool === "read" ? "structured-read" : worldExecution("test-output");
 				},
 				patternContinue: ({ candidate, output, parentConfirmed }) => {
 					if (candidate.key.tool !== "read") return undefined;
@@ -1129,7 +1130,10 @@ describe("PatternAware runtime integration", () => {
 		const events: SpeculativeActionEvent<string>[] = [];
 		const runtime = makeSpeculativeActionRuntime(
 			adapter({
-				draftPropose: () => ({ candidates: [scheduledCandidate("a.ts", 10)], draftTokens: 0 }),
+				draftPropose: () => ({
+					candidates: [patternCandidate("bash", { command: "collect metrics" }, "metrics", 0)],
+					draftTokens: 0,
+				}),
 				captureResourceVersion: () => ({ captureMs: 2, captureBytes: 3, captureFiles: 1 }),
 				isResourceExpired: () => ({
 					expired: false,
@@ -1138,15 +1142,18 @@ describe("PatternAware runtime integration", () => {
 					filesRead: 1,
 					mode: "exact",
 				}),
-				candidateExecutionMetrics: () => ({ sandboxSetupMs: 6, changeCollectionMs: 7 }),
+				executeCandidate: () =>
+					worldExecution("prefetched", {
+						executionMetrics: { setupMs: 6, captureMs: 7 },
+						adoptionMetrics: {
+							durationMs: 8,
+							validationMs: 3,
+							bytesValidated: 5,
+							resourcesValidated: 1,
+							resourcesAdopted: 1,
+						},
+					}),
 				candidateSizeBytes: () => 64,
-				adoptCandidate: ({ candidate, output }) => {
-					candidate.commitMs = 8;
-					candidate.commitValidationMs = 3;
-					candidate.commitValidationBytes = 5;
-					candidate.commitValidationFiles = 1;
-					return output;
-				},
 				onEvent: (event) => {
 					events.push(event);
 				},
@@ -1166,7 +1173,7 @@ describe("PatternAware runtime integration", () => {
 			}),
 		);
 
-		expect(await runtime.consume(call("turn", "read", { path: "a.ts" }))).toBe("prefetched");
+		expect(await runtime.consume(call("turn", "bash", { command: "collect metrics" }))).toBe("prefetched");
 		expect(events.find((event) => event.type === "hit")).toEqual(
 			expect.objectContaining({
 				validationMs: 4,
@@ -1258,9 +1265,9 @@ describe("PatternAware runtime integration", () => {
 				}),
 				executeCandidate: ({ tool }) => {
 					executions.push(tool);
-					return `${tool}-result`;
+					const output = `${tool}-result`;
+					return tool === "bash" ? worldExecution(output) : output;
 				},
-				adoptCandidate: ({ output }) => output,
 				patternContinue: ({ candidate, parentConfirmed }) => {
 					if (candidate.tool !== "bash") return undefined;
 					expect(parentConfirmed).toBe(true);
@@ -1298,11 +1305,20 @@ describe("PatternAware runtime integration", () => {
 					],
 					draftTokens: 0,
 				}),
-				executeCandidate: ({ tool, concrete }) => `${tool}:${String(concrete.path ?? concrete.command)}`,
-				adoptCandidate: ({ candidate, output }) => {
-					candidate.commitValidationFiles = 1;
-					candidate.changedResources = ["a.ts"];
-					return output;
+				executeCandidate: ({ tool, concrete }) => {
+					const output = `${tool}:${String(concrete.path ?? concrete.command)}`;
+					return tool === "bash"
+						? worldExecution(output, {
+								resources: ["a.ts"],
+								adoptionMetrics: {
+									durationMs: 1,
+									validationMs: 1,
+									bytesValidated: 1,
+									resourcesValidated: 1,
+									resourcesAdopted: 1,
+								},
+							})
+						: output;
 				},
 			}),
 		);
@@ -1410,8 +1426,21 @@ function adapter(overrides: AdapterOverrides = {}): Adapter {
 		actionKey: (tool, input) => key(tool, input as Record<string, unknown>),
 		actual: (input) => ({ tool: input.tool, input: input.input }),
 		preflightCandidate: () => ({ ok: true }),
-		executeCandidate: () => "prefetched",
+		executeCandidate: ({ tool }) => (tool === "bash" ? worldExecution("prefetched") : "prefetched"),
 		...runtimeOverrides,
+	};
+}
+
+function worldExecution(output: string, overrides: Partial<WorldBranch<string>> = {}): WorldBranch<string> {
+	return {
+		output,
+		backend: "test",
+		resources: [],
+		capturedBytes: 0,
+		executionMetrics: {},
+		state: "ready",
+		adopt: async () => output,
+		...overrides,
 	};
 }
 

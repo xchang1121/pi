@@ -20,7 +20,7 @@ import {
 	PI_ACTION_SEMANTICS,
 	usageTokenCount,
 } from "./common.ts";
-import type { ExecutionWorldMode, WorldBranch } from "./execution-world.ts";
+import type { ExecutionWorldMode } from "./execution-world.ts";
 import {
 	acquirePatternAwareStore,
 	asPatternAwareRuntimeContext,
@@ -49,12 +49,7 @@ import type {
 	SpeculativeActionSettings,
 	SpeculativePlanSource,
 } from "./runtime.ts";
-import {
-	candidateExecutionMs,
-	candidateToolNames,
-	estimateValueBytes,
-	makeSpeculativeActionRuntime,
-} from "./runtime.ts";
+import { candidateExecutionMs, candidateToolNames, makeSpeculativeActionRuntime } from "./runtime.ts";
 import type { SpeculativeAgentSandbox } from "./workspace-sandbox.ts";
 
 export interface SpeculativeAgentSettingsInput {
@@ -172,7 +167,6 @@ export function installSpeculativeAction(
 	const previousActual = agent.actualToolCall;
 	const actionSemantics = options.actionSemantics ?? PI_ACTION_SEMANTICS;
 	const projectionRules = (options.projectionRules ?? []).filter((rule) => actionSemantics.supportsProjector(rule.id));
-	const worldBranches = new WeakMap<SettleToolCallResult, WorldBranch<SettleToolCallResult>>();
 	const executionWorldMode = (tool: string): ExecutionWorldMode | undefined => {
 		const mode = actionSemantics.sandboxMode(tool);
 		return mode === "file_mutation" || mode === "workspace_snapshot" ? mode : undefined;
@@ -560,27 +554,13 @@ export function installSpeculativeAction(
 					callID,
 					signal,
 				});
-				worldBranches.set(branch.output, branch);
-				return branch.output;
+				return branch;
 			}
 			try {
 				return { result: await tool.execute(callID, args as never, signal), isError: false };
 			} catch (error) {
 				return errorSettlement(error instanceof Error ? error.message : String(error));
 			}
-		},
-		candidateSizeBytes: ({ output }) => {
-			const branch = worldBranches.get(output);
-			return estimateValueBytes(output) + (branch?.capturedBytes ?? 0);
-		},
-		candidateExecutionMetrics: ({ output }) => {
-			const branch = worldBranches.get(output);
-			return branch
-				? {
-						sandboxSetupMs: branch.executionMetrics.setupMs,
-						changeCollectionMs: branch.executionMetrics.captureMs,
-					}
-				: {};
 		},
 		rejectCandidateOutput: ({ output }) => (output.isError ? "tool_error_result" : undefined),
 		captureResourceVersion: ({ action }) => captureResourceVersion(action, options.cwd, actionSemantics),
@@ -589,23 +569,6 @@ export function installSpeculativeAction(
 		watchResourceVersion: ({ candidate, onInvalidated }) =>
 			watchResourceVersion(candidate.resourceVersion, onInvalidated),
 		projectionRules,
-		adoptCandidate: async ({ action, candidate, output }) => {
-			if (action.execution !== "sandbox") return output;
-			const branch = worldBranches.get(output);
-			if (!branch || !options.sandbox) return undefined;
-			const started = performance.now();
-			try {
-				const adopted = await branch.adopt();
-				candidate.commitMs = branch.adoptionMetrics?.durationMs ?? Math.max(0, performance.now() - started);
-				candidate.commitValidationMs = branch.adoptionMetrics?.validationMs;
-				candidate.commitValidationFiles = branch.adoptionMetrics?.resourcesValidated;
-				candidate.commitValidationBytes = branch.adoptionMetrics?.bytesValidated;
-				candidate.changedResources = [...branch.resources];
-				return adopted;
-			} catch {
-				return undefined;
-			}
-		},
 		prepareCandidate: async ({ candidate, signal }) => {
 			if (candidate.execution !== "sandbox" && actionSemantics.execution(candidate.tool) !== "sandbox") return;
 			const mode = executionWorldMode(candidate.tool);

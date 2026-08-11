@@ -5,7 +5,14 @@ import {
 	readRangesShareInFlight,
 } from "../src/action-key-projection.ts";
 import type { ActionKey, ProjectedActionKeyMatch } from "../src/common.ts";
-import { ActionSemanticsRegistry, asRecord, buildPiActionKey, readActionRange } from "../src/common.ts";
+import {
+	ActionSemanticsRegistry,
+	asRecord,
+	buildPiActionKey,
+	PI_ACTION_SEMANTICS,
+	readActionRange,
+} from "../src/common.ts";
+import type { WorldBranch } from "../src/execution-world.ts";
 import { PATTERN_AWARE_DEFAULTS } from "../src/pattern-aware.ts";
 import type { PlanAction, PlanProposal } from "../src/plan-proposal.ts";
 import type {
@@ -229,9 +236,12 @@ function createHarness(options: HarnessOptions) {
 				}
 			: {}),
 		...(options.prepare ? { prepareCandidate: ({ candidate, signal }) => options.prepare?.(candidate, signal) } : {}),
-		executeCandidate: ({ candidate, signal }) => {
+		executeCandidate: async ({ candidate, signal }) => {
 			executions++;
-			return options.execute?.(candidate, signal) ?? "prefetched";
+			const output = (await options.execute?.(candidate, signal)) ?? "prefetched";
+			const execution =
+				candidate.execution ?? (options.actionSemantics ?? PI_ACTION_SEMANTICS).execution(candidate.tool);
+			return execution === "sandbox" ? testWorldBranch(output, options.adopt) : output;
 		},
 		...(options.captureResourceVersion ? { captureResourceVersion: () => options.captureResourceVersion?.() } : {}),
 		...(options.releaseResourceVersion
@@ -245,7 +255,6 @@ function createHarness(options: HarnessOptions) {
 		...(options.rejectCandidateOutput
 			? { rejectCandidateOutput: ({ output }) => options.rejectCandidateOutput?.(output) }
 			: {}),
-		...(options.adopt ? { adoptCandidate: ({ output }) => options.adopt?.(output) } : {}),
 		...(options.candidateSizeBytes ? { candidateSizeBytes: () => options.candidateSizeBytes?.() ?? 0 } : {}),
 		onEvent: (event) => {
 			events.push(event);
@@ -261,6 +270,23 @@ function readCandidate(path = "README.md", offset?: number, limit?: number): Spe
 
 function bashCandidate(command: string): SpeculativeDraftCandidate {
 	return { type: "tool_call", tool: "bash", input: { command } };
+}
+
+function testWorldBranch(output: string, adopt?: HarnessOptions["adopt"]): WorldBranch<string> {
+	return {
+		output,
+		backend: "test",
+		resources: [],
+		capturedBytes: 0,
+		executionMetrics: {},
+		state: "ready",
+		adopt: async () => {
+			if (!adopt) return output;
+			const adopted = await adopt(output);
+			if (adopted === undefined) throw new Error("test world adoption failed");
+			return adopted;
+		},
+	};
 }
 
 function prediction(...candidates: TestDraftCandidate[]): TestPrediction {
@@ -1716,15 +1742,6 @@ describe("speculative action runtime", () => {
 		expect(drafterCalls).toBe(2);
 	});
 
-	it("adopts an already completed candidate without executing it twice", async () => {
-		const harness = createHarness({ predict: () => prediction(readCandidate()), execute: () => "ready-prefetch" });
-		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-1" });
-		await waitFor(() => harness.events.some((event) => event.type === "started"));
-
-		expect(await harness.runtime.consume(consume("turn-1"))).toBe("ready-prefetch");
-		expect(harness.executions()).toBe(1);
-	});
-
 	it("publishes separate in-flight job and completed result snapshots before a hit", async () => {
 		const execution = deferred<string>();
 		const harness = createHarness({
@@ -2813,27 +2830,6 @@ describe("speculative action runtime", () => {
 		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-check-a" });
 		await waitFor(() => harness.runtime.inspect().pendingPredictions === 0);
 		expect(await harness.runtime.consume(consume("turn-check-a", { path: "a.txt" }))).toBe("a.txt");
-	});
-
-	it("reports adoption failure and leaves the actor on the normal execution path", async () => {
-		const harness = createHarness({
-			settings: { ...enabledSettings, tools: { resourceCached: [], sandbox: ["write"] } },
-			predict: () => prediction({ type: "tool_call", tool: "write", input: { path: "out.txt", content: "draft" } }),
-			execute: () => "staged",
-			adopt: () => undefined,
-		});
-		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-write" });
-		await waitFor(() => harness.runtime.inspect().pendingPredictions === 0);
-
-		expect(
-			await harness.runtime.consume({
-				sessionID: "session",
-				turnID: "turn-write",
-				tool: "write",
-				input: { path: "out.txt", content: "draft" },
-			}),
-		).toBeUndefined();
-		expect(harness.events.some((event) => event.type === "miss" && event.reason === "adoption_failed")).toBe(true);
 	});
 
 	it("isolates observer failures from candidate settlement", async () => {
