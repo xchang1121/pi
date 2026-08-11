@@ -245,8 +245,8 @@ export const PATTERN_AWARE_DEFAULTS: PatternAwareSettings = {
 const MAX_BINDING_VARIANTS = 32;
 const MAX_COMPOSABLE_SOURCES = 48;
 const PERSIST_DEBOUNCE_MS = 200;
-const PERSISTENCE_VERSION = 10;
-const MIGRATABLE_PERSISTENCE_VERSION = 9;
+const PERSISTENCE_VERSION = 11;
+const MIN_MIGRATABLE_PERSISTENCE_VERSION = 9;
 
 class PredictiveContextTrie {
 	private readonly root: TrieNode = { children: new Map(), patterns: new Set() };
@@ -331,7 +331,9 @@ export class PatternAwareStore {
 			.catch(() => undefined);
 		if (
 			!parsed ||
-			(parsed.version !== PERSISTENCE_VERSION && parsed.version !== MIGRATABLE_PERSISTENCE_VERSION) ||
+			!Number.isInteger(parsed.version) ||
+			parsed.version < MIN_MIGRATABLE_PERSISTENCE_VERSION ||
+			parsed.version > PERSISTENCE_VERSION ||
 			!Array.isArray(parsed.patterns)
 		)
 			return;
@@ -345,7 +347,13 @@ export class PatternAwareStore {
 			for (const item of parsed.pools) {
 				const pool = mutablePool(item);
 				if (!pool || pool.context.some((event) => event.tool === "$llm")) continue;
-				this.pools.set(pool.key, pool);
+				const key = patternPoolKey(pool.context, pool.targetTool, pool.targetSchemaHash);
+				const normalized = { ...pool, key };
+				const existing = this.pools.get(key);
+				this.pools.set(
+					key,
+					existing ? mergePatternPools(existing, normalized, this.settings) : normalized,
+				);
 				for (const sample of pool.samples) {
 					this.clock = Math.max(
 						this.clock,
@@ -737,9 +745,7 @@ export class PatternAwareStore {
 
 	private learnOccurrence(context: ReadonlyArray<PatternAwareEvent>, target: PatternAwareEvent, gap: number) {
 		const signatures = context.map(signature);
-		const poolKey = hash(
-			stableStringify({ context: signatures, targetTool: target.tool, targetSchemaHash: target.schemaHash, gap }),
-		);
+		const poolKey = patternPoolKey(signatures, target.tool, target.schemaHash);
 		const pool = this.pools.get(poolKey) ?? {
 			key: poolKey,
 			context: signatures,
@@ -749,7 +755,7 @@ export class PatternAwareStore {
 		};
 		pool.samples.push({ context: [...context], target, gap });
 		pool.observations = (pool.observations ?? pool.samples.length - 1) + 1;
-		const sampleLimit = Math.max(this.settings.minOccurrences * 4, this.settings.maxContextLength * 4);
+		const sampleLimit = patternPoolSampleLimit(this.settings);
 		if (pool.samples.length > sampleLimit) pool.samples.splice(0, pool.samples.length - sampleLimit);
 		this.pools.set(poolKey, pool);
 		if (pool.samples.length < this.settings.minOccurrences) return;
@@ -804,8 +810,8 @@ export class PatternAwareStore {
 			bindings: inferred,
 			dependencies: bindingDependencies(inferred),
 			...(target.schemaHash ? { targetSchemaHash: target.schemaHash } : {}),
-			gapCounts: { [String(gap)]: 1 },
-			gapLastSeen: { [String(gap)]: target.sequence },
+			gapCounts: sampleGapCounts(pool.samples),
+			gapLastSeen: sampleGapLastSeen(pool.samples),
 			occurrences: pool.samples.length,
 			replayMatches,
 			historicalOpportunities: pool.samples.length,
@@ -2179,6 +2185,51 @@ function mutablePool(value: unknown): PatternPool | undefined {
 			? { inferenceBackoff: Math.min(8, Math.max(1, Math.floor(record.inferenceBackoff))) }
 			: {}),
 	};
+}
+
+function patternPoolKey(
+	context: ReadonlyArray<PatternAwareEventSignature>,
+	targetTool: string,
+	targetSchemaHash?: string,
+) {
+	return hash(stableStringify({ context, targetTool, targetSchemaHash }));
+}
+
+function mergePatternPools(left: PatternPool, right: PatternPool, settings: PatternAwareSettings): PatternPool {
+	const observations =
+		(left.observations ?? left.samples.length) + (right.observations ?? right.samples.length);
+	const samples = [...left.samples, ...right.samples]
+		.sort((a, b) => a.target.sequence - b.target.sequence)
+		.slice(-patternPoolSampleLimit(settings));
+	return {
+		key: left.key,
+		context: left.context,
+		targetTool: left.targetTool,
+		...(left.targetSchemaHash ? { targetSchemaHash: left.targetSchemaHash } : {}),
+		samples,
+		observations,
+		nextInferenceAt: observations,
+		inferenceBackoff: 1,
+	};
+}
+
+function patternPoolSampleLimit(settings: Pick<PatternAwareSettings, "minOccurrences" | "maxContextLength">) {
+	return Math.max(settings.minOccurrences * 4, settings.maxContextLength * 4);
+}
+
+function sampleGapCounts(samples: ReadonlyArray<PatternSample>) {
+	const counts: Record<string, number> = {};
+	for (const sample of samples) counts[String(sample.gap)] = (counts[String(sample.gap)] ?? 0) + 1;
+	return counts;
+}
+
+function sampleGapLastSeen(samples: ReadonlyArray<PatternSample>) {
+	const lastSeen: Record<string, number> = {};
+	for (const sample of samples) {
+		const gap = String(sample.gap);
+		lastSeen[gap] = Math.max(lastSeen[gap] ?? 0, sample.target.sequence);
+	}
+	return lastSeen;
 }
 
 function bindingEvidenceThreshold(settings: Pick<PatternAwareSettings, "minOccurrences">) {

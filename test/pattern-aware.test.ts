@@ -170,6 +170,29 @@ describe("PatternAware", () => {
 		expect(candidate?.horizon).toBeGreaterThanOrEqual(1);
 	});
 
+	test("combines support for one pattern across different observed gaps", () => {
+		const store = new PatternAwareStore(
+			settings({ maxContextLength: 1, maxFutureGap: 1, minOccurrences: 2, futureGapCoverage: 0.9 }),
+		);
+		store.observe(input({ sessionID: "immediate", tool: "grep", input: {}, outputPaths: ["src/a.ts"] }));
+		store.observe(input({ sessionID: "immediate", tool: "read", input: { filePath: "src/a.ts" } }));
+		store.finishSession("immediate");
+
+		store.observe(input({ sessionID: "delayed", tool: "grep", input: {}, outputPaths: ["src/b.ts"] }));
+		store.observe(input({ sessionID: "delayed", tool: "bash", input: { command: "pwd" } }));
+		store.observe(input({ sessionID: "delayed", tool: "read", input: { filePath: "src/b.ts" } }));
+
+		const pattern = store
+			.snapshot()
+			.find((item) => item.targetTool === "read" && item.context.length === 1 && item.context[0]?.tool === "grep");
+		expect(pattern).toMatchObject({ occurrences: 2, replayMatches: 2, gapCounts: { "0": 1, "1": 1 } });
+
+		store.observe(input({ sessionID: "probe", tool: "grep", input: {}, outputPaths: ["src/c.ts"] }));
+		const candidate = store.predict("probe").find((item) => item.tool === "read");
+		expect(candidate?.input).toEqual({ filePath: "src/c.ts" });
+		expect(candidate?.horizon).toBe(1);
+	});
+
 	test("uses weighted gap coverage instead of the largest observed gap", () => {
 		const store = new PatternAwareStore(settings({ maxFutureGap: 8, futureGapCoverage: 0.8 }));
 		expect(store.registerValidatedPattern(validatedGapPattern({ "0": 9, "5": 1 }))).toBe(true);
@@ -340,7 +363,7 @@ describe("PatternAware", () => {
 
 		const raw = await fs.readFile(file, "utf8");
 		expect(raw).not.toContain('"history"');
-		expect(JSON.parse(raw).version).toBe(10);
+		expect(JSON.parse(raw).version).toBe(11);
 		const second = new PatternAwareStore(settings(), file);
 		await second.load();
 		second.observe(input({ sessionID: "three", tool: "grep", input: {}, outputPaths: ["src/c.ts"] }));
@@ -364,6 +387,65 @@ describe("PatternAware", () => {
 		const next = await acquirePatternAwareStore(workspace, settings());
 		expect(next.store).not.toBe(first.store);
 		await next.release();
+	});
+
+	test("merges v10 gap-partitioned pools before collecting new evidence", async () => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "pi-pattern-gap-migration-"));
+		temporary.push(directory);
+		const file = path.join(directory, "patterns.json");
+		const legacySample = (sessionID: string, filePath: string, gap: number, sequence: number) => ({
+			context: [
+				{
+					...input({ sessionID, tool: "grep", input: {}, outputPaths: [filePath] }),
+					sequence,
+				},
+			],
+			target: {
+				...input({ sessionID, tool: "read", input: { filePath } }),
+				sequence: sequence + 1,
+			},
+			gap,
+		});
+		await fs.writeFile(
+			file,
+			JSON.stringify({
+				version: 10,
+				patterns: [],
+				pools: [
+					{
+						key: "legacy-gap-0",
+						context: [{ tool: "grep", outcome: "success" }],
+						targetTool: "read",
+						samples: [legacySample("legacy-immediate", "src/a.ts", 0, 1)],
+						observations: 1,
+					},
+					{
+						key: "legacy-gap-1",
+						context: [{ tool: "grep", outcome: "success" }],
+						targetTool: "read",
+						samples: [legacySample("legacy-delayed", "src/b.ts", 1, 3)],
+						observations: 1,
+					},
+				],
+			}),
+		);
+
+		const store = new PatternAwareStore(
+			settings({ maxContextLength: 1, maxFutureGap: 1, minOccurrences: 3 }),
+			file,
+		);
+		await store.load();
+		store.observe(input({ sessionID: "fresh", tool: "grep", input: {}, outputPaths: ["src/c.ts"] }));
+		store.observe(input({ sessionID: "fresh", tool: "read", input: { filePath: "src/c.ts" } }));
+
+		const pattern = store
+			.snapshot()
+			.find((item) => item.targetTool === "read" && item.context.length === 1 && item.context[0]?.tool === "grep");
+		expect(pattern).toMatchObject({
+			occurrences: 3,
+			replayMatches: 3,
+			gapCounts: { "0": 2, "1": 1 },
+		});
 	});
 
 	test("migrates v9 patterns without treating ambiguous unused work as actor misses", async () => {
