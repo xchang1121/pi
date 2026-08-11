@@ -87,6 +87,74 @@ describe("speculative action common", () => {
 		expect(buildPiActionKey("edit", { path: "file", edits: [] }, "/workspace")).toBeUndefined();
 	});
 
+	it("namespaces K(a) by execution class and validated schema", () => {
+		const base = buildActionKey({
+			tool: "custom",
+			execution: "resource_cached",
+			resources: ["resource"],
+			input: { alpha: 1, beta: 2 },
+			schemaHash: "schema-a",
+		});
+		const reordered = buildActionKey({
+			tool: "custom",
+			execution: "resource_cached",
+			resources: ["resource"],
+			input: { beta: 2, alpha: 1 },
+			schemaHash: "schema-a",
+		});
+		const sandbox = buildActionKey({
+			tool: "custom",
+			execution: "sandbox",
+			resources: ["resource"],
+			input: { alpha: 1, beta: 2 },
+			schemaHash: "schema-a",
+		});
+		const nextSchema = buildActionKey({
+			tool: "custom",
+			execution: "resource_cached",
+			resources: ["resource"],
+			input: { alpha: 1, beta: 2 },
+			schemaHash: "schema-b",
+		});
+		const implicitSchema = buildActionKey({
+			tool: "custom",
+			execution: "resource_cached",
+			resources: ["resource"],
+			input: { value: 1 },
+		});
+		const explicitEmptySchema = buildActionKey({
+			tool: "custom",
+			execution: "resource_cached",
+			resources: ["resource"],
+			input: { value: 1 },
+			schemaHash: "",
+		});
+
+		expect(reordered.key).toBe(base.key);
+		expect(new Set([base.key, sandbox.key, nextSchema.key]).size).toBe(3);
+		expect(implicitSchema.key).toBe(explicitEmptySchema.key);
+		expect(base.schemaHash).toBe("schema-a");
+	});
+
+	it("allows read projection only inside one schema namespace", () => {
+		const broad = buildPiActionKey("read", { path: "a.ts", offset: 1, limit: 100 }, "/workspace", "schema-a");
+		const compatible = buildPiActionKey("read", { path: "a.ts", offset: 20, limit: 10 }, "/workspace", "schema-a");
+		const changedSchema = buildPiActionKey("read", { path: "a.ts", offset: 20, limit: 10 }, "/workspace", "schema-b");
+		const grepBroad = buildPiActionKey("grep", { pattern: "TODO", limit: 100 }, "/workspace", "schema-a");
+		const grepNarrow = buildPiActionKey("grep", { pattern: "TODO", limit: 10 }, "/workspace", "schema-a");
+		const findBroad = buildPiActionKey("find", { pattern: "*.ts", limit: 100 }, "/workspace", "schema-a");
+		const findNarrow = buildPiActionKey("find", { pattern: "*.ts", limit: 10 }, "/workspace", "schema-a");
+		const projectors = [READ_RANGE_ACTION_KEY_PROJECTOR];
+
+		expect(broad && compatible ? actionKeyMatches(broad, compatible, projectors) : false).toBe(true);
+		expect(broad && changedSchema ? actionKeyMatches(broad, changedSchema, projectors) : true).toBe(false);
+		expect(broad && changedSchema ? actionKeyProjectionPartitions(broad, projectors) : []).not.toEqual(
+			changedSchema ? actionKeyProjectionPartitions(changedSchema, projectors) : [],
+		);
+		expect(grepBroad && grepNarrow ? actionKeyMatches(grepBroad, grepNarrow, projectors) : true).toBe(false);
+		expect(findBroad && findNarrow ? actionKeyMatches(findBroad, findNarrow, projectors) : true).toBe(false);
+	});
+
 	it("selects configured readonly and sandbox candidates independently", () => {
 		expect(DEFAULTS.tools.sandbox).toEqual(["bash", "write", "edit"]);
 		expect(
@@ -109,7 +177,7 @@ describe("speculative action common", () => {
 			id: "custom.subset",
 			partition: (action) =>
 				action.tool === "custom"
-					? JSON.stringify([action.execution, action.resources, action.input.namespace])
+					? JSON.stringify([action.execution, action.schemaHash, action.resources, action.input.namespace])
 					: undefined,
 			project: (speculative, actor) => {
 				const speculativeValues = Array.isArray(speculative.input.values) ? speculative.input.values : undefined;
@@ -121,6 +189,7 @@ describe("speculative action common", () => {
 						tool: speculative.tool,
 						execution: speculative.execution,
 						resources: speculative.resources,
+						schemaHash: speculative.schemaHash,
 						input: { ...speculative.input, values: actorValues },
 					}),
 					distance: speculativeValues.length - actorValues.length,

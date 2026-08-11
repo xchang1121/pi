@@ -681,7 +681,7 @@ describe("PatternAware runtime integration", () => {
 		const events: SpeculativeActionEvent<string>[] = [];
 		const runtime = makeSpeculativeActionRuntime(
 			adapter({
-				settings: () => ({ ...settings(), resourceCacheMaxBytes: 1100 }),
+				settings: () => ({ ...settings(), resourceCacheMaxBytes: 1200 }),
 				predict: (input) => ({
 					candidates: [scheduledCandidate(input.turnID === "turn_1" ? "a.ts" : "b.ts", 10)],
 					draftTokens: 0,

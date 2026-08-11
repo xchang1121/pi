@@ -16,6 +16,8 @@ export interface ActionKey {
 	readonly input: Readonly<Record<string, unknown>>;
 	readonly resources: readonly string[];
 	readonly execution: SpeculativeExecution;
+	/** Stable hash of the validated input schema used by both producer and consumer. */
+	readonly schemaHash: string;
 }
 
 export interface ProjectedActionKey {
@@ -109,8 +111,15 @@ export function buildActionKey(input: {
 	readonly execution: SpeculativeExecution;
 	readonly resources: readonly string[];
 	readonly input: Record<string, unknown>;
+	readonly schemaHash?: string;
 }): ActionKey {
-	const key = stableStringify({ tool: input.tool, input: input.input });
+	const schemaHash = input.schemaHash ?? "";
+	const key = stableStringify({
+		tool: input.tool,
+		execution: input.execution,
+		schemaHash,
+		input: input.input,
+	});
 	return {
 		key,
 		hash: fastHash(key),
@@ -118,6 +127,7 @@ export function buildActionKey(input: {
 		input: structuredClone(input.input),
 		resources: input.resources,
 		execution: input.execution,
+		schemaHash,
 	};
 }
 
@@ -132,7 +142,7 @@ export function patternAwareInput(action: ActionKey): Record<string, unknown> {
 }
 
 /** Build a conservative action key for Pi's built-in read, grep, and find tools. */
-export function buildPiActionKey(tool: string, input: unknown, cwd: string): ActionKey | undefined {
+export function buildPiActionKey(tool: string, input: unknown, cwd: string, schemaHash = ""): ActionKey | undefined {
 	const record = asRecord(input);
 	if (!record) return undefined;
 
@@ -144,6 +154,7 @@ export function buildPiActionKey(tool: string, input: unknown, cwd: string): Act
 			tool,
 			execution: "resource_cached",
 			resources: [resource],
+			schemaHash,
 			input: {
 				path: resource,
 				offset: normalizeReadOffset(record.offset),
@@ -160,6 +171,7 @@ export function buildPiActionKey(tool: string, input: unknown, cwd: string): Act
 			tool,
 			execution: "resource_cached",
 			resources: [root],
+			schemaHash,
 			input: {
 				pattern: record.pattern,
 				path: root,
@@ -180,6 +192,7 @@ export function buildPiActionKey(tool: string, input: unknown, cwd: string): Act
 			tool,
 			execution: "resource_cached",
 			resources: [root],
+			schemaHash,
 			input: {
 				pattern: record.pattern,
 				path: root,
@@ -195,6 +208,7 @@ export function buildPiActionKey(tool: string, input: unknown, cwd: string): Act
 			tool,
 			execution: "sandbox",
 			resources: [normalizedCwd],
+			schemaHash,
 			input: {
 				command: record.command,
 				cwd: normalizedCwd,
@@ -211,6 +225,7 @@ export function buildPiActionKey(tool: string, input: unknown, cwd: string): Act
 			tool,
 			execution: "sandbox",
 			resources: [resource],
+			schemaHash,
 			input: { path: resource, content: record.content },
 		});
 	}
@@ -231,6 +246,7 @@ export function buildPiActionKey(tool: string, input: unknown, cwd: string): Act
 			tool,
 			execution: "sandbox",
 			resources: [resource],
+			schemaHash,
 			input: { path: resource, edits },
 		});
 	}

@@ -335,11 +335,21 @@ export function installSpeculativeAction(
 			};
 		},
 		actionKey: (toolName, input, context) => {
-			if (context.type === "consume") return buildPiActionKey(toolName, input, options.cwd);
+			if (context.type === "consume") {
+				const tool = agent.state.tools.find((candidate) => candidate.name === toolName);
+				return buildPiActionKey(
+					toolName,
+					input,
+					options.cwd,
+					tool ? stableHash(tool.parameters ?? null) : undefined,
+				);
+			}
 			const tool = context.data.tools.get(toolName);
 			if (!tool) return undefined;
 			const validated = validateCandidateArguments(tool, toolName, input, "spec_key");
-			return validated === undefined ? undefined : buildPiActionKey(toolName, validated, options.cwd);
+			return validated === undefined
+				? undefined
+				: buildPiActionKey(toolName, validated, options.cwd, context.data.schemaHashes[toolName]);
 		},
 		actual: (input) => ({ id: input.id, tool: input.tool, input: input.args }),
 		preflightCandidate: async ({ data, tool: toolName, concrete, action, callID, signal }) => {

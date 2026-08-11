@@ -496,6 +496,7 @@ describe("M4 workspace sandbox", () => {
 						input: args,
 						resources: ["../outside.txt"],
 						execution: "sandbox",
+						schemaHash: "",
 					},
 					callID: "spec-escape",
 					signal: new AbortController().signal,

@@ -36,6 +36,21 @@ interface ProjectionReadDetails {
 
 type ProjectionReadTool = AgentTool<typeof readSchema, ProjectionReadDetails>;
 
+const reorderedReadSchema = Type.Object({
+	limit: Type.Optional(Type.Number()),
+	path: Type.String(),
+	offset: Type.Optional(Type.Number()),
+});
+type ReorderedReadTool = AgentTool<typeof reorderedReadSchema, { source: string }>;
+
+const changedReadSchema = Type.Object({
+	path: Type.String(),
+	offset: Type.Optional(Type.Number()),
+	limit: Type.Optional(Type.Number()),
+	encoding: Type.Optional(Type.String()),
+});
+type ChangedReadTool = AgentTool<typeof changedReadSchema, { source: string }>;
+
 const writeSchema = Type.Object({ path: Type.String(), content: Type.String() });
 type WriteTool = AgentTool<typeof writeSchema, { target: string }>;
 
@@ -254,6 +269,112 @@ describe("Pi Agent speculative integration", () => {
 		expect(result?.role === "toolResult" ? result.content : undefined).toEqual([
 			{ type: "text", text: "prefetched README" },
 		]);
+		await installed.uninstall();
+	});
+
+	it("keeps a speculative hit when a live tool is replaced by a schema-equivalent definition", async () => {
+		let speculativeExecutions = 0;
+		let replacementExecutions = 0;
+		const events: SpeculativeActionEvent<string>[] = [];
+		const original: ReadTool = {
+			name: "read",
+			label: "Read",
+			description: "Read a file",
+			parameters: readSchema,
+			async execute() {
+				speculativeExecutions++;
+				return { content: [{ type: "text", text: "cached README" }], details: { source: "original" } };
+			},
+		};
+		const replacement: ReorderedReadTool = {
+			name: "read",
+			label: "Read",
+			description: "Read a file",
+			parameters: reorderedReadSchema,
+			async execute() {
+				replacementExecutions++;
+				return { content: [{ type: "text", text: "replacement README" }], details: { source: "replacement" } };
+			},
+		};
+		const streams = createStreamHarness({ actorDelayMs: 100, draftOnlyFirst: true });
+		const agent = new Agent({ initialState: { model: createModel(), tools: [original] }, streamFn: streams.stream });
+		const installed = installSpeculativeAction(agent, {
+			cwd: "/workspace",
+			getSettings: () => ({
+				enabled: true,
+				patternAware: { enabled: false },
+				tools: { resourceCached: ["read"] },
+			}),
+			preflight: () => true,
+			onEvent: (event) => {
+				events.push(event);
+			},
+		});
+
+		const prompt = agent.prompt("Read README.md");
+		await waitFor(() => speculativeExecutions === 1);
+		agent.state.tools = [replacement];
+		await prompt;
+
+		expect(speculativeExecutions).toBe(1);
+		expect(replacementExecutions).toBe(0);
+		expect(events.some((event) => event.type === "hit" && event.tool === "read")).toBe(true);
+		expect(events.some((event) => event.type === "actual")).toBe(false);
+		await installed.uninstall();
+	});
+
+	it("rejects a cached result when a live tool schema changes before the actor call", async () => {
+		let originalToolExecutions = 0;
+		let replacementToolExecutions = 0;
+		const events: SpeculativeActionEvent<string>[] = [];
+		const original: ReadTool = {
+			name: "read",
+			label: "Read",
+			description: "Read a file",
+			parameters: readSchema,
+			async execute() {
+				originalToolExecutions++;
+				return { content: [{ type: "text", text: "stale schema result" }], details: { source: "original" } };
+			},
+		};
+		const replacement: ChangedReadTool = {
+			name: "read",
+			label: "Read",
+			description: "Read a file with encoding",
+			parameters: changedReadSchema,
+			async execute() {
+				replacementToolExecutions++;
+				return { content: [{ type: "text", text: "current schema result" }], details: { source: "replacement" } };
+			},
+		};
+		const streams = createStreamHarness({ actorDelayMs: 100, draftOnlyFirst: true });
+		const agent = new Agent({ initialState: { model: createModel(), tools: [original] }, streamFn: streams.stream });
+		const installed = installSpeculativeAction(agent, {
+			cwd: "/workspace",
+			getSettings: () => ({
+				enabled: true,
+				patternAware: { enabled: false },
+				tools: { resourceCached: ["read"] },
+			}),
+			preflight: () => true,
+			onEvent: (event) => {
+				events.push(event);
+			},
+		});
+
+		const prompt = agent.prompt("Read README.md");
+		await waitFor(() => originalToolExecutions === 1);
+		agent.state.tools = [replacement];
+		await prompt;
+
+		// The normal Agent loop snapshots tools at prompt start, so rejecting the
+		// speculative entry falls back to that authoritative snapshot. The replacement
+		// only changes the live schema used to decide whether reuse is still safe.
+		expect(originalToolExecutions).toBe(2);
+		expect(replacementToolExecutions).toBe(0);
+		expect(events.some((event) => event.type === "hit")).toBe(false);
+		expect(events.some((event) => event.type === "actual" && event.tool === "read")).toBe(true);
+		expect(events.some((event) => event.type === "miss" && event.reason === "key_mismatch")).toBe(true);
 		await installed.uninstall();
 	});
 

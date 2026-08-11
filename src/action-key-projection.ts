@@ -72,5 +72,5 @@ export function readRangesShareInFlight(speculative: ActionKey, actor: ActionKey
 function readProjectionPartition(action: ActionKey): string | undefined {
 	const range = readActionRange(action);
 	if (!range) return undefined;
-	return JSON.stringify([action.execution, action.resources, range.path]);
+	return JSON.stringify([action.execution, action.schemaHash, action.resources, range.path]);
 }

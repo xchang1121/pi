@@ -5,6 +5,7 @@
 ### Breaking Changes
 
 - Replaced the separate `keyProjectors` and `projectOutput` integration hooks with unified `projectionRules`; each lossless rule now owns its key relation, realized coverage proof, output reconstruction, and directed in-flight compatibility.
+- Added required `ActionKey.schemaHash`; canonical keys now include execution class and validated input schema, preventing reuse after an in-session tool contract change.
 
 ### Added
 
