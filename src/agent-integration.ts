@@ -425,6 +425,7 @@ export function installSpeculativeAction(
 				? { sandboxSetupMs: execution.setupMs, changeCollectionMs: execution.changeCollectionMs }
 				: {};
 		},
+		rejectCandidateOutput: ({ output }) => (output.isError ? "tool_error_result" : undefined),
 		captureResourceVersion: ({ action }) => captureResourceVersion(action, options.cwd),
 		releaseResourceVersion,
 		isResourceExpired: ({ candidate }) => validateResourceVersion(candidate.resourceVersion),

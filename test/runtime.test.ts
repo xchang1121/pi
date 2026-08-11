@@ -68,6 +68,7 @@ interface HarnessOptions {
 		keyMatch: ProjectedActionKeyMatch,
 	) => Promise<string | undefined> | string | undefined;
 	readonly captureProjectionCoverage?: (action: ActionKey, output: string) => unknown | undefined;
+	readonly rejectCandidateOutput?: (output: string) => string | undefined;
 	readonly adopt?: (output: string) => Promise<string | undefined> | string | undefined;
 	readonly observerThrows?: boolean;
 }
@@ -163,6 +164,9 @@ function createHarness(options: HarnessOptions) {
 			? { isResourceExpired: (input) => options.isResourceExpired?.(input) ?? false }
 			: {}),
 		projectionRules,
+		...(options.rejectCandidateOutput
+			? { rejectCandidateOutput: ({ output }) => options.rejectCandidateOutput?.(output) }
+			: {}),
 		...(options.adopt ? { adoptCandidate: ({ output }) => options.adopt?.(output) } : {}),
 		onEvent: (event) => {
 			events.push(event);
@@ -1490,6 +1494,13 @@ describe("speculative action runtime", () => {
 		).toBe("projected:broad-valid");
 		expect(projectionOrder).toEqual(["tight-invalid", "broad-valid"]);
 		expect(harness.events.filter((event) => event.type === "miss")).toHaveLength(0);
+		expect(harness.events.find((event) => event.type === "hit")).toMatchObject({
+			lookup: {
+				candidateCount: 2,
+				compatibleCount: 2,
+				rejections: [{ reason: "view_not_covered", count: 1 }],
+			},
+		});
 		await harness.runtime.finishTurn(consume("turn-cascade-projection", {}));
 
 		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-exact-after-projection" });
@@ -1522,6 +1533,9 @@ describe("speculative action runtime", () => {
 		).toBe("projected:fresh-broad");
 		expect(harness.events.filter((event) => event.type === "hit")).toHaveLength(1);
 		expect(harness.events.filter((event) => event.type === "miss")).toHaveLength(0);
+		expect(harness.events.find((event) => event.type === "hit")).toMatchObject({
+			lookup: { candidateCount: 2, compatibleCount: 2, rejections: [{ reason: "resource_expired", count: 1 }] },
+		});
 	});
 
 	it("falls through a rejected candidate without deleting a reusable result", async () => {
@@ -1550,6 +1564,13 @@ describe("speculative action runtime", () => {
 				consume("turn-cascade-authorization", { path: "README.md", offset: 120, limit: 10 }),
 			),
 		).toBe("projected:broad");
+		expect(harness.events.find((event) => event.type === "hit")).toMatchObject({
+			lookup: {
+				candidateCount: 2,
+				compatibleCount: 2,
+				rejections: [{ reason: "candidate_permission_rejected", count: 1 }],
+			},
+		});
 		await harness.runtime.finishTurn(consume("turn-cascade-authorization", {}));
 
 		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-authorized-exact" });
@@ -1584,6 +1605,126 @@ describe("speculative action runtime", () => {
 
 		expect(await result).toBe("projected:ready-broad");
 		expect(harness.events.filter((event) => event.type === "miss")).toHaveLength(0);
+		expect(harness.events.find((event) => event.type === "hit")).toMatchObject({
+			lookup: {
+				candidateCount: 2,
+				compatibleCount: 2,
+				rejections: [{ reason: "candidate_execution_failed", count: 1 }],
+			},
+		});
+	});
+
+	it("reports aggregate K(a) mismatch reasons without copying action inputs into lookup telemetry", async () => {
+		let draftCalls = 0;
+		const harness = createHarness({
+			predict: () =>
+				draftCalls++ === 0
+					? prediction(readCandidate("secret-name.ts", 20, 10), readCandidate("other.ts", 1, 100), {
+							type: "tool_call",
+							tool: "grep",
+							input: { pattern: "private-pattern", path: "." },
+						})
+					: prediction(),
+			execute: () => "cached",
+			projectOutput: (output) => output,
+		});
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-lookup-miss" });
+		await waitFor(() => harness.runtime.inspect("session").pendingPredictions === 0);
+
+		expect(
+			await harness.runtime.consume(consume("turn-lookup-miss", { path: "secret-name.ts", offset: 1, limit: 100 })),
+		).toBeUndefined();
+		await harness.runtime.finishTurn(consume("turn-lookup-miss", {}));
+
+		const miss = harness.events.find((event) => event.type === "miss" && event.reason === "key_mismatch");
+		expect(miss).toMatchObject({
+			lookup: {
+				candidateCount: 3,
+				compatibleCount: 0,
+				rejections: [
+					{ reason: "different_core", count: 1 },
+					{ reason: "different_tool", count: 1 },
+					{ reason: "view_not_covered", count: 1 },
+				],
+			},
+		});
+		const lookup = miss && "lookup" in miss ? miss.lookup : undefined;
+		expect(JSON.stringify(lookup)).not.toContain("secret-name");
+		expect(JSON.stringify(lookup)).not.toContain("private-pattern");
+	});
+
+	it("discards a completed output rejected by the adapter before it enters the cache", async () => {
+		let draftCalls = 0;
+		const harness = createHarness({
+			predict: () => (draftCalls++ === 0 ? prediction(readCandidate()) : prediction()),
+			execute: () => "tool-error",
+			rejectCandidateOutput: (output) => (output === "tool-error" ? "tool_error_result" : undefined),
+		});
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-rejected-output" });
+		await waitFor(() =>
+			harness.events.some((event) => event.type === "cancelled" && event.reason === "tool_error_result"),
+		);
+
+		expect(await harness.runtime.consume(consume("turn-rejected-output"))).toBeUndefined();
+		expect(harness.events.some((event) => event.type === "completed")).toBe(false);
+		expect(harness.events.some((event) => event.type === "hit")).toBe(false);
+		expect(harness.runtime.inspect("session").resourceCandidates).toBe(0);
+		await harness.runtime.finishTurn(consume("turn-rejected-output", {}));
+
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-after-rejected-output" });
+		await waitFor(() => harness.runtime.inspect("session").pendingPredictions === 0);
+		expect(await harness.runtime.consume(consume("turn-after-rejected-output"))).toBeUndefined();
+		expect(harness.executions()).toBe(1);
+	});
+
+	it("wakes an actor waiting on an output that becomes non-cacheable and records the rejection", async () => {
+		const execution = deferred<string>();
+		const harness = createHarness({
+			predict: () => prediction(readCandidate()),
+			execute: () => execution.promise,
+			rejectCandidateOutput: () => "tool_error_result",
+		});
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-running-rejected-output" });
+		await waitFor(() => harness.executions() === 1);
+		const result = harness.runtime.consume(consume("turn-running-rejected-output"));
+		execution.resolve("tool-error");
+
+		expect(await result).toBeUndefined();
+		expect(harness.events.find((event) => event.type === "miss")).toMatchObject({
+			reason: "tool_error_result",
+			lookup: {
+				candidateCount: 1,
+				compatibleCount: 1,
+				rejections: [{ reason: "tool_error_result", count: 1 }],
+			},
+		});
+		expect(harness.events.some((event) => event.type === "hit")).toBe(false);
+	});
+
+	it("fails closed when output validation throws but accepts an output with no rejection reason", async () => {
+		const rejected = createHarness({
+			predict: () => prediction(readCandidate()),
+			execute: () => "candidate",
+			rejectCandidateOutput: () => {
+				throw new Error("validator failed");
+			},
+		});
+		await rejected.runtime.startTurn({ sessionID: "session", turnID: "turn-validator-error" });
+		await waitFor(() =>
+			rejected.events.some(
+				(event) => event.type === "cancelled" && event.reason === "candidate_output_validation_failed",
+			),
+		);
+		expect(await rejected.runtime.consume(consume("turn-validator-error"))).toBeUndefined();
+
+		const accepted = createHarness({
+			predict: () => prediction(readCandidate()),
+			execute: () => "candidate",
+			rejectCandidateOutput: () => undefined,
+		});
+		await accepted.runtime.startTurn({ sessionID: "session", turnID: "turn-validator-accepts" });
+		await waitFor(() => accepted.executions() === 1);
+		expect(await accepted.runtime.consume(consume("turn-validator-accepts"))).toBe("candidate");
 	});
 
 	it("prefers a completed high-value candidate over a just-started tighter candidate", async () => {

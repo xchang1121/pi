@@ -5,6 +5,7 @@ import {
 	type ActionKeyProjector,
 	actionKeyMatch,
 	actionKeyMatches,
+	actionKeyMismatchReason,
 	actionKeyProjectionPartitions,
 	buildActionKey,
 	buildDrafterToolCallPrompt,
@@ -153,6 +154,43 @@ describe("speculative action common", () => {
 		);
 		expect(grepBroad && grepNarrow ? actionKeyMatches(grepBroad, grepNarrow, projectors) : true).toBe(false);
 		expect(findBroad && findNarrow ? actionKeyMatches(findBroad, findNarrow, projectors) : true).toBe(false);
+	});
+
+	it("classifies K(a) mismatches without exposing action inputs", () => {
+		const projectors = [READ_RANGE_ACTION_KEY_PROJECTOR];
+		const broad = buildPiActionKey("read", { path: "a.ts", offset: 1, limit: 100 }, "/workspace", "schema-a");
+		const narrow = buildPiActionKey("read", { path: "a.ts", offset: 20, limit: 10 }, "/workspace", "schema-a");
+		const otherPath = buildPiActionKey(
+			"read",
+			{ path: "secret-name.ts", offset: 20, limit: 10 },
+			"/workspace",
+			"schema-a",
+		);
+		const otherSchema = buildPiActionKey("read", { path: "a.ts", offset: 20, limit: 10 }, "/workspace", "schema-b");
+		const otherTool = buildPiActionKey("grep", { pattern: "private-pattern" }, "/workspace", "schema-a");
+		const sandbox = buildActionKey({
+			tool: "read",
+			execution: "sandbox",
+			resources: narrow?.resources ?? [],
+			input: { ...(narrow?.input ?? {}) },
+			schemaHash: "schema-a",
+		});
+
+		expect(broad && narrow ? actionKeyMismatchReason(broad, narrow, projectors) : "missing").toBeUndefined();
+		expect(narrow ? actionKeyMismatchReason(narrow, narrow, projectors) : "missing").toBeUndefined();
+		expect(broad && narrow ? actionKeyMismatchReason(narrow, broad, projectors) : "missing").toBe("view_not_covered");
+		expect(broad && narrow ? actionKeyMismatchReason(narrow, broad) : "missing").toBe("different_core");
+		expect(broad && otherPath ? actionKeyMismatchReason(broad, otherPath, projectors) : "missing").toBe(
+			"different_core",
+		);
+		expect(broad && otherSchema ? actionKeyMismatchReason(broad, otherSchema, projectors) : "missing").toBe(
+			"different_schema",
+		);
+		expect(broad ? actionKeyMismatchReason(sandbox, broad, projectors) : "missing").toBe("different_execution");
+		expect(broad && otherTool ? actionKeyMismatchReason(otherTool, broad, projectors) : "missing").toBe(
+			"different_tool",
+		);
+		expect(JSON.stringify(actionKeyMismatchReason(broad!, otherPath!, projectors))).not.toContain("secret-name");
 	});
 
 	it("selects configured readonly and sandbox candidates independently", () => {

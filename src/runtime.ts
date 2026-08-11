@@ -1,6 +1,13 @@
 import type { ActionProjectionCoverage, ActionProjectionRule } from "./action-key-projection.ts";
 import type { ActionKey, ActionKeyMatch, DrafterToolDefinition, SpeculativeExecution } from "./common.ts";
-import { actionKeyMatch, clampCandidateLimit, DEFAULTS, inferredExecution, KEYABLE_TOOLS } from "./common.ts";
+import {
+	actionKeyMatch,
+	actionKeyMismatchReason,
+	clampCandidateLimit,
+	DEFAULTS,
+	inferredExecution,
+	KEYABLE_TOOLS,
+} from "./common.ts";
 import type { PatternAwareDependency, PatternAwareResolution, PatternAwareSettings } from "./pattern-aware.ts";
 import { ToolCache } from "./tool-cache.ts";
 import {
@@ -180,6 +187,17 @@ export interface SpeculativeCacheSnapshot {
 	readonly observedWallMs?: number;
 }
 
+export interface SpeculativeLookupRejection {
+	readonly reason: string;
+	readonly count: number;
+}
+
+export interface SpeculativeLookupDiagnostics {
+	readonly candidateCount: number;
+	readonly compatibleCount: number;
+	readonly rejections: readonly SpeculativeLookupRejection[];
+}
+
 interface SpeculativeSchedulingEventFields {
 	readonly source: "drafter" | "pattern_aware" | "cache";
 	readonly patternID?: string;
@@ -262,6 +280,7 @@ export type SpeculativeActionEvent<SessionID> = SpeculativeCacheSnapshot &
 					draftCandidate: string;
 					predictedAction: string;
 					actualAction: string;
+					lookup?: SpeculativeLookupDiagnostics;
 				})
 		| (SpeculativeEventBase<SessionID> & {
 				type: "miss";
@@ -272,6 +291,7 @@ export type SpeculativeActionEvent<SessionID> = SpeculativeCacheSnapshot &
 				draftCandidate?: string;
 				predictedAction?: string;
 				actualAction?: string;
+				lookup?: SpeculativeLookupDiagnostics;
 		  })
 		| (SpeculativeEventBase<SessionID> &
 				SpeculativeSchedulingEventFields & {
@@ -405,6 +425,11 @@ export interface SpeculativeActionRuntimeAdapter<
 	}) => MaybePromise<(() => void) | undefined>;
 	/** Lossless projections jointly define K(a) relation, realized coverage, and output reconstruction. */
 	readonly projectionRules?: readonly ActionProjectionRule<Output>[];
+	/** Return a reason to discard an output that must never become a reusable speculative result. */
+	readonly rejectCandidateOutput?: (input: {
+		readonly output: Output;
+		readonly candidate: SpeculativeCandidate;
+	}) => string | undefined;
 	readonly adoptCandidate?: (input: {
 		readonly stateData: StateData;
 		readonly consumeInput: ConsumeInput;
@@ -529,6 +554,7 @@ interface TurnState<SessionID, Output, StateData> {
 		readonly key: ActionKey;
 		readonly actualAction: string;
 		readonly predictedAction?: string;
+		readonly lookup: SpeculativeLookupDiagnostics;
 	};
 	terminal: boolean;
 	finished: boolean;
@@ -919,7 +945,12 @@ export function makeSpeculativeActionRuntime<
 		reason: string,
 		key?: ActionKey,
 		detail?: string,
-		diagnostics: { draftCandidate?: string; predictedAction?: string; actualAction?: string } = {},
+		diagnostics: {
+			readonly draftCandidate?: string;
+			readonly predictedAction?: string;
+			readonly actualAction?: string;
+			readonly lookup?: SpeculativeLookupDiagnostics;
+		} = {},
 	): Promise<void> => {
 		await emit({
 			type: "miss",
@@ -1781,6 +1812,34 @@ export function makeSpeculativeActionRuntime<
 			}
 			await publishStarted(state, candidate);
 			let executionStarted = candidate.startedAt;
+			const rejectExecution = async (error: unknown): Promise<void> => {
+				if (candidate.run.status === "closed") {
+					candidate.execution.resolve({ ok: false, error });
+					return;
+				}
+				const classified =
+					error instanceof SpeculativeJobError
+						? error
+						: new SpeculativeJobError("candidate_execution_failed", error);
+				const completedAt = Date.now();
+				const executionMs = Math.max(0, completedAt - executionStarted);
+				candidate.run = { status: "closed", reason: classified.reason, completedAt, executionMs };
+				schedulerFor(state.sessionID).discard(candidate);
+				candidate.schedulerOutcome = "discarded";
+				recordDrafterFailure(state, candidate, "source_error");
+				expireDrafterLeases(candidate, undefined, "invalidated");
+				await settlePatternLeases(candidate, "invalidated", "system");
+				for (const lease of candidate.leases) {
+					if (lease.state === "matched") lease.state = "invalidated";
+				}
+				if (state.candidates.get(candidate.key.key) === candidate) state.candidates.delete(candidate.key.key);
+				removeTurnAdmission(state, candidate);
+				removePersistentCandidate(state, candidate);
+				releaseCandidateResourceVersion(candidate);
+				await publishCancelled(state, candidate, classified.reason, errorDetail(classified));
+				await publishCache(state);
+				candidate.execution.resolve({ ok: false, error: classified });
+			};
 			void Promise.resolve()
 				.then(async () => {
 					await Promise.resolve();
@@ -1881,75 +1940,60 @@ export function makeSpeculativeActionRuntime<
 						signal: candidateController.signal,
 					});
 				})
-				.then(
-					async (output) => {
-						if (candidate.run.status === "closed") {
-							candidate.execution.resolve({
-								ok: false,
-								error: new Error(`speculative_${candidate.run.reason}`),
-							});
-							return;
-						}
-						const completedAt = Date.now();
-						const executionMs = Math.max(0, completedAt - executionStarted);
-						candidate.projectionCoverage = captureProjectionCoverage(action, output);
-						candidate.run = { status: "ready", completedAt, executionMs, output };
-						observeServiceTime(candidate.tool, executionMs);
-						Object.assign(candidate, adapter.candidateExecutionMetrics?.({ output, candidate }) ?? {});
-						observeExecutionOverhead(
-							candidate.key.tool,
-							(candidate.resourceCaptureMs ?? 0) +
-								(candidate.sandboxSetupMs ?? 0) +
-								(candidate.changeCollectionMs ?? 0),
+				.then(async (output) => {
+					if (candidate.run.status === "closed") {
+						candidate.execution.resolve({
+							ok: false,
+							error: new Error(`speculative_${candidate.run.reason}`),
+						});
+						return;
+					}
+					const completedAt = Date.now();
+					const executionMs = Math.max(0, completedAt - executionStarted);
+					let outputRejection: string | undefined;
+					try {
+						outputRejection = adapter.rejectCandidateOutput?.({ output, candidate });
+					} catch (error) {
+						await rejectExecution(new SpeculativeJobError("candidate_output_validation_failed", error));
+						return;
+					}
+					if (outputRejection !== undefined) {
+						const reason = outputRejection.trim() || "candidate_output_rejected";
+						await rejectExecution(new SpeculativeJobError(reason, new Error(reason)));
+						return;
+					}
+					candidate.projectionCoverage = captureProjectionCoverage(action, output);
+					candidate.run = { status: "ready", completedAt, executionMs, output };
+					observeServiceTime(candidate.tool, executionMs);
+					Object.assign(candidate, adapter.candidateExecutionMetrics?.({ output, candidate }) ?? {});
+					observeExecutionOverhead(
+						candidate.key.tool,
+						(candidate.resourceCaptureMs ?? 0) +
+							(candidate.sandboxSetupMs ?? 0) +
+							(candidate.changeCollectionMs ?? 0),
+					);
+					candidate.estimatedBytes += Math.max(
+						0,
+						adapter.candidateSizeBytes?.({ output, candidate }) ?? estimateValueBytes(output),
+					);
+					schedulerFor(state.sessionID).complete(candidate);
+					for (const evicted of trimPersistentCandidates(state.sessionID, state.settings, candidate)) {
+						await preemptCandidate(evicted, "resource_cache_byte_limit", "discarded");
+					}
+					await publishCache(state);
+					await publishCompleted(state, candidate);
+					candidate.execution.resolve({ ok: true, output });
+					if (action.execution !== "sandbox") {
+						await continuePatternCandidate(
+							state,
+							input,
+							candidate,
+							output,
+							candidate.hits > 0 ||
+								candidate.leases.some((lease) => lease.state === "matched" || lease.state === "hit"),
 						);
-						candidate.estimatedBytes += Math.max(
-							0,
-							adapter.candidateSizeBytes?.({ output, candidate }) ?? estimateValueBytes(output),
-						);
-						schedulerFor(state.sessionID).complete(candidate);
-						for (const evicted of trimPersistentCandidates(state.sessionID, state.settings, candidate)) {
-							await preemptCandidate(evicted, "resource_cache_byte_limit", "discarded");
-						}
-						await publishCache(state);
-						await publishCompleted(state, candidate);
-						candidate.execution.resolve({ ok: true, output });
-						if (action.execution !== "sandbox") {
-							await continuePatternCandidate(
-								state,
-								input,
-								candidate,
-								output,
-								candidate.hits > 0 ||
-									candidate.leases.some((lease) => lease.state === "matched" || lease.state === "hit"),
-							);
-						}
-					},
-					async (error: unknown) => {
-						if (candidate.run.status === "closed") {
-							candidate.execution.resolve({ ok: false, error });
-							return;
-						}
-						const reason = error instanceof SpeculativeJobError ? error.reason : "candidate_execution_failed";
-						const completedAt = Date.now();
-						const executionMs = Math.max(0, completedAt - executionStarted);
-						candidate.run = { status: "closed", reason, completedAt, executionMs };
-						schedulerFor(state.sessionID).discard(candidate);
-						candidate.schedulerOutcome = "discarded";
-						recordDrafterFailure(state, candidate, "source_error");
-						expireDrafterLeases(candidate, undefined, "invalidated");
-						await settlePatternLeases(candidate, "invalidated", "system");
-						for (const lease of candidate.leases) {
-							if (lease.state === "matched") lease.state = "invalidated";
-						}
-						if (state.candidates.get(candidate.key.key) === candidate) state.candidates.delete(candidate.key.key);
-						removeTurnAdmission(state, candidate);
-						removePersistentCandidate(state, candidate);
-						releaseCandidateResourceVersion(candidate);
-						await publishCancelled(state, candidate, reason, errorDetail(error));
-						await publishCache(state);
-						candidate.execution.resolve({ ok: false, error });
-					},
-				);
+					}
+				}, rejectExecution);
 		}
 		return accepted;
 	};
@@ -2236,7 +2280,8 @@ export function makeSpeculativeActionRuntime<
 				consumeInput: input,
 			});
 			const actualAction = diagnosticAction(actualCall.tool, actualCall.input, actual);
-			const activeDrafterPlan = [...availableCandidates(state).values()].some(hasActiveDrafterLease);
+			const candidates = [...new Set(availableCandidates(state).values())];
+			const activeDrafterPlan = candidates.some(hasActiveDrafterLease);
 			if (!actual) {
 				if (activeDrafterPlan) state.drafterPlanMismatch = true;
 				await preemptForAuthoritative(state, { class: "global", units: 1 });
@@ -2245,9 +2290,29 @@ export function makeSpeculativeActionRuntime<
 
 			state.actorKeys.add(actual.key);
 			const choices = matchingCandidates(state, actual);
+			const rejectionCounts = new Map<string, number>();
+			const recordRejection = (reason: string, count = 1): void => {
+				if (count <= 0) return;
+				rejectionCounts.set(reason, (rejectionCounts.get(reason) ?? 0) + count);
+			};
+			for (const candidate of candidates) {
+				const reason = actionKeyMismatchReason(candidate.key, actual, keyProjectors);
+				if (reason) recordRejection(reason);
+			}
+			const lookupDiagnostics = (): SpeculativeLookupDiagnostics => ({
+				candidateCount: candidates.length,
+				compatibleCount: choices.length,
+				rejections: [...rejectionCounts]
+					.sort(([left], [right]) => left.localeCompare(right))
+					.map(([reason, count]) => ({ reason, count })),
+			});
 			const actualConcrete = adapter.authorizeCandidate ? asConcreteInput(actualCall.input) : undefined;
 			if (adapter.authorizeCandidate && !actualConcrete) {
-				await publishMiss(state, "invalid_tool_call_input", actual, undefined, { actualAction });
+				recordRejection("invalid_tool_call_input", choices.length);
+				await publishMiss(state, "invalid_tool_call_input", actual, undefined, {
+					actualAction,
+					lookup: lookupDiagnostics(),
+				});
 				await preemptForAuthoritative(state, resourceProfile(actual.tool, actual.execution));
 				return undefined;
 			}
@@ -2269,8 +2334,14 @@ export function makeSpeculativeActionRuntime<
 						readonly matchedDrafterPlan: boolean;
 				  }
 				| undefined;
-			const reject = (choice: RankedRuntimeCandidate<Output>, reason: string, detail?: string): void => {
+			const reject = (
+				choice: RankedRuntimeCandidate<Output>,
+				reason: string,
+				detail?: string,
+				lookupReason = reason,
+			): void => {
 				lastFailure = { choice, reason, ...(detail ? { detail } : {}) };
+				recordRejection(lookupReason);
 			};
 
 			for (const choice of choices) {
@@ -2382,7 +2453,7 @@ export function makeSpeculativeActionRuntime<
 				const projection = await projectCandidateOutput(candidate, actual, output, match);
 				if (!projection.ok) {
 					releaseCandidateClaim(candidate, state.turnID);
-					reject(choice, "projection_failed", projection.reason);
+					reject(choice, "projection_failed", projection.reason, projection.reason);
 					continue;
 				}
 				candidate.projectionMs += projection.durationMs;
@@ -2403,6 +2474,7 @@ export function makeSpeculativeActionRuntime<
 					const diagnosticCandidate = lastFailure?.choice.candidate ?? choices[0]?.candidate;
 					await publishMiss(state, lastFailure?.reason ?? "candidate_unavailable", actual, lastFailure?.detail, {
 						actualAction,
+						lookup: lookupDiagnostics(),
 						...(diagnosticCandidate
 							? {
 									draftCandidate: diagnosticCandidate.draftCandidate,
@@ -2421,6 +2493,7 @@ export function makeSpeculativeActionRuntime<
 							key: actual,
 							actualAction,
 							predictedAction: candidatesDiagnostic(predicted),
+							lookup: lookupDiagnostics(),
 						};
 					}
 				}
@@ -2497,6 +2570,7 @@ export function makeSpeculativeActionRuntime<
 				draftCandidate: candidate.draftCandidate,
 				predictedAction: candidate.predictedAction,
 				actualAction,
+				lookup: lookupDiagnostics(),
 				...schedulingEventFields(candidate, eventSource),
 				...cacheSnapshot(state),
 			});
@@ -2572,6 +2646,7 @@ export function makeSpeculativeActionRuntime<
 				await publishMiss(state, "key_mismatch", state.pendingDrafterMismatch.key, undefined, {
 					predictedAction: state.pendingDrafterMismatch.predictedAction,
 					actualAction: state.pendingDrafterMismatch.actualAction,
+					lookup: state.pendingDrafterMismatch.lookup,
 				});
 			}
 		}

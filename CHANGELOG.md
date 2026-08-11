@@ -20,6 +20,7 @@
 - Added an indexed per-session tool cache with atomic exact-key registration for cross-turn single-flight reuse.
 - Added production Pi `read` range projection backed by structured realized-output coverage; grep and find remain exact-key-only.
 - Added probation/protected speculative cache tiers: new results remain eviction-first until a successful actor hit promotes them, with bounded protected occupancy by entries and bytes.
+- Added aggregate, input-free K(a) rejection counts to hit and miss telemetry.
 
 ### Changed
 
@@ -35,6 +36,7 @@
 
 ### Fixed
 
+- Tool error settlements are discarded before they can become reusable speculative cache entries.
 - Agent uninstall now releases owned workspace sandbox pools immediately instead of retaining Windows file watchers until the idle timeout.
 - Native release manifests and smoke requests now use protocol v3 and verify the isolation attestation.
 - Shell dispatch recognizes Windows-style executable paths even when protocol tests run on a non-Windows host.

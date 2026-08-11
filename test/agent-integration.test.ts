@@ -272,6 +272,44 @@ describe("Pi Agent speculative integration", () => {
 		await installed.uninstall();
 	});
 
+	it("never reuses a speculative tool error as the actor's authoritative settlement", async () => {
+		let toolExecutions = 0;
+		const events: SpeculativeActionEvent<string>[] = [];
+		const tool: ReadTool = {
+			name: "read",
+			label: "Read",
+			description: "Read a file",
+			parameters: readSchema,
+			async execute() {
+				toolExecutions++;
+				throw new Error("transient read failure");
+			},
+		};
+		const streams = createStreamHarness({ actorDelayMs: 100, draftOnlyFirst: true });
+		const agent = new Agent({ initialState: { model: createModel(), tools: [tool] }, streamFn: streams.stream });
+		const installed = installSpeculativeAction(agent, {
+			cwd: "/workspace",
+			getSettings: () => ({
+				enabled: true,
+				patternAware: { enabled: false },
+				tools: { resourceCached: ["read"] },
+			}),
+			preflight: () => true,
+			onEvent: (event) => {
+				events.push(event);
+			},
+		});
+
+		await agent.prompt("Read README.md");
+
+		expect(toolExecutions).toBe(2);
+		expect(events.some((event) => event.type === "hit")).toBe(false);
+		expect(events.some((event) => event.type === "cancelled" && event.reason === "tool_error_result")).toBe(true);
+		expect(events.some((event) => event.type === "actual" && event.tool === "read")).toBe(true);
+		expect(installed.runtime.inspect(installed.sessionID).resourceCandidates).toBe(0);
+		await installed.uninstall();
+	});
+
 	it("keeps a speculative hit when a live tool is replaced by a schema-equivalent definition", async () => {
 		let speculativeExecutions = 0;
 		let replacementExecutions = 0;

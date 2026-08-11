@@ -47,6 +47,13 @@ export interface ProjectedActionKeyMatch {
 
 export type ActionKeyMatch = ExactActionKeyMatch | ProjectedActionKeyMatch;
 
+export type ActionKeyMismatchReason =
+	| "different_tool"
+	| "different_execution"
+	| "different_schema"
+	| "different_core"
+	| "view_not_covered";
+
 export interface DrafterToolDefinition {
 	readonly name: string;
 	readonly description?: string;
@@ -291,6 +298,24 @@ export function actionKeyMatch(
 		best = { kind: "projected", projector: projector.id, distance: projected.distance };
 	}
 	return best;
+}
+
+/** Explain why K(a_s) cannot satisfy K(a) without exposing either action's input. */
+export function actionKeyMismatchReason(
+	speculative: ActionKey,
+	actor: ActionKey,
+	projectors: readonly ActionKeyProjector[] = [],
+): ActionKeyMismatchReason | undefined {
+	if (actionKeyMatch(speculative, actor, projectors)) return undefined;
+	if (speculative.tool !== actor.tool) return "different_tool";
+	if (speculative.execution !== actor.execution) return "different_execution";
+	if (speculative.schemaHash !== actor.schemaHash) return "different_schema";
+
+	const speculativePartitions = new Set(actionKeyProjectionPartitions(speculative, projectors));
+	if (actionKeyProjectionPartitions(actor, projectors).some((partition) => speculativePartitions.has(partition))) {
+		return "view_not_covered";
+	}
+	return "different_core";
 }
 
 /** Projection partitions used only as a cache lookup optimization. */
