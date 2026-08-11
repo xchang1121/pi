@@ -89,12 +89,13 @@ export interface PredictionLease {
 	readonly id: string;
 	readonly source: "drafter" | "pattern_aware";
 	readonly patternID?: string;
-	readonly patternContext?: unknown;
+	patternContext?: unknown;
 	readonly providerTurnID: string;
 	readonly anchorActionSeq: number;
 	readonly horizon?: number;
 	readonly validThroughActionSeq?: number;
-	continuationExpanded?: boolean;
+	empiricalProbability?: number;
+	continuationExpansion?: "speculative" | "confirmed";
 	state: "active" | "matched" | "hit" | "expired" | "invalidated";
 	resolvedActionSeq?: number;
 }
@@ -1481,8 +1482,40 @@ export function makeSpeculativeActionRuntime<
 			return true;
 		}
 		if (!draft.patternID) return false;
-		if (candidate.leases.some((lease) => lease.state === "active" && lease.patternID === draft.patternID)) {
-			return false;
+		const empiricalProbability =
+			typeof draft.empiricalProbability === "number" && Number.isFinite(draft.empiricalProbability)
+				? Math.max(0, Math.min(1, draft.empiricalProbability))
+				: undefined;
+		const scheduling = schedulingMetadata(draft, candidate.key);
+		const utility = expectedUtility(scheduling);
+		const existingLease = candidate.leases.find(
+			(lease) => lease.state === "active" && lease.patternID === draft.patternID,
+		);
+		if (existingLease) {
+			const leaseProbabilityIncreased =
+				empiricalProbability !== undefined &&
+				(existingLease.empiricalProbability === undefined ||
+					empiricalProbability > existingLease.empiricalProbability);
+			const utilityIncreased = utility > candidate.utility;
+			if (!leaseProbabilityIncreased && !utilityIncreased) return false;
+			if (leaseProbabilityIncreased) {
+				existingLease.empiricalProbability = empiricalProbability;
+				existingLease.patternContext = draft.patternContext;
+				if (existingLease.continuationExpansion !== "confirmed") {
+					existingLease.continuationExpansion = undefined;
+				}
+				if (candidate.empiricalProbability === undefined || empiricalProbability > candidate.empiricalProbability) {
+					candidate.empiricalProbability = empiricalProbability;
+					candidate.conditionalProbability = draft.conditionalProbability;
+					candidate.depth = draft.depth;
+				}
+			}
+			if (utilityIncreased) {
+				candidate.scheduling = scheduling;
+				candidate.utility = utility;
+				schedulerFor(state.sessionID).update(candidate, scheduling);
+			}
+			return true;
 		}
 		const horizon = Math.max(0, Math.floor(draft.horizon ?? 0));
 		candidate.leases.push({
@@ -1494,15 +1527,15 @@ export function makeSpeculativeActionRuntime<
 			anchorActionSeq,
 			horizon,
 			validThroughActionSeq: anchorActionSeq + horizon + 1,
+			...(empiricalProbability !== undefined ? { empiricalProbability } : {}),
 			state: "active",
 		});
-		const scheduling = schedulingMetadata(draft, candidate.key);
-		if (expectedUtility(scheduling) > candidate.utility) {
+		if (utility > candidate.utility) {
 			candidate.empiricalProbability = draft.empiricalProbability;
 			candidate.conditionalProbability = draft.conditionalProbability;
 			candidate.depth = draft.depth;
 			candidate.scheduling = scheduling;
-			candidate.utility = expectedUtility(scheduling);
+			candidate.utility = utility;
 			schedulerFor(state.sessionID).update(candidate, scheduling);
 		}
 		try {
@@ -1673,6 +1706,9 @@ export function makeSpeculativeActionRuntime<
 				anchorActionSeq: predictionAnchorActionSeq,
 				...(horizon !== undefined
 					? { horizon, validThroughActionSeq: predictionAnchorActionSeq + horizon + 1 }
+					: {}),
+				...(source === "pattern_aware" && typeof draft.empiricalProbability === "number"
+					? { empiricalProbability: Math.max(0, Math.min(1, draft.empiricalProbability)) }
 					: {}),
 				state: "active",
 			};
@@ -1981,13 +2017,14 @@ export function makeSpeculativeActionRuntime<
 			if (
 				lease.source !== "pattern_aware" ||
 				!lease.patternID ||
-				lease.continuationExpanded ||
+				lease.continuationExpansion === "confirmed" ||
+				(!parentConfirmed && lease.continuationExpansion === "speculative") ||
 				lease.state === "expired" ||
 				lease.state === "invalidated"
 			) {
 				continue;
 			}
-			lease.continuationExpanded = true;
+			lease.continuationExpansion = parentConfirmed ? "confirmed" : "speculative";
 			let prediction: SpeculativePrediction | undefined;
 			try {
 				prediction = await adapter.continuePatternAware({
@@ -2534,9 +2571,7 @@ export function makeSpeculativeActionRuntime<
 			});
 			await recordAndPredict(state, input, actualCall, actual, output, executionMs, true, actionSequence);
 			if (actualCall.id) state.actorCallSequences.delete(actualCall.id);
-			if (actual.execution === "sandbox") {
-				await continuePatternCandidate(state, state.startInput as StartInput, candidate, output, true);
-			}
+			await continuePatternCandidate(state, state.startInput as StartInput, candidate, output, true);
 			return output;
 		} finally {
 			state.pendingActionSequences.delete(actionSequence);

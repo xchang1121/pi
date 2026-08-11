@@ -640,6 +640,237 @@ describe("PatternAware runtime integration", () => {
 		expect(await runtime.consume(call("turn", "bash", { command: "npm test" }))).toBe("test-output");
 	});
 
+	it("upgrades an already-expanded chain after parent confirmation without re-executing it", async () => {
+		const executions = new Map<string, number>();
+		const continuations: string[] = [];
+		const launches: string[] = [];
+		let predictions = 0;
+		const runtime = makeSpeculativeActionRuntime(
+			adapter({
+				settings: () => ({ ...settings(), predictionTimeoutMs: 5_000 }),
+				predictPatternAware: () => ({
+					candidates:
+						predictions++ === 0 ? [confidenceCandidate("parent.ts", "parent", 0.25, { confidence: 0.25 })] : [],
+					draftTokens: 0,
+				}),
+				executeCandidate: ({ concrete }) => {
+					const path = String(concrete.path);
+					executions.set(path, (executions.get(path) ?? 0) + 1);
+					return `${path}:output`;
+				},
+				continuePatternAware: ({ candidate, patternContext, parentConfirmed }) => {
+					const path = String(candidate.input.path);
+					const confidence = (patternContext as { confidence?: number } | undefined)?.confidence;
+					continuations.push(`${path}:${parentConfirmed}:${candidate.empiricalProbability}:${confidence}`);
+					if (path === "parent.ts") {
+						const next = parentConfirmed ? 0.8 : 0.2;
+						return {
+							candidates: [confidenceCandidate("child.ts", "child", next, { confidence: next })],
+							draftTokens: 0,
+						};
+					}
+					if (path === "child.ts") {
+						const next = confidence === 0.8 ? 0.6 : 0.1;
+						return {
+							candidates: [confidenceCandidate("grandchild.ts", "grandchild", next, { confidence: next })],
+							draftTokens: 0,
+						};
+					}
+					return undefined;
+				},
+				onPatternLaunched: (patternID) => {
+					launches.push(patternID);
+				},
+			}),
+		);
+
+		await runtime.startTurn(start("upgrade-chain"));
+		await waitFor(() => continuations.includes("grandchild.ts:false:0.1:0.1"));
+		expect(Object.fromEntries(executions)).toEqual({
+			"parent.ts": 1,
+			"child.ts": 1,
+			"grandchild.ts": 1,
+		});
+
+		expect(await runtime.consume(call("upgrade-chain", "read", { path: "parent.ts" }))).toBe("parent.ts:output");
+		await waitFor(() => continuations.includes("grandchild.ts:false:0.6:0.6"));
+
+		expect(continuations).toEqual([
+			"parent.ts:false:0.25:0.25",
+			"child.ts:false:0.2:0.2",
+			"grandchild.ts:false:0.1:0.1",
+			"parent.ts:true:0.25:0.25",
+			"child.ts:false:0.8:0.8",
+			"grandchild.ts:false:0.6:0.6",
+		]);
+		expect(launches).toEqual(["parent", "child", "grandchild"]);
+		expect(Object.fromEntries(executions)).toEqual({
+			"parent.ts": 1,
+			"child.ts": 1,
+			"grandchild.ts": 1,
+		});
+
+		await runtime.consume(call("upgrade-chain", "read", { path: "parent.ts" }));
+		expect(continuations.filter((item) => item.startsWith("parent.ts:true"))).toHaveLength(1);
+		await runtime.dispose();
+	});
+
+	it("reconsiders a previously rejected descendant when its parent becomes authoritative", async () => {
+		const executions: string[] = [];
+		const parentConfirmations: boolean[] = [];
+		const events: SpeculativeActionEvent<string>[] = [];
+		const launches: string[] = [];
+		let predictions = 0;
+		const runtime = makeSpeculativeActionRuntime(
+			adapter({
+				settings: () => ({
+					...settings(),
+					candidateLimit: 1,
+					maxConcurrentActions: 1,
+					predictionTimeoutMs: 5_000,
+				}),
+				predictPatternAware: () => ({
+					candidates: predictions++ === 0 ? [confidenceCandidate("parent.ts", "parent", 0.5)] : [],
+					draftTokens: 0,
+				}),
+				executeCandidate: ({ concrete }) => {
+					const path = String(concrete.path ?? concrete.pattern);
+					executions.push(path);
+					return `${path}:output`;
+				},
+				continuePatternAware: ({ candidate, parentConfirmed }) => {
+					if (candidate.input.path !== "parent.ts") return undefined;
+					parentConfirmations.push(parentConfirmed);
+					return {
+						candidates: [
+							{
+								...confidenceCandidate("child.ts", "child", parentConfirmed ? 0.9 : 0.2),
+								tool: "grep",
+								input: { pattern: "child.ts" },
+							},
+						],
+						draftTokens: 0,
+					};
+				},
+				onPatternLaunched: (patternID) => {
+					launches.push(patternID);
+				},
+				onEvent: (event) => {
+					events.push(event);
+				},
+			}),
+		);
+
+		await runtime.startTurn(start("admit-after-confirmation"));
+		await waitFor(() =>
+			events.some(
+				(event) =>
+					event.type === "cancelled" &&
+					event.tool === "grep" &&
+					event.reason === "candidate_budget_insufficient_expected_benefit",
+			),
+		);
+		expect(executions).toEqual(["parent.ts"]);
+		expect(parentConfirmations).toEqual([false]);
+
+		expect(await runtime.consume(call("admit-after-confirmation", "read", { path: "parent.ts" }))).toBe(
+			"parent.ts:output",
+		);
+		await waitFor(() => executions.includes("child.ts"));
+
+		expect(parentConfirmations).toEqual([false, true]);
+		expect(executions).toEqual(["parent.ts", "child.ts"]);
+		expect(launches).toEqual(["parent", "child"]);
+		await runtime.dispose();
+	});
+
+	it("expands a running parent once at confirmed confidence when the actor arrives first", async () => {
+		const executions: string[] = [];
+		const parentConfirmations: boolean[] = [];
+		const outcomes: string[] = [];
+		let releaseParent!: (output: string) => void;
+		const parentOutput = new Promise<string>((resolve) => {
+			releaseParent = resolve;
+		});
+		let predictions = 0;
+		const runtime = makeSpeculativeActionRuntime(
+			adapter({
+				predictPatternAware: () => ({
+					candidates: predictions++ === 0 ? [confidenceCandidate("parent.ts", "parent", 0.4)] : [],
+					draftTokens: 0,
+				}),
+				executeCandidate: ({ concrete }) => {
+					const path = String(concrete.path ?? concrete.pattern);
+					executions.push(path);
+					return path === "parent.ts" ? parentOutput : "child-output";
+				},
+				continuePatternAware: ({ candidate, parentConfirmed }) => {
+					if (candidate.input.path !== "parent.ts") return undefined;
+					parentConfirmations.push(parentConfirmed);
+					return {
+						candidates: [
+							{
+								...confidenceCandidate("child.ts", "child", 0.8),
+								tool: "grep",
+								input: { pattern: "child.ts" },
+							},
+						],
+						draftTokens: 0,
+					};
+				},
+				onPatternResolved: (patternID, outcome) => {
+					outcomes.push(`${patternID}:${outcome}`);
+				},
+			}),
+		);
+
+		await runtime.startTurn(start("actor-first"));
+		await waitFor(() => executions.includes("parent.ts"));
+		const consumed = runtime.consume(call("actor-first", "read", { path: "parent.ts" }));
+		await waitFor(() => outcomes.includes("parent:consumed"));
+		releaseParent("parent-output");
+
+		expect(await consumed).toBe("parent-output");
+		await waitFor(() => executions.includes("child.ts"));
+		expect(parentConfirmations).toEqual([true]);
+		expect(executions).toEqual(["parent.ts", "child.ts"]);
+		await runtime.dispose();
+	});
+
+	it("does not upgrade descendants when the actor misses their speculative parent", async () => {
+		const parentConfirmations: boolean[] = [];
+		const executions: string[] = [];
+		let predictions = 0;
+		const runtime = makeSpeculativeActionRuntime(
+			adapter({
+				predictPatternAware: () => ({
+					candidates: predictions++ === 0 ? [confidenceCandidate("parent.ts", "parent", 0.4)] : [],
+					draftTokens: 0,
+				}),
+				executeCandidate: ({ concrete }) => {
+					executions.push(String(concrete.path));
+					return "output";
+				},
+				continuePatternAware: ({ candidate, parentConfirmed }) => {
+					if (candidate.input.path !== "parent.ts") return undefined;
+					parentConfirmations.push(parentConfirmed);
+					return {
+						candidates: [confidenceCandidate("child.ts", "child", parentConfirmed ? 0.9 : 0.2)],
+						draftTokens: 0,
+					};
+				},
+			}),
+		);
+
+		await runtime.startTurn(start("parent-miss"));
+		await waitFor(() => executions.includes("child.ts"));
+		expect(await runtime.consume(call("parent-miss", "find", { pattern: "*.ts" }))).toBeUndefined();
+
+		expect(parentConfirmations).toEqual([false]);
+		expect(executions).toEqual(["parent.ts", "child.ts"]);
+		await runtime.dispose();
+	});
+
 	it("does not expand the frontier after terminal cancellation", async () => {
 		let continuations = 0;
 		let aborted = 0;
@@ -964,8 +1195,9 @@ describe("PatternAware runtime integration", () => {
 					return `${tool}-result`;
 				},
 				adoptCandidate: ({ output }) => output,
-				continuePatternAware: ({ candidate }) => {
+				continuePatternAware: ({ candidate, parentConfirmed }) => {
 					if (candidate.tool !== "bash") return undefined;
+					expect(parentConfirmed).toBe(true);
 					continuations++;
 					return {
 						candidates: [patternCandidate("read", { path: "generated.txt" }, "sandbox_child", 0)],
@@ -1061,6 +1293,26 @@ function patternCandidate(
 		empiricalProbability: 1,
 		expectedDurationMs: 10,
 		expectedLatencyBenefitMs: 10,
+	};
+}
+
+function confidenceCandidate(
+	path: string,
+	patternID: string,
+	empiricalProbability: number,
+	patternContext?: unknown,
+): SpeculativeDraftCandidate {
+	return {
+		type: "tool_call",
+		source: "pattern_aware",
+		tool: "read",
+		input: { path },
+		patternID,
+		...(patternContext !== undefined ? { patternContext } : {}),
+		horizon: 0,
+		empiricalProbability,
+		conditionalProbability: empiricalProbability,
+		expectedDurationMs: 100,
 	};
 }
 
