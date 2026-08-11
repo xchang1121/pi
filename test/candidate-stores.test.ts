@@ -56,18 +56,21 @@ describe("ActionStore", () => {
 });
 
 describe("ResultCache", () => {
-	it("keeps probation/protected state scoped and evicts probation before actor-validated results", () => {
-		const cache = new ResultCache<string, Entry>();
+	it("evicts the least valuable probation entry before actor-validated results", () => {
+		const cache = new ResultCache<string, Entry>([], (item) => (item.id === "valuable" ? 100 : Number.NaN));
 		const shared = entry("shared", "a.ts", 1, 20, 8);
-		const probation = entry("probation", "b.ts", 1, 20, 8);
+		const valuable = entry("valuable", "b.ts", 1, 20, 8);
+		const worthless = entry("worthless", "c.ts", 1, 20, 8);
 		cache.insert("one", shared);
 		cache.insert("two", shared);
-		cache.insert("one", probation);
+		cache.insert("one", valuable);
+		cache.insert("one", worthless);
 		cache.recordActorHit("one", shared);
 
 		expect(cache.stateOf("one", shared)).toBe("protected");
 		expect(cache.stateOf("two", shared)).toBe("probation");
-		expect(cache.trim("one", { maxEntries: 1, maxBytes: 8 })).toEqual([probation]);
+		expect(cache.trim("one", { maxEntries: 2, maxBytes: 16 })).toEqual([worthless]);
+		expect(cache.trim("one", { maxEntries: 1, maxBytes: 8 })).toEqual([valuable]);
 		expect(cache.values("one")).toEqual([shared]);
 		expect(cache.snapshot("one")).toEqual({
 			probationEntries: 0,

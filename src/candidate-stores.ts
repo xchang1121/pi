@@ -216,9 +216,11 @@ export interface ResultCacheSnapshot {
 export class ResultCache<Scope, Entry extends SizedActionStoreEntry> {
 	private readonly index: ActionStore<Scope, Entry>;
 	private readonly tiers = new Map<Scope, Map<Entry, ResultCacheEntryState>>();
+	private readonly score: (entry: Entry) => number;
 
-	constructor(projectors: readonly ActionKeyProjector[] = []) {
+	constructor(projectors: readonly ActionKeyProjector[] = [], score: (entry: Entry) => number = () => 0) {
 		this.index = new ActionStore(projectors);
+		this.score = score;
 	}
 
 	insert(scope: Scope, entry: Entry): Entry | undefined {
@@ -312,8 +314,10 @@ export class ResultCache<Scope, Entry extends SizedActionStoreEntry> {
 		const evicted: Entry[] = [];
 		while (entries.length > maxEntries || bytes > maxBytes) {
 			const victim =
-				entries.find((entry) => this.stateOf(scope, entry) === "probation" && canEvict(entry)) ??
-				entries.find((entry) => this.stateOf(scope, entry) === "protected" && canEvict(entry));
+				this.lowestValue(
+					entries.filter((entry) => this.stateOf(scope, entry) === "probation" && canEvict(entry)),
+				) ??
+				this.lowestValue(entries.filter((entry) => this.stateOf(scope, entry) === "protected" && canEvict(entry)));
 			if (!victim) break;
 			bytes -= entryBytes(victim);
 			this.delete(scope, victim);
@@ -351,12 +355,20 @@ export class ResultCache<Scope, Entry extends SizedActionStoreEntry> {
 				.filter((entry) => this.stateOf(scope, entry) === "protected");
 			const protectedBytes = protectedEntries.reduce((total, entry) => total + entryBytes(entry), 0);
 			if (protectedEntries.length <= protectedEntryLimit && protectedBytes <= protectedByteLimit) break;
-			const victim = protectedEntries[0];
+			const victim = this.lowestValue(protectedEntries);
 			if (!victim) break;
 			this.tiersFor(scope).set(victim, "probation");
 			demoted.push(victim);
 		}
 		return demoted;
+	}
+
+	private lowestValue(entries: readonly Entry[]): Entry | undefined {
+		return entries.reduce<Entry | undefined>(
+			(lowest, entry) =>
+				!lowest || finiteValue(this.score(entry)) < finiteValue(this.score(lowest)) ? entry : lowest,
+			undefined,
+		);
 	}
 }
 
@@ -366,6 +378,10 @@ function finiteLimit(value: number): number {
 
 function finiteFraction(value: number): number {
 	return Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : 0.8;
+}
+
+function finiteValue(value: number): number {
+	return Number.isFinite(value) ? Math.max(0, value) : 0;
 }
 
 function entryBytes(entry: SizedActionStoreEntry): number {

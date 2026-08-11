@@ -633,7 +633,7 @@ export function makeSpeculativeActionRuntime<
 	const projectionRules = [...projectionRuleByID.values()];
 	const keyProjectors = projectionRules;
 	const jobs = new ActionStore<SessionID, RuntimeCandidate<Output>>(keyProjectors);
-	const results = new ResultCache<SessionID, RuntimeCandidate<Output>>(keyProjectors);
+	const results = new ResultCache<SessionID, RuntimeCandidate<Output>>(keyProjectors, candidateCacheValue);
 	// Exclusive branches are deliberately exact-only; projections are for shareable results.
 	const branches = new ActionStore<SessionID, RuntimeCandidate<Output>>();
 	const tokenTotals = new Map<SessionID, number>();
@@ -3378,6 +3378,14 @@ export function candidateToolNames(
 
 export function candidateExecutionMs(candidate: SpeculativeCandidate): number {
 	return candidate.run.status === "ready" || candidate.run.status === "closed" ? (candidate.run.executionMs ?? 0) : 0;
+}
+
+function candidateCacheValue<Output>(candidate: RuntimeCandidate<Output>): number {
+	const savedMs = Math.max(
+		0,
+		candidateExecutionMs(candidate) * Math.max(1, candidate.hits) - candidate.validationMs - candidate.projectionMs,
+	);
+	return savedMs / (finiteMetric(candidate.estimatedBytes) + 4096);
 }
 
 function candidateCompletedAt(candidate: SpeculativeCandidate): number | undefined {
