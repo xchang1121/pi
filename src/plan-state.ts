@@ -55,6 +55,7 @@ type MutablePlan = {
 	id: string;
 	source: string;
 	revision: number;
+	nextRevision: number;
 	draftTokens: number;
 	nodes: Map<string, MutableNode>;
 };
@@ -91,15 +92,36 @@ export class PlanState {
 		return plan ? planSnapshot(plan) : undefined;
 	}
 
-	takeReady(actionSequence: number): readonly PlanExecutionNode[] {
+	reserveRevision(proposalID: string): number | undefined {
+		const plan = this.plans.get(proposalID);
+		if (!plan) return undefined;
+		const revision = Math.max(plan.nextRevision, plan.revision + 1);
+		plan.nextRevision = revision + 1;
+		return revision;
+	}
+
+	retireTerminalPlans(retain: (node: PlanExecutionNode) => boolean = () => false): readonly PlanExecutionNode[] {
+		const retired: PlanExecutionNode[] = [];
+		for (const [id, plan] of this.plans) {
+			const nodes = [...plan.nodes.values()].map((node) => nodeSnapshot(plan, node));
+			if (!nodes.every((node) => terminal(node.state)) || nodes.some(retain)) continue;
+			retired.push(...nodes);
+			this.plans.delete(id);
+		}
+		return Object.freeze(retired);
+	}
+
+	takeReady(
+		actionSequence: number,
+		shouldLaunch?: (node: PlanExecutionNode) => boolean,
+	): readonly PlanExecutionNode[] {
 		const settledSequence = sequence(actionSequence);
+		const launch = shouldLaunch ?? ((node: PlanExecutionNode) => node.launchActionSeq <= settledSequence);
 		for (const plan of this.plans.values()) this.blockImpossible(plan);
 		const ready = this.mutableValues()
 			.filter(
 				({ plan, node }) =>
-					node.state === "deferred" &&
-					node.launchActionSeq <= settledSequence &&
-					this.dependenciesSatisfied(plan, node),
+					node.state === "deferred" && this.dependenciesSatisfied(plan, node) && launch(nodeSnapshot(plan, node)),
 			)
 			.sort(
 				(left, right) =>
@@ -110,6 +132,13 @@ export class PlanState {
 			);
 		for (const { node } of ready) node.state = "launching";
 		return ready.map(({ plan, node }) => nodeSnapshot(plan, node));
+	}
+
+	launchable(): readonly PlanExecutionNode[] {
+		for (const plan of this.plans.values()) this.blockImpossible(plan);
+		return this.mutableValues()
+			.filter(({ plan, node }) => node.state === "deferred" && this.dependenciesSatisfied(plan, node))
+			.map(({ plan, node }) => nodeSnapshot(plan, node));
 	}
 
 	promote(proposalID: string, actionID: string): PlanPromotion {
@@ -281,6 +310,7 @@ export class PlanState {
 			id: input.id,
 			source: input.source,
 			revision: input.revision,
+			nextRevision: Math.max(current?.nextRevision ?? 0, input.revision + 1),
 			draftTokens: input.draftTokens,
 			nodes,
 		};

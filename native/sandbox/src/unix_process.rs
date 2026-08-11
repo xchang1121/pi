@@ -1,6 +1,4 @@
 // Modified for Pi's speculative-action sandbox migration.
-use std::collections::BTreeMap;
-use std::env;
 use std::io;
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -124,19 +122,6 @@ pub fn capture(
     drop(signals);
     close(pipe[0]);
     outcome
-}
-
-pub fn safe_environment() -> BTreeMap<String, String> {
-    env::vars()
-        .filter(|(name, _)| safe_environment_name(name))
-        .collect()
-}
-
-fn safe_environment_name(name: &str) -> bool {
-    matches!(
-        name,
-        "PATH" | "LANG" | "TZ" | "TERM" | "COLORTERM" | "NO_COLOR" | "FORCE_COLOR"
-    ) || name.starts_with("LC_")
 }
 
 fn collect_process(
@@ -301,14 +286,6 @@ fn cvt(value: libc::c_int, operation: &str) -> Result<libc::c_int> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn environment_is_allowlisted() {
-        assert!(safe_environment_name("PATH"));
-        assert!(safe_environment_name("LC_ALL"));
-        assert!(!safe_environment_name("DEEPSEEK_API_KEY"));
-        assert!(!safe_environment_name("SSH_AUTH_SOCK"));
-    }
 
     #[test]
     fn output_tail_is_bounded() {

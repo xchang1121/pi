@@ -1,12 +1,21 @@
 // Modified for Pi's speculative-action sandbox migration.
+use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::fs;
+use std::fs::{self, File};
+use std::io::{Seek, Write};
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandTransport {
+    Argv,
+    Stdin,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -15,6 +24,9 @@ pub struct ExecuteRequest {
     pub command: String,
     #[serde(default)]
     pub shell: Option<String>,
+    pub shell_args: Vec<String>,
+    pub command_transport: CommandTransport,
+    pub environment: BTreeMap<String, String>,
     pub cwd: PathBuf,
     pub sandbox_root: PathBuf,
     pub source_root: PathBuf,
@@ -43,24 +55,24 @@ pub struct CheckResponse {
     pub detail: String,
 }
 
-pub fn shell_arguments(shell: &Path, command: &str) -> Vec<String> {
-    let path = shell.as_os_str().to_string_lossy();
-    let filename = path.rsplit(['/', '\\']).next().unwrap_or_default();
-    let lowercase = filename.to_ascii_lowercase();
-    let name = lowercase.strip_suffix(".exe").unwrap_or(&lowercase);
-    if name == "cmd" {
-        return vec!["/d".into(), "/s".into(), "/c".into(), command.into()];
+pub fn command_arguments(request: &ExecuteRequest, command: &str) -> Vec<String> {
+    let mut arguments = request.shell_args.clone();
+    if request.command_transport == CommandTransport::Argv {
+        arguments.push(command.into());
     }
-    if name == "powershell" || name == "pwsh" {
-        return vec![
-            "-NoLogo".into(),
-            "-NoProfile".into(),
-            "-NonInteractive".into(),
-            "-Command".into(),
-            command.into(),
-        ];
+    arguments
+}
+
+pub fn command_input_file(request: &ExecuteRequest, directory: &Path) -> Result<Option<File>> {
+    if request.command_transport != CommandTransport::Stdin {
+        return Ok(None);
     }
-    vec!["-c".into(), command.into()]
+    let mut input = tempfile::tempfile_in(directory).context("create command stdin")?;
+    input
+        .write_all(request.command.as_bytes())
+        .context("write command stdin")?;
+    input.rewind().context("rewind command stdin")?;
+    Ok(Some(input))
 }
 
 pub fn run(args: &[OsString]) -> i32 {
@@ -132,6 +144,27 @@ fn validate_request(request: &ExecuteRequest) -> Result<()> {
     }
     if request.command.trim().is_empty() {
         bail!("command must not be empty");
+    }
+    if request
+        .shell
+        .as_deref()
+        .is_some_and(|shell| shell.trim().is_empty() || shell.contains('\0'))
+        || request
+            .shell_args
+            .iter()
+            .any(|argument| argument.contains('\0'))
+    {
+        bail!("shell and shellArgs must not be empty or contain NUL");
+    }
+    let mut environment_bytes = 0usize;
+    for (name, value) in &request.environment {
+        if name.is_empty() || name.contains(['=', '\0']) || value.contains('\0') {
+            bail!("environment contains an invalid entry");
+        }
+        environment_bytes = environment_bytes.saturating_add(name.len() + value.len() + 2);
+    }
+    if environment_bytes > 4 * 1024 * 1024 {
+        bail!("environment must not exceed 4194304 bytes");
     }
     if !request.cwd.is_absolute()
         || !request.sandbox_root.is_absolute()
@@ -245,6 +278,9 @@ mod tests {
             version: PROTOCOL_VERSION,
             command: "printf ok".into(),
             shell: Some("/bin/sh".into()),
+            shell_args: vec!["-c".into()],
+            command_transport: CommandTransport::Argv,
+            environment: BTreeMap::from([("PATH".into(), "/usr/bin".into())]),
             cwd: PathBuf::from("/tmp/sandbox/work"),
             sandbox_root: PathBuf::from("/tmp/sandbox"),
             source_root: PathBuf::from("/source"),
@@ -267,6 +303,9 @@ mod tests {
             version: PROTOCOL_VERSION,
             command: "true".into(),
             shell: None,
+            shell_args: vec!["-c".into()],
+            command_transport: CommandTransport::Argv,
+            environment: BTreeMap::new(),
             cwd: PathBuf::from("/tmp/elsewhere"),
             sandbox_root: PathBuf::from("/tmp/sandbox"),
             source_root: PathBuf::from("/source"),
@@ -282,6 +321,9 @@ mod tests {
             version: PROTOCOL_VERSION,
             command: "true".into(),
             shell: None,
+            shell_args: vec!["-c".into()],
+            command_transport: CommandTransport::Argv,
+            environment: BTreeMap::new(),
             cwd: PathBuf::from("/tmp/source/sandbox"),
             sandbox_root: PathBuf::from("/tmp/source/sandbox"),
             source_root: PathBuf::from("/tmp/source"),
@@ -311,24 +353,28 @@ mod tests {
     }
 
     #[test]
-    fn uses_shell_specific_command_arguments() {
+    fn preserves_resolved_shell_arguments_and_transport() {
+        let mut request = ExecuteRequest {
+            version: PROTOCOL_VERSION,
+            command: "printf ok".into(),
+            shell: Some("/bin/bash".into()),
+            shell_args: vec!["--noprofile".into(), "-c".into()],
+            command_transport: CommandTransport::Argv,
+            environment: BTreeMap::new(),
+            cwd: PathBuf::from("/tmp/sandbox"),
+            sandbox_root: PathBuf::from("/tmp/sandbox"),
+            source_root: PathBuf::from("/source"),
+            timeout_ms: 1,
+            max_output_bytes: 16_384,
+        };
         assert_eq!(
-            shell_arguments(Path::new("/bin/bash"), "printf ok"),
-            vec!["-c", "printf ok"]
+            command_arguments(&request, &request.command),
+            vec!["--noprofile", "-c", "printf ok"]
         );
+        request.command_transport = CommandTransport::Stdin;
         assert_eq!(
-            shell_arguments(Path::new(r"C:\Windows\System32\cmd.exe"), "echo ok"),
-            vec!["/d", "/s", "/c", "echo ok"]
-        );
-        assert_eq!(
-            shell_arguments(Path::new("pwsh.exe"), "Write-Output ok"),
-            vec![
-                "-NoLogo",
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "Write-Output ok"
-            ]
+            command_arguments(&request, &request.command),
+            vec!["--noprofile", "-c"]
         );
     }
 }

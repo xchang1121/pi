@@ -20,16 +20,32 @@ export type SpeculativeSchedulingMetadata = {
 	readonly resource: SpeculativeResourceProfile;
 };
 
+export type SpeculativeAdmissionGroup = {
+	readonly id: string;
+	readonly limit: number;
+};
+
+export type SpeculativeDeadline = {
+	readonly stepsUntilCall: number;
+	readonly averageStepMs: number;
+	readonly expectedDurationMs: number;
+	readonly safetyMarginMs?: number;
+};
+
 export type SpeculativeSchedulerEntry<Job> = {
 	readonly job: Job;
 	readonly metadata: SpeculativeSchedulingMetadata;
 	readonly utility: number;
 	readonly sequence: number;
+	readonly group?: string;
 };
 
 export type SpeculativeAdmission<Job> =
 	| { readonly admitted: true; readonly preempted: ReadonlyArray<Job>; readonly utility: number }
-	| { readonly admitted: false; readonly reason: "budget_exhausted" | "insufficient_expected_benefit" };
+	| {
+			readonly admitted: false;
+			readonly reason: "budget_exhausted" | "group_exhausted" | "insufficient_expected_benefit";
+	  };
 
 export class ToolSpeculationScheduler<Job extends object> {
 	private readonly running = new Map<Job, SpeculativeSchedulerEntry<Job>>();
@@ -39,6 +55,7 @@ export class ToolSpeculationScheduler<Job extends object> {
 		job: Job,
 		metadata: SpeculativeSchedulingMetadata,
 		capacity: number | SpeculativeResourceBudget,
+		group?: SpeculativeAdmissionGroup,
 	): SpeculativeAdmission<Job> {
 		const normalized = normalizeMetadata(metadata);
 		const utility = expectedUtility(normalized);
@@ -48,8 +65,18 @@ export class ToolSpeculationScheduler<Job extends object> {
 		const budget = normalizeBudget(capacity);
 		const victims: SpeculativeSchedulerEntry<Job>[] = [];
 		let remaining = [...this.running.values()];
+		const normalizedGroup = group ? { id: group.id, limit: normalizeUnits(group.limit) } : undefined;
+		if (normalizedGroup && groupSize(remaining, normalizedGroup.id) >= normalizedGroup.limit) {
+			const victim = this.lowestUtility().find(
+				(entry) => entry.group === normalizedGroup.id && entry.utility < utility,
+			);
+			if (!victim) return { admitted: false, reason: "group_exhausted" };
+			victims.push(victim);
+			remaining = remaining.filter((entry) => entry !== victim);
+		}
 		if (!fits(remaining, normalized.resource, budget)) {
 			for (const entry of this.lowestUtility()) {
+				if (victims.includes(entry)) continue;
 				if (entry.utility >= utility) break;
 				if (!helpsFit(remaining, entry, normalized.resource, budget)) continue;
 				victims.push(entry);
@@ -59,7 +86,13 @@ export class ToolSpeculationScheduler<Job extends object> {
 			if (!fits(remaining, normalized.resource, budget)) return { admitted: false, reason: "budget_exhausted" };
 		}
 		for (const victim of victims) this.running.delete(victim.job);
-		this.running.set(job, { job, metadata: normalized, utility, sequence: ++this.sequence });
+		this.running.set(job, {
+			job,
+			metadata: normalized,
+			utility,
+			sequence: ++this.sequence,
+			...(normalizedGroup ? { group: normalizedGroup.id } : {}),
+		});
 		return { admitted: true, preempted: victims.map((entry) => entry.job), utility };
 	}
 
@@ -154,6 +187,15 @@ export function speculativeResourceBudget(capacity: number): SpeculativeResource
 export function expectedUtility(metadata: SpeculativeSchedulingMetadata) {
 	const normalized = normalizeMetadata(metadata);
 	return (normalized.expectedBenefitMs - (normalized.overheadCostMs ?? 0)) / normalized.resource.units;
+}
+
+export function speculativeLaunchDelay(deadline: SpeculativeDeadline): number {
+	const steps = Math.max(0, Math.floor(finite(deadline.stepsUntilCall)));
+	if (steps <= 1) return 0;
+	const stepMs = Math.max(1, finite(deadline.averageStepMs));
+	const durationMs = Math.max(0, finite(deadline.expectedDurationMs));
+	const safetyMarginMs = Math.max(25, finite(deadline.safetyMarginMs ?? 0), Math.min(stepMs, durationMs) * 0.1);
+	return Math.max(0, steps * stepMs - durationMs - safetyMarginMs);
 }
 
 export function resourceProfile(
@@ -257,6 +299,10 @@ function classUnits<Job>(
 				: 0),
 		0,
 	);
+}
+
+function groupSize<Job>(entries: ReadonlyArray<SpeculativeSchedulerEntry<Job>>, group: string): number {
+	return entries.reduce((count, entry) => count + (entry.group === group ? 1 : 0), 0);
 }
 
 function normalizeUnits(value: number) {

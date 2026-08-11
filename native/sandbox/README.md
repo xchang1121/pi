@@ -10,8 +10,8 @@ JSON protocol on every supported platform:
 - macOS: an in-process Seatbelt profile with source/home/network denial,
   staged-workspace writes, and process-tree supervision.
 - Windows: a per-user, zero-capability AppContainer; package-SID access only
-  to the staged workspace; a restricted base token; a private desktop;
-  process mitigations; explicit handle inheritance; and kill-on-close Jobs.
+  to the staged workspace; a private desktop; process mitigations; explicit
+  handle inheritance; and kill-on-close Jobs.
 
 The package build helper compiles this crate, hashes the result, and records a
 platform asset in `prebuilds/manifest.json`. The TypeScript broker verifies

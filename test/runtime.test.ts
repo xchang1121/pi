@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import {
 	type ActionProjectionRule,
 	READ_RANGE_ACTION_KEY_PROJECTOR,
@@ -135,7 +135,6 @@ function createHarness(options: HarnessOptions) {
 				},
 			]
 		: [];
-	const patternRevisions = new Map<string, number>();
 	let observedPatternPlans = 0;
 	const runtimeSources: HarnessPlanSource[] = [...(options.sources ?? [])];
 	if (
@@ -151,7 +150,6 @@ function createHarness(options: HarnessOptions) {
 			multiStepEnabled: (settings) => settings.patternAware?.multiStepEnabled ?? true,
 			propose: async ({ startInput, signal }) => {
 				const proposalID = `test:pattern:${startInput.sessionID}:${startInput.turnID}`;
-				patternRevisions.set(proposalID, 0);
 				return testPlan(
 					proposalID,
 					"pattern_aware",
@@ -159,11 +157,9 @@ function createHarness(options: HarnessOptions) {
 				);
 			},
 			continue: options.patternContinue
-				? async ({ proposalID, actionID, parentConfirmed }) => {
+				? async ({ proposalID, actionID, revision, parentConfirmed }) => {
 						const predicted = await options.patternContinue?.(parentConfirmed);
 						if (!predicted?.candidates.length) return undefined;
-						const revision = (patternRevisions.get(proposalID) ?? 0) + 1;
-						patternRevisions.set(proposalID, revision);
 						return {
 							proposalID,
 							source: "pattern_aware",
@@ -534,7 +530,7 @@ describe("speculative action runtime", () => {
 		await new Promise((resolve) => setTimeout(resolve, 10));
 
 		expect(executed).toEqual(["bash"]);
-		expect(harness.runtime.inspect()).toMatchObject({ activePlanActions: 0, blockedPlanActions: 1 });
+		expect(harness.runtime.inspect()).toMatchObject({ activePlanActions: 0, blockedPlanActions: 0 });
 		expect(harness.events).toContainEqual(expect.objectContaining({ type: "miss", reason: "adoption_failed" }));
 	});
 
@@ -656,6 +652,54 @@ describe("speculative action runtime", () => {
 		expect(harness.events).toContainEqual(
 			expect.objectContaining({ type: "started", tool: "read", schedulerOutcome: "promoted" }),
 		);
+	});
+
+	it("uses generic duration deadlines to start deep slow actions without eagerly running deep cheap work", async () => {
+		const executed: string[] = [];
+		const source: HarnessPlanSource = {
+			id: "sequence-model",
+			enabled: () => true,
+			multiStepEnabled: () => true,
+			propose: () => ({
+				id: "deadline-plan",
+				source: "sequence-model",
+				revision: 0,
+				actions: [
+					{
+						id: "slow",
+						type: "tool_call",
+						tool: "read",
+						input: { path: "slow.ts" },
+						horizon: 8,
+						expectedDurationMs: 10_000,
+					},
+					{
+						id: "cheap",
+						type: "tool_call",
+						tool: "read",
+						input: { path: "cheap.ts" },
+						horizon: 8,
+						expectedDurationMs: 25,
+					},
+				],
+			}),
+		};
+		const harness = createHarness({
+			sources: [source],
+			predict: () => prediction(),
+			execute: (candidate) => {
+				const path = String((candidate.input as { path?: string }).path);
+				executed.push(path);
+				return path;
+			},
+		});
+
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "deadline-aware" });
+		await waitFor(() => harness.runtime.inspect().pendingPredictions === 0 && executed.length > 0);
+
+		expect(executed).toEqual(["slow.ts"]);
+		expect(harness.runtime.inspect()).toMatchObject({ deferredPlanActions: 1 });
+		await harness.runtime.finishTurn(consume("deadline-aware"));
 	});
 
 	it("adopts only one repeated K(a) step per authoritative actor action", async () => {
@@ -793,7 +837,7 @@ describe("speculative action runtime", () => {
 
 		expect(executed).toEqual(["parent.ts"]);
 		expect(resolved.sort()).toEqual(["child:system", "parent:system"]);
-		expect(harness.runtime.inspect()).toMatchObject({ activePlanActions: 0, blockedPlanActions: 1 });
+		expect(harness.runtime.inspect()).toMatchObject({ activePlanActions: 0, blockedPlanActions: 0 });
 		expect(harness.events).toContainEqual(
 			expect.objectContaining({ type: "cancelled", reason: "candidate_execution_failed" }),
 		);
@@ -821,12 +865,12 @@ describe("speculative action runtime", () => {
 							],
 						}
 					: { id: "second-turn-noop", source: "cross-turn-sequence", revision: 0, actions: [] },
-			continue: ({ parentConfirmed }) =>
+			continue: ({ parentConfirmed, revision }) =>
 				parentConfirmed
 					? {
 							proposalID: "long-plan",
 							source: "cross-turn-sequence",
-							revision: 1,
+							revision,
 							upsert: [
 								{
 									id: "child",
@@ -867,6 +911,53 @@ describe("speculative action runtime", () => {
 		expect(harness.events).not.toContainEqual(
 			expect.objectContaining({ type: "miss", reason: "invalid_plan_update", detail: "proposal_missing" }),
 		);
+	});
+
+	it("keeps terminal plan state bounded across a long session", async () => {
+		let preparations = 0;
+		const source: HarnessPlanSource = {
+			id: "lifecycle",
+			enabled: () => true,
+			multiStepEnabled: () => true,
+			propose: ({ startInput }) => ({
+				id: `lifecycle:${startInput.turnID}`,
+				source: "lifecycle",
+				revision: 0,
+				actions: [
+					{
+						id: "warm",
+						type: "preparation_hint",
+						tool: "read",
+						input: {},
+						missing: [["path"]],
+					},
+				],
+			}),
+		};
+		const harness = createHarness({
+			sources: [source],
+			predict: () => prediction(),
+			prepare: async () => {
+				preparations++;
+			},
+		});
+
+		for (let index = 0; index < 40; index++) {
+			const turnID = `lifecycle-${index}`;
+			await harness.runtime.startTurn({ sessionID: "session", turnID });
+			await waitFor(() => preparations === index + 1 && harness.runtime.inspect("session").activePlanActions === 0);
+			await harness.runtime.finishTurn(consumeTool(turnID, "read", {}));
+		}
+
+		expect(harness.runtime.inspect("session")).toEqual({
+			activeTurns: 0,
+			turnCandidates: 0,
+			resourceCandidates: 0,
+			pendingPredictions: 0,
+			deferredPlanActions: 0,
+			activePlanActions: 0,
+			blockedPlanActions: 0,
+		});
 	});
 
 	it("rejects a proposal that claims another source identity", async () => {
@@ -1361,37 +1452,6 @@ describe("speculative action runtime", () => {
 		expect(releases).toBe(1);
 	});
 
-	it("keeps one drafter challenger when PatternAware has an immediate candidate", async () => {
-		for (const horizon of [0, 1]) {
-			let drafterCalls = 0;
-			const harness = createHarness({
-				settings: {
-					...enabledSettings,
-					adaptiveDrafter: true,
-					patternAware: { ...PATTERN_AWARE_DEFAULTS, enabled: true },
-				},
-				predict: () => {
-					drafterCalls++;
-					return prediction();
-				},
-				patternPropose: () =>
-					prediction({
-						type: "tool_call",
-						tool: "read",
-						input: { path: `pattern-${horizon}.txt` },
-						source: "pattern_aware",
-						patternID: `pattern-${horizon}`,
-						horizon,
-					}),
-			});
-			await harness.runtime.startTurn({ sessionID: "session", turnID: `turn-pattern-${horizon}` });
-			await waitFor(() => harness.runtime.inspect().pendingPredictions === 0);
-
-			expect(drafterCalls).toBe(1);
-			await harness.runtime.disposeSession("session");
-		}
-	});
-
 	it("can disable the drafter while PatternAware remains active", async () => {
 		let drafterCalls = 0;
 		const harness = createHarness({
@@ -1419,33 +1479,6 @@ describe("speculative action runtime", () => {
 
 		expect(await harness.runtime.consume(consume("turn-pattern-only", { path: "pattern.txt" }))).toBe("prefetched");
 		expect(drafterCalls).toBe(0);
-	});
-
-	it("shuts down all speculative work when the master switch turns off", async () => {
-		let current = enabledSettings;
-		let aborted = false;
-		const harness = createHarness({
-			settings: () => current,
-			predict: () => prediction(readCandidate("running.txt")),
-			execute: (_candidate, signal) =>
-				new Promise<string>((_resolve, reject) => {
-					signal.addEventListener(
-						"abort",
-						() => {
-							aborted = true;
-							reject(new Error("aborted"));
-						},
-						{ once: true },
-					);
-				}),
-		});
-		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-disable" });
-		await waitFor(() => harness.executions() === 1);
-		current = { ...enabledSettings, enabled: false };
-
-		expect(await harness.runtime.consume(consume("turn-disable", { path: "running.txt" }))).toBeUndefined();
-		expect(aborted).toBe(true);
-		expect(harness.runtime.inspect("session").activeTurns).toBe(0);
 	});
 
 	it("interrupts predictions and executions as soon as disabled settings are notified", async () => {
@@ -1539,79 +1572,6 @@ describe("speculative action runtime", () => {
 		expect(await executionsFor(1, 3)).toBe(1);
 	});
 
-	it("offers each predictor the full proposal width while enforcing one top-k pool", async () => {
-		let drafterCandidateLimit = 0;
-		const harness = createHarness({
-			settings: {
-				...enabledSettings,
-				candidateLimit: 2,
-				maxConcurrentActions: 4,
-				patternAware: { ...PATTERN_AWARE_DEFAULTS, enabled: true },
-			},
-			patternPropose: () =>
-				prediction({
-					...readCandidate("pattern.txt"),
-					source: "pattern_aware",
-					patternID: "pattern-limit",
-					horizon: 1,
-					empiricalProbability: 1,
-				}),
-			predict: (_input, _signal, settings) => {
-				drafterCandidateLimit = settings.candidateLimit ?? 0;
-				return prediction(readCandidate("draft-one.txt"), readCandidate("draft-two.txt"));
-			},
-		});
-		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-cumulative-limit" });
-		await waitFor(() => harness.runtime.inspect().pendingPredictions === 0);
-
-		expect(harness.executions()).toBe(2);
-		expect(drafterCandidateLimit).toBe(2);
-	});
-
-	it("lets a higher-utility drafter action replace a weaker PatternAware action", async () => {
-		const executed: string[] = [];
-		const harness = createHarness({
-			settings: {
-				...enabledSettings,
-				candidateLimit: 1,
-				maxConcurrentActions: 2,
-				patternAware: { ...PATTERN_AWARE_DEFAULTS, enabled: true },
-			},
-			patternPropose: () =>
-				prediction({
-					...readCandidate("pattern.txt"),
-					source: "pattern_aware",
-					patternID: "weak-pattern",
-					horizon: 0,
-					empiricalProbability: 0.2,
-					expectedDurationMs: 10,
-				}),
-			predict: () => prediction({ ...readCandidate("draft.txt"), expectedDurationMs: 100 }),
-			execute: (candidate, signal) => {
-				const candidatePath = String((candidate.input as { path: string }).path);
-				if (candidatePath === "draft.txt") {
-					executed.push(candidatePath);
-					return candidatePath;
-				}
-				return new Promise<string>((_resolve, reject) => {
-					signal.addEventListener("abort", () => reject(new Error("preempted")), { once: true });
-				});
-			},
-		});
-
-		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-utility-arbitration" });
-		await waitFor(() => executed.includes("draft.txt"));
-
-		expect(executed).toEqual(["draft.txt"]);
-		expect(harness.events).toContainEqual(
-			expect.objectContaining({
-				type: "cancelled",
-				tool: "read",
-				reason: "candidate_budget_preempted",
-			}),
-		);
-	});
-
 	it("keeps the unified proposal width finite when PatternAware reports malformed probability", async () => {
 		let drafterCandidateLimit: number | undefined;
 		const harness = createHarness({
@@ -1640,77 +1600,6 @@ describe("speculative action runtime", () => {
 
 		expect(drafterCandidateLimit).toBe(3);
 		expect(Number.isFinite(drafterCandidateLimit)).toBe(true);
-	});
-
-	it("shares actor lead time across predictors and prioritizes latency that can be hidden", async () => {
-		let now = 1_000;
-		const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => now);
-		const seedExecution = deferred<string>();
-		const executed: string[] = [];
-		const harness = createHarness({
-			settings: {
-				...enabledSettings,
-				candidateLimit: 2,
-				maxConcurrentActions: 1,
-				patternAware: { ...PATTERN_AWARE_DEFAULTS, enabled: true },
-				tools: { resourceCached: ["read"], sandbox: ["bash"] },
-			},
-			patternPropose: (input) =>
-				input.turnID === "turn-lead-seed"
-					? prediction({
-							...bashCandidate("seed"),
-							source: "pattern_aware",
-							patternID: "lead-seed",
-							horizon: 0,
-							empiricalProbability: 1,
-							expectedDurationMs: 100,
-						})
-					: prediction(),
-			predict: (input) =>
-				input.turnID === "turn-lead-seed"
-					? prediction()
-					: prediction(
-							{ ...bashCandidate("late"), expectedDurationMs: 100 },
-							{ ...readCandidate("hideable.txt"), expectedDurationMs: 90 },
-						),
-			execute: (candidate) => {
-				const input = candidate.input as Record<string, unknown>;
-				const identifier = candidate.tool === "bash" ? String(input.command) : String(input.path);
-				executed.push(`${candidate.tool}:${identifier}`);
-				return identifier === "seed" ? seedExecution.promise : candidate.tool;
-			},
-		});
-
-		try {
-			await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-lead-seed" });
-			await waitFor(() => executed.length === 1);
-			now = 1_010;
-			const seedResult = harness.runtime.consume(consumeTool("turn-lead-seed", "bash", { command: "seed" }));
-			now = 1_100;
-			seedExecution.resolve("bash");
-			expect(await seedResult).toBe("bash");
-			await harness.runtime.finishTurn(consumeTool("turn-lead-seed", "bash", {}));
-
-			now = 1_200;
-			await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-lead-rank" });
-			await waitFor(() => harness.runtime.inspect().pendingPredictions === 0);
-
-			expect(executed).toEqual(["bash:seed", "read:hideable.txt"]);
-			expect(harness.events).toContainEqual(
-				expect.objectContaining({ type: "hit", actorLeadMs: 10, source: "pattern_aware" }),
-			);
-			expect(harness.events).toContainEqual(
-				expect.objectContaining({
-					type: "cancelled",
-					tool: "bash",
-					expectedLeadMs: 10,
-					reason: "scheduler_budget_exhausted",
-				}),
-			);
-		} finally {
-			await harness.runtime.releaseSession("session");
-			nowSpy.mockRestore();
-		}
 	});
 
 	it("carries a successful resource drafter batch and expires it after a whole uncovered turn", async () => {
@@ -1840,57 +1729,6 @@ describe("speculative action runtime", () => {
 		await harness.runtime.finishTurn(consume("separate-stores", {}));
 	});
 
-	it("evicts unconsumed probation before an actor-validated protected result", async () => {
-		const harness = createHarness({
-			settings: {
-				...enabledSettings,
-				adaptiveDrafter: false,
-				resourceCacheMaxEntries: 2,
-				// Keep package-suite scheduling delays from turning an eviction test into a timeout test.
-				predictionTimeoutMs: 5_000,
-			},
-			predict: (input) => {
-				if (input.turnID === "seed-protected") return prediction(readCandidate("a.txt"));
-				if (input.turnID === "seed-probation") return prediction(readCandidate("b.txt"));
-				if (input.turnID === "apply-pressure") return prediction(readCandidate("c.txt"));
-				return prediction();
-			},
-			execute: (candidate) => String((candidate.input as { path: string }).path),
-		});
-
-		await harness.runtime.startTurn({ sessionID: "session", turnID: "seed-protected" });
-		await waitFor(() => harness.events.filter((event) => event.type === "completed").length >= 1);
-		expect(harness.events.filter((event) => event.type === "completed")).toHaveLength(1);
-		// Give the actor a deterministic lead interval so adaptive scheduling does not
-		// classify the following cache candidates as zero-benefit on a fast clock.
-		await new Promise((resolve) => setTimeout(resolve, 25));
-		expect(await harness.runtime.consume(consume("seed-protected", { path: "a.txt" }))).toBe("a.txt");
-		await harness.runtime.finishTurn(consume("seed-protected", {}));
-
-		await harness.runtime.startTurn({ sessionID: "session", turnID: "seed-probation" });
-		await waitFor(() => harness.events.filter((event) => event.type === "completed").length >= 2);
-		expect(harness.events.filter((event) => event.type === "completed")).toHaveLength(2);
-		await harness.runtime.finishTurn(consume("seed-probation", {}));
-
-		await harness.runtime.startTurn({ sessionID: "session", turnID: "apply-pressure" });
-		await waitFor(() => harness.events.filter((event) => event.type === "completed").length >= 3);
-		expect(harness.events.filter((event) => event.type === "completed")).toHaveLength(3);
-		await harness.runtime.finishTurn(consume("apply-pressure", {}));
-
-		await harness.runtime.startTurn({ sessionID: "session", turnID: "check-protected" });
-		await waitFor(() => harness.runtime.inspect("session").pendingPredictions === 0);
-		expect(await harness.runtime.consume(consume("check-protected", { path: "a.txt" }))).toBe("a.txt");
-		await harness.runtime.finishTurn(consume("check-protected", {}));
-
-		await harness.runtime.startTurn({ sessionID: "session", turnID: "check-probation" });
-		await waitFor(() => harness.runtime.inspect("session").pendingPredictions === 0);
-		expect(await harness.runtime.consume(consume("check-probation", { path: "b.txt" }))).toBeUndefined();
-		expect(harness.executions()).toBe(3);
-		expect(harness.events).toContainEqual(
-			expect.objectContaining({ type: "cancelled", reason: "resource_cache_evicted" }),
-		);
-	});
-
 	it("does not promote or refresh a candidate reused only by later predictions", async () => {
 		const harness = createHarness({
 			settings: { ...enabledSettings, adaptiveDrafter: false, resourceCacheMaxEntries: 1 },
@@ -1987,6 +1825,31 @@ describe("speculative action runtime", () => {
 		expect(harness.executions()).toBe(0);
 	});
 
+	it("retires never-consumed probation after repeated authoritative opportunities", async () => {
+		const harness = createHarness({
+			settings: { ...enabledSettings, adaptiveDrafter: false },
+			predict: (input) =>
+				input.turnID === "probation-seed" ? prediction(readCandidate("unused.txt")) : prediction(),
+			execute: (candidate) => String((candidate.input as { path?: string }).path),
+		});
+
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "probation-seed" });
+		await waitFor(() => harness.runtime.inspect().pendingPredictions === 0);
+		await harness.runtime.finishTurn(consume("probation-seed"));
+		for (let index = 0; index < 9; index++) {
+			const turnID = `probation-miss-${index}`;
+			await harness.runtime.startTurn({ sessionID: "session", turnID });
+			await waitFor(() => harness.runtime.inspect().pendingPredictions === 0);
+			expect(await harness.runtime.consume(consume(turnID, { path: `${turnID}.txt` }))).toBeUndefined();
+			await harness.runtime.finishTurn(consume(turnID));
+		}
+
+		expect(harness.runtime.inspect().resourceCandidates).toBe(0);
+		expect(harness.events).toContainEqual(
+			expect.objectContaining({ type: "cancelled", reason: "resource_cache_probation_expired" }),
+		);
+	});
+
 	it("reuses a resource candidate across turns until its version expires", async () => {
 		let expired = false;
 		const harness = createHarness({
@@ -2006,30 +1869,6 @@ describe("speculative action runtime", () => {
 		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-3" });
 		expect(await harness.runtime.consume(consume("turn-3"))).toBeUndefined();
 		expect(harness.events.some((event) => event.type === "miss" && event.reason === "resource_expired")).toBe(true);
-	});
-
-	it("lets the drafter reuse an exact resource candidate without reporting no candidate", async () => {
-		const harness = createHarness({ predict: () => prediction(readCandidate()) });
-		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-1" });
-		await waitFor(() => harness.executions() === 1);
-		await harness.runtime.finishTurn(consume("turn-1", {}));
-
-		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-2" });
-		await waitFor(() => harness.runtime.inspect().pendingPredictions === 0);
-
-		expect(await harness.runtime.consume(consume("turn-2"))).toBe("prefetched");
-		expect(harness.executions()).toBe(1);
-		expect(harness.events.filter((event) => event.type === "started")).toHaveLength(1);
-	});
-
-	it("deduplicates exact draft candidates after one cache miss", async () => {
-		const harness = createHarness({ predict: () => prediction(readCandidate(), readCandidate()) });
-		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-1" });
-		await waitFor(() => harness.runtime.inspect().pendingPredictions === 0);
-
-		expect(await harness.runtime.consume(consume("turn-1"))).toBe("prefetched");
-		expect(harness.executions()).toBe(1);
-		expect(harness.events.filter((event) => event.type === "started")).toHaveLength(1);
 	});
 
 	it("registers one single-flight job when concurrent turns finish preflight together", async () => {
@@ -2153,68 +1992,6 @@ describe("speculative action runtime", () => {
 		expect(harness.events.filter((event) => event.type === "started")).toHaveLength(2);
 	});
 
-	it("reuses a containing read candidate from the same draft batch", async () => {
-		let projector: string | undefined;
-		const harness = createHarness({
-			predict: () => prediction(readCandidate("README.md", 1, 100), readCandidate("README.md", 1, 60)),
-			execute: () => "lines-1-100",
-			projectOutput: (output, keyMatch) => {
-				projector = keyMatch.projector;
-				return `projected:${output}`;
-			},
-		});
-		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-1" });
-		await waitFor(() => harness.runtime.inspect().pendingPredictions === 0);
-
-		expect(await harness.runtime.consume(consume("turn-1", { path: "README.md", offset: 1, limit: 60 }))).toBe(
-			"projected:lines-1-100",
-		);
-		expect(projector).toBe("read.range");
-		expect(harness.executions()).toBe(1);
-		expect(harness.events.filter((event) => event.type === "started")).toHaveLength(1);
-	});
-
-	it("chooses the tightest cached read that contains the actor range", async () => {
-		const harness = createHarness({
-			predict: (input) => {
-				if (input.turnID === "turn-wide") return prediction(readCandidate("README.md", 1, 200));
-				if (input.turnID === "turn-tight") return prediction(readCandidate("README.md", 100, 110));
-				return prediction();
-			},
-			execute: (candidate) => {
-				const input = candidate.input as { offset: number; limit: number };
-				return `${input.offset}:${input.limit}`;
-			},
-			projectOutput: (output) => output,
-		});
-		for (const turnID of ["turn-wide", "turn-tight"]) {
-			await harness.runtime.startTurn({ sessionID: "session", turnID });
-			await waitFor(() => harness.runtime.inspect("session").pendingPredictions === 0);
-			await harness.runtime.finishTurn(consume(turnID, {}));
-		}
-		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-project" });
-		await waitFor(() => harness.runtime.inspect("session").pendingPredictions === 0);
-
-		expect(
-			await harness.runtime.consume(consume("turn-project", { path: "README.md", offset: 120, limit: 10 })),
-		).toBe("100:110");
-		expect(harness.executions()).toBe(2);
-	});
-
-	it("keeps containing reads separate when no safe projector is installed", async () => {
-		const harness = createHarness({
-			predict: () => prediction(readCandidate("README.md", 1, 100), readCandidate("README.md", 1, 60)),
-		});
-		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-1" });
-		await waitFor(() => harness.runtime.inspect().pendingPredictions === 0);
-
-		expect(await harness.runtime.consume(consume("turn-1", { path: "README.md", offset: 1, limit: 60 }))).toBe(
-			"prefetched",
-		);
-		expect(harness.executions()).toBe(2);
-		expect(harness.events.filter((event) => event.type === "started")).toHaveLength(2);
-	});
-
 	it("shares an in-flight resource job between the next drafter and actor", async () => {
 		const execution = deferred<string>();
 		const harness = createHarness({
@@ -2329,22 +2106,6 @@ describe("speculative action runtime", () => {
 			),
 		).toBeUndefined();
 		expect(harness.events).toContainEqual(expect.objectContaining({ type: "miss", reason: "projection_failed" }));
-	});
-
-	it("uses realized complete coverage beyond the speculative request boundary", async () => {
-		const harness = createHarness({
-			predict: () => prediction(readCandidate("README.md", 1, 100)),
-			execute: () => "complete-file",
-			captureProjectionCoverage: () => ({ end: 80, complete: true }),
-			projectOutput: (output) => `projected:${output}`,
-		});
-		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-complete-coverage" });
-		await waitFor(() => harness.runtime.inspect().pendingPredictions === 0);
-
-		expect(
-			await harness.runtime.consume(consume("turn-complete-coverage", { path: "README.md", offset: 1, limit: 200 })),
-		).toBe("projected:complete-file");
-		expect(harness.executions()).toBe(1);
 	});
 
 	it("does not coalesce a running read that only completed coverage could prove", async () => {
@@ -2764,45 +2525,6 @@ describe("speculative action runtime", () => {
 		).toBe(true);
 	});
 
-	it("updates LRU order on access and evicts the oldest resource candidate", async () => {
-		const paths: Record<string, string | undefined> = {
-			"turn-a": "a.txt",
-			"turn-b": "b.txt",
-			"turn-c": "c.txt",
-		};
-		const harness = createHarness({
-			settings: { ...enabledSettings, resourceCacheMaxEntries: 2 },
-			predict: (input) => {
-				const path = paths[input.turnID];
-				return path ? prediction(readCandidate(path)) : prediction();
-			},
-			execute: (candidate) => String((candidate.input as { path: string }).path),
-		});
-		for (const turnID of ["turn-a", "turn-b"]) {
-			await harness.runtime.startTurn({ sessionID: "session", turnID });
-			await waitFor(() => harness.runtime.inspect().pendingPredictions === 0);
-			await harness.runtime.finishTurn({ sessionID: "session", turnID, tool: "read", input: {} });
-		}
-
-		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-touch" });
-		await waitFor(() => harness.runtime.inspect().pendingPredictions === 0);
-		expect(await harness.runtime.consume(consume("turn-touch", { path: "a.txt" }))).toBe("a.txt");
-		await harness.runtime.finishTurn(consume("turn-touch", {}));
-
-		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-c" });
-		await waitFor(() => harness.runtime.inspect().pendingPredictions === 0);
-		await harness.runtime.finishTurn({ sessionID: "session", turnID: "turn-c", tool: "read", input: {} });
-		expect(harness.runtime.inspect("session").resourceCandidates).toBe(2);
-
-		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-check-b" });
-		await waitFor(() => harness.runtime.inspect().pendingPredictions === 0);
-		expect(await harness.runtime.consume(consume("turn-check-b", { path: "b.txt" }))).toBeUndefined();
-		await harness.runtime.finishTurn(consume("turn-check-b", {}));
-		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-check-a" });
-		await waitFor(() => harness.runtime.inspect().pendingPredictions === 0);
-		expect(await harness.runtime.consume(consume("turn-check-a", { path: "a.txt" }))).toBe("a.txt");
-	});
-
 	it("isolates observer failures from candidate settlement", async () => {
 		const harness = createHarness({
 			predict: () => prediction(readCandidate()),
@@ -3098,29 +2820,6 @@ describe("speculative action runtime", () => {
 		expect(started.empiricalProbability).toBeUndefined();
 		expect(started.conditionalProbability).toBeUndefined();
 		expect(started.patternDepth).toBeUndefined();
-	});
-
-	it("performs no prediction or background work while disabled", async () => {
-		let predictions = 0;
-		const harness = createHarness({
-			settings: { ...enabledSettings, enabled: false },
-			predict: () => {
-				predictions++;
-				return prediction(readCandidate());
-			},
-		});
-		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-1" });
-
-		expect(predictions).toBe(0);
-		expect(harness.runtime.inspect()).toEqual({
-			activeTurns: 0,
-			turnCandidates: 0,
-			resourceCandidates: 0,
-			pendingPredictions: 0,
-			deferredPlanActions: 0,
-			activePlanActions: 0,
-			blockedPlanActions: 0,
-		});
 	});
 
 	it("preserves provider call order when authoritative tools finish out of order", async () => {

@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { contains } from "./common.ts";
 import type { SandboxProcessRunner, SandboxProcessRunnerInput } from "./workspace-sandbox.ts";
 
-export const NATIVE_SANDBOX_PROTOCOL_VERSION = 3;
+export const NATIVE_SANDBOX_PROTOCOL_VERSION = 4;
 export const NATIVE_SANDBOX_DEFAULT_TIMEOUT_MS = 120_000;
 export const NATIVE_SANDBOX_DEFAULT_MAX_OUTPUT_BYTES = 1024 * 1024;
 
@@ -122,7 +122,10 @@ export async function executeNativeSandbox(
 	const request = validateExecuteRequest({
 		version: NATIVE_SANDBOX_PROTOCOL_VERSION,
 		command: input.command,
-		...(input.shell ? { shell: input.shell } : {}),
+		shell: input.shell,
+		shellArgs: [...input.shellArgs],
+		commandTransport: input.commandTransport,
+		environment: input.environment,
 		cwd: path.resolve(input.cwd),
 		sandboxRoot: path.resolve(input.processRoot),
 		sourceRoot: path.resolve(input.sourceRoot),
@@ -353,7 +356,10 @@ function validateExecuteRequest<
 		sourceRoot: string;
 		timeoutMs: number;
 		maxOutputBytes: number;
-		shell?: string;
+		shell: string;
+		shellArgs: readonly string[];
+		commandTransport: "argv" | "stdin";
+		environment: Readonly<Record<string, string>>;
 	},
 >(request: T): T {
 	if (request.version !== NATIVE_SANDBOX_PROTOCOL_VERSION) throw new Error("Unsupported native sandbox protocol.");

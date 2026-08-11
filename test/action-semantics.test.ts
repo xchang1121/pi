@@ -93,6 +93,21 @@ describe("ActionSemanticsRegistry", () => {
 		);
 	});
 
+	it("never equates identical actions resolved to different execution backends", () => {
+		const first = PI_ACTION_SEMANTICS.buildKey("bash", { command: "echo $VALUE" }, "/workspace", "schema", {
+			fingerprint: "local:env-a",
+		});
+		const second = PI_ACTION_SEMANTICS.buildKey("bash", { command: "echo $VALUE" }, "/workspace", "schema", {
+			fingerprint: "local:env-b",
+		});
+
+		expect(first).toBeDefined();
+		expect(second).toBeDefined();
+		if (!first || !second) throw new Error("Expected keyed bash actions");
+		expect(actionKeyMatch(first, second)).toBeUndefined();
+		expect(actionKeyMismatchReason(first, second)).toBe("different_executor");
+	});
+
 	it("supports a new host tool with one semantics definition", () => {
 		const registry = new ActionSemanticsRegistry([
 			resourceDefinition("stat", "host.stat.v1", (input) => {

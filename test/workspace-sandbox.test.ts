@@ -223,9 +223,21 @@ describe("workspace ExecutionWorld", () => {
 			await writeFile(path.join(root, "input.txt"), "hello", "utf8");
 			await writeFile(path.join(root, "delete.txt"), "remove me", "utf8");
 			const sandbox = createWorkspaceSandbox({
-				shell: "/bin/bash",
-				processRunner: async ({ command, shell, cwd, processRoot, sourceRoot, signal }) => {
+				processRunner: async ({
+					command,
+					shell,
+					shellArgs,
+					commandTransport,
+					environment,
+					cwd,
+					processRoot,
+					sourceRoot,
+					signal,
+				}) => {
 					expect(shell).toBe("/bin/bash");
+					expect(shellArgs).toEqual(["--noprofile", "-c"]);
+					expect(commandTransport).toBe("argv");
+					expect(environment).toEqual({ PATH: "/resolved/bin", PI_TEST: "visible" });
 					expect(path.dirname(cwd)).toBe(processRoot);
 					expect(sourceRoot).toBe(root);
 					expect(processRoot).not.toBe(root);
@@ -251,6 +263,7 @@ describe("workspace ExecutionWorld", () => {
 				toolName: "bash",
 				args,
 				action: requiredAction("bash", args, root),
+				invocation: resolvedInvocation(script, root, 5),
 				callID: "spec-bash",
 				signal: new AbortController().signal,
 			});
@@ -266,6 +279,57 @@ describe("workspace ExecutionWorld", () => {
 			expect(await readFile(path.join(root, "input.txt"), "utf8")).toBe("changed");
 			await expect(stat(path.join(root, "delete.txt"))).rejects.toThrow();
 			expect(createWorkspaceSandbox().supports("workspace_snapshot")).toBe(false);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	}, 10_000);
+
+	it("mirrors and adopts ignored files that are part of the agent-visible environment", async () => {
+		const root = await mkdtemp(path.join(os.tmpdir(), "pi-spec-ignored-world-test-"));
+		try {
+			await mkdir(path.join(root, "node_modules", "pkg"), { recursive: true });
+			await mkdir(path.join(root, ".pi"), { recursive: true });
+			await writeFile(path.join(root, ".gitignore"), "node_modules/\n.pi/\n*.log\n", "utf8");
+			await writeFile(path.join(root, "node_modules", "pkg", "index.js"), "source dependency\n", "utf8");
+			await writeFile(path.join(root, ".pi", "state.json"), '{"state":"source"}\n', "utf8");
+			await writeFile(path.join(root, "build.log"), "source log\n", "utf8");
+
+			const sandbox = createWorkspaceSandbox({
+				processRunner: async ({ cwd }) => {
+					expect(await readFile(path.join(cwd, "node_modules", "pkg", "index.js"), "utf8")).toBe(
+						"source dependency\n",
+					);
+					expect(await readFile(path.join(cwd, ".pi", "state.json"), "utf8")).toBe('{"state":"source"}\n');
+					await writeFile(path.join(cwd, "node_modules", "pkg", "index.js"), "sandbox dependency\n", "utf8");
+					await writeFile(path.join(cwd, ".pi", "result.json"), '{"result":"sandbox"}\n', "utf8");
+					await rm(path.join(cwd, "build.log"));
+					return settlement("ignored state changed");
+				},
+			});
+			const args = { command: "unused" };
+			const execution = await sandbox.fork({
+				mode: "workspace_snapshot",
+				cwd: root,
+				tool: bashTool,
+				toolName: "bash",
+				args,
+				action: requiredAction("bash", args, root),
+				invocation: resolvedInvocation(args.command, root),
+				callID: "spec-ignored-world",
+				signal: new AbortController().signal,
+			});
+
+			expect(execution.resources).toEqual([".pi/result.json", "build.log", "node_modules/pkg/index.js"]);
+			expect(await readFile(path.join(root, "node_modules", "pkg", "index.js"), "utf8")).toBe("source dependency\n");
+			await expect(stat(path.join(root, ".pi", "result.json"))).rejects.toThrow();
+			expect(await readFile(path.join(root, "build.log"), "utf8")).toBe("source log\n");
+
+			await execution.adopt();
+			expect(await readFile(path.join(root, "node_modules", "pkg", "index.js"), "utf8")).toBe(
+				"sandbox dependency\n",
+			);
+			expect(await readFile(path.join(root, ".pi", "result.json"), "utf8")).toBe('{"result":"sandbox"}\n');
+			await expect(stat(path.join(root, "build.log"))).rejects.toThrow();
 		} finally {
 			await rm(root, { recursive: true, force: true });
 		}
@@ -291,6 +355,7 @@ describe("workspace ExecutionWorld", () => {
 				toolName: "bash",
 				args,
 				action: requiredAction("bash", args, root),
+				invocation: resolvedInvocation(args.command, root),
 				callID: "spec-conflict",
 				signal: new AbortController().signal,
 			});
@@ -465,6 +530,7 @@ describe("workspace ExecutionWorld", () => {
 					toolName: "bash",
 					args,
 					action: requiredAction("bash", args, root),
+					invocation: resolvedInvocation(args.command, root),
 					callID: "spec-created-symlink",
 					signal: new AbortController().signal,
 				}),
@@ -493,6 +559,7 @@ describe("workspace ExecutionWorld", () => {
 					toolName: "bash",
 					args,
 					action: requiredAction("bash", args, root),
+					invocation: resolvedInvocation(args.command, root),
 					callID: "spec-cleanup",
 					signal: new AbortController().signal,
 				}),
@@ -529,6 +596,7 @@ describe("workspace ExecutionWorld", () => {
 				toolName: "bash",
 				args,
 				action: requiredAction("bash", args, root),
+				invocation: resolvedInvocation(args.command, root),
 				callID: "spec-abort",
 				signal: controller.signal,
 			});
@@ -562,6 +630,7 @@ describe("workspace ExecutionWorld", () => {
 						execution: "sandbox",
 						semanticsEpoch: "test.write.v1",
 						schemaHash: "",
+						executionFingerprint: "",
 					},
 					callID: "spec-escape",
 					signal: new AbortController().signal,
@@ -834,6 +903,21 @@ function requiredAction(tool: string, args: unknown, cwd: string) {
 	const action = buildPiActionKey(tool, args, cwd);
 	if (!action) throw new Error(`Expected action key for ${tool}`);
 	return action;
+}
+
+function resolvedInvocation(command: string, cwd: string, timeout?: number) {
+	return {
+		executor: "test.bash.local.v1",
+		process: {
+			command,
+			cwd,
+			environment: { PATH: "/resolved/bin", PI_TEST: "visible" },
+			shell: "/bin/bash",
+			shellArgs: ["--noprofile", "-c"],
+			commandTransport: "argv" as const,
+			...(timeout === undefined ? {} : { timeout }),
+		},
+	};
 }
 
 function settlement(text: string): SettleToolCallResult {

@@ -67,6 +67,35 @@ describe("PlanState updates", () => {
 		expect(state.plan("plan")?.actions.map((item) => item.id)).toEqual(["a"]);
 	});
 
+	it("reserves monotonic continuation revisions without source-owned counters", () => {
+		const state = new PlanState();
+		state.apply(proposal([action("a")]), 0);
+
+		expect(state.reserveRevision("plan")).toBe(1);
+		expect(state.reserveRevision("plan")).toBe(2);
+		expect(state.apply({ proposalID: "plan", source: "test", revision: 2, upsert: [action("b")] }, 0)).toMatchObject({
+			accepted: true,
+		});
+		expect(state.reserveRevision("plan")).toBe(3);
+		expect(state.reserveRevision("missing")).toBeUndefined();
+	});
+
+	it("retires only fully terminal plans with no live candidate support", () => {
+		const state = new PlanState();
+		state.apply(proposal([action("kept"), action("done")]), 0);
+		state.takeReady(0);
+		state.markSucceeded("plan", "kept");
+		state.markSucceeded("plan", "done");
+
+		expect(state.retireTerminalPlans((node) => node.action.id === "kept")).toEqual([]);
+		expect(state.values()).toHaveLength(2);
+		expect(state.retireTerminalPlans()).toMatchObject([
+			{ action: { id: "kept" }, state: "succeeded" },
+			{ action: { id: "done" }, state: "succeeded" },
+		]);
+		expect(state.values()).toEqual([]);
+	});
+
 	it.each([
 		["missing parent", [action("child", { dependsOn: [{ actionID: "missing" }] })]],
 		["self edge", [action("self", { dependsOn: [{ actionID: "self" }] })]],
@@ -149,6 +178,20 @@ describe("PlanState updates", () => {
 });
 
 describe("PlanState scheduling", () => {
+	it("lets a source-neutral deadline policy claim launchable nodes without bypassing dependencies", () => {
+		const state = new PlanState();
+		const parent = action("parent", { horizon: 3 });
+		const deep = action("deep", { horizon: 5 });
+		const child = action("child", { dependsOn: [{ actionID: "parent", condition: "succeeded" }] });
+		state.apply(proposal([parent, deep, child]), 0);
+
+		expect(state.launchable().map(id)).toEqual(["parent", "deep"]);
+		expect(state.takeReady(0, (node) => node.action.id === "deep").map(id)).toEqual(["deep"]);
+		expect(state.takeReady(0, () => true).map(id)).toEqual(["parent"]);
+		state.markSucceeded("plan", "parent");
+		expect(state.takeReady(0, () => true).map(id)).toEqual(["child"]);
+	});
+
 	it("releases horizons and ordered descendants just in time", () => {
 		const state = new PlanState();
 		const parent = action("parent", { horizon: 2 });

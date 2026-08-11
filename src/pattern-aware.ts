@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { type ActionKey, type ActionKeyProjector, actionKeyCovers } from "./common.ts";
-import { PpmCountTrie, type PpmCountTrieRow } from "./ppm-count-trie.ts";
+import { PpmCountTrie, type PpmCountTrieRow, type PpmProbabilityEstimate } from "./ppm-count-trie.ts";
 
 export type PatternAwareSettings = {
 	readonly enabled: boolean;
@@ -94,7 +94,7 @@ export type PatternAwareBinding = (
 	  }
 	| {
 			readonly type: "transform";
-			readonly operation: "dirname" | "basename" | "normalize_path" | "trim" | "lowercase" | "uppercase";
+			readonly operation: "dirname" | "basename" | "normalize_path";
 			readonly source: PatternAwareBinding;
 	  }
 	| {
@@ -109,10 +109,9 @@ export type PatternAwareBinding = (
 	  }
 	| {
 			readonly type: "join";
-			readonly operation: "concat" | "join_path" | "relative_path";
+			readonly operation: "join_path";
 			readonly left: PatternAwareBinding;
 			readonly right: PatternAwareBinding;
-			readonly separator?: string;
 	  }
 ) & {
 	readonly variantCounts?: Readonly<Record<string, number>>;
@@ -154,6 +153,9 @@ export type PatternAwareCandidate = {
 	readonly input: Record<string, unknown>;
 	readonly missing: ReadonlyArray<PatternAwarePath>;
 	readonly patternID: string;
+	/** Canonical action identity; plan support adds the parent path while K(a) remains the execution identity. */
+	readonly actionIdentity: string;
+	readonly supportingPatternIDs: ReadonlyArray<string>;
 	readonly horizon: number;
 	readonly empiricalProbability: number;
 	readonly conditionalProbability: number;
@@ -259,7 +261,7 @@ export const PATTERN_AWARE_DEFAULTS: PatternAwareSettings = {
 };
 
 const MAX_BINDING_VARIANTS = 32;
-const MAX_COMPOSABLE_SOURCES = 48;
+const MAX_PATH_SOURCES = 24;
 const PERSIST_DEBOUNCE_MS = 200;
 const PERSISTENCE_VERSION = 12;
 const MIN_MIGRATABLE_PERSISTENCE_VERSION = 9;
@@ -589,7 +591,7 @@ export class PatternAwareStore {
 				groups.set(identity, group);
 			}
 		}
-		const predictions = [...groups.values()].map((group) => {
+		const predictions = [...groups.entries()].map(([identity, group]) => {
 			const ordered = [...group].sort(
 				(left, right) =>
 					right.pattern.context.length - left.pattern.context.length ||
@@ -607,12 +609,8 @@ export class PatternAwareStore {
 				this.settings,
 				this.clock,
 			);
-			const controlProbability =
-				backoffProbability(
-					ordered.map((item) => item.pattern),
-					this.clock,
-					this.settings.decayHalfLifeEvents,
-				) * gapCoverage;
+			const patterns = ordered.map((item) => item.pattern);
+			const replayProbability = backoffProbability(patterns, this.clock, this.settings.decayHalfLifeEvents);
 			const ppmEstimate = this.sequenceModel.estimate(sequenceContext, representative.pattern.targetTool);
 			const totalWeight = ordered.reduce(
 				(total, item) =>
@@ -639,24 +637,27 @@ export class PatternAwareStore {
 							recencyWeight(item.pattern.lastSeenSequence, this.clock, this.settings.decayHalfLifeEvents),
 					0,
 				) / Math.max(1, totalWeight);
-			// PPM estimates relative control-flow likelihood; replay/actor feedback
-			// calibrates whether this concrete pattern remains reusable.
-			const beamControlProbability =
-				ppmEstimate === undefined ? controlProbability : ppmEstimate.probability * controlProbability;
-			const branchProbability = Math.max(0, Math.min(1, beamControlProbability * variantProbability));
-			const beamScore =
-				continuation.pathProbability * branchProbability * Math.max(1, Math.max(0, expectedDurationMs));
+			const calibration = calibratePatternProbability(
+				replayProbability,
+				patternEvidence(patterns, this.clock, this.settings.decayHalfLifeEvents),
+				ppmEstimate,
+			);
+			const conditionalProbability = clampProbability(calibration.probability * gapCoverage * variantProbability);
+			const empiricalProbability = clampProbability(continuation.pathProbability * conditionalProbability);
+			const beamScore = empiricalProbability * Math.max(1, Math.max(0, expectedDurationMs));
 			return {
+				actionIdentity: hash(identity),
 				ordered,
 				representative,
 				horizon,
 				gapCoverage,
-				controlProbability,
+				replayProbability,
+				calibration,
 				variantProbability,
-				rawProbability: Math.max(0, controlProbability * variantProbability),
+				conditionalProbability,
+				empiricalProbability,
 				expectedDurationMs,
 				ppmEstimate,
-				branchProbability,
 				beamScore,
 			};
 		});
@@ -664,8 +665,8 @@ export class PatternAwareStore {
 			.sort(
 				(left, right) =>
 					right.beamScore - left.beamScore ||
-					right.branchProbability - left.branchProbability ||
-					right.rawProbability - left.rawProbability ||
+					right.empiricalProbability - left.empiricalProbability ||
+					right.conditionalProbability - left.conditionalProbability ||
 					Number(right.representative.type === "tool_call") - Number(left.representative.type === "tool_call") ||
 					left.horizon - right.horizon ||
 					left.representative.pattern.id.localeCompare(right.representative.pattern.id) ||
@@ -674,29 +675,25 @@ export class PatternAwareStore {
 			.slice(0, this.settings.beamWidth);
 		for (const [beamIndex, prediction] of beam.entries()) {
 			const {
+				actionIdentity,
 				ordered,
 				representative,
 				horizon,
 				gapCoverage,
-				controlProbability,
+				replayProbability,
+				calibration,
 				variantProbability,
-				rawProbability,
+				conditionalProbability,
+				empiricalProbability,
 				expectedDurationMs,
 				ppmEstimate,
-				branchProbability,
 				beamScore,
 			} = prediction;
-			// Future-gap candidates are marginal events, not mutually exclusive branches: several
-			// tools predicted from the same context may all occur within their learned horizons.
-			// Normalize only binding variants within one concrete candidate; sibling candidates
-			// retain their independently calibrated probability.
-			const conditionalProbability = Math.max(0, Math.min(1, rawProbability));
-			const empiricalProbability = Math.max(0, Math.min(1, continuation.pathProbability * conditionalProbability));
-			const beamPathProbability = Math.max(0, Math.min(1, continuation.pathProbability * branchProbability));
+			const supportingPatternIDs = [...new Set(ordered.map((item) => item.pattern.id))];
 			const nextContinuation: PatternAwareContinuation = {
 				history: predictiveHistory,
 				visitedPatternIDs: [...continuation.visitedPatternIDs, representative.pattern.id],
-				pathProbability: beamPathProbability,
+				pathProbability: empiricalProbability,
 			};
 			result.push({
 				type: representative.type,
@@ -705,6 +702,8 @@ export class PatternAwareStore {
 				input: representative.input,
 				missing: representative.missing,
 				patternID: representative.pattern.id,
+				actionIdentity,
+				supportingPatternIDs,
 				horizon,
 				empiricalProbability,
 				conditionalProbability,
@@ -717,21 +716,20 @@ export class PatternAwareStore {
 					{
 						source: "pattern_aware",
 						patternID: representative.pattern.id,
-						supportingPatterns: ordered.map((item) => item.pattern.id),
+						supportingPatterns: supportingPatternIDs,
 						context: representative.pattern.context,
 						tool: representative.pattern.targetTool,
 						input: representative.input,
 						missing: representative.missing,
 						empiricalProbability,
 						conditionalProbability,
-						controlProbability,
+						replayProbability,
 						ppmProbability: ppmEstimate?.probability,
+						ppmWeight: calibration.ppmWeight,
 						ppmOrder: ppmEstimate?.order,
 						ppmEvidence: ppmEstimate?.evidence,
 						ppmEscapeMass: ppmEstimate?.escapeMass,
 						variantProbability,
-						branchProbability,
-						beamPathProbability,
 						beamScore,
 						beamRank: beamIndex + 1,
 						beamWidth: this.settings.beamWidth,
@@ -1516,13 +1514,12 @@ function findBinding(
 function candidateBindings(
 	context: ReadonlyArray<PatternAwareEvent>,
 	target: unknown,
-	includeCompositions = true,
+	includePathTemplates = true,
 	targetIsPath = false,
 ): PatternAwareBinding[] {
-	if (!includeCompositions) return indexedBindings(context, target, targetIsPath);
+	if (!includePathTemplates) return indexedBindings(context, target, targetIsPath);
 	const result: PatternAwareBinding[] = [];
-	const composable: Array<{ readonly binding: PatternAwareBinding; readonly value: string; readonly path: boolean }> =
-		[];
+	const pathSources: Array<{ readonly binding: PatternAwareBinding; readonly value: string }> = [];
 	for (let index = context.length - 1; index >= 0; index--) {
 		const event = context[index]!;
 		const relativeEvent = index - context.length;
@@ -1537,22 +1534,15 @@ function candidateBindings(
 				const pathSource = typeof source === "string" && isPathSource(field, sourcePath, source);
 				if (sameValue(source, target) && (!targetIsPath || pathSource)) result.push(direct);
 				if (typeof source !== "string" || typeof target !== "string") continue;
-				if ((!targetIsPath || pathSource) && composable.length < MAX_COMPOSABLE_SOURCES)
-					composable.push({ binding: direct, value: source, path: pathSource });
 				const sources: PatternAwareBinding[] = [direct];
-				const operations = ["trim", "lowercase", "uppercase"] as const;
-				for (const operation of operations) {
-					const transformed: PatternAwareBinding = { type: "transform", operation, source: direct };
-					if (transform(operation, source) === target && (!targetIsPath || pathSource)) result.push(transformed);
-				}
 				if (!pathSource) continue;
+				if (pathSources.length < MAX_PATH_SOURCES) pathSources.push({ binding: direct, value: source });
 				for (const operation of ["dirname", "basename", "normalize_path"] as const) {
 					const transformed: PatternAwareBinding = { type: "transform", operation, source: direct };
 					if (transform(operation, source) === target) result.push(transformed);
 					sources.push(transformed);
-					const value = evaluateBinding(transformed, context);
-					if (typeof value === "string" && composable.length < MAX_COMPOSABLE_SOURCES)
-						composable.push({ binding: transformed, value, path: true });
+					const value = transform(operation, source);
+					if (pathSources.length < MAX_PATH_SOURCES) pathSources.push({ binding: transformed, value });
 				}
 				for (const binding of sources) {
 					const value = evaluateBinding(binding, context);
@@ -1584,42 +1574,13 @@ function candidateBindings(
 			}
 		}
 	}
-	if (includeCompositions && typeof target === "string") {
-		const sources = uniqueComposable(composable);
-		const components = sources.filter((item) => item.value.length > 0 && target.includes(item.value));
-		for (const left of components) {
-			for (const right of components) {
-				if (left.binding === right.binding) continue;
-				for (const separator of ["", " ", "=", ":", "/"]) {
-					if (`${left.value}${separator}${right.value}` !== target) continue;
-					result.push({
-						type: "join",
-						operation: "concat",
-						left: left.binding,
-						right: right.binding,
-						...(separator ? { separator } : {}),
-					});
-				}
-				if (
-					left.path &&
-					right.path &&
-					normalizePath(path.join(left.value, right.value)) === normalizePath(target)
-				) {
-					result.push({ type: "join", operation: "join_path", left: left.binding, right: right.binding });
-				}
-			}
-		}
-		const normalizedTarget = normalizePath(target);
-		const pathSources = sources.filter((item) => item.path);
-		const relativeRights = pathSources.filter((item) => normalizePath(item.value).endsWith(normalizedTarget));
-		for (const left of pathSources) {
-			for (const right of relativeRights) {
-				if (
-					left.binding !== right.binding &&
-					normalizePath(path.relative(left.value, right.value)) === normalizedTarget
-				) {
-					result.push({ type: "join", operation: "relative_path", left: left.binding, right: right.binding });
-				}
+	if (targetIsPath && typeof target === "string") {
+		const sources = uniquePathSources(pathSources);
+		for (const left of sources) {
+			for (const right of sources) {
+				if (left === right) continue;
+				if (normalizePath(path.join(left.value, right.value)) !== normalizePath(target)) continue;
+				result.push({ type: "join", operation: "join_path", left: left.binding, right: right.binding });
 			}
 		}
 	}
@@ -1830,9 +1791,7 @@ function isPathField(key: string) {
 	);
 }
 
-function uniqueComposable(
-	values: ReadonlyArray<{ readonly binding: PatternAwareBinding; readonly value: string; readonly path: boolean }>,
-) {
+function uniquePathSources(values: ReadonlyArray<{ readonly binding: PatternAwareBinding; readonly value: string }>) {
 	const seen = new Set<string>();
 	return values.filter((item) => {
 		const key = stableStringify(bindingStructure(item.binding));
@@ -1945,12 +1904,11 @@ function evaluateBinding(binding: PatternAwareBinding, context: ReadonlyArray<Pa
 		const left = evaluateBinding(binding.left, context);
 		const right = evaluateBinding(binding.right, context);
 		const values = bindingValuesFromResult(left).flatMap((leftValue) =>
-			bindingValuesFromResult(right).flatMap((rightValue) => {
-				if (typeof leftValue !== "string" || typeof rightValue !== "string") return [];
-				if (binding.operation === "join_path") return [normalizePath(path.join(leftValue, rightValue))];
-				if (binding.operation === "relative_path") return [normalizePath(path.relative(leftValue, rightValue))];
-				return [`${leftValue}${binding.separator ?? ""}${rightValue}`];
-			}),
+			bindingValuesFromResult(right).flatMap((rightValue) =>
+				typeof leftValue === "string" && typeof rightValue === "string"
+					? [normalizePath(path.join(leftValue, rightValue))]
+					: [],
+			),
 		);
 		return values.length > 1 ? multiValue(values) : (values[0] ?? MISSING);
 	}
@@ -2011,15 +1969,9 @@ function isMultiValue(value: unknown): value is MultiValue {
 	return Boolean(value && typeof value === "object" && MULTI in value);
 }
 
-function transform(
-	operation: "dirname" | "basename" | "normalize_path" | "trim" | "lowercase" | "uppercase",
-	value: string,
-) {
+function transform(operation: "dirname" | "basename" | "normalize_path", value: string) {
 	if (operation === "dirname") return path.dirname(value);
 	if (operation === "basename") return path.basename(value);
-	if (operation === "trim") return value.trim();
-	if (operation === "lowercase") return value.toLowerCase();
-	if (operation === "uppercase") return value.toUpperCase();
 	return path.normalize(value).replaceAll("\\", "/");
 }
 
@@ -2271,6 +2223,37 @@ function backoffProbability(patterns: ReadonlyArray<MutablePattern>, clock: numb
 	return Math.max(0, Math.min(1, estimate));
 }
 
+function patternEvidence(patterns: ReadonlyArray<MutablePattern>, clock: number, halfLife: number) {
+	return Math.max(
+		1,
+		...patterns.map((pattern) => {
+			const feedback = feedbackEvidence(pattern, clock, halfLife);
+			return (
+				pattern.historicalOpportunities * recencyWeight(pattern.lastSeenSequence, clock, halfLife) +
+				feedback.success +
+				feedback.failure
+			);
+		}),
+	);
+}
+
+function calibratePatternProbability(
+	replayProbability: number,
+	replayEvidence: number,
+	ppmEstimate: PpmProbabilityEstimate | undefined,
+) {
+	if (!ppmEstimate) return { probability: clampProbability(replayProbability), ppmWeight: 0 };
+	const ppmWeight = ppmEstimate.evidence / Math.max(1, ppmEstimate.evidence + replayEvidence * 2);
+	return {
+		probability: clampProbability(replayProbability * (1 - ppmWeight) + ppmEstimate.probability * ppmWeight),
+		ppmWeight,
+	};
+}
+
+function clampProbability(value: number) {
+	return Math.max(0, Math.min(1, Number.isFinite(value) ? value : 0));
+}
+
 function patternRank(pattern: MutablePattern, clock: number, halfLife: number) {
 	const feedback = feedbackEvidence(pattern, clock, halfLife);
 	return (
@@ -2489,11 +2472,7 @@ function isPatternAwareBinding(value: unknown, depth = 0): value is PatternAware
 		case "each":
 			return eventSource() && isPatternAwarePath(record.itemPath);
 		case "transform":
-			return (
-				["dirname", "basename", "normalize_path", "trim", "lowercase", "uppercase"].includes(
-					String(record.operation),
-				) && source()
-			);
+			return ["dirname", "basename", "normalize_path"].includes(String(record.operation)) && source();
 		case "coalesce":
 			return (
 				Array.isArray(record.sources) &&
@@ -2504,8 +2483,7 @@ function isPatternAwareBinding(value: unknown, depth = 0): value is PatternAware
 			return typeof record.prefix === "string" && typeof record.suffix === "string" && source();
 		case "join":
 			return (
-				["concat", "join_path", "relative_path"].includes(String(record.operation)) &&
-				(record.separator === undefined || typeof record.separator === "string") &&
+				record.operation === "join_path" &&
 				isPatternAwareBinding(record.left, depth + 1) &&
 				isPatternAwareBinding(record.right, depth + 1)
 			);

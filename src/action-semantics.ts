@@ -24,6 +24,10 @@ export interface ActionKey {
 	readonly semanticsEpoch: string;
 	/** Stable hash of the validated input schema used by both producer and consumer. */
 	readonly schemaHash: string;
+	/** Opaque digest of the concrete executor, shell, cwd, and visible environment. */
+	readonly executionFingerprint: string;
+	/** In-memory execution descriptor. It is deliberately excluded from diagnostics and persisted keys. */
+	readonly executionContext?: unknown;
 }
 
 export interface ProjectedActionKey {
@@ -60,6 +64,7 @@ export type ActionKeyMismatchReason =
 	| "different_execution"
 	| "different_semantics"
 	| "different_schema"
+	| "different_executor"
 	| "different_core"
 	| "projection_not_applicable";
 
@@ -158,7 +163,13 @@ export class ActionSemanticsRegistry {
 		return this.projectorsByID.has(id);
 	}
 
-	buildKey(tool: string, input: unknown, cwd: string, schemaHash = ""): ActionKey | undefined {
+	buildKey(
+		tool: string,
+		input: unknown,
+		cwd: string,
+		schemaHash = "",
+		execution?: { readonly fingerprint: string; readonly context?: unknown },
+	): ActionKey | undefined {
 		const definition = this.definition(tool);
 		if (!definition) return undefined;
 		let canonical: CanonicalAction | undefined;
@@ -175,6 +186,8 @@ export class ActionSemanticsRegistry {
 			input: canonical.input,
 			schemaHash,
 			semanticsEpoch: definition.epoch,
+			executionFingerprint: execution?.fingerprint,
+			executionContext: execution?.context,
 		});
 	}
 }
@@ -281,14 +294,18 @@ export function buildActionKey(input: {
 	readonly input: Readonly<Record<string, unknown>>;
 	readonly schemaHash?: string;
 	readonly semanticsEpoch?: string;
+	readonly executionFingerprint?: string;
+	readonly executionContext?: unknown;
 }): ActionKey {
 	const schemaHash = input.schemaHash ?? "";
 	const semanticsEpoch = input.semanticsEpoch ?? "";
+	const executionFingerprint = input.executionFingerprint ?? "";
 	const key = stableStringify({
 		tool: input.tool,
 		execution: input.execution,
 		semanticsEpoch,
 		schemaHash,
+		executionFingerprint,
 		input: input.input,
 	});
 	return {
@@ -300,6 +317,8 @@ export function buildActionKey(input: {
 		execution: input.execution,
 		semanticsEpoch,
 		schemaHash,
+		executionFingerprint,
+		...(input.executionContext !== undefined ? { executionContext: input.executionContext } : {}),
 	};
 }
 
@@ -376,6 +395,7 @@ export function actionKeyMismatchReason(
 	if (speculative.execution !== actor.execution) return "different_execution";
 	if (speculative.semanticsEpoch !== actor.semanticsEpoch) return "different_semantics";
 	if (speculative.schemaHash !== actor.schemaHash) return "different_schema";
+	if (speculative.executionFingerprint !== actor.executionFingerprint) return "different_executor";
 
 	const speculativePartitions = new Set(actionKeyProjectionPartitions(speculative, projectors));
 	if (actionKeyProjectionPartitions(actor, projectors).some((partition) => speculativePartitions.has(partition))) {
@@ -561,7 +581,14 @@ function canonicalEdit(input: unknown, cwd: string): CanonicalAction | undefined
 function readProjectionPartition(action: ActionKey): string | undefined {
 	const range = readActionRange(action);
 	if (!range) return undefined;
-	return JSON.stringify([action.execution, action.semanticsEpoch, action.schemaHash, action.resources, range.path]);
+	return JSON.stringify([
+		action.execution,
+		action.semanticsEpoch,
+		action.schemaHash,
+		action.executionFingerprint,
+		action.resources,
+		range.path,
+	]);
 }
 
 function assertDefinitionCoherence(definition: ActionSemanticsDefinition): void {

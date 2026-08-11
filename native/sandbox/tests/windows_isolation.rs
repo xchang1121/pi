@@ -9,7 +9,7 @@ use std::thread;
 use std::time::Duration;
 
 use pi_sandbox_native::protocol::{
-    CheckResponse, ExecuteRequest, ExecuteResponse, PROTOCOL_VERSION,
+    CheckResponse, CommandTransport, ExecuteRequest, ExecuteResponse, PROTOCOL_VERSION,
 };
 
 fn binary() -> &'static str {
@@ -68,6 +68,9 @@ fn run(
         version: PROTOCOL_VERSION,
         command: command.into(),
         shell: None,
+        shell_args: vec!["/d".into(), "/s".into(), "/c".into()],
+        command_transport: CommandTransport::Argv,
+        environment: std::env::vars().collect(),
         cwd: sandbox.to_path_buf(),
         sandbox_root: sandbox.to_path_buf(),
         source_root: source.to_path_buf(),
@@ -125,6 +128,9 @@ fn rejects_junction_escape_before_sandbox_setup() {
         version: PROTOCOL_VERSION,
         command: "echo escaped".into(),
         shell: None,
+        shell_args: vec!["/d".into(), "/s".into(), "/c".into()],
+        command_transport: CommandTransport::Argv,
+        environment: std::env::vars().collect(),
         cwd: junction,
         sandbox_root: sandbox,
         source_root: source,
@@ -320,6 +326,9 @@ fn terminating_the_broker_kills_descendants() {
         version: PROTOCOL_VERSION,
         command: "powershell.exe -NoProfile -NonInteractive -File parent.ps1".into(),
         shell: None,
+        shell_args: vec!["/d".into(), "/s".into(), "/c".into()],
+        command_transport: CommandTransport::Argv,
+        environment: std::env::vars().collect(),
         cwd: sandbox.clone(),
         sandbox_root: sandbox.clone(),
         source_root: source,

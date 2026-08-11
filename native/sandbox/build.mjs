@@ -5,7 +5,7 @@ import { chmod, copyFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-const PROTOCOL_VERSION = 3;
+const PROTOCOL_VERSION = 4;
 const crate = path.dirname(fileURLToPath(import.meta.url));
 const requested = parseArguments(process.argv.slice(2));
 const target = {
@@ -94,8 +94,9 @@ function rustTarget(target) {
 			if (targetLibdir.status !== 0) throw new Error(`Failed to inspect ${toolchain}.`);
 			const targetRoot = path.dirname(targetLibdir.stdout.trim());
 			const rustBin = path.join(targetRoot, "bin");
-			const llvmDlltool = findCommand("llvm-dlltool.exe");
-			const llvmBin = process.env.LLVM_MINGW_BIN ?? (llvmDlltool ? path.dirname(llvmDlltool) : undefined);
+			const foundLlvmDlltool = findCommand("llvm-dlltool.exe");
+			const llvmBin = process.env.LLVM_MINGW_BIN ?? (foundLlvmDlltool ? path.dirname(foundLlvmDlltool) : undefined);
+			const llvmDlltool = llvmBin ? path.join(llvmBin, "llvm-dlltool.exe") : undefined;
 			return {
 				triple: "x86_64-pc-windows-gnu",
 				toolchain,
@@ -104,7 +105,13 @@ function rustTarget(target) {
 						.filter(Boolean)
 						.join(path.delimiter),
 					CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: path.join(rustBin, "rust-lld.exe"),
-					RUSTFLAGS: [process.env.RUSTFLAGS, "-C link-self-contained=yes"].filter(Boolean).join(" "),
+					RUSTFLAGS: [
+						process.env.RUSTFLAGS,
+						"-C link-self-contained=yes",
+						...(llvmDlltool ? [`-C dlltool=${llvmDlltool}`] : []),
+					]
+						.filter(Boolean)
+						.join(" "),
 				},
 			};
 		}

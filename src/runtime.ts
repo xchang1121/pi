@@ -1,6 +1,6 @@
 import type { ActionProjectionCoverage, ActionProjectionRule } from "./action-key-projection.ts";
 import { CandidateAggregate, type CandidateReuseState, type CandidateRunState } from "./candidate-lifecycle.ts";
-import { ActionStore, ResultCache } from "./candidate-stores.ts";
+import { ActionStore, ResultCache, speculativeCacheValue } from "./candidate-stores.ts";
 import type {
 	ActionKey,
 	ActionKeyMatch,
@@ -25,6 +25,7 @@ import {
 	resourceProfile,
 	type SpeculativeResourceProfile,
 	type SpeculativeSchedulingMetadata,
+	speculativeLaunchDelay,
 	speculativeResourceBudget,
 	ToolSpeculationScheduler,
 } from "./tool-speculation-scheduler.ts";
@@ -151,6 +152,7 @@ export interface SpeculativeCandidate {
 	utility: number;
 	readonly leases: readonly PredictionLease[];
 	hits: number;
+	lastActorHitAt?: number;
 	authoritativeSequence?: number;
 	schedulerOutcome?: "reused" | "promoted" | "discarded" | "preempted";
 }
@@ -339,6 +341,8 @@ export interface SpeculativePlanSource<
 		readonly candidate: SpeculativeCandidate;
 		readonly proposalID: string;
 		readonly actionID: string;
+		/** Runtime-reserved revision for the continuation update. */
+		readonly revision: number;
 		readonly feedback: unknown;
 		readonly output: Output;
 		readonly parentConfirmed: boolean;
@@ -505,6 +509,12 @@ interface RuntimeCandidate<Output> extends SpeculativeCandidate {
 	worldBranch?: WorldBranch<Output>;
 }
 
+interface CandidateOwner<SessionID> {
+	readonly sessionID: SessionID;
+	readonly turnID: string;
+	readonly settings: SpeculativeActionSettings;
+}
+
 interface RankedRuntimeCandidate<Output> {
 	readonly candidate: RuntimeCandidate<Output>;
 	readonly match: ActionKeyMatch;
@@ -530,7 +540,6 @@ interface TurnState<SessionID, Output, StateData> {
 	readonly actorCallSequences: Map<string, number>;
 	readonly preparedHints: Set<string>;
 	readonly pendingActionSequences: Set<number>;
-	readonly turnAdmissions: Map<string, RuntimeCandidate<Output>>;
 	readonly plan: PlanState;
 	readonly sourceAttempts: Set<string>;
 	readonly sourceFeedback: Map<string, "success" | "actor_miss" | "source_error">;
@@ -538,6 +547,8 @@ interface TurnState<SessionID, Output, StateData> {
 	readonly pendingSchedulerCompletions: Set<RuntimeCandidate<Output>>;
 	actionSequence: number;
 	planDispatchDepth: number;
+	planDispatchTimer?: ReturnType<typeof setTimeout>;
+	lastActorActionAt?: number;
 	pendingPlanMismatch?: {
 		readonly sources: readonly string[];
 		readonly key: ActionKey;
@@ -567,6 +578,9 @@ class SpeculativeJobError extends Error {
 		this.name = "SpeculativeJobError";
 	}
 }
+
+const CACHE_PROBATION_MAX_AGE_MS = 5 * 60 * 1000;
+const CACHE_PROBATION_MAX_ACTOR_OPPORTUNITIES = 8;
 
 export function makeSpeculativeActionRuntime<
 	SessionID,
@@ -625,7 +639,8 @@ export function makeSpeculativeActionRuntime<
 	const wallTimes = new Map<SessionID, number>();
 	const actionSequences = new Map<SessionID, number>();
 	const schedulers = new Map<SessionID, ToolSpeculationScheduler<RuntimeCandidate<Output>>>();
-	const candidateOwners = new Map<RuntimeCandidate<Output>, TurnState<SessionID, Output, StateData>>();
+	const candidateOwners = new WeakMap<RuntimeCandidate<Output>, CandidateOwner<SessionID>>();
+	const actorStepTimes = new Map<SessionID, { count: number; averageMs: number }>();
 	const serviceTimes = new Map<string, { count: number; averageMs: number }>();
 	const executionOverheadTimes = new Map<string, { count: number; averageMs: number }>();
 	const hitOverheadTimes = new Map<string, { count: number; averageMs: number }>();
@@ -664,15 +679,15 @@ export function makeSpeculativeActionRuntime<
 		else schedulerFor(state.sessionID).complete(candidate);
 	};
 
-	const observeAverage = (
-		target: Map<string, { count: number; averageMs: number }>,
-		tool: string,
+	const observeAverage = <Key>(
+		target: Map<Key, { count: number; averageMs: number }>,
+		key: Key,
 		durationMs: number,
 	): void => {
 		const duration = finiteMetric(durationMs);
-		const current = target.get(tool) ?? { count: 0, averageMs: 0 };
+		const current = target.get(key) ?? { count: 0, averageMs: 0 };
 		const count = current.count + 1;
-		target.set(tool, { count, averageMs: current.averageMs + (duration - current.averageMs) / count });
+		target.set(key, { count, averageMs: current.averageMs + (duration - current.averageMs) / count });
 	};
 	const observeServiceTime = (tool: string, durationMs: number): void =>
 		observeAverage(serviceTimes, tool, durationMs);
@@ -689,6 +704,12 @@ export function makeSpeculativeActionRuntime<
 	const observeLeadTime = (tool: string, durationMs: number, horizon?: number): void => {
 		observeAverage(actorLeadTimes, schedulingKey(tool), durationMs);
 		if (horizon !== undefined) observeAverage(actorLeadTimes, schedulingKey(tool, horizon), durationMs);
+	};
+	const observeActorStep = (state: TurnState<SessionID, Output, StateData>, arrivedAt: number): void => {
+		const previous = state.lastActorActionAt ?? state.startedAt;
+		state.lastActorActionAt = arrivedAt;
+		const interval = Math.max(0, arrivedAt - previous);
+		if (interval >= 25) observeAverage(actorStepTimes, state.sessionID, interval);
 	};
 	const masterEnabled = (settings: SpeculativeActionSettings): boolean => settings.enabled;
 	const sourceEnabled = (settings: SpeculativeActionSettings, sourceID: string): boolean => {
@@ -879,32 +900,6 @@ export function makeSpeculativeActionRuntime<
 				: (serviceTimes.get(draft.tool)?.averageMs ?? 1);
 		const hidden = Math.min(duration, observedLeadTime(draft.tool, draft.horizon) ?? duration);
 		return Math.min(hidden, finiteNonNegative(draft.expectedLatencyBenefitMs, probability * hidden));
-	};
-
-	const removeTurnAdmission = (
-		state: TurnState<SessionID, Output, StateData>,
-		candidate: RuntimeCandidate<Output>,
-	): void => {
-		for (const [key, admitted] of state.turnAdmissions) {
-			if (admitted === candidate) state.turnAdmissions.delete(key);
-		}
-	};
-
-	const turnAdmission = (
-		state: TurnState<SessionID, Output, StateData>,
-		key: string,
-		utility: number,
-	): { readonly admitted: true; readonly victim?: RuntimeCandidate<Output> } | { readonly admitted: false } => {
-		for (const [candidateKey, candidate] of state.turnAdmissions) {
-			if (candidate.run.status === "closed") state.turnAdmissions.delete(candidateKey);
-		}
-		if (state.turnAdmissions.has(key)) return { admitted: true };
-		if (state.turnAdmissions.size < candidateLimit(state.settings)) return { admitted: true };
-		const victim = [...state.turnAdmissions.values()].sort(
-			(left, right) => left.utility - right.utility || left.startedAt - right.startedAt,
-		)[0];
-		if (!victim || victim.utility >= utility) return { admitted: false };
-		return { admitted: true, victim };
 	};
 
 	const emit = async (event: SpeculativeActionEvent<SessionID>): Promise<void> => {
@@ -1357,7 +1352,6 @@ export function makeSpeculativeActionRuntime<
 			if (lease.state === "matched") lease.state = "invalidated";
 		}
 		schedulerFor(state.sessionID).discard(candidate);
-		removeTurnAdmission(state, candidate);
 		removeCandidateFromStores(state, candidate);
 		releaseCandidateResourceVersion(candidate);
 		candidateOwners.delete(candidate);
@@ -1381,8 +1375,26 @@ export function makeSpeculativeActionRuntime<
 			candidate.lifecycle.settleClosed();
 			return;
 		}
-		await closeCandidate(owner, candidate, reason, "invalidated", publish, outcome);
-		if (publish) await publishCache(owner);
+		const state =
+			turns.get(turnKey(owner)) ??
+			createDisposalState<SessionID, Output, StateData>(
+				owner.sessionID,
+				owner.settings,
+				planStates.get(owner.sessionID),
+				owner.turnID,
+			);
+		await closeCandidate(state, candidate, reason, "invalidated", publish, outcome);
+		if (publish) await publishCache(state);
+		await compactPlanState(state);
+	};
+
+	const advanceCacheProbation = async (state: TurnState<SessionID, Output, StateData>): Promise<void> => {
+		for (const candidate of results.advanceActorOpportunity(state.sessionID, {
+			maxAgeMs: CACHE_PROBATION_MAX_AGE_MS,
+			maxOpportunities: CACHE_PROBATION_MAX_ACTOR_OPPORTUNITIES,
+		})) {
+			await preemptCandidate(candidate, "resource_cache_probation_expired", "discarded");
+		}
 	};
 
 	const preemptForAuthoritative = async (
@@ -1407,6 +1419,7 @@ export function makeSpeculativeActionRuntime<
 			if (state.sessionID !== sessionID) continue;
 			state.finished = true;
 			state.terminal = true;
+			clearPlanDispatchTimer(state);
 			state.predictionController.abort();
 			turns.delete(key);
 			await settleUnlaunchedPlanActions(state, "system");
@@ -1432,6 +1445,7 @@ export function makeSpeculativeActionRuntime<
 		tokenTotals.delete(sessionID);
 		wallTimes.delete(sessionID);
 		actionSequences.delete(sessionID);
+		actorStepTimes.delete(sessionID);
 		schedulers.delete(sessionID);
 		sourceBackoff.delete(sessionID);
 	};
@@ -1498,6 +1512,7 @@ export function makeSpeculativeActionRuntime<
 			}
 		}
 		await reportBlockedPlanActions(state);
+		await compactPlanState(state);
 	};
 
 	const invalidateChangedResources = async (
@@ -1940,17 +1955,6 @@ export function makeSpeculativeActionRuntime<
 				lifecycle,
 				hits: 0,
 			};
-			const turnDecision =
-				launchMode === "promoted"
-					? ({ admitted: true } as const)
-					: turnAdmission(state, action.key, candidate.utility);
-			if (!turnDecision.admitted) {
-				candidate.schedulerOutcome = "discarded";
-				lifecycle.close({ reason: "candidate_budget_insufficient_expected_benefit" });
-				lifecycle.settleClosed();
-				await publishCancelled(state, candidate, "candidate_budget_insufficient_expected_benefit");
-				continue;
-			}
 			const insertion = jobs.insertOrGetCompatible(state.sessionID, candidate, (existing, match) => {
 				const rule = projectionRuleByID.get(match.projector);
 				return (
@@ -1978,6 +1982,7 @@ export function makeSpeculativeActionRuntime<
 					candidate,
 					scheduling,
 					speculativeResourceBudget(concurrentActionLimit(state.settings)),
+					{ id: state.turnID, limit: candidateLimit(state.settings) },
 				);
 				if (!admission.admitted) {
 					jobs.delete(state.sessionID, candidate);
@@ -1991,13 +1996,12 @@ export function makeSpeculativeActionRuntime<
 			} else {
 				candidate.schedulerOutcome = "promoted";
 			}
-			if (turnDecision.victim) state.turnAdmissions.delete(turnDecision.victim.key.key);
-			state.turnAdmissions.set(action.key, candidate);
-			candidateOwners.set(candidate, state);
+			candidateOwners.set(candidate, {
+				sessionID: state.sessionID,
+				turnID: state.turnID,
+				settings: state.settings,
+			});
 			for (const victim of schedulerVictims) await preemptCandidate(victim);
-			if (turnDecision.victim && !schedulerVictims.includes(turnDecision.victim)) {
-				await preemptCandidate(turnDecision.victim, "candidate_budget_preempted");
-			}
 			accepted++;
 			await notifyLeaseLaunched(sourceLease);
 			await publishStarted(state, candidate);
@@ -2028,7 +2032,6 @@ export function makeSpeculativeActionRuntime<
 				for (const lease of candidate.leases) {
 					if (lease.state === "matched") lease.state = "invalidated";
 				}
-				removeTurnAdmission(state, candidate);
 				removeCandidateFromStores(state, candidate);
 				releaseCandidateResourceVersion(candidate);
 				candidateOwners.delete(candidate);
@@ -2273,6 +2276,30 @@ export function makeSpeculativeActionRuntime<
 		}
 	};
 
+	const compactPlanState = async (state: TurnState<SessionID, Output, StateData>): Promise<void> => {
+		const retained = new Set(
+			sessionCandidates(state.sessionID).flatMap((candidate) =>
+				candidate.leases.flatMap((lease) =>
+					(lease.state === "active" || lease.state === "matched") && lease.proposalID && lease.actionID
+						? [planActionIdentity(lease.proposalID, lease.actionID)]
+						: [],
+				),
+			),
+		);
+		await retirePlanActions(
+			state,
+			state.plan.retireTerminalPlans((node) => retained.has(planActionIdentity(node.proposalID, node.action.id))),
+		);
+		const contexts = planLaunchContexts.get(state.sessionID);
+		if (contexts?.size === 0) planLaunchContexts.delete(state.sessionID);
+		if (
+			state.plan.values().length === 0 &&
+			![...turns.values()].some((turn) => turn.sessionID === state.sessionID && turn.plan === state.plan)
+		) {
+			planStates.delete(state.sessionID);
+		}
+	};
+
 	const notifyUnlaunchedPlanResolved = async (
 		node: PlanExecutionNode,
 		outcome: Exclude<PlanActionResolution, "consumed">,
@@ -2304,6 +2331,24 @@ export function makeSpeculativeActionRuntime<
 			await notifyUnlaunchedPlanResolved(node, outcome);
 		}
 		await reportBlockedPlanActions(state);
+		await compactPlanState(state);
+	};
+	const planNodeLaunchDelay = (state: TurnState<SessionID, Output, StateData>, node: PlanExecutionNode): number => {
+		if (node.action.type === "preparation_hint") return 0;
+		const durationMs = finitePositive(
+			node.action.expectedDurationMs,
+			(serviceTimes.get(node.action.tool)?.averageMs ?? 1) +
+				(executionOverheadTimes.get(node.action.tool)?.averageMs ?? 0),
+		);
+		return speculativeLaunchDelay({
+			stepsUntilCall: Math.max(0, node.expectedActionSeq - state.actionSequence),
+			averageStepMs: actorStepTimes.get(state.sessionID)?.averageMs ?? 1_000,
+			expectedDurationMs: durationMs,
+		});
+	};
+	const clearPlanDispatchTimer = (state: TurnState<SessionID, Output, StateData>): void => {
+		if (state.planDispatchTimer) clearTimeout(state.planDispatchTimer);
+		state.planDispatchTimer = undefined;
 	};
 
 	const launchPlanNode = async (
@@ -2382,8 +2427,11 @@ export function makeSpeculativeActionRuntime<
 		candidateNames?: readonly string[],
 	): Promise<void> => {
 		if (state.finished || state.terminal) return;
+		clearPlanDispatchTimer(state);
 		const names = candidateNames ?? candidateToolNames(state.settings, actionSemantics);
-		const ready = [...state.plan.takeReady(state.actionSequence)].sort(
+		const ready = [
+			...state.plan.takeReady(state.actionSequence, (node) => planNodeLaunchDelay(state, node) <= 0),
+		].sort(
 			(left, right) =>
 				draftPriority(planActionDraft(right.proposalID, right.source, right.action)) -
 					draftPriority(planActionDraft(left.proposalID, left.source, left.action)) ||
@@ -2409,6 +2457,16 @@ export function makeSpeculativeActionRuntime<
 			}
 		}
 		await reportBlockedPlanActions(state);
+		await compactPlanState(state);
+		const nextDelay = Math.min(...state.plan.launchable().map((node) => planNodeLaunchDelay(state, node)));
+		if (Number.isFinite(nextDelay) && nextDelay > 0) {
+			clearPlanDispatchTimer(state);
+			state.planDispatchTimer = setTimeout(() => {
+				state.planDispatchTimer = undefined;
+				void dispatchReadyPlanActions(state, input, names).catch(() => undefined);
+			}, Math.ceil(nextDelay));
+			state.planDispatchTimer.unref?.();
+		}
 	};
 
 	const promoteDeferredPlanAction = async (
@@ -2566,6 +2624,8 @@ export function makeSpeculativeActionRuntime<
 				continue;
 			}
 			lease.continuationExpansion = parentConfirmed ? "confirmed" : "speculative";
+			const revision = state.plan.reserveRevision(lease.proposalID);
+			if (revision === undefined) continue;
 			try {
 				const updates = await source.continue({
 					startInput: input,
@@ -2574,6 +2634,7 @@ export function makeSpeculativeActionRuntime<
 					candidate,
 					proposalID: lease.proposalID,
 					actionID: lease.actionID,
+					revision,
 					feedback: lease.feedback,
 					output,
 					parentConfirmed,
@@ -2593,6 +2654,7 @@ export function makeSpeculativeActionRuntime<
 				// Producer continuation is optional and must not alter actor settlement.
 			}
 		}
+		pruneResolvedLeases(candidate);
 	};
 
 	const recordAndPredict = async (
@@ -2769,7 +2831,6 @@ export function makeSpeculativeActionRuntime<
 			actorCallSequences: new Map(),
 			preparedHints: new Set(),
 			pendingActionSequences: new Set(),
-			turnAdmissions: new Map(),
 			plan: planStateFor(input.sessionID),
 			sourceAttempts: new Set(),
 			sourceFeedback: new Map(),
@@ -2801,17 +2862,17 @@ export function makeSpeculativeActionRuntime<
 		const actorArrivedAt = Date.now();
 		const state = turns.get(turnKey(input));
 		if (!state || signal?.aborted) return undefined;
-		// Capture the jobs visible when the actor arrived. A fast validation
-		// failure may retire a job while settings or K(a) are still resolving;
-		// retaining the reference lets the actor receive the precise rejection
-		// instead of an indistinguishable empty-cache miss.
-		const candidatesAtArrival = [...availableCandidates(state).values()];
+		observeActorStep(state, actorArrivedAt);
 		const settings = await latestSettings();
 		if (!settings || !masterEnabled(settings)) {
 			await disableSession(input.sessionID);
 			return undefined;
 		}
 		if (state.finished || signal?.aborted) return undefined;
+		await advanceCacheProbation(state);
+		// Retain this post-expiry snapshot while K(a) resolves so a concurrent
+		// validation failure still reports its precise rejection reason.
+		const candidatesAtArrival = [...availableCandidates(state).values()];
 		const actionSequence = (actionSequences.get(state.sessionID) ?? state.actionSequence) + 1;
 		actionSequences.set(state.sessionID, actionSequence);
 		state.actionSequence = Math.max(state.actionSequence, actionSequence);
@@ -3076,13 +3137,13 @@ export function makeSpeculativeActionRuntime<
 			completePredictionMatch(candidate, actionSequence);
 			markCandidatePlanAdopted(state, candidate, actionSequence);
 			candidate.hits++;
+			candidate.lastActorHitAt = Date.now();
 			candidate.authoritativeSequence = Math.max(candidate.authoritativeSequence ?? 0, actionSequence);
 			if (candidate.reuse.kind === "shared") {
 				results.recordActorHit(state.sessionID, candidate, cacheLimits(state.settings));
 			} else {
 				candidate.lifecycle.markAdopted(executionMs);
 				schedulerFor(state.sessionID).discard(candidate);
-				removeTurnAdmission(state, candidate);
 				removeCandidateFromStores(state, candidate);
 				releaseCandidateResourceVersion(candidate);
 				candidateOwners.delete(candidate);
@@ -3170,6 +3231,7 @@ export function makeSpeculativeActionRuntime<
 		if (state.finished) return;
 		state.finished = true;
 		state.terminal = terminal;
+		clearPlanDispatchTimer(state);
 		state.predictionController.abort();
 		wallTimes.set(state.sessionID, (wallTimes.get(state.sessionID) ?? 0) + Math.max(0, Date.now() - state.startedAt));
 		turns.delete(turnKey(state));
@@ -3228,6 +3290,7 @@ export function makeSpeculativeActionRuntime<
 			if (hasActivePredictionLease(candidate)) continue;
 			await cancelCandidate(state, candidate, "turn_finished_without_hit");
 		}
+		await compactPlanState(state);
 		await publishCache(state);
 		if (terminal) {
 			await flushPredictionSources();
@@ -3258,9 +3321,11 @@ export function makeSpeculativeActionRuntime<
 	const abortState = async (state: TurnState<SessionID, Output, StateData>, reason: string): Promise<void> => {
 		if (state.finished) return;
 		state.finished = true;
+		clearPlanDispatchTimer(state);
 		state.predictionController.abort();
 		turns.delete(turnKey(state));
-		for (const candidate of new Set(state.turnAdmissions.values())) {
+		for (const candidate of sessionCandidates(state.sessionID)) {
+			if (candidateOwners.get(candidate)?.turnID !== state.turnID) continue;
 			if (candidate.run.status === "closed") continue;
 			await preemptCandidate(candidate, reason, "discarded");
 		}
@@ -3294,6 +3359,7 @@ export function makeSpeculativeActionRuntime<
 		tokenTotals.delete(sessionID);
 		wallTimes.delete(sessionID);
 		actionSequences.delete(sessionID);
+		actorStepTimes.delete(sessionID);
 		schedulers.delete(sessionID);
 		sourceBackoff.delete(sessionID);
 		planStates.delete(sessionID);
@@ -3312,7 +3378,7 @@ export function makeSpeculativeActionRuntime<
 		planStates.clear();
 		planLaunchContexts.clear();
 		actionSequences.clear();
-		candidateOwners.clear();
+		actorStepTimes.clear();
 	};
 
 	const inspect = (sessionID?: SessionID): SpeculativeRuntimeInspection => {
@@ -3354,12 +3420,19 @@ export function candidateExecutionMs(candidate: SpeculativeCandidate): number {
 	return candidate.run.status === "ready" || candidate.run.status === "closed" ? (candidate.run.executionMs ?? 0) : 0;
 }
 
-function candidateCacheValue<Output>(candidate: RuntimeCandidate<Output>): number {
-	const savedMs = Math.max(
-		0,
-		candidateExecutionMs(candidate) * Math.max(1, candidate.hits) - candidate.validationMs - candidate.projectionMs,
+function candidateCacheValue<Output>(candidate: RuntimeCandidate<Output>, now: number): number {
+	return speculativeCacheValue(
+		{
+			executionMs: candidateExecutionMs(candidate),
+			validationMs: candidate.validationMs,
+			projectionMs: candidate.projectionMs,
+			bytes: candidate.estimatedBytes,
+			hits: candidate.hits,
+			createdAt: candidate.startedAt,
+			...(candidate.lastActorHitAt !== undefined ? { lastHitAt: candidate.lastActorHitAt } : {}),
+		},
+		now,
 	);
-	return savedMs / (finiteMetric(candidate.estimatedBytes) + 4096);
 }
 
 function candidateCompletedAt(candidate: SpeculativeCandidate): number | undefined {
@@ -3463,11 +3536,12 @@ function createDisposalState<SessionID, Output, StateData>(
 	sessionID: SessionID,
 	settings: SpeculativeActionSettings,
 	plan = new PlanState(),
+	turnID = "<dispose>",
 ): TurnState<SessionID, Output, StateData> {
 	return {
 		sessionID,
-		turnID: "<dispose>",
-		startInput: { sessionID, turnID: "<dispose>" },
+		turnID,
+		startInput: { sessionID, turnID },
 		startedAt: Date.now(),
 		data: undefined as StateData,
 		settings,
@@ -3476,7 +3550,6 @@ function createDisposalState<SessionID, Output, StateData>(
 		actorCallSequences: new Map(),
 		preparedHints: new Set(),
 		pendingActionSequences: new Set(),
-		turnAdmissions: new Map(),
 		plan,
 		sourceAttempts: new Set(),
 		sourceFeedback: new Map(),

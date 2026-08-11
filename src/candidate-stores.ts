@@ -190,6 +190,43 @@ export interface ResultCacheLimits {
 	readonly protectedFraction?: number;
 }
 
+export interface ResultCacheProbationPolicy {
+	readonly maxAgeMs: number;
+	readonly maxOpportunities: number;
+}
+
+export interface SpeculativeCacheValueMetrics {
+	readonly executionMs: number;
+	readonly validationMs: number;
+	readonly projectionMs: number;
+	readonly bytes: number;
+	readonly hits: number;
+	readonly createdAt: number;
+	readonly lastHitAt?: number;
+}
+
+export const CACHE_HIT_HALF_LIFE_MS = 30 * 60 * 1000;
+
+export function speculativeCacheValue(
+	metrics: SpeculativeCacheValueMetrics,
+	now = Date.now(),
+	halfLifeMs = CACHE_HIT_HALF_LIFE_MS,
+): number {
+	const savedMs = Math.max(
+		0,
+		finiteValue(metrics.executionMs) - finiteValue(metrics.validationMs) - finiteValue(metrics.projectionMs),
+	);
+	const referenceAt = metrics.hits > 0 ? (metrics.lastHitAt ?? metrics.createdAt) : metrics.createdAt;
+	const ageMs = Math.max(0, finiteValue(now - referenceAt));
+	const decay = halfLifeMs > 0 ? 2 ** (-ageMs / halfLifeMs) : 0;
+	const reuseWeight = metrics.hits > 0 ? 1 + finiteValue(metrics.hits) * decay : 0.1 * decay;
+	return (reuseWeight * savedMs) / (finiteValue(metrics.bytes) + 4096);
+}
+
+type CacheMetadata =
+	| { readonly state: "probation"; readonly createdAt: number; readonly opportunities: number }
+	| { readonly state: "protected" };
+
 export interface ResultCacheLookup<Entry> extends ActionStoreLookup<Entry> {
 	readonly state: ResultCacheEntryState;
 }
@@ -208,17 +245,23 @@ export interface ResultCacheSnapshot {
 /** Completed shareable results with speculative probation and actor-validated protection. */
 export class ResultCache<Scope, Entry extends SizedActionStoreEntry> {
 	private readonly index: ActionStore<Scope, Entry>;
-	private readonly tiers = new Map<Scope, Map<Entry, ResultCacheEntryState>>();
-	private readonly score: (entry: Entry) => number;
+	private readonly metadata = new Map<Scope, Map<Entry, CacheMetadata>>();
+	private readonly score: (entry: Entry, now: number) => number;
+	private readonly now: () => number;
 
-	constructor(projectors: readonly ActionKeyProjector[] = [], score: (entry: Entry) => number = () => 0) {
+	constructor(
+		projectors: readonly ActionKeyProjector[] = [],
+		score: (entry: Entry, now: number) => number = () => 0,
+		now: () => number = Date.now,
+	) {
 		this.index = new ActionStore(projectors);
 		this.score = score;
+		this.now = now;
 	}
 
 	insert(scope: Scope, entry: Entry): Entry | undefined {
 		const existing = this.index.insert(scope, entry);
-		if (!existing) this.tiersFor(scope).set(entry, "probation");
+		if (!existing) this.placeOnProbation(scope, entry);
 		return existing;
 	}
 
@@ -228,36 +271,52 @@ export class ResultCache<Scope, Entry extends SizedActionStoreEntry> {
 		canReuseProjected: (existing: Entry, match: ProjectedActionKeyMatch) => boolean = () => false,
 	): ResultCacheInsertResult<Entry> {
 		const result = this.index.insertOrGetCompatible(scope, entry, canReuseProjected);
-		const tiers = this.tiersFor(scope);
-		if (result.inserted) tiers.set(entry, "probation");
-		return { ...result, state: tiers.get(result.entry) ?? "probation" };
+		if (result.inserted) this.placeOnProbation(scope, entry);
+		return { ...result, state: this.stateOf(scope, result.entry) ?? "probation" };
 	}
 
 	lookup(scope: Scope, action: ActionKey): readonly ResultCacheLookup<Entry>[] {
-		const tiers = this.tiers.get(scope);
 		return this.index.lookup(scope, action).map((item) => ({
 			entry: item.entry,
 			match: item.match,
-			state: tiers?.get(item.entry) ?? "probation",
+			state: this.stateOf(scope, item.entry) ?? "probation",
 		}));
 	}
 
 	recordActorHit(scope: Scope, entry: Entry, limits?: ResultCacheLimits): readonly Entry[] {
 		if (this.index.getExact(scope, entry.key) !== entry) return [];
-		this.tiersFor(scope).set(entry, "protected");
+		this.metadataFor(scope).set(entry, { state: "protected" });
 		this.index.touch(scope, entry);
 		return limits ? this.rebalanceProtected(scope, limits) : [];
 	}
 
+	advanceActorOpportunity(scope: Scope, policy: ResultCacheProbationPolicy): readonly Entry[] {
+		const now = this.now();
+		const maxAgeMs = expirationLimit(policy.maxAgeMs);
+		const maxOpportunities = expirationLimit(policy.maxOpportunities);
+		const expired: Entry[] = [];
+		for (const entry of this.index.values(scope)) {
+			const current = this.metadata.get(scope)?.get(entry);
+			if (!current || current.state !== "probation") continue;
+			if (now - current.createdAt >= maxAgeMs || current.opportunities >= maxOpportunities) {
+				this.delete(scope, entry);
+				expired.push(entry);
+				continue;
+			}
+			this.metadataFor(scope).set(entry, { ...current, opportunities: current.opportunities + 1 });
+		}
+		return expired;
+	}
+
 	stateOf(scope: Scope, entry: Entry): ResultCacheEntryState | undefined {
-		return this.index.getExact(scope, entry.key) === entry ? this.tiers.get(scope)?.get(entry) : undefined;
+		return this.index.getExact(scope, entry.key) === entry ? this.metadata.get(scope)?.get(entry)?.state : undefined;
 	}
 
 	delete(scope: Scope, entry: Entry): boolean {
 		if (!this.index.delete(scope, entry)) return false;
-		const tiers = this.tiers.get(scope);
-		tiers?.delete(entry);
-		if (tiers?.size === 0) this.tiers.delete(scope);
+		const metadata = this.metadata.get(scope);
+		metadata?.delete(entry);
+		if (metadata?.size === 0) this.metadata.delete(scope);
 		return true;
 	}
 
@@ -280,7 +339,7 @@ export class ResultCache<Scope, Entry extends SizedActionStoreEntry> {
 		let protectedBytes = 0;
 		for (const entry of this.index.values(scope)) {
 			const bytes = entryBytes(entry);
-			if (this.tiers.get(scope)?.get(entry) === "protected") {
+			if (this.stateOf(scope, entry) === "protected") {
 				protectedEntries++;
 				protectedBytes += bytes;
 			} else {
@@ -312,12 +371,16 @@ export class ResultCache<Scope, Entry extends SizedActionStoreEntry> {
 		return evicted;
 	}
 
-	private tiersFor(scope: Scope): Map<Entry, ResultCacheEntryState> {
-		const existing = this.tiers.get(scope);
+	private metadataFor(scope: Scope): Map<Entry, CacheMetadata> {
+		const existing = this.metadata.get(scope);
 		if (existing) return existing;
-		const created = new Map<Entry, ResultCacheEntryState>();
-		this.tiers.set(scope, created);
+		const created = new Map<Entry, CacheMetadata>();
+		this.metadata.set(scope, created);
 		return created;
+	}
+
+	private placeOnProbation(scope: Scope, entry: Entry): void {
+		this.metadataFor(scope).set(entry, { state: "probation", createdAt: this.now(), opportunities: 0 });
 	}
 
 	private rebalanceProtected(scope: Scope, limits: ResultCacheLimits): readonly Entry[] {
@@ -328,24 +391,25 @@ export class ResultCache<Scope, Entry extends SizedActionStoreEntry> {
 			entryCapacity === 0 || fraction === 0 ? 0 : Math.max(1, Math.floor(entryCapacity * fraction));
 		const protectedByteLimit = Math.floor(byteCapacity * fraction);
 		const demoted: Entry[] = [];
+		const now = this.now();
 		while (true) {
 			const protectedEntries = this.index
 				.values(scope)
 				.filter((entry) => this.stateOf(scope, entry) === "protected");
 			const protectedBytes = protectedEntries.reduce((total, entry) => total + entryBytes(entry), 0);
 			if (protectedEntries.length <= protectedEntryLimit && protectedBytes <= protectedByteLimit) break;
-			const victim = this.lowestValue(protectedEntries);
+			const victim = this.lowestValue(protectedEntries, now);
 			if (!victim) break;
-			this.tiersFor(scope).set(victim, "probation");
+			this.metadataFor(scope).set(victim, { state: "probation", createdAt: now, opportunities: 0 });
 			demoted.push(victim);
 		}
 		return demoted;
 	}
 
-	private lowestValue(entries: readonly Entry[]): Entry | undefined {
+	private lowestValue(entries: readonly Entry[], now = this.now()): Entry | undefined {
 		return entries.reduce<Entry | undefined>(
 			(lowest, entry) =>
-				!lowest || finiteValue(this.score(entry)) < finiteValue(this.score(lowest)) ? entry : lowest,
+				!lowest || finiteValue(this.score(entry, now)) < finiteValue(this.score(lowest, now)) ? entry : lowest,
 			undefined,
 		);
 	}
@@ -361,6 +425,10 @@ function finiteFraction(value: number): number {
 
 function finiteValue(value: number): number {
 	return Number.isFinite(value) ? Math.max(0, value) : 0;
+}
+
+function expirationLimit(value: number): number {
+	return Number.isFinite(value) ? Math.max(0, value) : Number.POSITIVE_INFINITY;
 }
 
 function entryBytes(entry: SizedActionStoreEntry): number {

@@ -3,7 +3,9 @@
 
 use anyhow::{Context, Result, anyhow};
 use std::ffi::c_void;
+use std::fs::File;
 use std::mem::{size_of, zeroed};
+use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 use windows::Win32::Foundation::{
     CloseHandle, HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation, WAIT_OBJECT_0,
@@ -108,6 +110,7 @@ pub fn run_lockdown(
     target_exe: &Path,
     target_args: &[String],
     env_overlay: &[(String, String)],
+    input: Option<&File>,
     appcontainer: &mut SECURITY_CAPABILITIES,
     desktop: &mut IsolatedDesk,
 ) -> Result<u32> {
@@ -115,12 +118,10 @@ pub fn run_lockdown(
     // parent-process escape target.
     self_protect::install_broker_dacl().context("protect AppContainer broker")?;
 
-    // 2) Restricted token. Each handle is RAII-owned so any `?`
-    //    below closes whatever was already opened.
+    // AppContainer is the isolation boundary. A second restricted-token layer
+    // breaks classic tool runtimes without strengthening that boundary.
     let self_tok = OwnedHandle(open_self_token()?);
-    let restricted =
-        OwnedHandle(token::make_sandbox_token(self_tok.raw()).context("make_sandbox_token")?);
-    let primary = OwnedHandle(to_primary(restricted.raw()).context("to_primary")?);
+    let primary = OwnedHandle(to_primary(self_tok.raw()).context("to_primary")?);
 
     // 3) Job. `breakaway_ok = false` — this is the load-bearing
     //    containment Job; the child must NOT be able to break away.
@@ -143,7 +144,7 @@ pub fn run_lockdown(
         );
     }
 
-    // The environment block contains only the explicit safe variables.
+    // The environment block contains exactly the resolved invocation.
     let mut env = build_env_block(env_overlay);
 
     // 6) Command line + application name.
@@ -157,7 +158,7 @@ pub fn run_lockdown(
         | MITIGATION_FONT_DISABLE
         | MITIGATION_IMAGE_LOAD_NO_REMOTE
         | MITIGATION_IMAGE_LOAD_NO_LOW_LABEL;
-    let std_handles = collect_inheritable_std_handles();
+    let std_handles = collect_inheritable_std_handles(input);
     let mut handle_list: Vec<HANDLE> = std_handles
         .iter()
         .copied()
@@ -179,8 +180,7 @@ pub fn run_lockdown(
     //    stdio are the outer broker's anonymous pipes. Without explicit
     //    `hStd*`
     //    wiring the child would try to allocate a conhost on the
-    //    non-interactive desktop — which under the restricted token
-    //    hangs.
+    //    non-interactive desktop and hang.
     let mut six: STARTUPINFOEXW = unsafe { zeroed() };
     six.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
     six.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
@@ -280,8 +280,7 @@ pub fn run_lockdown(
     unsafe {
         GetExitCodeProcess(child.process(), &mut code).context("GetExitCodeProcess")?;
     }
-    // `child` (closes hProcess/hThread), `primary`/`restricted`/
-    // `self_tok` (CloseHandle) all drop here.
+    // `child` (closes hProcess/hThread), `primary`, and `self_tok` all drop here.
     // Keep `attrs` (its backing buffer + the borrowed `mitigation`
     // and `handle_list`) and `job` alive until here. The kernel
     // snapshots the attribute list at CreateProcess time, but
@@ -295,8 +294,8 @@ pub fn run_lockdown(
 
 // ─── Environment block ──────────────────────────────────────────────
 
-/// Build a `CREATE_UNICODE_ENVIRONMENT` block from the explicitly allowed
-/// key/value pairs. No broker environment variable is inherited implicitly.
+/// Build a `CREATE_UNICODE_ENVIRONMENT` block from the resolved key/value
+/// pairs. No broker environment variable is inherited implicitly.
 fn build_env_block(overlay: &[(String, String)]) -> Vec<u16> {
     use std::os::windows::ffi::OsStrExt;
 
@@ -557,7 +556,7 @@ impl Drop for ProcThreadAttrs {
 /// make the whitelist is also `default()` in `hStd*` (the child sees
 /// a null std handle for that stream rather than a stale value the
 /// kernel never duplicated).
-fn collect_inheritable_std_handles() -> [HANDLE; 3] {
+fn collect_inheritable_std_handles(input: Option<&File>) -> [HANDLE; 3] {
     let mut out = [HANDLE::default(); 3];
     for (i, which) in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE]
         .into_iter()
@@ -575,6 +574,14 @@ fn collect_inheritable_std_handles() -> [HANDLE; 3] {
         let r = unsafe { SetHandleInformation(h, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT) };
         if r.is_ok() {
             out[i] = h;
+        }
+    }
+    if let Some(input) = input {
+        let handle = HANDLE(input.as_raw_handle());
+        if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT) }
+            .is_ok()
+        {
+            out[0] = handle;
         }
     }
     out

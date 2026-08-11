@@ -79,6 +79,22 @@ describe("PatternAware", () => {
 		).toEqual(target);
 	});
 
+	test("does not infer arbitrary case changes or string concatenation as reusable argument semantics", () => {
+		const context = [event({ sessionID: "one", tool: "inspect", input: { left: "Alpha", right: "Beta" } })];
+		const target = { normalized: "alpha", command: "Alpha:Beta" };
+		const bindings = inferBindings(context, target);
+
+		expect(bindings).toMatchObject({
+			'["normalized"]': { type: "constant", value: "alpha" },
+			'["command"]': { type: "constant", value: "Alpha:Beta" },
+		});
+		expect(
+			applyBindings(bindings, [
+				event({ sessionID: "two", tool: "inspect", input: { left: "Gamma", right: "Delta" } }),
+			]),
+		).toEqual(target);
+	});
+
 	test("learns online after repeated authoritative chains and predicts without an LLM", () => {
 		const store = new PatternAwareStore(settings());
 		trainGrepRead(store, "one", "src/a.ts");
@@ -1245,6 +1261,9 @@ describe("PatternAware", () => {
 		expect(
 			JSON.parse(reads.find((candidate) => candidate.input.offset === undefined)!.diagnostic).supportingPatterns,
 		).toEqual(expect.arrayContaining(["default-implicit", "default-explicit"]));
+		expect(reads.find((candidate) => candidate.input.offset === undefined)?.supportingPatternIDs).toEqual(
+			expect.arrayContaining(["default-implicit", "default-explicit"]),
+		);
 	});
 
 	test("backs off across matching suffix contexts", () => {
@@ -1327,7 +1346,11 @@ describe("PatternAware", () => {
 		expect(candidates[0]).toMatchObject({ tool: "bash", expectedDurationMs: 100 });
 		expect(diagnostic).toMatchObject({ beamRank: 1, beamWidth: 1, ppmOrder: 1 });
 		expect(diagnostic.ppmProbability).toBeGreaterThan(0);
+		expect(diagnostic.ppmWeight).toBeGreaterThan(0);
 		expect(candidates[0]!.expectedLatencyBenefitMs).toBeGreaterThan(1);
+		expect(candidates[0]!.expectedLatencyBenefitMs).toBeCloseTo(
+			candidates[0]!.empiricalProbability * candidates[0]!.expectedDurationMs,
+		);
 		expect(candidates[0]!.continuation.pathProbability).toBeCloseTo(
 			candidates[0]!.expectedLatencyBenefitMs / candidates[0]!.expectedDurationMs,
 		);

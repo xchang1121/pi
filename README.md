@@ -167,7 +167,7 @@ The native sandbox provides platform-specific isolation:
 
 - Linux: namespaces, a read-only host mount, seccomp, capability removal, and process-tree supervision.
 - macOS: a Seatbelt profile, source/home/network restrictions, and process-tree supervision.
-- Windows: a zero-capability AppContainer, restricted token, private desktop, and Job supervision.
+- Windows: a zero-capability AppContainer, private desktop, process mitigations, and Job supervision.
 
 `ExecutionWorld` is the isolation boundary used by the Agent adapter. `ActionSemanticsRegistry` selects a world mode (`file_mutation` or `workspace_snapshot`); the world does not maintain a second hard-coded tool list. A completed `WorldBranch` seals the tool output and promotable filesystem delta together. Process-local cwd/environment state and blocked network effects are never promoted. Concurrent consumers join one conflict-checked, transactional adoption, while an unadopted branch cannot change the actor's world.
 

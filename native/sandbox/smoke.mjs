@@ -6,7 +6,7 @@ import path from "node:path";
 const binaryArgument = process.argv.find((argument) => argument.startsWith("--binary="));
 if (!binaryArgument) throw new Error("usage: node smoke.mjs --binary=FILE");
 const binary = path.resolve(binaryArgument.slice("--binary=".length));
-const protocolVersion = 3;
+const protocolVersion = 4;
 const check = await invoke(["--native-sandbox", "check"]);
 if (check.status !== 0 || check.json.version !== protocolVersion || check.json.ready !== true) {
 	throw new Error(`Native sandbox is not ready: ${check.stderr || check.stdout}`);
@@ -31,6 +31,9 @@ try {
 			version: protocolVersion,
 			command,
 			shell: process.platform === "win32" ? process.env.ComSpec : "/bin/sh",
+			shellArgs: process.platform === "win32" ? ["/d", "/s", "/c"] : ["-c"],
+			commandTransport: "argv",
+			environment: process.env,
 			cwd: sandboxRoot,
 			sandboxRoot,
 			sourceRoot,

@@ -4,6 +4,7 @@ import type {
 	Agent,
 	AgentTool,
 	AgentToolCall,
+	AgentToolInvocation,
 	AgentToolResult,
 	SettleToolCallContext,
 	SettleToolCallResult,
@@ -147,6 +148,10 @@ export interface InstalledSpeculativeAction {
 	readonly uninstall: () => Promise<void>;
 }
 
+export function patternPlanActionID(actionIdentity: string, parentActionID = "root"): string {
+	return `pattern:${stableHash({ actionIdentity, parentActionID }).slice(0, 16)}`;
+}
+
 /**
  * Install source-neutral speculative plan execution on an Agent.
  *
@@ -260,12 +265,13 @@ export function installSpeculativeAction(
 		AgentConsumeInput,
 		AgentStateData
 	>;
-	type PatternPlanFeedback = PatternAwareRuntimeContext & { readonly patternID: string };
-	const patternPlanRevisions = new Map<string, number>();
+	type PatternPlanFeedback = PatternAwareRuntimeContext & { readonly patternIDs: ReadonlyArray<string> };
 	const asPatternPlanFeedback = (value: unknown): PatternPlanFeedback | undefined => {
 		const context = asPatternAwareRuntimeContext(value);
-		if (!context || typeof (value as { patternID?: unknown })?.patternID !== "string") return undefined;
-		return { ...context, patternID: (value as { patternID: string }).patternID };
+		const patternIDs = (value as { patternIDs?: unknown })?.patternIDs;
+		if (!context || !Array.isArray(patternIDs) || !patternIDs.every((item) => typeof item === "string"))
+			return undefined;
+		return { ...context, patternIDs };
 	};
 	const patternPlanAction = (
 		candidate: PatternAwareCandidate,
@@ -286,10 +292,8 @@ export function installSpeculativeAction(
 		expectedLatencyBenefitMs: candidate.expectedLatencyBenefitMs,
 		depth: candidate.depth,
 		...(dependsOn?.length ? { dependsOn } : {}),
-		feedback: { ...patternAwareRuntimeContext(store, candidate), patternID: candidate.patternID },
+		feedback: { ...patternAwareRuntimeContext(store, candidate), patternIDs: candidate.supportingPatternIDs },
 	});
-	const patternActionID = (candidate: PatternAwareCandidate): string =>
-		`${candidate.patternID}:${stableHash({ tool: candidate.tool, input: candidate.input }).slice(0, 16)}`;
 	const drafterSource: AgentPlanSource = {
 		id: "drafter",
 		enabled: (settings) => settings.drafterEnabled ?? DEFAULTS.drafterEnabled,
@@ -364,16 +368,27 @@ export function installSpeculativeAction(
 			}
 			const store = await resolvePatternStore(settings);
 			const proposalID = `pattern:${startInput.turnID}`;
-			patternPlanRevisions.set(proposalID, 0);
 			const candidates = store.predict(startInput.sessionID, definitionSchemaHashes(definitions));
 			return {
 				id: proposalID,
 				source: "pattern_aware",
 				revision: 0,
-				actions: candidates.map((candidate) => patternPlanAction(candidate, store, patternActionID(candidate))),
+				actions: candidates.map((candidate) =>
+					patternPlanAction(candidate, store, patternPlanActionID(candidate.actionIdentity)),
+				),
 			};
 		},
-		continue: async ({ startInput, data, candidate, proposalID, actionID, feedback, output, parentConfirmed }) => {
+		continue: async ({
+			startInput,
+			data,
+			candidate,
+			proposalID,
+			actionID,
+			revision,
+			feedback,
+			output,
+			parentConfirmed,
+		}) => {
 			const context = asPatternPlanFeedback(feedback);
 			if (!context) return undefined;
 			const observation = projectPatternAwareObservation(
@@ -401,14 +416,14 @@ export function installSpeculativeAction(
 				parentConfirmed,
 			);
 			if (!next.length) return undefined;
-			const revision = (patternPlanRevisions.get(proposalID) ?? 0) + 1;
-			patternPlanRevisions.set(proposalID, revision);
 			return {
 				proposalID,
 				source: "pattern_aware",
 				revision,
 				upsert: next.map((item) =>
-					patternPlanAction(item, context.store, patternActionID(item), [{ actionID, condition: "succeeded" }]),
+					patternPlanAction(item, context.store, patternPlanActionID(item.actionIdentity, actionID), [
+						{ actionID, condition: "succeeded" },
+					]),
 				),
 			};
 		},
@@ -439,19 +454,15 @@ export function installSpeculativeAction(
 		},
 		onLaunched: ({ feedback }) => {
 			const context = asPatternPlanFeedback(feedback);
-			context?.store.launched(context.patternID);
+			for (const patternID of context?.patternIDs ?? []) context?.store.launched(patternID);
 		},
 		onResolved: ({ feedback, outcome }) => {
 			const context = asPatternPlanFeedback(feedback);
-			context?.store.resolved(context.patternID, outcome);
+			for (const patternID of context?.patternIDs ?? []) context?.store.resolved(patternID, outcome);
 		},
 		flush: async () => {
-			try {
-				if (openedPatternStore) await (await openedPatternStore).store.flush();
-				if (options.patternStore) await (await options.patternStore).flush();
-			} finally {
-				patternPlanRevisions.clear();
-			}
+			if (openedPatternStore) await (await openedPatternStore).store.flush();
+			if (options.patternStore) await (await options.patternStore).flush();
 		},
 	};
 
@@ -474,22 +485,34 @@ export function installSpeculativeAction(
 				input.tools.map((tool) => ({ name: tool.name, inputSchema: tool.parameters })),
 			),
 		}),
-		actionKey: (toolName, input, context) => {
+		actionKey: async (toolName, input, context) => {
+			let tool: AgentTool | undefined;
+			let validated: unknown;
 			if (context.type === "consume") {
-				const tool = agent.state.tools.find((candidate) => candidate.name === toolName);
-				return actionSemantics.buildKey(
-					toolName,
-					input,
-					options.cwd,
-					tool ? stableHash(tool.parameters ?? null) : undefined,
-				);
+				tool = agent.state.tools.find((candidate) => candidate.name === toolName);
+				validated = input;
+			} else {
+				tool = context.data.tools.get(toolName);
+				if (!tool) return undefined;
+				validated = validateCandidateArguments(tool, toolName, input, "spec_key");
+				if (validated === undefined) return undefined;
 			}
-			const tool = context.data.tools.get(toolName);
 			if (!tool) return undefined;
-			const validated = validateCandidateArguments(tool, toolName, input, "spec_key");
-			return validated === undefined
-				? undefined
-				: actionSemantics.buildKey(toolName, validated, options.cwd, context.data.schemaHashes[toolName]);
+			let invocation: AgentToolInvocation | undefined;
+			try {
+				invocation = await tool.resolveInvocation?.(validated as never);
+			} catch {
+				return undefined;
+			}
+			const schemaHash =
+				context.type === "consume" ? stableHash(tool.parameters ?? null) : context.data.schemaHashes[toolName];
+			return actionSemantics.buildKey(
+				toolName,
+				validated,
+				options.cwd,
+				schemaHash,
+				invocation ? { fingerprint: stableHash(invocation), context: invocation } : undefined,
+			);
 		},
 		actual: (input) => ({ id: input.id, tool: input.tool, input: input.args }),
 		preflightCandidate: async ({ data, tool: toolName, concrete, action, callID, signal }) => {
@@ -500,6 +523,9 @@ export function installSpeculativeAction(
 			const mode = executionWorldMode(toolName);
 			if (action.execution === "sandbox" && (!mode || !options.sandbox?.supports(mode))) {
 				return { ok: false, reason: "sandbox_unavailable" };
+			}
+			if (mode === "workspace_snapshot" && !asAgentToolInvocation(action.executionContext)?.process) {
+				return { ok: false, reason: "execution_context_unavailable" };
 			}
 			const result = await options.preflight({ tool, toolName, args, action, signal });
 			return typeof result === "boolean"
@@ -540,6 +566,7 @@ export function installSpeculativeAction(
 					toolName,
 					args,
 					action,
+					invocation: asAgentToolInvocation(action.executionContext),
 					callID,
 					signal,
 				});
@@ -726,6 +753,11 @@ export function installSpeculativeAction(
 			}
 		},
 	};
+}
+
+function asAgentToolInvocation(value: unknown): AgentToolInvocation | undefined {
+	if (!value || typeof value !== "object" || typeof (value as { executor?: unknown }).executor !== "string") return;
+	return value as AgentToolInvocation;
 }
 
 function validateCandidateArguments(

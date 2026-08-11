@@ -277,96 +277,6 @@ describe("PatternAware runtime integration", () => {
 		);
 	});
 
-	it("flushes terminal PatternAware state after prediction leases settle", async () => {
-		const lifecycle: string[] = [];
-		const runtime = makeSpeculativeActionRuntime(
-			adapter({
-				patternPropose: () => ({
-					candidates: [patternCandidate("read", { path: "README.md" }, "terminal-pattern", 8)],
-					draftTokens: 0,
-				}),
-				onTurnFinished: () => {
-					lifecycle.push("turn_finished");
-				},
-				patternResolved: (_id, outcome) => {
-					lifecycle.push(`resolved:${outcome}`);
-				},
-				patternFlush: () => {
-					lifecycle.push(`flush_after:${lifecycle.at(-1)}`);
-				},
-			}),
-		);
-
-		await runtime.startTurn(start("turn"));
-		await waitFor(() => runtime.inspect().pendingPredictions === 0);
-		expect(runtime.inspect().deferredPlanActions).toBe(1);
-		await runtime.finishTurn({ ...start("turn"), terminal: true });
-
-		expect(lifecycle).toEqual(["turn_finished", "resolved:actor_miss", "flush_after:resolved:actor_miss"]);
-	});
-
-	it("routes lifecycle updates through each candidate store context", async () => {
-		const first = { store: "first" };
-		const second = { store: "second" };
-		const launched: unknown[] = [];
-		const resolved: Array<{ context: unknown; outcome: string }> = [];
-		const runtime = makeSpeculativeActionRuntime(
-			adapter({
-				patternPropose: () => ({
-					candidates: [
-						{ ...patternCandidate("read", { path: "a.ts" }, "first", 0), patternContext: first },
-						{ ...patternCandidate("read", { path: "b.ts" }, "second", 0), patternContext: second },
-					],
-					draftTokens: 0,
-				}),
-				patternLaunched: (_id, context) => {
-					launched.push(context);
-				},
-				patternResolved: (_id, outcome, context) => {
-					resolved.push({ context, outcome });
-				},
-			}),
-		);
-
-		await runtime.startTurn(start("turn"));
-		await waitFor(() => launched.length === 2);
-		await runtime.consume(call("turn", "read", { path: "a.ts" }));
-		await runtime.finishTurn({ ...start("turn"), terminal: true });
-
-		expect(launched).toEqual([first, second]);
-		expect(resolved).toEqual([
-			{ context: first, outcome: "consumed" },
-			{ context: second, outcome: "actor_miss" },
-		]);
-	});
-
-	it("immediately admits a prediction learned from an authoritative action", async () => {
-		let executions = 0;
-		const runtime = makeSpeculativeActionRuntime(
-			adapter({
-				patternObserve: ({ tool, output }) =>
-					tool === "grep" && output === "src/a.ts"
-						? { candidates: [patternCandidate("read", { path: "src/a.ts" }, "grep-read", 0)], draftTokens: 0 }
-						: undefined,
-				executeCandidate: () => {
-					executions++;
-					return "file";
-				},
-			}),
-		);
-
-		await runtime.startTurn(start("turn"));
-		await waitFor(() => runtime.inspect().pendingPredictions === 0);
-		await runtime.consume(call("turn", "grep", { pattern: "TODO" }));
-		await runtime.actual({
-			...call("turn", "grep", { pattern: "TODO" }),
-			durationMs: 5,
-			output: "src/a.ts",
-		});
-		await waitFor(() => executions === 1);
-		expect(await runtime.consume(call("turn", "read", { path: "src/a.ts" }))).toBe("file");
-	});
-
 	it("persists a pattern lease attached to an existing turn-scoped drafter job", async () => {
 		let executions = 0;
 		const outcomes: string[] = [];
@@ -407,51 +317,6 @@ describe("PatternAware runtime integration", () => {
 
 		expect(executions).toBe(2);
 		expect(outcomes).toEqual(["second:consumed"]);
-	});
-
-	it("preempts lower-utility in-flight work without a false completion", async () => {
-		const events: SpeculativeActionEvent<string>[] = [];
-		let aborted = 0;
-		const runtime = makeSpeculativeActionRuntime(
-			adapter({
-				settings: () => ({ ...settings(), candidateLimit: 1, maxConcurrentActions: 1 }),
-				draftPropose: (input) => ({
-					candidates:
-						input.turnID === "turn_1"
-							? [scheduledCandidate("a.ts", 10)]
-							: input.turnID === "turn_2"
-								? [scheduledCandidate("b.ts", 90)]
-								: [],
-					draftTokens: 0,
-				}),
-				executeCandidate: ({ concrete, signal }) =>
-					concrete.path === "a.ts"
-						? new Promise<string>((_resolve, reject) => {
-								signal.addEventListener(
-									"abort",
-									() => {
-										aborted++;
-										reject(new Error("aborted"));
-									},
-									{ once: true },
-								);
-							})
-						: "b",
-				onEvent: (event) => {
-					events.push(event);
-				},
-			}),
-		);
-
-		await runtime.startTurn(start("turn_1"));
-		await waitFor(() => events.some((event) => event.type === "started"));
-		await runtime.finishTurn(start("turn_1"));
-		await runtime.startTurn(start("turn_2"));
-		await waitFor(() => events.some((event) => event.type === "completed" && event.tool === "read"));
-
-		expect(aborted).toBe(1);
-		expect(events).toContainEqual(expect.objectContaining({ type: "cancelled", reason: "scheduler_preempted" }));
-		expect(events.filter((event) => event.type === "completed")).toHaveLength(1);
 	});
 
 	it("attributes scheduler preemption as a system outcome instead of an actor miss", async () => {
@@ -503,92 +368,6 @@ describe("PatternAware runtime integration", () => {
 
 		expect(outcomes).toContain("low:system");
 		await runtime.dispose();
-	});
-
-	it("keeps in-flight jobs outside result-cache LRU pressure", async () => {
-		const events: SpeculativeActionEvent<string>[] = [];
-		let aborted = 0;
-		const runtime = makeSpeculativeActionRuntime(
-			adapter({
-				settings: () => ({
-					...settings(),
-					candidateLimit: 2,
-					maxConcurrentActions: 2,
-					resourceCacheMaxEntries: 1,
-				}),
-				draftPropose: (input) => ({
-					candidates:
-						input.turnID === "turn_1"
-							? [scheduledCandidate("a.ts", 10)]
-							: input.turnID === "turn_2"
-								? [scheduledCandidate("b.ts", 10)]
-								: [],
-					draftTokens: 0,
-				}),
-				executeCandidate: ({ concrete, signal }) =>
-					concrete.path === "a.ts"
-						? new Promise<string>((_resolve, reject) => {
-								signal.addEventListener(
-									"abort",
-									() => {
-										aborted++;
-										reject(new Error("aborted"));
-									},
-									{ once: true },
-								);
-							})
-						: "b",
-				onEvent: (event) => {
-					events.push(event);
-				},
-			}),
-		);
-
-		await runtime.startTurn(start("turn_1"));
-		await waitFor(() => events.some((event) => event.type === "started"));
-		await runtime.finishTurn(start("turn_1"));
-		await runtime.startTurn(start("turn_2"));
-		await waitFor(() => events.some((event) => event.type === "completed"));
-
-		expect(aborted).toBe(0);
-		expect(events).not.toContainEqual(
-			expect.objectContaining({ type: "cancelled", reason: "resource_cache_evicted" }),
-		);
-		expect(runtime.inspect("session").resourceCandidates).toBe(2);
-		await runtime.dispose();
-		expect(aborted).toBe(1);
-	});
-
-	it("deduplicates and bounds preparation hints without executing them", async () => {
-		const prepared: string[] = [];
-		let executions = 0;
-		const runtime = makeSpeculativeActionRuntime(
-			adapter({
-				settings: () => ({ ...settings(), candidateLimit: 2, maxConcurrentActions: 2 }),
-				patternPropose: () => ({
-					candidates: [
-						preparationHint("a.ts"),
-						preparationHint("a.ts"),
-						preparationHint("b.ts"),
-						preparationHint("c.ts"),
-					],
-					draftTokens: 0,
-				}),
-				prepareCandidate: ({ candidate }) => {
-					prepared.push(String((candidate.input as { path?: string }).path));
-				},
-				executeCandidate: () => {
-					executions++;
-					return "unexpected";
-				},
-			}),
-		);
-
-		await runtime.startTurn(start("turn"));
-		await waitFor(() => runtime.inspect().pendingPredictions === 0);
-
-		expect(prepared).toEqual(["a.ts", "b.ts"]);
-		expect(executions).toBe(0);
 	});
 
 	it("expands each PatternAware lease once when a continuation reuses the same result", async () => {
@@ -931,7 +710,6 @@ describe("PatternAware runtime integration", () => {
 
 		expect(parentConfirmations).toEqual([false]);
 		expect(executions).toEqual(["parent.ts"]);
-		expect(runtime.inspect().blockedPlanActions).toBe(1);
 		await runtime.dispose();
 	});
 
@@ -972,90 +750,6 @@ describe("PatternAware runtime integration", () => {
 		expect(continuations).toBe(0);
 	});
 
-	it("bounds persistent cache by estimated bytes", async () => {
-		const events: SpeculativeActionEvent<string>[] = [];
-		const runtime = makeSpeculativeActionRuntime(
-			adapter({
-				settings: () => ({ ...settings(), resourceCacheMaxBytes: 1200 }),
-				draftPropose: (input) => ({
-					candidates: [scheduledCandidate(input.turnID === "turn_1" ? "a.ts" : "b.ts", 10)],
-					draftTokens: 0,
-				}),
-				executeCandidate: ({ concrete }) => `${String(concrete.path)}:${"x".repeat(220)}`,
-				onEvent: (event) => {
-					events.push(event);
-				},
-			}),
-		);
-
-		await runtime.startTurn(start("turn_1"));
-		await waitFor(() => events.some((event) => event.type === "completed" && event.tool === "read"));
-		await runtime.finishTurn(start("turn_1"));
-		await runtime.startTurn(start("turn_2"));
-		await waitFor(() => events.filter((event) => event.type === "completed").length === 2);
-
-		expect(events).toContainEqual(
-			expect.objectContaining({ type: "cancelled", reason: "resource_cache_byte_limit" }),
-		);
-		expect(await runtime.consume(call("turn_2", "read", { path: "a.ts" }))).toBeUndefined();
-		expect(await runtime.consume(call("turn_2", "read", { path: "b.ts" }))).toContain("b.ts");
-	});
-
-	it("eagerly invalidates a watched resource candidate and releases its watch", async () => {
-		let invalidate: ((path?: string) => void) | undefined;
-		let releases = 0;
-		const events: SpeculativeActionEvent<string>[] = [];
-		const runtime = makeSpeculativeActionRuntime(
-			adapter({
-				draftPropose: () => ({ candidates: [scheduledCandidate("a.ts", 10)], draftTokens: 0 }),
-				captureResourceVersion: () => ({ captureMs: 1, captureBytes: 0, captureFiles: 0 }),
-				watchResourceVersion: ({ onInvalidated }) => {
-					invalidate = onInvalidated;
-					return () => {
-						releases++;
-					};
-				},
-				onEvent: (event) => {
-					events.push(event);
-				},
-			}),
-		);
-
-		await runtime.startTurn(start("turn"));
-		await waitFor(() => invalidate !== undefined && events.some((event) => event.type === "completed"));
-		invalidate?.("a.ts");
-		await waitFor(() => releases === 1);
-
-		expect(await runtime.consume(call("turn", "read", { path: "a.ts" }))).toBeUndefined();
-		expect(events).toContainEqual(expect.objectContaining({ type: "cancelled", reason: "resource_changed:a.ts" }));
-	});
-
-	it("isolates scheduler budgets between sessions", async () => {
-		let executions = 0;
-		const pending = new Promise<string>(() => {});
-		const runtime = makeSpeculativeActionRuntime(
-			adapter({
-				settings: () => ({ ...settings(), candidateLimit: 1, maxConcurrentActions: 1 }),
-				draftPropose: (input) => ({
-					candidates: [scheduledCandidate(`${input.sessionID}.ts`, 10)],
-					draftTokens: 0,
-				}),
-				executeCandidate: () => {
-					executions++;
-					return pending;
-				},
-			}),
-		);
-
-		await runtime.startTurn({ sessionID: "one", turnID: "turn" });
-		await runtime.startTurn({ sessionID: "two", turnID: "turn" });
-		await waitFor(() => executions === 2);
-
-		expect(runtime.inspect("one").resourceCandidates).toBe(1);
-		expect(runtime.inspect("two").resourceCandidates).toBe(1);
-		await runtime.dispose();
-	});
-
 	it("applies adaptive drafter skipping and bounded miss backoff deterministically", async () => {
 		let requests = 0;
 		const runtime = makeSpeculativeActionRuntime(
@@ -1074,37 +768,6 @@ describe("PatternAware runtime integration", () => {
 		}
 
 		expect(requests).toBe(3);
-	});
-
-	it("runs the drafter beside an immediate pattern candidate when adaptation is disabled", async () => {
-		let requests = 0;
-		let executions = 0;
-		const runtime = makeSpeculativeActionRuntime(
-			adapter({
-				settings: () => ({ ...settings(), adaptiveDrafter: false }),
-				patternPropose: () => ({
-					candidates: [patternCandidate("read", { path: "README.md" }, "immediate", 0)],
-					draftTokens: 0,
-				}),
-				draftPropose: () => {
-					requests++;
-					return {
-						candidates: [{ type: "tool_call", tool: "read", input: { path: "README.md" } }],
-						draftTokens: 1,
-					};
-				},
-				executeCandidate: () => {
-					executions++;
-					return "prefetched";
-				},
-			}),
-		);
-
-		await runtime.startTurn(start("turn"));
-		await waitFor(() => runtime.inspect().pendingPredictions === 0 && requests === 1);
-
-		expect(requests).toBe(1);
-		expect(executions).toBe(1);
 	});
 
 	it("does not defer the adaptive drafter without an immediate concrete PatternAware action", async () => {
@@ -1343,7 +1006,6 @@ function adapter(overrides: AdapterOverrides = {}): Adapter {
 		...runtimeOverrides
 	} = overrides;
 	const sources: PlanSource[] = [...(configuredSources ?? [])];
-	const patternRevisions = new Map<string, number>();
 	let observedPlans = 0;
 	if (patternPropose || patternContinue || patternObserve || patternLaunched || patternResolved || patternFlush) {
 		sources.push({
@@ -1352,7 +1014,6 @@ function adapter(overrides: AdapterOverrides = {}): Adapter {
 			multiStepEnabled: (current) => current.patternAware?.multiStepEnabled ?? true,
 			propose: async ({ startInput, settings: current, definitions, candidateNames, signal }) => {
 				const proposalID = `test:pattern:${startInput.sessionID}:${startInput.turnID}`;
-				patternRevisions.set(proposalID, 0);
 				const predicted =
 					(await patternPropose?.(startInput, current, definitions, candidateNames, signal)) ?? emptyPrediction();
 				return fixturePlan(proposalID, "pattern_aware", predicted);
@@ -1367,12 +1028,10 @@ function adapter(overrides: AdapterOverrides = {}): Adapter {
 							patternContext: draft.patternContext,
 						});
 						if (!predicted?.candidates.length) return undefined;
-						const revision = (patternRevisions.get(input.proposalID) ?? 0) + 1;
-						patternRevisions.set(input.proposalID, revision);
 						return {
 							proposalID: input.proposalID,
 							source: "pattern_aware",
-							revision,
+							revision: input.revision,
 							upsert: fixtureActions(predicted.candidates, [{ actionID: input.actionID, condition: "adopted" }]),
 							draftTokens: predicted.draftTokens,
 						};

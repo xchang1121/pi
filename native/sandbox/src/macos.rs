@@ -3,13 +3,14 @@ use std::env;
 use std::ffi::{CStr, CString, c_char};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 
 use crate::protocol::{
-    CheckResponse, ExecuteRequest, ExecuteResponse, PROTOCOL_VERSION, canonicalize_request,
+    CheckResponse, CommandTransport, ExecuteRequest, ExecuteResponse, PROTOCOL_VERSION,
+    canonicalize_request, command_arguments, command_input_file,
 };
 
 const SANDBOX_KIND: &str = "workspace+native-macos";
@@ -94,22 +95,16 @@ pub fn execute(request: &ExecuteRequest) -> Result<ExecuteResponse> {
 
 fn exec_command(request: &ExecuteRequest, temporary: &Path, profile: &str) -> Result<i32> {
     apply_profile(profile)?;
-    let mut environment = crate::unix_process::safe_environment();
-    let temporary = temporary.to_string_lossy().into_owned();
-    environment.insert("HOME".into(), "/nonexistent".into());
-    environment.insert("TMPDIR".into(), temporary.clone());
-    environment.insert("TMP".into(), temporary.clone());
-    environment.insert("TEMP".into(), temporary);
-
     let shell = request.shell.as_deref().unwrap_or("/bin/sh");
+    let stdin = command_input_file(request, temporary)?
+        .map(Stdio::from)
+        .unwrap_or_else(Stdio::null);
     let error = Command::new(shell)
-        .args(crate::protocol::shell_arguments(
-            Path::new(shell),
-            &request.command,
-        ))
+        .args(command_arguments(request, &request.command))
         .current_dir(&request.cwd)
         .env_clear()
-        .envs(environment)
+        .envs(&request.environment)
+        .stdin(stdin)
         .exec();
     Err(error).with_context(|| format!("exec sandbox shell {shell}"))
 }
@@ -203,6 +198,9 @@ mod tests {
             version: PROTOCOL_VERSION,
             command: "true".into(),
             shell: None,
+            shell_args: vec!["-c".into()],
+            command_transport: CommandTransport::Argv,
+            environment: std::env::vars().collect(),
             cwd: PathBuf::from("/private/tmp/sandbox"),
             sandbox_root: PathBuf::from("/private/tmp/sandbox"),
             source_root: PathBuf::from("/Users/me/source"),

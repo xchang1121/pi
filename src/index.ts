@@ -12,4 +12,5 @@ export * from "./plan-state.ts";
 export * from "./resource-version.ts";
 export * from "./runtime.ts";
 export * from "./tool-speculation-scheduler.ts";
+export * from "./trace-summary.ts";
 export * from "./workspace-sandbox.ts";

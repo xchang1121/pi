@@ -12,7 +12,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use windows::Win32::Foundation::HANDLE;
 
 use crate::protocol::{
-    CheckResponse, ExecuteRequest, ExecuteResponse, PROTOCOL_VERSION, canonicalize_request,
+    CheckResponse, CommandTransport, ExecuteRequest, ExecuteResponse, PROTOCOL_VERSION,
+    canonicalize_request, command_arguments, command_input_file,
 };
 
 const SANDBOX_KIND: &str = "workspace+native-windows";
@@ -23,7 +24,7 @@ pub fn check() -> CheckResponse {
             version: PROTOCOL_VERSION,
             platform: "windows".into(),
             ready: true,
-            detail: "per-user AppContainer, package-SID workspace ACL, restricted token, isolated desktop, and job supervision available".into(),
+			detail: "per-user AppContainer, package-SID workspace ACL, isolated desktop, and job supervision available".into(),
         },
         Err(error) => CheckResponse {
             version: PROTOCOL_VERSION,
@@ -57,7 +58,10 @@ fn check_ready() -> Result<()> {
     let request = ExecuteRequest {
         version: PROTOCOL_VERSION,
         command: ">sandbox-ready.txt echo ready".into(),
-        shell: None,
+        shell: Some(command_processor()?.to_string_lossy().into_owned()),
+        shell_args: vec!["/d".into(), "/s".into(), "/c".into()],
+        command_transport: CommandTransport::Argv,
+        environment: std::env::vars().collect(),
         cwd: sandbox.clone(),
         sandbox_root: sandbox.clone(),
         source_root: source,
@@ -199,14 +203,19 @@ fn run_internal_inner(args: &[OsString]) -> Result<u32> {
         .context("create AppContainer temporary directory")?;
     std::env::set_current_dir(process_path(&request.cwd)).context("enter AppContainer cwd")?;
     let command = requested_shell(&request)?;
-    let args = sandbox_shell_arguments(&command, &request.command);
-    let temporary_path = process_path(temporary.path());
-    let environment = safe_environment_overlay(&temporary_path);
+    let args = command_arguments(&request, &request.command);
+    let input = command_input_file(&request, temporary.path())?;
+    let environment = request
+        .environment
+        .iter()
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect::<Vec<_>>();
     let mut capabilities = appcontainer.security_capabilities();
     crate::launch::run_lockdown(
         &command,
         &args,
         &environment,
+        input.as_ref(),
         &mut capabilities,
         &mut desktop,
     )
@@ -280,56 +289,6 @@ fn requested_shell(request: &ExecuteRequest) -> Result<PathBuf> {
     bail!("configured shell not found on PATH: {shell}")
 }
 
-fn sandbox_shell_arguments(shell: &Path, command: &str) -> Vec<String> {
-    let name = shell
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if name != "powershell" && name != "pwsh" {
-        return crate::protocol::shell_arguments(shell, command);
-    }
-    let bootstrap = concat!(
-        "$__PiSandboxRoot=[Environment]::CurrentDirectory;",
-        "New-PSDrive -Name PiSandbox -PSProvider FileSystem ",
-        "-Root $__PiSandboxRoot -Scope Global | Out-Null;",
-        "Set-Location 'PiSandbox:\\';",
-        "Remove-Variable __PiSandboxRoot;"
-    );
-    crate::protocol::shell_arguments(shell, &format!("{bootstrap}{command}"))
-}
-
-fn safe_environment_overlay(temporary: &Path) -> Vec<(String, String)> {
-    let mut environment = [
-        "PATH",
-        "PATHEXT",
-        "SystemRoot",
-        "WINDIR",
-        "ComSpec",
-        "SystemDrive",
-        "NUMBER_OF_PROCESSORS",
-        "PROCESSOR_ARCHITECTURE",
-        "PROCESSOR_IDENTIFIER",
-    ]
-    .into_iter()
-    .filter_map(|name| std::env::var(name).ok().map(|value| (name.into(), value)))
-    .collect::<Vec<_>>();
-    let temporary = temporary.to_string_lossy().into_owned();
-    environment.extend(
-        [
-            "HOME",
-            "USERPROFILE",
-            "APPDATA",
-            "LOCALAPPDATA",
-            "TEMP",
-            "TMP",
-        ]
-        .into_iter()
-        .map(|name| (name.into(), temporary.clone())),
-    );
-    environment
-}
-
 struct Tail {
     bytes: Vec<u8>,
     truncated: bool,
@@ -395,14 +354,5 @@ mod tests {
         append_tail(&mut bytes, b"5678", 6, &mut truncated);
         assert_eq!(bytes, b"345678");
         assert!(truncated);
-    }
-
-    #[test]
-    fn environment_overlay_excludes_credentials() {
-        assert!(
-            safe_environment_overlay(Path::new(r"C:\sandbox\tmp"))
-                .iter()
-                .all(|(name, _)| !name.contains("TOKEN") && !name.contains("KEY"))
-        );
     }
 }

@@ -148,6 +148,9 @@ describe("M5 native sandbox broker", () => {
 					{
 						command: "printf ok",
 						shell: "/bin/bash",
+						shellArgs: ["--noprofile", "-c"],
+						commandTransport: "argv",
+						environment: { PATH: "/usr/bin", PI_TEST: "resolved" },
 						cwd,
 						processRoot,
 						sourceRoot,
@@ -164,6 +167,9 @@ describe("M5 native sandbox broker", () => {
 								version: NATIVE_SANDBOX_PROTOCOL_VERSION,
 								command: "printf ok",
 								shell: "/bin/bash",
+								shellArgs: ["--noprofile", "-c"],
+								commandTransport: "argv",
+								environment: { PATH: "/usr/bin", PI_TEST: "resolved" },
 								cwd,
 								sandboxRoot: processRoot,
 								sourceRoot,
@@ -313,6 +319,10 @@ describe("M5 native sandbox broker", () => {
 function commandInput(sourceRoot: string, processRoot: string, cwd = processRoot) {
 	return {
 		command: "printf ok",
+		shell: "/bin/bash",
+		shellArgs: ["-c"],
+		commandTransport: "argv" as const,
+		environment: { PATH: "/usr/bin" },
 		cwd,
 		processRoot,
 		sourceRoot,

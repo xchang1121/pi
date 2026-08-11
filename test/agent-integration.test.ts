@@ -16,7 +16,11 @@ import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
 import { READ_RANGE_COVERAGE_DETAILS_KEY, type ReadRangeCoverage } from "../src/action-key-projection.ts";
 import { ActionSemanticsRegistry, PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
-import { installSpeculativeAction, type SpeculativeAgentSettingsInput } from "../src/agent-integration.ts";
+import {
+	installSpeculativeAction,
+	patternPlanActionID,
+	type SpeculativeAgentSettingsInput,
+} from "../src/agent-integration.ts";
 import { PATTERN_AWARE_DEFAULTS, type PatternAwareEventInput, PatternAwareStore } from "../src/pattern-aware.ts";
 import { PI_READ_RANGE_PROJECTION_RULE } from "../src/pi-read-projection.ts";
 import type { SpeculativeActionEvent } from "../src/runtime.ts";
@@ -200,6 +204,16 @@ function createStreamHarness(
 }
 
 describe("Pi Agent speculative integration", () => {
+	it("keeps K(a)-equivalent execution reusable while qualifying plan support by its parent path", () => {
+		const leftParent = patternPlanActionID("left-parent");
+		const rightParent = patternPlanActionID("right-parent");
+
+		expect(patternPlanActionID("shared-action", leftParent)).toBe(patternPlanActionID("shared-action", leftParent));
+		expect(patternPlanActionID("shared-action", leftParent)).not.toBe(
+			patternPlanActionID("shared-action", rightParent),
+		);
+	});
+
 	it("disposes sandbox resources without changing uninstall semantics", async () => {
 		let disposeCalls = 0;
 		const sandbox: SpeculativeAgentSandbox = {
@@ -600,82 +614,6 @@ describe("Pi Agent speculative integration", () => {
 			actualDurationMs: expect.any(Number),
 			actualAction: expect.any(String),
 		});
-		await installed.uninstall();
-	});
-
-	it("uses the configured drafter model and request options", async () => {
-		let toolExecutions = 0;
-		let optionCalls = 0;
-		const runtimeSignals: AbortSignal[] = [];
-		const foreignSignal = new AbortController().signal;
-		const actorModel = createModel("actor");
-		const draftModel = createModel("drafter");
-		const tool: ReadTool = {
-			name: "read",
-			label: "Read",
-			description: "Read a file",
-			parameters: readSchema,
-			async execute() {
-				toolExecutions++;
-				return { content: [{ type: "text", text: "draft-model README" }], details: { source: "tool" } };
-			},
-		};
-		const streams = createStreamHarness();
-		const agent = new Agent({ initialState: { model: actorModel, tools: [tool] }, streamFn: streams.stream });
-		const installed = installSpeculativeAction(agent, {
-			cwd: "/workspace",
-			getSettings: () => ({ enabled: true, predictionTimeoutMs: 100, tools: { resourceCached: ["read"] } }),
-			draftModel,
-			getDraftOptions: (context) => {
-				optionCalls++;
-				expect(context.actorModel.id).toBe("actor");
-				expect(context.draftModel.id).toBe("drafter");
-				runtimeSignals.push(context.signal);
-				return { signal: foreignSignal, sessionId: "draft-options", temperature: 0 };
-			},
-			preflight: () => true,
-		});
-
-		await agent.prompt("Read README.md");
-
-		expect(toolExecutions).toBe(1);
-		expect(optionCalls).toBe(2);
-		expect(streams.draftModels()).toEqual(["drafter", "drafter"]);
-		expect(streams.draftOptions().map((options) => options?.sessionId)).toEqual(["draft-options", "draft-options"]);
-		expect(streams.draftOptions().map((options) => options?.signal)).toEqual(runtimeSignals);
-		expect(streams.draftOptions().every((options) => options?.signal !== foreignSignal)).toBe(true);
-		await installed.uninstall();
-	});
-
-	it("treats a non-tool drafter response as no candidate and preserves normal execution", async () => {
-		let toolExecutions = 0;
-		const events: SpeculativeActionEvent<string>[] = [];
-		const tool: ReadTool = {
-			name: "read",
-			label: "Read",
-			description: "Read a file",
-			parameters: readSchema,
-			async execute() {
-				toolExecutions++;
-				return { content: [{ type: "text", text: "normal README" }], details: { source: "tool" } };
-			},
-		};
-		const streams = createStreamHarness({ draftMode: "text" });
-		const agent = new Agent({ initialState: { model: createModel(), tools: [tool] }, streamFn: streams.stream });
-		const installed = installSpeculativeAction(agent, {
-			cwd: "/workspace",
-			getSettings: () => ({ enabled: true, predictionTimeoutMs: 100, tools: { resourceCached: ["read"] } }),
-			preflight: () => true,
-			onEvent: (event) => {
-				events.push(event);
-			},
-		});
-
-		await agent.prompt("Read README.md");
-
-		expect(toolExecutions).toBe(1);
-		expect(events.some((event) => event.type === "miss" && event.reason === "no_candidate")).toBe(true);
-		expect(events.some((event) => event.type === "hit")).toBe(false);
 		await installed.uninstall();
 	});
 

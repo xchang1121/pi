@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { READ_RANGE_ACTION_KEY_PROJECTOR } from "../src/action-key-projection.ts";
-import { ActionStore, ResultCache } from "../src/candidate-stores.ts";
+import { ActionStore, ResultCache, speculativeCacheValue } from "../src/candidate-stores.ts";
 import type { ActionKey } from "../src/common.ts";
 import { actionKeyCovers, buildPiActionKey } from "../src/common.ts";
 
@@ -102,6 +102,48 @@ describe("ResultCache", () => {
 		expect(branches.getExact("session", branch.key)).toBe(branch);
 		expect(results.trim("session", { maxEntries: 0, maxBytes: 0 })).toEqual([result]);
 		expect(branches.values("session")).toEqual([branch]);
+	});
+
+	it("expires only unvalidated probation after bounded actor opportunities or wall time", () => {
+		let now = 1_000;
+		const cache = new ResultCache<string, Entry>(
+			[],
+			() => 0,
+			() => now,
+		);
+		const missed = entry("missed", "missed.ts");
+		const protectedEntry = entry("protected", "protected.ts");
+		cache.insert("session", missed);
+		cache.insert("session", protectedEntry);
+		cache.recordActorHit("session", protectedEntry);
+
+		const policy = { maxAgeMs: 1_000, maxOpportunities: 2 };
+		expect(cache.advanceActorOpportunity("session", policy)).toEqual([]);
+		expect(cache.advanceActorOpportunity("session", policy)).toEqual([]);
+		expect(cache.advanceActorOpportunity("session", policy)).toEqual([missed]);
+		expect(cache.stateOf("session", protectedEntry)).toBe("protected");
+
+		const timedOut = entry("timed-out", "timed.ts");
+		cache.insert("session", timedOut);
+		now += 1_000;
+		expect(cache.advanceActorOpportunity("session", policy)).toEqual([timedOut]);
+	});
+
+	it("decays proven reuse value while keeping validation and projection costs honest", () => {
+		const base = {
+			executionMs: 100,
+			validationMs: 10,
+			projectionMs: 5,
+			bytes: 4_096,
+			createdAt: 0,
+		};
+		const freshProtected = speculativeCacheValue({ ...base, hits: 1, lastHitAt: 0 }, 0, 1_000);
+		const agedProtected = speculativeCacheValue({ ...base, hits: 1, lastHitAt: 0 }, 1_000, 1_000);
+		const freshProbation = speculativeCacheValue({ ...base, hits: 0 }, 0, 1_000);
+
+		expect(freshProtected).toBeGreaterThan(agedProtected);
+		expect(agedProtected).toBeGreaterThan(freshProbation);
+		expect(speculativeCacheValue({ ...base, hits: 3, validationMs: 100 }, 0, 1_000)).toBe(0);
 	});
 });
 

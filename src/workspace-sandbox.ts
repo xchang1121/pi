@@ -4,7 +4,7 @@ import { constants as fsConstants } from "node:fs";
 import { chmod, type FileHandle, lstat, mkdir, mkdtemp, open, rename, rm, rmdir } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import type { AgentTool, SettleToolCallResult } from "@earendil-works/pi-agent-core";
+import type { AgentTool, AgentToolInvocation, SettleToolCallResult } from "@earendil-works/pi-agent-core";
 import type { ActionKey } from "./common.ts";
 import { asRecord, contains, slash } from "./common.ts";
 import type {
@@ -48,6 +48,7 @@ export interface SpeculativeSandboxExecuteContext {
 	readonly toolName: string;
 	readonly args: unknown;
 	readonly action: ActionKey;
+	readonly invocation?: AgentToolInvocation;
 	readonly callID: string;
 	readonly signal: AbortSignal;
 }
@@ -56,12 +57,15 @@ export type SpeculativeAgentSandbox = ExecutionWorld<SpeculativeSandboxExecuteCo
 
 export interface SandboxProcessRunnerInput {
 	readonly command: string;
-	readonly shell?: string;
+	readonly shell: string;
 	readonly cwd: string;
 	/** Private parent mounted by native isolation; cwd must remain inside it. */
 	readonly processRoot: string;
 	readonly sourceRoot: string;
 	readonly timeout?: number;
+	readonly environment: Readonly<Record<string, string>>;
+	readonly shellArgs: readonly string[];
+	readonly commandTransport: "argv" | "stdin";
 	readonly signal: AbortSignal;
 }
 
@@ -117,17 +121,9 @@ interface PreparedGitWorkspace {
 	readonly commit: string;
 }
 
-const SNAPSHOT_EXCLUDES = [
-	".git",
-	".pi",
-	"node_modules",
-	"dist",
-	".next",
-	"__pycache__",
-	".pytest_cache",
-	".mypy_cache",
-	".ruff_cache",
-] as const;
+// The execution world mirrors everything the actor can read below cwd. Git metadata is
+// replaced by the private repository and adoption's own temporary files are internal.
+const SNAPSHOT_EXCLUDES = [".git"] as const;
 const SANDBOX_REPOSITORY_IDLE_MS = 5 * 60 * 1000;
 const GIT_PATHSPEC_BATCH_BYTES = 32 * 1024;
 const SANDBOX_STAGING_FILE_PREFIX = ".pi-speculative-";
@@ -161,7 +157,7 @@ export function createWorkspaceSandbox(options: WorkspaceSandboxOptions = {}): S
 			if (context.mode === "file_mutation") {
 				snapshot = await executeMutation(context, options.gitBinary);
 			} else if (context.mode === "workspace_snapshot" && options.processRunner) {
-				snapshot = await executeWorkspaceSnapshot(context, options.processRunner, options.gitBinary, options.shell);
+				snapshot = await executeWorkspaceSnapshot(context, options.processRunner, options.gitBinary);
 			} else {
 				throw new Error(`Execution world does not support mode ${context.mode}`);
 			}
@@ -378,25 +374,25 @@ async function executeWorkspaceSnapshot(
 	context: SpeculativeSandboxExecuteContext,
 	runner: SandboxProcessRunner,
 	gitBinary?: string,
-	shell?: string,
 ): Promise<WorkspaceExecutionSnapshot> {
-	const args = asRecord(context.args);
-	if (!args || typeof args.command !== "string") throw new Error(`${context.toolName}.command must be a string`);
-	if (args.timeout !== undefined && (typeof args.timeout !== "number" || !Number.isFinite(args.timeout))) {
-		throw new Error(`${context.toolName}.timeout must be a finite number`);
-	}
+	const invocation = context.invocation?.process;
+	if (!invocation) throw new Error(`${context.toolName} has no isolated process invocation`);
 	const sourceRoot = path.resolve(context.cwd);
-	const command = args.command;
+	const invocationCwd = path.resolve(invocation.cwd);
+	if (!contains(sourceRoot, invocationCwd)) throw new Error(`${context.toolName}.cwd escapes workspace`);
 	const setupStarted = performance.now();
 	return withPrivateGitWorkspace(sourceRoot, gitBinary ?? "git", async (workspace) => {
 		const setupMs = Math.max(0, performance.now() - setupStarted);
 		const output = await runner({
-			command,
-			...(shell ? { shell } : {}),
-			cwd: workspace.sandboxRoot,
+			command: invocation.command,
+			shell: invocation.shell,
+			shellArgs: invocation.shellArgs,
+			commandTransport: invocation.commandTransport,
+			environment: invocation.environment,
+			cwd: path.join(workspace.sandboxRoot, path.relative(sourceRoot, invocationCwd)),
 			processRoot: workspace.processRoot,
 			sourceRoot,
-			...(typeof args.timeout === "number" ? { timeout: args.timeout } : {}),
+			...(invocation.timeout !== undefined ? { timeout: invocation.timeout } : {}),
 			signal: context.signal,
 		});
 		const collectionStarted = performance.now();
@@ -743,15 +739,11 @@ async function sandboxIndexChanges(repository: PooledGitRepository): Promise<str
 			[...prefix, "diff-files", "--name-only", "--no-renames", "-z", "--"],
 			repository.sourceRoot,
 		),
-		git(
-			repository.gitBinary,
-			[...prefix, "ls-files", "--others", "--exclude-standard", "-z", "--"],
-			repository.sourceRoot,
-		),
+		git(repository.gitBinary, [...prefix, "ls-files", "--others", "-z", "--"], repository.sourceRoot),
 	]);
-	return [...new Set([...parseNullList(tracked), ...parseNullList(untracked)])].map((file) =>
-		path.resolve(repository.sourceRoot, file),
-	);
+	return [...new Set([...parseNullList(tracked), ...parseNullList(untracked)])]
+		.filter((file) => !isSnapshotExcluded(slash(file)))
+		.map((file) => path.resolve(repository.sourceRoot, file));
 }
 
 async function withRepositoryLock<T>(repository: PooledGitRepository, run: () => Promise<T>): Promise<T> {
@@ -907,10 +899,12 @@ async function collectSandboxChanges(workspace: PrivateGitWorkspace): Promise<re
 	);
 	const untracked = await git(
 		workspace.gitBinary,
-		["-C", workspace.sandboxRoot, "ls-files", "--others", "--exclude-standard", "-z", "--"],
+		["-C", workspace.sandboxRoot, "ls-files", "--others", "-z", "--"],
 		workspace.sandboxRoot,
 	);
-	const resources = [...new Set([...parseNullList(tracked), ...parseNullList(untracked)])].sort();
+	const resources = [...new Set([...parseNullList(tracked), ...parseNullList(untracked)])]
+		.filter((resource) => !isSnapshotExcluded(slash(resource)))
+		.sort();
 	const changes: SandboxFileChange[] = [];
 	for (const resource of resources) {
 		if (!resource || path.isAbsolute(resource) || resource.split("/").includes("..")) {

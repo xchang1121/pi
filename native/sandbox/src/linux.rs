@@ -7,13 +7,14 @@ use std::mem::size_of;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 
 use crate::protocol::{
-    CheckResponse, ExecuteRequest, ExecuteResponse, PROTOCOL_VERSION, canonicalize_request,
+    CheckResponse, CommandTransport, ExecuteRequest, ExecuteResponse, PROTOCOL_VERSION,
+    canonicalize_request, command_arguments, command_input_file,
 };
 
 const SANDBOX_KIND: &str = "workspace+native-linux";
@@ -46,7 +47,10 @@ fn probe_isolation() -> Result<()> {
     let response = execute(&ExecuteRequest {
         version: PROTOCOL_VERSION,
         command: "true".into(),
-        shell: None,
+        shell: Some("/bin/sh".into()),
+        shell_args: vec!["-c".into()],
+        command_transport: CommandTransport::Argv,
+        environment: env::vars().collect(),
         cwd: sandbox.clone(),
         sandbox_root: sandbox,
         source_root: source,
@@ -194,21 +198,16 @@ fn exec_command(request: &ExecuteRequest) -> Result<()> {
     install_seccomp()?;
     drop_capabilities()?;
 
-    let mut environment = crate::unix_process::safe_environment();
-    environment.insert("HOME".into(), "/nonexistent".into());
-    environment.insert("TMPDIR".into(), "/tmp".into());
-    environment.insert("TMP".into(), "/tmp".into());
-    environment.insert("TEMP".into(), "/tmp".into());
-
     let shell = request.shell.as_deref().unwrap_or("/bin/sh");
+    let stdin = command_input_file(request, Path::new("/tmp"))?
+        .map(Stdio::from)
+        .unwrap_or_else(Stdio::null);
     let error = Command::new(shell)
-        .args(crate::protocol::shell_arguments(
-            Path::new(shell),
-            &request.command,
-        ))
+        .args(command_arguments(request, &request.command))
         .current_dir(&request.cwd)
         .env_clear()
-        .envs(environment)
+        .envs(&request.environment)
+        .stdin(stdin)
         .exec();
     Err(error).with_context(|| format!("exec sandbox shell {shell}"))
 }
