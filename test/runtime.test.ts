@@ -962,16 +962,16 @@ describe("speculative action runtime", () => {
 		});
 
 		await harness.runtime.startTurn({ sessionID: "session", turnID: "seed-protected" });
-		await waitFor(() => harness.runtime.inspect("session").pendingPredictions === 0);
+		await waitFor(() => harness.events.filter((event) => event.type === "completed").length === 1);
 		expect(await harness.runtime.consume(consume("seed-protected", { path: "a.txt" }))).toBe("a.txt");
 		await harness.runtime.finishTurn(consume("seed-protected", {}));
 
 		await harness.runtime.startTurn({ sessionID: "session", turnID: "seed-probation" });
-		await waitFor(() => harness.executions() >= 2);
+		await waitFor(() => harness.events.filter((event) => event.type === "completed").length === 2);
 		await harness.runtime.finishTurn(consume("seed-probation", {}));
 
 		await harness.runtime.startTurn({ sessionID: "session", turnID: "apply-pressure" });
-		await waitFor(() => harness.executions() >= 3);
+		await waitFor(() => harness.events.filter((event) => event.type === "completed").length === 3);
 		await harness.runtime.finishTurn(consume("apply-pressure", {}));
 
 		await harness.runtime.startTurn({ sessionID: "session", turnID: "check-protected" });
