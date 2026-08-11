@@ -3,6 +3,7 @@ export * from "./agent-integration.ts";
 export * from "./candidate-lifecycle.ts";
 export * from "./candidate-stores.ts";
 export * from "./common.ts";
+export * from "./container-sandbox.ts";
 export * from "./execution-world.ts";
 export * from "./native-sandbox.ts";
 export * from "./pattern-aware.ts";
