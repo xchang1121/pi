@@ -1585,12 +1585,6 @@ export function makeSpeculativeActionRuntime<
 			}
 			if (draft.type === "preparation_hint") {
 				if (!candidateNames.includes(draft.tool)) continue;
-				if (
-					draft.source === "pattern_aware" &&
-					(draft.empiricalProbability ?? 0) < (state.settings.patternAware?.minEmpiricalProbability ?? 0)
-				) {
-					continue;
-				}
 				const hintKey = diagnosticJson({ tool: draft.tool, input: draft.input, missing: draft.missing });
 				if (state.preparedHints.has(hintKey) || state.preparedHints.size >= turnCandidateLimit) continue;
 				state.preparedHints.add(hintKey);

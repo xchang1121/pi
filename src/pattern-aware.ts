@@ -12,7 +12,10 @@ export type PatternAwareSettings = {
 	readonly futureGapCoverage: number;
 	readonly decayHalfLifeEvents: number;
 	readonly minOccurrences: number;
-	readonly minEmpiricalProbability: number;
+	/** Minimum historical replay precision required for a concrete argument mapper. */
+	readonly minBindingReplayProbability: number;
+	/** @deprecated Configuration input alias for minBindingReplayProbability. */
+	readonly minEmpiricalProbability?: number;
 	readonly maxPatterns: number;
 };
 
@@ -235,7 +238,7 @@ export const PATTERN_AWARE_DEFAULTS: PatternAwareSettings = {
 	futureGapCoverage: 0.9,
 	decayHalfLifeEvents: 2048,
 	minOccurrences: 2,
-	minEmpiricalProbability: 0.75,
+	minBindingReplayProbability: 0.75,
 	maxPatterns: 4096,
 };
 
@@ -449,7 +452,7 @@ export class PatternAwareStore {
 
 	registerValidatedPattern(input: PatternAwarePattern) {
 		const pattern = mutablePattern(input);
-		if (!pattern || !eligible(pattern, this.settings, Math.max(this.clock, pattern.lastSeenSequence))) return false;
+		if (!pattern || !structurallyEligible(pattern, this.settings)) return false;
 		this.patterns.set(pattern.id, pattern);
 		this.clock = Math.max(this.clock, pattern.lastSeenSequence);
 		this.indexDirty = true;
@@ -509,12 +512,7 @@ export class PatternAwareStore {
 		this.ensureIndex();
 		for (const patternID of this.trie.matching(predictiveHistory)) {
 			const pattern = this.patterns.get(patternID);
-			if (
-				!pattern ||
-				!structurallyEligible(pattern, this.settings) ||
-				!runtimeEligible(pattern, this.settings, this.clock)
-			)
-				continue;
+			if (!pattern || !structurallyEligible(pattern, this.settings)) continue;
 			if (continuation.visitedPatternIDs.includes(pattern.id)) continue;
 			if (pattern.targetSchemaHash && schemaHashes[pattern.targetTool] !== pattern.targetSchemaHash) continue;
 			if (!matchesSuffix(predictiveHistory, pattern.context)) continue;
@@ -598,8 +596,7 @@ export class PatternAwareStore {
 					rawProbability: Math.max(0, controlProbability * variantProbability),
 					expectedDurationMs,
 				};
-			})
-			.filter((prediction) => prediction.controlProbability >= this.settings.minEmpiricalProbability);
+			});
 		for (const prediction of predictions) {
 			const {
 				ordered,
@@ -775,8 +772,8 @@ export class PatternAwareStore {
 				sameValue(concrete, sample.target.input),
 			);
 		}).length;
-		const empiricalProbability = replayMatches / pool.samples.length;
-		if (empiricalProbability < this.settings.minEmpiricalProbability) return;
+		const bindingReplayProbability = replayMatches / pool.samples.length;
+		if (bindingReplayProbability < this.settings.minBindingReplayProbability) return;
 		const id = hash(
 			stableStringify({
 				context: signatures,
@@ -1042,9 +1039,9 @@ export function patternAwareSettings(value: unknown): PatternAwareSettings {
 		futureGapCoverage: probabilitySetting(record?.futureGapCoverage, PATTERN_AWARE_DEFAULTS.futureGapCoverage),
 		decayHalfLifeEvents: positiveInteger(record?.decayHalfLifeEvents, PATTERN_AWARE_DEFAULTS.decayHalfLifeEvents),
 		minOccurrences: positiveInteger(record?.minOccurrences, PATTERN_AWARE_DEFAULTS.minOccurrences),
-		minEmpiricalProbability: probabilitySetting(
-			record?.minEmpiricalProbability,
-			PATTERN_AWARE_DEFAULTS.minEmpiricalProbability,
+		minBindingReplayProbability: probabilitySetting(
+			record?.minBindingReplayProbability ?? record?.minEmpiricalProbability,
+			PATTERN_AWARE_DEFAULTS.minBindingReplayProbability,
 		),
 		maxPatterns: positiveInteger(record?.maxPatterns, PATTERN_AWARE_DEFAULTS.maxPatterns),
 	};
@@ -1863,24 +1860,10 @@ function leaves(value: unknown, prefix: Array<string | number> = []): Array<[Arr
 	return result;
 }
 
-function eligible(pattern: MutablePattern, settings: PatternAwareSettings, clock = pattern.lastSeenSequence) {
-	if (!structurallyEligible(pattern, settings)) return false;
-	if (probability(pattern) < settings.minEmpiricalProbability) return false;
-	return runtimeEligible(pattern, settings, clock);
-}
-
-function runtimeEligible(pattern: MutablePattern, settings: PatternAwareSettings, clock: number) {
-	const feedback = feedbackEvidence(pattern, clock, settings.decayHalfLifeEvents);
-	if (feedback.success + feedback.failure < settings.minOccurrences) return true;
-	const useful = feedback.success * pattern.averageDurationMs;
-	const wasted = feedback.failure * pattern.averageDurationMs;
-	return useful >= wasted;
-}
-
 function structurallyEligible(pattern: MutablePattern, settings: PatternAwareSettings) {
 	return (
 		pattern.occurrences >= settings.minOccurrences &&
-		pattern.replayMatches / Math.max(1, pattern.occurrences) >= settings.minEmpiricalProbability
+		pattern.replayMatches / Math.max(1, pattern.occurrences) >= settings.minBindingReplayProbability
 	);
 }
 

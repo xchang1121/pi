@@ -212,7 +212,8 @@ describe("PatternAware", () => {
 			store.launched("attributed");
 			store.resolved("attributed", outcome);
 		}
-		expect(store.predict("probe").some((item) => item.patternID === "attributed")).toBe(true);
+		const beforeActorMiss = store.predict("probe").find((item) => item.patternID === "attributed");
+		expect(beforeActorMiss).toBeDefined();
 
 		for (let index = 0; index < 2; index++) {
 			store.launched("attributed");
@@ -226,7 +227,9 @@ describe("PatternAware", () => {
 			staleInvalidations: 2,
 			systemCancellations: 2,
 		});
-		expect(store.predict("probe").some((item) => item.patternID === "attributed")).toBe(false);
+		const afterActorMiss = store.predict("probe").find((item) => item.patternID === "attributed");
+		expect(afterActorMiss).toBeDefined();
+		expect(afterActorMiss!.empiricalProbability).toBeLessThan(beforeActorMiss!.empiricalProbability);
 	});
 
 	test("discounts stale runtime failures so fresh successes recover after drift", () => {
@@ -237,7 +240,8 @@ describe("PatternAware", () => {
 			store.launched("drift");
 			store.resolved("drift", "actor_miss");
 		}
-		expect(store.predict("probe").some((item) => item.patternID === "drift")).toBe(false);
+		const afterFailures = store.predict("probe").find((item) => item.patternID === "drift");
+		expect(afterFailures).toBeDefined();
 
 		for (let index = 0; index < 8; index++) {
 			store.observeTurn({
@@ -251,7 +255,10 @@ describe("PatternAware", () => {
 			store.resolved("drift", "consumed");
 		}
 
-		expect(store.predict("probe").some((item) => item.patternID === "drift")).toBe(true);
+		const afterRecovery = store.predict("probe").find((item) => item.patternID === "drift");
+		expect(afterRecovery).toBeDefined();
+		const recoveredPattern = store.snapshot().find((item) => item.id === "drift");
+		expect(recoveredPattern!.recentSuccessWeight).toBeGreaterThan(recoveredPattern!.recentFailureWeight);
 	});
 
 	test("lets recent gap behavior replace stale high-volume history", () => {
@@ -508,8 +515,17 @@ describe("PatternAware", () => {
 		});
 	});
 
-	test("computes empirical probability from context opportunities and suppresses weak patterns", () => {
-		const store = new PatternAwareStore(settings({ minEmpiricalProbability: 0.75 }));
+	test("migrates the legacy empirical threshold to binding replay precision", () => {
+		expect(patternAwareSettings({ minEmpiricalProbability: 0.4 })).toMatchObject({
+			minBindingReplayProbability: 0.4,
+		});
+		expect(
+			patternAwareSettings({ minEmpiricalProbability: 0.4, minBindingReplayProbability: 0.9 }),
+		).toMatchObject({ minBindingReplayProbability: 0.9 });
+	});
+
+	test("emits weak control-flow candidates for bounded utility admission", () => {
+		const store = new PatternAwareStore(settings({ minBindingReplayProbability: 0.75 }));
 		trainGrepRead(store, "one", "src/a.ts");
 		trainGrepRead(store, "two", "src/b.ts");
 
@@ -524,7 +540,37 @@ describe("PatternAware", () => {
 		expect(pattern?.historicalMatches).toBe(2);
 		expect(pattern?.historicalOpportunities).toBe(4);
 		expect(pattern?.empiricalProbability).toBe(0.5);
-		expect(store.predict("miss-two").some((item) => item.tool === "read")).toBe(false);
+
+		store.observe(input({ sessionID: "probe", tool: "grep", input: {}, outputPaths: ["src/e.ts"] }));
+		const candidate = store.predict("probe").find((item) => item.tool === "read");
+		expect(candidate?.empiricalProbability).toBeGreaterThan(0);
+		expect(candidate?.empiricalProbability).toBeLessThan(0.75);
+	});
+
+	test("still rejects unreliable argument mappers", () => {
+		const store = new PatternAwareStore(settings({ minBindingReplayProbability: 0.75 }));
+		expect(
+			store.registerValidatedPattern(
+				validatedGapPattern(
+					{ "0": 10 },
+					{ id: "unreliable-binding", occurrences: 10, replayMatches: 7 },
+				),
+			),
+		).toBe(false);
+	});
+
+	test("keeps low-feedback candidates available for scheduler utility ranking", () => {
+		const store = new PatternAwareStore(settings());
+		expect(store.registerValidatedPattern(validatedGapPattern({ "0": 10 }))).toBe(true);
+		for (let index = 0; index < 3; index++) {
+			store.launched("gap-pattern");
+			store.resolved("gap-pattern", "actor_miss");
+		}
+
+		store.observe(input({ sessionID: "probe", tool: "grep", input: {} }));
+		const candidate = store.predict("probe").find((item) => item.tool === "read");
+		expect(candidate).toBeDefined();
+		expect(candidate?.empiricalProbability).toBeLessThan(1);
 	});
 
 	test("emits preparation hints when control flow matches before all bound payloads are available", () => {
@@ -1194,7 +1240,7 @@ describe("PatternAware", () => {
 		expect(store.recent("finished")).toHaveLength(0);
 	});
 
-	test("accepts externally supplied patterns only after the same historical validation", () => {
+	test("validates imported binding replay independently of control confidence", () => {
 		const learned = new PatternAwareStore(settings());
 		trainGrepRead(learned, "one", "src/a.ts");
 		trainGrepRead(learned, "two", "src/b.ts");
@@ -1213,7 +1259,7 @@ describe("PatternAware", () => {
 				historicalMatches: 1,
 				empiricalProbability: 0.1,
 			}),
-		).toBe(false);
+		).toBe(true);
 		imported.observe(input({ sessionID: "probe", tool: "grep", input: {}, outputPaths: ["src/c.ts"] }));
 		expect(imported.predict("probe").some((item) => item.tool === "read" && item.type === "tool_call")).toBe(true);
 	});
