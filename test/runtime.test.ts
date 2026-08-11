@@ -699,7 +699,7 @@ describe("speculative action runtime", () => {
 		expect(await executionsFor(1, 3)).toBe(1);
 	});
 
-	it("applies the per-turn candidate limit cumulatively across PatternAware and the drafter", async () => {
+	it("offers each predictor the full proposal width while enforcing one top-k pool", async () => {
 		let drafterCandidateLimit = 0;
 		const harness = createHarness({
 			settings: {
@@ -725,7 +725,7 @@ describe("speculative action runtime", () => {
 		await waitFor(() => harness.runtime.inspect().pendingPredictions === 0);
 
 		expect(harness.executions()).toBe(2);
-		expect(drafterCandidateLimit).toBe(1);
+		expect(drafterCandidateLimit).toBe(2);
 	});
 
 	it("lets a higher-utility drafter action replace a weaker PatternAware action", async () => {
@@ -772,7 +772,7 @@ describe("speculative action runtime", () => {
 		);
 	});
 
-	it("keeps drafter budgeting finite when PatternAware reports malformed probability", async () => {
+	it("keeps the unified proposal width finite when PatternAware reports malformed probability", async () => {
 		let drafterCandidateLimit: number | undefined;
 		const harness = createHarness({
 			settings: {
@@ -802,7 +802,7 @@ describe("speculative action runtime", () => {
 		expect(Number.isFinite(drafterCandidateLimit)).toBe(true);
 	});
 
-	it("learns actor lead time and prioritizes latency that can actually be hidden", async () => {
+	it("shares actor lead time across predictors and prioritizes latency that can be hidden", async () => {
 		let now = 1_000;
 		const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => now);
 		const seedExecution = deferred<string>();
@@ -812,11 +812,23 @@ describe("speculative action runtime", () => {
 				...enabledSettings,
 				candidateLimit: 2,
 				maxConcurrentActions: 1,
+				patternAware: { ...PATTERN_AWARE_DEFAULTS, enabled: true },
 				tools: { resourceCached: ["read"], sandbox: ["bash"] },
 			},
+			predictPatternAware: (input) =>
+				input.turnID === "turn-lead-seed"
+					? prediction({
+							...bashCandidate("seed"),
+							source: "pattern_aware",
+							patternID: "lead-seed",
+							horizon: 0,
+							empiricalProbability: 1,
+							expectedDurationMs: 100,
+						})
+					: prediction(),
 			predict: (input) =>
 				input.turnID === "turn-lead-seed"
-					? prediction({ ...bashCandidate("seed"), expectedDurationMs: 100 })
+					? prediction()
 					: prediction(
 							{ ...bashCandidate("late"), expectedDurationMs: 100 },
 							{ ...readCandidate("hideable.txt"), expectedDurationMs: 90 },
@@ -844,7 +856,9 @@ describe("speculative action runtime", () => {
 			await waitFor(() => harness.runtime.inspect().pendingPredictions === 0);
 
 			expect(executed).toEqual(["bash:seed", "read:hideable.txt"]);
-			expect(harness.events).toContainEqual(expect.objectContaining({ type: "hit", actorLeadMs: 10 }));
+			expect(harness.events).toContainEqual(
+				expect.objectContaining({ type: "hit", actorLeadMs: 10, source: "pattern_aware" }),
+			);
 			expect(harness.events).toContainEqual(
 				expect.objectContaining({
 					type: "cancelled",
