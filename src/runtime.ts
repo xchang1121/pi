@@ -1,11 +1,6 @@
 import type { ActionProjectionCoverage, ActionProjectionRule } from "./action-key-projection.ts";
-import {
-	CandidateAggregate,
-	CandidateCatalog,
-	type CandidateReuseState,
-	type CandidateRunState,
-} from "./candidate-lifecycle.ts";
-import { BranchStore, JobTable, ResultCache } from "./candidate-stores.ts";
+import { CandidateAggregate, type CandidateReuseState, type CandidateRunState } from "./candidate-lifecycle.ts";
+import { ActionStore, ResultCache } from "./candidate-stores.ts";
 import type {
 	ActionKey,
 	ActionKeyMatch,
@@ -645,19 +640,15 @@ export function makeSpeculativeActionRuntime<
 	}
 	const projectionRules = [...projectionRuleByID.values()];
 	const keyProjectors = projectionRules;
-	const jobs = new JobTable<SessionID, RuntimeCandidate<Output>>(keyProjectors);
+	const jobs = new ActionStore<SessionID, RuntimeCandidate<Output>>(keyProjectors);
 	const results = new ResultCache<SessionID, RuntimeCandidate<Output>>(keyProjectors);
 	// Exclusive branches are deliberately exact-only; projections are for shareable results.
-	const branches = new BranchStore<SessionID, RuntimeCandidate<Output>>();
+	const branches = new ActionStore<SessionID, RuntimeCandidate<Output>>();
 	const tokenTotals = new Map<SessionID, number>();
 	const wallTimes = new Map<SessionID, number>();
 	const actionSequences = new Map<SessionID, number>();
 	const schedulers = new Map<SessionID, ToolSpeculationScheduler<RuntimeCandidate<Output>>>();
-	const candidateCatalog = new CandidateCatalog<
-		SessionID,
-		RuntimeCandidate<Output>,
-		TurnState<SessionID, Output, StateData>
-	>();
+	const candidateOwners = new Map<RuntimeCandidate<Output>, TurnState<SessionID, Output, StateData>>();
 	const serviceTimes = new Map<string, { count: number; averageMs: number }>();
 	const executionOverheadTimes = new Map<string, { count: number; averageMs: number }>();
 	const hitOverheadTimes = new Map<string, { count: number; averageMs: number }>();
@@ -1398,7 +1389,7 @@ export function makeSpeculativeActionRuntime<
 		removeTurnAdmission(state, candidate);
 		removeCandidateFromStores(state, candidate);
 		releaseCandidateResourceVersion(candidate);
-		candidateCatalog.retire(candidate);
+		candidateOwners.delete(candidate);
 		candidate.lifecycle.settleClosed();
 		if (publish) await publishCancelled(state, candidate, reason);
 		return true;
@@ -1410,12 +1401,12 @@ export function makeSpeculativeActionRuntime<
 		outcome: "preempted" | "discarded" = "preempted",
 		publish = true,
 	): Promise<void> => {
-		const owner = candidateCatalog.owner(candidate);
+		const owner = candidateOwners.get(candidate);
 		if (!owner) {
 			candidate.schedulerOutcome = outcome;
 			candidate.lifecycle.close({ reason });
 			releaseCandidateResourceVersion(candidate);
-			candidateCatalog.retire(candidate);
+			candidateOwners.delete(candidate);
 			candidate.lifecycle.settleClosed();
 			return;
 		}
@@ -1440,7 +1431,7 @@ export function makeSpeculativeActionRuntime<
 		reason = "speculative_action_disabled",
 		publish = true,
 	): Promise<void> => {
-		const candidates = new Set<RuntimeCandidate<Output>>(candidateCatalog.sessionValues(sessionID));
+		const candidates = new Set<RuntimeCandidate<Output>>(sessionCandidates(sessionID));
 		for (const [key, state] of turns) {
 			if (state.sessionID !== sessionID) continue;
 			state.finished = true;
@@ -1461,10 +1452,7 @@ export function makeSpeculativeActionRuntime<
 		if (notifiedMasterEnabled) return;
 		const sessions = new Set<SessionID>(schedulers.keys());
 		for (const state of turns.values()) sessions.add(state.sessionID);
-		for (const candidate of candidateCatalog.allValues()) {
-			const record = candidateCatalog.record(candidate);
-			if (record) sessions.add(record.sessionID);
-		}
+		for (const sessionID of [...jobs.scopes(), ...results.scopes(), ...branches.scopes()]) sessions.add(sessionID);
 		await Promise.all([...sessions].map((sessionID) => disableSession(sessionID)));
 	};
 
@@ -2034,7 +2022,7 @@ export function makeSpeculativeActionRuntime<
 			}
 			if (turnDecision.victim) state.turnAdmissions.delete(turnDecision.victim.key.key);
 			state.turnAdmissions.set(action.key, candidate);
-			candidateCatalog.register(state.sessionID, turnKey(state), candidate, state);
+			candidateOwners.set(candidate, state);
 			for (const victim of schedulerVictims) await preemptCandidate(victim);
 			if (turnDecision.victim && !schedulerVictims.includes(turnDecision.victim)) {
 				await preemptCandidate(turnDecision.victim, "candidate_budget_preempted");
@@ -2072,7 +2060,7 @@ export function makeSpeculativeActionRuntime<
 				removeTurnAdmission(state, candidate);
 				removeCandidateFromStores(state, candidate);
 				releaseCandidateResourceVersion(candidate);
-				candidateCatalog.retire(candidate);
+				candidateOwners.delete(candidate);
 				await publishCancelled(state, candidate, classified.reason, errorDetail(classified));
 				await publishCache(state);
 				candidate.lifecycle.settleClosed();
@@ -3128,7 +3116,7 @@ export function makeSpeculativeActionRuntime<
 				removeTurnAdmission(state, candidate);
 				removeCandidateFromStores(state, candidate);
 				releaseCandidateResourceVersion(candidate);
-				candidateCatalog.retire(candidate);
+				candidateOwners.delete(candidate);
 			}
 			await invalidateChangedResources(state, actual, candidate);
 			const matchedLeases = candidate.leases.filter(
@@ -3277,7 +3265,6 @@ export function makeSpeculativeActionRuntime<
 			planStates.delete(state.sessionID);
 			planLaunchContexts.delete(state.sessionID);
 		}
-		candidateCatalog.detachAllFromTurn(turnKey(state));
 		if (!schedulerFor(state.sessionID).snapshot().length) schedulers.delete(state.sessionID);
 	};
 
@@ -3304,11 +3291,10 @@ export function makeSpeculativeActionRuntime<
 		state.finished = true;
 		state.predictionController.abort();
 		turns.delete(turnKey(state));
-		for (const candidate of candidateCatalog.turnValues(turnKey(state))) {
+		for (const candidate of new Set(state.turnAdmissions.values())) {
 			if (candidate.run.status === "closed") continue;
 			await preemptCandidate(candidate, reason, "discarded");
 		}
-		candidateCatalog.detachAllFromTurn(turnKey(state));
 	};
 
 	const finishTurn = async (input: FinishInput): Promise<void> => {
@@ -3333,7 +3319,7 @@ export function makeSpeculativeActionRuntime<
 			planStates.get(sessionID),
 		);
 		await settleUnlaunchedPlanActions(stateForEvents, "system");
-		for (const candidate of candidateCatalog.sessionValues(sessionID)) {
+		for (const candidate of sessionCandidates(sessionID)) {
 			await closeCandidate(stateForEvents, candidate, "session_disposed", "invalidated", true);
 		}
 		tokenTotals.delete(sessionID);
@@ -3350,16 +3336,14 @@ export function makeSpeculativeActionRuntime<
 		const sessions = new Set<SessionID>();
 		for (const state of turns.values()) sessions.add(state.sessionID);
 		for (const sessionID of tokenTotals.keys()) sessions.add(sessionID);
-		for (const candidate of candidateCatalog.allValues()) {
-			const record = candidateCatalog.record(candidate);
-			if (record) sessions.add(record.sessionID);
-		}
+		for (const sessionID of [...jobs.scopes(), ...results.scopes(), ...branches.scopes()]) sessions.add(sessionID);
 		for (const sessionID of sessions) await disposeSession(sessionID);
 		schedulers.clear();
 		sourceBackoff.clear();
 		planStates.clear();
 		planLaunchContexts.clear();
 		actionSequences.clear();
+		candidateOwners.clear();
 	};
 
 	const inspect = (sessionID?: SessionID): SpeculativeRuntimeInspection => {

@@ -325,6 +325,6 @@ If the Drafter uses a different provider from the actor, use `getDraftOptions` t
 
 ## Implementation overview
 
-The actor and Drafter run concurrently. Candidates pass schema validation, preflight, resource-version capture, and execution-strategy selection. Completed candidates enter either `ResultCache` or `BranchStore`; isolated effects are represented by a sealed `WorldBranch`. When the actor emits a tool call, Pi Agent's `settleToolCall` hook tries to reuse an exact match or a conservatively projected result. PatternAware persists its templates and bounded PPM count trie by workspace hash, retains a small expected-benefit beam, and leaves DAG execution, freshness, and resource scheduling to the source-neutral runtime.
+The actor and Drafter run concurrently. Candidates pass schema validation, preflight, resource-version capture, and execution-strategy selection. Completed candidates enter either `ResultCache` or an exact-only `ActionStore`; isolated effects are represented by a sealed `WorldBranch`. When the actor emits a tool call, Pi Agent's `settleToolCall` hook tries to reuse an exact match or a conservatively projected result. PatternAware persists its templates and bounded PPM count trie by workspace hash, retains a small expected-benefit beam, and leaves DAG execution, freshness, and resource scheduling to the source-neutral runtime.
 
 Hits, misses, cancellation, actual execution, draft tokens, cache state, and sandbox-stage timings are exposed as typed events for experiment collection and visualization.

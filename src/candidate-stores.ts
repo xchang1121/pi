@@ -18,6 +18,16 @@ export interface ActionStoreInsertResult<Entry> extends ActionStoreLookup<Entry>
 	readonly inserted: boolean;
 }
 
+export interface ActionStoreLimits {
+	readonly maxEntries: number;
+	readonly maxBytes: number;
+}
+
+export interface ActionStoreSnapshot {
+	readonly entries: number;
+	readonly bytes: number;
+}
+
 interface IndexedActionStoreLookup<Entry> extends ActionStoreLookup<Entry> {
 	readonly recency: number;
 }
@@ -27,8 +37,8 @@ interface IndexedScope<Entry> {
 	readonly partitions: Map<string, Set<Entry>>;
 }
 
-/** Projection-aware identity index shared by the three candidate stores. */
-class ActionIndex<Scope, Entry extends ActionStoreEntry> {
+/** Scoped action identity, projection lookup, recency, and bounded storage. */
+export class ActionStore<Scope, Entry extends SizedActionStoreEntry> {
 	private readonly scopesByID = new Map<Scope, IndexedScope<Entry>>();
 	private readonly projectors: readonly ActionKeyProjector[];
 
@@ -69,9 +79,9 @@ class ActionIndex<Scope, Entry extends ActionStoreEntry> {
 		return this.scopesByID.get(scope)?.entries.get(action.key);
 	}
 
-	lookup(scope: Scope, action: ActionKey): readonly IndexedActionStoreLookup<Entry>[] {
+	lookup(scope: Scope, action: ActionKey): readonly ActionStoreLookup<Entry>[] {
 		const state = this.scopesByID.get(scope);
-		return state ? this.lookupRecords(state, action) : [];
+		return state ? this.lookupRecords(state, action).map(({ entry, match }) => ({ entry, match })) : [];
 	}
 
 	touch(scope: Scope, entry: Entry): boolean {
@@ -101,6 +111,28 @@ class ActionIndex<Scope, Entry extends ActionStoreEntry> {
 
 	scopes(): readonly Scope[] {
 		return [...this.scopesByID.keys()];
+	}
+
+	snapshot(scope: Scope): ActionStoreSnapshot {
+		const entries = this.values(scope);
+		return { entries: entries.length, bytes: entries.reduce((total, entry) => total + entryBytes(entry), 0) };
+	}
+
+	trim(scope: Scope, limits: ActionStoreLimits, canEvict: (entry: Entry) => boolean = () => true): Entry[] {
+		const maxEntries = finiteLimit(limits.maxEntries);
+		const maxBytes = finiteLimit(limits.maxBytes);
+		let entries = this.values(scope);
+		let bytes = entries.reduce((total, entry) => total + entryBytes(entry), 0);
+		const evicted: Entry[] = [];
+		while (entries.length > maxEntries || bytes > maxBytes) {
+			const victim = entries.find(canEvict);
+			if (!victim) break;
+			bytes -= entryBytes(victim);
+			this.delete(scope, victim);
+			evicted.push(victim);
+			entries = this.values(scope);
+		}
+		return evicted;
 	}
 
 	clearScope(scope: Scope): Entry[] {
@@ -156,51 +188,6 @@ class ActionIndex<Scope, Entry extends ActionStoreEntry> {
 	}
 }
 
-/** In-flight single-flight owners. Entries leave this table before becoming reusable results or branches. */
-export class JobTable<Scope, Job extends ActionStoreEntry> {
-	private readonly index: ActionIndex<Scope, Job>;
-
-	constructor(projectors: readonly ActionKeyProjector[] = []) {
-		this.index = new ActionIndex(projectors);
-	}
-
-	insertOrGetCompatible(
-		scope: Scope,
-		job: Job,
-		canReuseProjected?: (existing: Job, match: ProjectedActionKeyMatch) => boolean,
-	): ActionStoreInsertResult<Job> {
-		return this.index.insertOrGetCompatible(scope, job, canReuseProjected);
-	}
-
-	getExact(scope: Scope, action: ActionKey): Job | undefined {
-		return this.index.getExact(scope, action);
-	}
-
-	lookup(scope: Scope, action: ActionKey): readonly ActionStoreLookup<Job>[] {
-		return this.index.lookup(scope, action).map(({ entry, match }) => ({ entry, match }));
-	}
-
-	delete(scope: Scope, job: Job): boolean {
-		return this.index.delete(scope, job);
-	}
-
-	values(scope: Scope): readonly Job[] {
-		return this.index.values(scope);
-	}
-
-	allValues(): readonly Job[] {
-		return this.index.allValues();
-	}
-
-	scopes(): readonly Scope[] {
-		return this.index.scopes();
-	}
-
-	clearScope(scope: Scope): Job[] {
-		return this.index.clearScope(scope);
-	}
-}
-
 export type ResultCacheEntryState = "probation" | "protected";
 
 export interface ResultCacheLimits {
@@ -227,11 +214,11 @@ export interface ResultCacheSnapshot {
 
 /** Completed shareable results with speculative probation and actor-validated protection. */
 export class ResultCache<Scope, Entry extends SizedActionStoreEntry> {
-	private readonly index: ActionIndex<Scope, Entry>;
+	private readonly index: ActionStore<Scope, Entry>;
 	private readonly tiers = new Map<Scope, Map<Entry, ResultCacheEntryState>>();
 
 	constructor(projectors: readonly ActionKeyProjector[] = []) {
-		this.index = new ActionIndex(projectors);
+		this.index = new ActionStore(projectors);
 	}
 
 	insert(scope: Scope, entry: Entry): Entry | undefined {
@@ -370,82 +357,6 @@ export class ResultCache<Scope, Entry extends SizedActionStoreEntry> {
 			demoted.push(victim);
 		}
 		return demoted;
-	}
-}
-
-export interface BranchStoreLimits {
-	readonly maxEntries: number;
-	readonly maxBytes: number;
-}
-
-export interface BranchStoreSnapshot {
-	readonly entries: number;
-	readonly bytes: number;
-}
-
-/** Completed exclusive sandbox branches. Claims and adoption remain owned by CandidateAggregate. */
-export class BranchStore<Scope, Branch extends SizedActionStoreEntry> {
-	private readonly index: ActionIndex<Scope, Branch>;
-
-	constructor(projectors: readonly ActionKeyProjector[] = []) {
-		this.index = new ActionIndex(projectors);
-	}
-
-	insert(scope: Scope, branch: Branch): Branch | undefined {
-		return this.index.insert(scope, branch);
-	}
-
-	getExact(scope: Scope, action: ActionKey): Branch | undefined {
-		return this.index.getExact(scope, action);
-	}
-
-	lookup(scope: Scope, action: ActionKey): readonly ActionStoreLookup<Branch>[] {
-		return this.index.lookup(scope, action).map(({ entry, match }) => ({ entry, match }));
-	}
-
-	delete(scope: Scope, branch: Branch): boolean {
-		return this.index.delete(scope, branch);
-	}
-
-	values(scope: Scope): readonly Branch[] {
-		return this.index.values(scope);
-	}
-
-	allValues(): readonly Branch[] {
-		return this.index.allValues();
-	}
-
-	scopes(): readonly Scope[] {
-		return this.index.scopes();
-	}
-
-	snapshot(scope: Scope): BranchStoreSnapshot {
-		const branches = this.index.values(scope);
-		return {
-			entries: branches.length,
-			bytes: branches.reduce((total, branch) => total + entryBytes(branch), 0),
-		};
-	}
-
-	trim(scope: Scope, limits: BranchStoreLimits, canEvict: (branch: Branch) => boolean = () => true): Branch[] {
-		const maxEntries = finiteLimit(limits.maxEntries);
-		const maxBytes = finiteLimit(limits.maxBytes);
-		let branches = this.index.values(scope);
-		let bytes = branches.reduce((total, branch) => total + entryBytes(branch), 0);
-		const evicted: Branch[] = [];
-		while (branches.length > maxEntries || bytes > maxBytes) {
-			const victim = branches.find(canEvict);
-			if (!victim) break;
-			bytes -= entryBytes(victim);
-			this.index.delete(scope, victim);
-			evicted.push(victim);
-			branches = this.index.values(scope);
-		}
-		return evicted;
-	}
-
-	clearScope(scope: Scope): Branch[] {
-		return this.index.clearScope(scope);
 	}
 }
 

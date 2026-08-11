@@ -325,6 +325,6 @@ await installed.uninstall();
 
 ## 实现概览
 
-Actor 与 Drafter 并行运行，候选依次经过 schema 校验、preflight、资源版本捕获和执行策略选择。完成的候选进入 `ResultCache` 或 `BranchStore`，隔离副作用由封存的 `WorldBranch` 表示；Actor 发出工具调用时，Pi Agent 的 `settleToolCall` hook 尝试复用完全匹配或安全可投影的结果。PatternAware 按 workspace hash 持久化模板和有界 PPM 计数 trie，只保留少量预期收益最高的 beam；DAG 执行、新鲜度和资源调度仍由来源无关的 runtime 统一负责。
+Actor 与 Drafter 并行运行，候选依次经过 schema 校验、preflight、资源版本捕获和执行策略选择。完成的候选进入 `ResultCache` 或仅支持精确匹配的 `ActionStore`，隔离副作用由封存的 `WorldBranch` 表示；Actor 发出工具调用时，Pi Agent 的 `settleToolCall` hook 尝试复用完全匹配或安全可投影的结果。PatternAware 按 workspace hash 持久化模板和有界 PPM 计数 trie，只保留少量预期收益最高的 beam；DAG 执行、新鲜度和资源调度仍由来源无关的 runtime 统一负责。
 
 所有命中、未命中、取消、实际执行、草稿 token、缓存和沙箱阶段耗时均以 typed event 暴露，供实验记录与可视化使用。

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { CandidateAggregate, CandidateCatalog } from "../src/candidate-lifecycle.ts";
+import { CandidateAggregate } from "../src/candidate-lifecycle.ts";
 
 interface Lease {
 	readonly id: string;
@@ -117,87 +117,5 @@ describe("CandidateAggregate", () => {
 		expect(aggregate.leases.map((lease) => lease.id)).toEqual(["initial", "matched", "expired"]);
 		aggregate.pruneLeases((lease) => lease.state === "active" || lease.state === "matched");
 		expect(aggregate.leases.map((lease) => lease.id)).toEqual(["initial", "matched"]);
-	});
-});
-
-describe("CandidateCatalog", () => {
-	it("maintains identity ownership with independent session and turn indexes", () => {
-		const catalog = new CandidateCatalog<string, object, { readonly id: string }>();
-		const first = { id: "same-key" };
-		const second = { id: "same-key" };
-		const owner = { id: "owner" };
-
-		catalog.register("session-a", "session-a:turn-1", first, owner);
-		catalog.register("session-a", "session-a:turn-1", second, owner);
-		expect(catalog.sessionValues("session-a")).toEqual([first, second]);
-		expect(catalog.turnValues("session-a:turn-1")).toEqual([first, second]);
-		expect(catalog.owner(first)).toBe(owner);
-		expect(catalog.record(first)).toEqual({
-			sessionID: "session-a",
-			owner,
-			turns: new Set(["session-a:turn-1"]),
-		});
-	});
-
-	it("attaches and detaches turns idempotently without changing session ownership", () => {
-		const catalog = new CandidateCatalog<string, object, string>();
-		const candidate = {};
-		catalog.register("session", "turn-a", candidate, "owner");
-
-		expect(catalog.attachTurn(candidate, "turn-b")).toBe(true);
-		expect(catalog.attachTurn(candidate, "turn-b")).toBe(true);
-		expect(catalog.turnValues("turn-b")).toEqual([candidate]);
-		expect(catalog.detachTurn(candidate, "turn-b")).toBe(true);
-		expect(catalog.detachTurn(candidate, "turn-b")).toBe(false);
-		expect(catalog.sessionValues("session")).toEqual([candidate]);
-		expect(catalog.record(candidate)?.turns).toEqual(new Set(["turn-a"]));
-	});
-
-	it("returns defensive record snapshots and detaches every candidate from a finished turn", () => {
-		const catalog = new CandidateCatalog<string, object, string>();
-		const first = {};
-		const second = {};
-		catalog.register("session", "turn-a", first, "first-owner");
-		catalog.register("session", "turn-b", second, "second-owner");
-		catalog.attachTurn(second, "turn-a");
-		const snapshot = catalog.record(first);
-		(snapshot?.turns as Set<string>).clear();
-
-		expect(catalog.turnValues("turn-a")).toEqual([first, second]);
-		catalog.detachAllFromTurn("turn-a");
-		expect(catalog.turnValues("turn-a")).toEqual([]);
-		expect(catalog.record(first)?.turns).toEqual(new Set());
-		expect(catalog.record(second)?.turns).toEqual(new Set(["turn-b"]));
-		expect(catalog.sessionValues("session")).toEqual([first, second]);
-	});
-
-	it("retires a candidate atomically from every index and tolerates unknown identities", () => {
-		const catalog = new CandidateCatalog<string, object, string>();
-		const candidate = {};
-		const unknown = {};
-		catalog.register("session", "turn-a", candidate, "owner");
-		catalog.attachTurn(candidate, "turn-b");
-
-		expect(catalog.retire(candidate)).toBe(true);
-		expect(catalog.retire(candidate)).toBe(false);
-		expect(catalog.retire(unknown)).toBe(false);
-		expect(catalog.attachTurn(unknown, "turn-c")).toBe(false);
-		expect(catalog.detachTurn(unknown, "turn-c")).toBe(false);
-		expect(catalog.owner(candidate)).toBeUndefined();
-		expect(catalog.record(candidate)).toBeUndefined();
-		expect(catalog.sessionValues("session")).toEqual([]);
-		expect(catalog.turnValues("turn-a")).toEqual([]);
-		expect(catalog.turnValues("turn-b")).toEqual([]);
-		expect(catalog.allValues()).toEqual([]);
-	});
-
-	it("rejects duplicate registration of the same candidate identity", () => {
-		const catalog = new CandidateCatalog<string, object, string>();
-		const candidate = {};
-		catalog.register("session", "turn-a", candidate, "owner");
-
-		expect(() => catalog.register("session", "turn-b", candidate, "other-owner")).toThrow(
-			"candidate is already registered",
-		);
 	});
 });
