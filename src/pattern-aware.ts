@@ -3,12 +3,17 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { type ActionKey, type ActionKeyProjector, actionKeyCovers } from "./common.ts";
+import { PpmCountTrie, type PpmCountTrieRow } from "./ppm-count-trie.ts";
 
 export type PatternAwareSettings = {
 	readonly enabled: boolean;
 	/** Admit future-gap/preparation candidates and expand completed predictions into a multi-step frontier. */
 	readonly multiStepEnabled: boolean;
 	readonly maxContextLength: number;
+	/** Maximum competing concrete actions retained at each PatternAware frontier. */
+	readonly beamWidth: number;
+	/** Maximum number of recursively predicted actions on one branch. */
+	readonly maxPredictionDepth: number;
 	readonly maxFutureGap: number;
 	readonly futureGapCoverage: number;
 	readonly decayHalfLifeEvents: number;
@@ -155,6 +160,7 @@ export type PatternAwareCandidate = {
 	readonly empiricalProbability: number;
 	readonly conditionalProbability: number;
 	readonly expectedDurationMs: number;
+	readonly expectedLatencyBenefitMs: number;
 	readonly dependencies: ReadonlyArray<PatternAwareDependency>;
 	readonly continuation: PatternAwareContinuation;
 	readonly depth: number;
@@ -207,6 +213,7 @@ type PersistedState = {
 	readonly version: number;
 	readonly patterns: ReadonlyArray<PatternAwarePattern>;
 	readonly pools?: ReadonlyArray<PatternPool>;
+	readonly sequenceCounts?: ReadonlyArray<PpmCountTrieRow>;
 };
 
 type PatternSample = {
@@ -243,6 +250,8 @@ export const PATTERN_AWARE_DEFAULTS: PatternAwareSettings = {
 	enabled: true,
 	multiStepEnabled: true,
 	maxContextLength: 6,
+	beamWidth: 4,
+	maxPredictionDepth: 6,
 	maxFutureGap: 8,
 	futureGapCoverage: 0.9,
 	decayHalfLifeEvents: 2048,
@@ -254,7 +263,7 @@ export const PATTERN_AWARE_DEFAULTS: PatternAwareSettings = {
 const MAX_BINDING_VARIANTS = 32;
 const MAX_COMPOSABLE_SOURCES = 48;
 const PERSIST_DEBOUNCE_MS = 200;
-const PERSISTENCE_VERSION = 11;
+const PERSISTENCE_VERSION = 12;
 const MIN_MIGRATABLE_PERSISTENCE_VERSION = 9;
 
 class PredictiveContextTrie {
@@ -299,6 +308,7 @@ export class PatternAwareStore {
 	private readonly pending = new Map<string, PendingValidation[]>();
 	private readonly history = new Map<string, PatternAwareEvent[]>();
 	private trie = new PredictiveContextTrie();
+	private sequenceModel: PpmCountTrie;
 	private indexDirty = true;
 	private clock = 0;
 	private write: Promise<void> = Promise.resolve();
@@ -316,6 +326,7 @@ export class PatternAwareStore {
 		actionSemantics?: PatternAwareActionSemantics,
 	) {
 		this.settings = settings;
+		this.sequenceModel = new PpmCountTrie(settings.maxContextLength);
 		this.persistenceFile = persistenceFile;
 		this.actionSemantics = actionSemantics;
 	}
@@ -325,6 +336,7 @@ export class PatternAwareStore {
 			settings.minOccurrences !== this.settings.minOccurrences ||
 			settings.maxContextLength !== this.settings.maxContextLength;
 		this.settings = settings;
+		this.sequenceModel.reconfigure(settings.maxContextLength, settings.maxPatterns);
 		if (actionSemantics) this.actionSemantics = actionSemantics;
 		if (resetInference) {
 			for (const pool of this.pools.values()) {
@@ -376,6 +388,9 @@ export class PatternAwareStore {
 				}
 			}
 		}
+		if (Array.isArray(parsed.sequenceCounts)) this.sequenceModel.restore(parsed.sequenceCounts);
+		else this.seedSequenceModelFromPatterns();
+		this.sequenceModel.trim(this.settings.maxPatterns);
 		this.indexDirty = true;
 		this.trimPools();
 		this.trimPatterns();
@@ -418,7 +433,14 @@ export class PatternAwareStore {
 		if (actions.length) this.resolvePendingBatch(first.sessionID, actions);
 		const prior = actionHistory(history);
 		for (const event of actions) {
-			if (event.learnTarget !== false) this.learn(prior, event);
+			if (event.learnTarget !== false) {
+				this.sequenceModel.observe(
+					prior.map((item) => signatureToken(signature(item))),
+					event.tool,
+					event.sequence,
+				);
+				this.learn(prior, event);
+			}
 		}
 		history.push(...events);
 		this.history.set(first.sessionID, history);
@@ -426,6 +448,7 @@ export class PatternAwareStore {
 		this.trimSessionHistory(history);
 		this.trimPools();
 		this.trimPatterns();
+		this.sequenceModel.trim(this.settings.maxPatterns);
 		this.persist();
 		return this.predict(first.sessionID, schemaHashes);
 	}
@@ -518,7 +541,9 @@ export class PatternAwareStore {
 		schemaHashes: Readonly<Record<string, string>>,
 		continuation: PatternAwareContinuation,
 	) {
+		if (continuation.visitedPatternIDs.length >= this.settings.maxPredictionDepth) return [];
 		const predictiveHistory = actionHistory(history);
+		const sequenceContext = predictiveHistory.map((event) => signatureToken(signature(event)));
 		const result: PatternAwareCandidate[] = [];
 		const groups = new Map<
 			string,
@@ -534,7 +559,6 @@ export class PatternAwareStore {
 		for (const patternID of this.trie.matching(predictiveHistory)) {
 			const pattern = this.patterns.get(patternID);
 			if (!pattern || !structurallyEligible(pattern, this.settings)) continue;
-			if (continuation.visitedPatternIDs.includes(pattern.id)) continue;
 			if (pattern.targetSchemaHash && schemaHashes[pattern.targetTool] !== pattern.targetSchemaHash) continue;
 			if (!matchesSuffix(predictiveHistory, pattern.context)) continue;
 			const context = predictiveHistory.slice(-pattern.context.length);
@@ -591,6 +615,7 @@ export class PatternAwareStore {
 					this.clock,
 					this.settings.decayHalfLifeEvents,
 				) * gapCoverage;
+			const ppmEstimate = this.sequenceModel.estimate(sequenceContext, representative.pattern.targetTool);
 			const totalWeight = ordered.reduce(
 				(total, item) =>
 					total +
@@ -616,6 +641,13 @@ export class PatternAwareStore {
 							recencyWeight(item.pattern.lastSeenSequence, this.clock, this.settings.decayHalfLifeEvents),
 					0,
 				) / Math.max(1, totalWeight);
+			// PPM estimates relative control-flow likelihood; replay/actor feedback
+			// calibrates whether this concrete pattern remains reusable.
+			const beamControlProbability =
+				ppmEstimate === undefined ? controlProbability : ppmEstimate.probability * controlProbability;
+			const branchProbability = Math.max(0, Math.min(1, beamControlProbability * variantProbability));
+			const beamScore =
+				continuation.pathProbability * branchProbability * Math.max(1, Math.max(0, expectedDurationMs));
 			return {
 				ordered,
 				representative,
@@ -625,9 +657,24 @@ export class PatternAwareStore {
 				variantProbability,
 				rawProbability: Math.max(0, controlProbability * variantProbability),
 				expectedDurationMs,
+				ppmEstimate,
+				branchProbability,
+				beamScore,
 			};
 		});
-		for (const prediction of predictions) {
+		const beam = predictions
+			.sort(
+				(left, right) =>
+					right.beamScore - left.beamScore ||
+					right.branchProbability - left.branchProbability ||
+					right.rawProbability - left.rawProbability ||
+					Number(right.representative.type === "tool_call") - Number(left.representative.type === "tool_call") ||
+					left.horizon - right.horizon ||
+					left.representative.pattern.id.localeCompare(right.representative.pattern.id) ||
+					stableStringify(left.representative.input).localeCompare(stableStringify(right.representative.input)),
+			)
+			.slice(0, this.settings.beamWidth);
+		for (const [beamIndex, prediction] of beam.entries()) {
 			const {
 				ordered,
 				representative,
@@ -637,6 +684,9 @@ export class PatternAwareStore {
 				variantProbability,
 				rawProbability,
 				expectedDurationMs,
+				ppmEstimate,
+				branchProbability,
+				beamScore,
 			} = prediction;
 			// Future-gap candidates are marginal events, not mutually exclusive branches: several
 			// tools predicted from the same context may all occur within their learned horizons.
@@ -644,10 +694,11 @@ export class PatternAwareStore {
 			// retain their independently calibrated probability.
 			const conditionalProbability = Math.max(0, Math.min(1, rawProbability));
 			const empiricalProbability = Math.max(0, Math.min(1, continuation.pathProbability * conditionalProbability));
+			const beamPathProbability = Math.max(0, Math.min(1, continuation.pathProbability * branchProbability));
 			const nextContinuation: PatternAwareContinuation = {
 				history: predictiveHistory,
 				visitedPatternIDs: [...continuation.visitedPatternIDs, representative.pattern.id],
-				pathProbability: empiricalProbability,
+				pathProbability: beamPathProbability,
 			};
 			result.push({
 				type: representative.type,
@@ -660,6 +711,7 @@ export class PatternAwareStore {
 				empiricalProbability,
 				conditionalProbability,
 				expectedDurationMs,
+				expectedLatencyBenefitMs: beamScore,
 				dependencies: representative.pattern.dependencies,
 				continuation: nextContinuation,
 				depth: nextContinuation.visitedPatternIDs.length,
@@ -675,7 +727,16 @@ export class PatternAwareStore {
 						empiricalProbability,
 						conditionalProbability,
 						controlProbability,
+						ppmProbability: ppmEstimate?.probability,
+						ppmOrder: ppmEstimate?.order,
+						ppmEvidence: ppmEstimate?.evidence,
+						ppmEscapeMass: ppmEstimate?.escapeMass,
 						variantProbability,
+						branchProbability,
+						beamPathProbability,
+						beamScore,
+						beamRank: beamIndex + 1,
+						beamWidth: this.settings.beamWidth,
 						gapCoverage,
 						expectedDurationMs,
 						dependencies: representative.pattern.dependencies,
@@ -1021,6 +1082,43 @@ export class PatternAwareStore {
 		if (evicted.length) this.indexDirty = true;
 	}
 
+	private seedSequenceModelFromPatterns() {
+		const exact = new Map<
+			string,
+			{
+				readonly context: readonly string[];
+				readonly target: string;
+				count: number;
+				lastSeen: number;
+			}
+		>();
+		for (const pattern of this.patterns.values()) {
+			const count = Math.max(0, pattern.gapCounts["0"] ?? 0);
+			if (count <= 0) continue;
+			const context = pattern.context.map(signatureToken);
+			const key = stableStringify({ context, target: pattern.targetTool });
+			const current = exact.get(key);
+			if (!current || count > current.count) {
+				exact.set(key, {
+					context,
+					target: pattern.targetTool,
+					count,
+					lastSeen: pattern.lastSeenSequence,
+				});
+			}
+		}
+		const root = new Map<string, { count: number; lastSeen: number }>();
+		for (const item of exact.values()) {
+			this.sequenceModel.setCount(item.context, item.target, item.count, item.lastSeen);
+			if (item.context.length !== 1) continue;
+			const current = root.get(item.target) ?? { count: 0, lastSeen: 0 };
+			current.count += item.count;
+			current.lastSeen = Math.max(current.lastSeen, item.lastSeen);
+			root.set(item.target, current);
+		}
+		for (const [target, item] of root) this.sequenceModel.setCount([], target, item.count, item.lastSeen);
+	}
+
 	private persist() {
 		if (!this.persistenceFile || !this.loaded) return;
 		this.dirty = true;
@@ -1039,6 +1137,7 @@ export class PatternAwareStore {
 			version: PERSISTENCE_VERSION,
 			patterns: this.snapshot(),
 			pools: this.persistedPools(),
+			sequenceCounts: this.sequenceModel.snapshot(this.settings.maxPatterns),
 		};
 		const target = this.persistenceFile;
 		this.write = this.write
@@ -1138,6 +1237,8 @@ export function patternAwareSettings(value: unknown): PatternAwareSettings {
 				? record.multiStepEnabled
 				: PATTERN_AWARE_DEFAULTS.multiStepEnabled,
 		maxContextLength: positiveInteger(record?.maxContextLength, PATTERN_AWARE_DEFAULTS.maxContextLength),
+		beamWidth: positiveInteger(record?.beamWidth, PATTERN_AWARE_DEFAULTS.beamWidth),
+		maxPredictionDepth: positiveInteger(record?.maxPredictionDepth, PATTERN_AWARE_DEFAULTS.maxPredictionDepth),
 		maxFutureGap: nonNegativeInteger(record?.maxFutureGap, PATTERN_AWARE_DEFAULTS.maxFutureGap),
 		futureGapCoverage: probabilitySetting(record?.futureGapCoverage, PATTERN_AWARE_DEFAULTS.futureGapCoverage),
 		decayHalfLifeEvents: positiveInteger(record?.decayHalfLifeEvents, PATTERN_AWARE_DEFAULTS.decayHalfLifeEvents),

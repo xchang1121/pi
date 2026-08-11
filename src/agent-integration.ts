@@ -288,6 +288,7 @@ export function installSpeculativeAction(
 		empiricalProbability: candidate.empiricalProbability,
 		conditionalProbability: candidate.conditionalProbability,
 		expectedDurationMs: candidate.expectedDurationMs,
+		expectedLatencyBenefitMs: candidate.expectedLatencyBenefitMs,
 		depth: candidate.depth,
 		...(dependsOn?.length ? { dependsOn } : {}),
 		feedback: { ...patternAwareRuntimeContext(store, candidate), patternID: candidate.patternID },

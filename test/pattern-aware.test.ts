@@ -364,7 +364,7 @@ describe("PatternAware", () => {
 
 		const raw = await fs.readFile(file, "utf8");
 		expect(raw).not.toContain('"history"');
-		expect(JSON.parse(raw).version).toBe(11);
+		expect(JSON.parse(raw).version).toBe(12);
 		const second = new PatternAwareStore(settings(), file);
 		await second.load();
 		second.observe(input({ sessionID: "three", tool: "grep", input: {}, outputPaths: ["src/c.ts"] }));
@@ -557,6 +557,35 @@ describe("PatternAware", () => {
 		expect(second.snapshot().some((item) => item.targetTool === "read")).toBe(true);
 	});
 
+	test("persists PPM counts so beam ordering survives a process restart", async () => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "pi-pattern-ppm-"));
+		temporary.push(directory);
+		const file = path.join(directory, "patterns.json");
+		const configured = settings({ beamWidth: 1 });
+		const first = new PatternAwareStore(configured, file);
+		await first.load();
+		for (let index = 0; index < 4; index++) {
+			first.observe(input({ sessionID: `read-${index}`, tool: "grep", input: {} }));
+			first.observe(input({ sessionID: `read-${index}`, tool: "read", input: { path: "README.md" } }));
+		}
+		for (let index = 0; index < 2; index++) {
+			first.observe(input({ sessionID: `bash-${index}`, tool: "grep", input: {} }));
+			first.observe(input({ sessionID: `bash-${index}`, tool: "bash", input: { command: "npm test" } }));
+		}
+		await first.flush();
+
+		const persisted = JSON.parse(await fs.readFile(file, "utf8"));
+		expect(persisted.version).toBe(12);
+		expect(persisted.sequenceCounts.length).toBeGreaterThan(0);
+		const restored = new PatternAwareStore(configured, file);
+		await restored.load();
+		restored.observe(input({ sessionID: "probe", tool: "grep", input: {} }));
+
+		expect(restored.predict("probe")).toEqual([
+			expect.objectContaining({ tool: "read", input: { path: "README.md" } }),
+		]);
+	});
+
 	test("retains inference evidence and retry state across short-lived processes", async () => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "pi-pattern-constant-pool-"));
 		temporary.push(directory);
@@ -619,10 +648,18 @@ describe("PatternAware", () => {
 	});
 
 	test("normalizes partial PatternAware settings", () => {
-		expect(patternAwareSettings({ maxContextLength: 3, maxFutureGap: 0 })).toEqual({
+		expect(
+			patternAwareSettings({ maxContextLength: 3, beamWidth: 2, maxPredictionDepth: 4, maxFutureGap: 0 }),
+		).toEqual({
 			...PATTERN_AWARE_DEFAULTS,
 			maxContextLength: 3,
+			beamWidth: 2,
+			maxPredictionDepth: 4,
 			maxFutureGap: 0,
+		});
+		expect(patternAwareSettings({ beamWidth: 0, maxPredictionDepth: Number.NaN })).toMatchObject({
+			beamWidth: PATTERN_AWARE_DEFAULTS.beamWidth,
+			maxPredictionDepth: PATTERN_AWARE_DEFAULTS.maxPredictionDepth,
 		});
 	});
 
@@ -1274,6 +1311,83 @@ describe("PatternAware", () => {
 		expect(bash?.input).toEqual({ command: "bun test tests/gamma.test.ts" });
 		expect(bash?.depth).toBe(3);
 		expect(new Set(bash?.continuation.visitedPatternIDs).size).toBe(3);
+	});
+
+	test("uses PPM probability and expected hidden time to retain a bounded high-value beam", () => {
+		const store = new PatternAwareStore(settings({ beamWidth: 1, maxContextLength: 1, maxFutureGap: 0 }));
+		for (let index = 0; index < 8; index++) {
+			store.observe(input({ sessionID: `fast-${index}`, tool: "grep", input: {}, durationMs: 1 }));
+			store.observe(
+				input({ sessionID: `fast-${index}`, tool: "read", input: { path: "README.md" }, durationMs: 1 }),
+			);
+		}
+		for (let index = 0; index < 4; index++) {
+			store.observe(input({ sessionID: `slow-${index}`, tool: "grep", input: {}, durationMs: 1 }));
+			store.observe(
+				input({ sessionID: `slow-${index}`, tool: "bash", input: { command: "npm test" }, durationMs: 100 }),
+			);
+		}
+
+		store.observe(input({ sessionID: "probe", tool: "grep", input: {} }));
+		const candidates = store.predict("probe");
+		const diagnostic = JSON.parse(candidates[0]!.diagnostic);
+
+		expect(candidates).toHaveLength(1);
+		expect(candidates[0]).toMatchObject({ tool: "bash", expectedDurationMs: 100 });
+		expect(diagnostic).toMatchObject({ beamRank: 1, beamWidth: 1, ppmOrder: 1 });
+		expect(diagnostic.ppmProbability).toBeGreaterThan(0);
+		expect(candidates[0]!.expectedLatencyBenefitMs).toBeGreaterThan(1);
+		expect(candidates[0]!.continuation.pathProbability).toBeCloseTo(
+			candidates[0]!.expectedLatencyBenefitMs / candidates[0]!.expectedDurationMs,
+		);
+	});
+
+	test("calibrates PPM beam value with concrete actor-miss feedback", () => {
+		const store = new PatternAwareStore(settings({ beamWidth: 1, maxContextLength: 1, maxFutureGap: 0 }));
+		trainGrepRead(store, "one", "src/a.ts");
+		trainGrepRead(store, "two", "src/b.ts");
+		store.observe(input({ sessionID: "probe", tool: "grep", input: {}, outputPaths: ["src/c.ts"] }));
+
+		const before = store.predict("probe").find((item) => item.tool === "read");
+		expect(before).toBeDefined();
+		for (let index = 0; index < 3; index++) {
+			store.launched(before!.patternID);
+			store.resolved(before!.patternID, "actor_miss");
+		}
+
+		const after = store.predict("probe").find((item) => item.tool === "read");
+		expect(after).toBeDefined();
+		expect(after!.expectedLatencyBenefitMs).toBeLessThan(before!.expectedLatencyBenefitMs);
+	});
+
+	test("allows a recurring motif to extend until the explicit prediction-depth bound", () => {
+		const store = new PatternAwareStore(
+			settings({ beamWidth: 1, maxContextLength: 1, maxFutureGap: 0, maxPredictionDepth: 3 }),
+		);
+		for (const sessionID of ["one", "two"]) {
+			for (let step = 0; step < 4; step++) {
+				store.observe(input({ sessionID, tool: "read", input: { path: "loop.ts" } }));
+			}
+		}
+
+		store.observe(input({ sessionID: "probe", tool: "read", input: { path: "loop.ts" } }));
+		const first = store.predict("probe")[0]!;
+		const second = store.continue(
+			first.continuation,
+			input({ sessionID: "probe", tool: "read", input: { path: "loop.ts" }, learnTarget: false }),
+		)[0]!;
+		const third = store.continue(
+			second.continuation,
+			input({ sessionID: "probe", tool: "read", input: { path: "loop.ts" }, learnTarget: false }),
+		)[0]!;
+		const exhausted = store.continue(
+			third.continuation,
+			input({ sessionID: "probe", tool: "read", input: { path: "loop.ts" }, learnTarget: false }),
+		);
+
+		expect([first.depth, second.depth, third.depth]).toEqual([1, 2, 3]);
+		expect(new Set(third.continuation.visitedPatternIDs).size).toBe(1);
+		expect(exhausted).toEqual([]);
 	});
 
 	test("replays held-out workflows with top-one bindings across a three-step frontier", () => {

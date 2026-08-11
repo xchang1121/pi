@@ -86,6 +86,8 @@ The master switch is off by default. After `/speculative-action on`, the followi
 | Drafter | On | Predict candidates concurrently with the actor |
 | PatternAware | On | Learn and match historical action templates |
 | PatternAware multi-step | On | Admit future actions and expand multi-step speculation |
+| Pattern beam width | 4 | Retain the highest expected-latency-reduction actions at each learned frontier |
+| Pattern prediction depth | 6 | Bound recursive multi-step expansion, including recurring motifs |
 | Adaptive drafter | On | Skip redundant drafter requests when a useful template is already available |
 | Candidate limit | 8 | Maximum accepted candidates per prediction |
 | Concurrent actions | 8 | Maximum concurrent speculative actions |
@@ -121,7 +123,9 @@ Complete example:
     "adaptiveDrafter": true,
     "patternAware": {
       "enabled": true,
-      "multiStepEnabled": true
+      "multiStepEnabled": true,
+      "beamWidth": 4,
+      "maxPredictionDepth": 6
     },
     "tools": {
       "resourceCached": ["read", "grep", "find"],
@@ -284,6 +288,8 @@ const installed = installSpeculativeAction(agent, {
     patternAware: {
       enabled: true,
       multiStepEnabled: true,
+      beamWidth: 4,
+      maxPredictionDepth: 6,
       futureGapCoverage: 0.9,
       decayHalfLifeEvents: 2048,
     },
@@ -317,6 +323,6 @@ If the Drafter uses a different provider from the actor, use `getDraftOptions` t
 
 ## Implementation overview
 
-The actor and Drafter run concurrently. Candidates pass schema validation, preflight, resource-version capture, and execution-strategy selection. Completed candidates enter a session cache with entry and memory limits. When the actor emits a tool call, Pi Agent's `settleToolCall` hook tries to reuse an exact match or a conservatively projected result. PatternAware state is persisted by workspace hash, and multi-step expansion is bounded by concurrency, depth, future gap, probability, and lifecycle limits.
+The actor and Drafter run concurrently. Candidates pass schema validation, preflight, resource-version capture, and execution-strategy selection. Completed candidates enter a session cache with entry and memory limits. When the actor emits a tool call, Pi Agent's `settleToolCall` hook tries to reuse an exact match or a conservatively projected result. PatternAware persists its templates and bounded PPM count trie by workspace hash, retains a small expected-benefit beam, and leaves DAG execution, freshness, and resource scheduling to the source-neutral runtime.
 
 Hits, misses, cancellation, actual execution, draft tokens, cache state, and sandbox-stage timings are exposed as typed events for experiment collection and visualization.

@@ -86,6 +86,8 @@ spec: on · native · 3/4 hits · 1.2s saved · 5/512 cached
 | Drafter | 开启 | 与 Actor 并行预测候选动作 |
 | PatternAware | 开启 | 学习并匹配历史动作模板 |
 | PatternAware multi-step | 开启 | 允许未来动作和多步投机展开 |
+| Pattern beam width | 4 | 在每个学习到的前沿只保留预期延迟收益最高的动作 |
+| Pattern prediction depth | 6 | 限制递归多步展开深度，同时允许有界的重复模式 |
 | Adaptive drafter | 开启 | 已有高价值模板时跳过冗余 drafter 请求 |
 | Candidate limit | 8 | 每次最多接收的候选数 |
 | Concurrent actions | 8 | 最大并行投机动作数 |
@@ -121,7 +123,9 @@ spec: on · native · 3/4 hits · 1.2s saved · 5/512 cached
     "adaptiveDrafter": true,
     "patternAware": {
       "enabled": true,
-      "multiStepEnabled": true
+      "multiStepEnabled": true,
+      "beamWidth": 4,
+      "maxPredictionDepth": 6
     },
     "tools": {
       "resourceCached": ["read", "grep", "find"],
@@ -284,6 +288,8 @@ const installed = installSpeculativeAction(agent, {
     patternAware: {
       enabled: true,
       multiStepEnabled: true,
+      beamWidth: 4,
+      maxPredictionDepth: 6,
       futureGapCoverage: 0.9,
       decayHalfLifeEvents: 2048,
     },
@@ -317,6 +323,6 @@ await installed.uninstall();
 
 ## 实现概览
 
-Actor 与 Drafter 并行运行，候选依次经过 schema 校验、preflight、资源版本捕获和执行策略选择。完成的候选进入带容量和内存上限的 session cache；Actor 发出工具调用时，Pi Agent 的 `settleToolCall` hook 尝试复用完全匹配或安全可投影的结果。PatternAware 状态按 workspace hash 持久化，多步展开受到并发、深度、future gap、概率和生命周期限制。
+Actor 与 Drafter 并行运行，候选依次经过 schema 校验、preflight、资源版本捕获和执行策略选择。完成的候选进入带容量和内存上限的 session cache；Actor 发出工具调用时，Pi Agent 的 `settleToolCall` hook 尝试复用完全匹配或安全可投影的结果。PatternAware 按 workspace hash 持久化模板和有界 PPM 计数 trie，只保留少量预期收益最高的 beam；DAG 执行、新鲜度和资源调度仍由来源无关的 runtime 统一负责。
 
 所有命中、未命中、取消、实际执行、草稿 token、缓存和沙箱阶段耗时均以 typed event 暴露，供实验记录与可视化使用。
