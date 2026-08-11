@@ -170,6 +170,8 @@ export interface SpeculativeCacheSnapshot {
 	readonly cacheByteCapacity?: number;
 	readonly cacheRunning: number;
 	readonly cacheCompleted: number;
+	readonly cacheProbation: number;
+	readonly cacheProtected: number;
 	readonly activeCandidates: number;
 	readonly turnCandidates: number;
 	readonly resourceCandidates: number;
@@ -576,6 +578,11 @@ export function makeSpeculativeActionRuntime<
 		typeof settings.resourceCacheMaxBytes === "number" && Number.isFinite(settings.resourceCacheMaxBytes)
 			? Math.max(1, Math.floor(settings.resourceCacheMaxBytes))
 			: 256 * 1024 * 1024;
+	const cacheLimits = (settings: SpeculativeActionSettings) => ({
+		maxEntries: resourceCacheLimit(settings),
+		maxBytes: resourceCacheByteLimit(settings),
+		protectedFraction: 0.8,
+	});
 	const schedulerFor = (sessionID: SessionID): ToolSpeculationScheduler<RuntimeCandidate<Output>> => {
 		const existing = schedulers.get(sessionID);
 		if (existing) return existing;
@@ -812,6 +819,9 @@ export function makeSpeculativeActionRuntime<
 	const cacheSnapshot = (state: TurnState<SessionID, Output, StateData>): SpeculativeCacheSnapshot => {
 		const candidates = cachedCandidates(state);
 		const running = candidates.filter((candidate) => candidate.run.status === "running").length;
+		const protectedEntries = candidates.filter(
+			(candidate) => persistentCandidates.stateOf(state.sessionID, candidate) === "protected",
+		).length;
 		return {
 			cacheEntries: candidates.length,
 			cacheCapacity: state.settings.resourceCacheMaxEntries,
@@ -819,6 +829,8 @@ export function makeSpeculativeActionRuntime<
 			cacheByteCapacity: resourceCacheByteLimit(state.settings),
 			cacheRunning: running,
 			cacheCompleted: candidates.length - running,
+			cacheProbation: candidates.length - protectedEntries,
+			cacheProtected: protectedEntries,
 			activeCandidates: running,
 			turnCandidates: candidates.filter((candidate) => candidate.reuse.kind === "exclusive").length,
 			resourceCandidates: candidates.filter((candidate) => candidate.reuse.kind === "shared").length,
@@ -1052,13 +1064,6 @@ export function makeSpeculativeActionRuntime<
 		}
 	};
 
-	const touchPersistentCandidate = (
-		state: TurnState<SessionID, Output, StateData>,
-		candidate: RuntimeCandidate<Output>,
-	): void => {
-		persistentCandidates.touch(state.sessionID, candidate);
-	};
-
 	const trimPersistentCandidates = (
 		sessionID: SessionID,
 		settings: SpeculativeActionSettings,
@@ -1066,8 +1071,8 @@ export function makeSpeculativeActionRuntime<
 	): RuntimeCandidate<Output>[] => {
 		return persistentCandidates.trim(
 			sessionID,
-			{ maxEntries: resourceCacheLimit(settings), maxBytes: resourceCacheByteLimit(settings) },
-			(candidate) => candidate !== protectedCandidate && candidate.schedulerOutcome !== "promoted",
+			cacheLimits(settings),
+			(candidate) => candidate !== protectedCandidate,
 		);
 	};
 
@@ -1341,13 +1346,11 @@ export function makeSpeculativeActionRuntime<
 	): RuntimeCandidate<Output> | undefined => {
 		const exact = state.candidates.get(actual.key) ?? persistentCandidates.getExact(state.sessionID, actual);
 		if (exact && candidateCanMatch(exact, actionSequence) && claimCandidate(exact, state.turnID)) {
-			touchPersistentCandidate(state, exact);
 			return exact;
 		}
 		for (const candidate of matchingCandidates(state, actual)) {
 			if (!candidateCanMatch(candidate, actionSequence)) continue;
 			if (!claimCandidate(candidate, state.turnID)) continue;
-			touchPersistentCandidate(state, candidate);
 			return candidate;
 		}
 		return undefined;
@@ -1394,7 +1397,6 @@ export function makeSpeculativeActionRuntime<
 				await expireCandidate(state, candidate, "candidate_resource_expired");
 				continue;
 			}
-			touchPersistentCandidate(state, candidate);
 			return candidate;
 		}
 		return undefined;
@@ -2353,7 +2355,9 @@ export function makeSpeculativeActionRuntime<
 			completePredictionMatch(candidate, actionSequence);
 			candidate.hits++;
 			candidate.authoritativeSequence = Math.max(candidate.authoritativeSequence ?? 0, actionSequence);
-			if (candidate.reuse.kind === "exclusive") {
+			if (candidate.reuse.kind === "shared") {
+				persistentCandidates.recordActorHit(state.sessionID, candidate, cacheLimits(state.settings));
+			} else {
 				candidate.reuse.state = "adopted";
 				candidate.reuse.claimTurnID = undefined;
 				const completedAt = candidateCompletedAt(candidate);

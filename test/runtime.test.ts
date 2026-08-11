@@ -896,6 +896,8 @@ describe("speculative action runtime", () => {
 			cacheCapacity: 7,
 			cacheRunning: 1,
 			cacheCompleted: 0,
+			cacheProbation: 1,
+			cacheProtected: 0,
 			activeCandidates: 1,
 			turnCandidates: 0,
 			resourceCandidates: 1,
@@ -913,7 +915,13 @@ describe("speculative action runtime", () => {
 			cacheEntries: 1,
 			cacheRunning: 0,
 			cacheCompleted: 1,
+			cacheProbation: 1,
+			cacheProtected: 0,
 			activeCandidates: 0,
+		});
+		expect(harness.events.find((event) => event.type === "hit")).toMatchObject({
+			cacheProbation: 0,
+			cacheProtected: 1,
 		});
 	});
 
@@ -926,7 +934,72 @@ describe("speculative action runtime", () => {
 		expect(harness.events.find((event) => event.type === "cache")).toMatchObject({
 			cacheCompleted: 1,
 			cacheRunning: 0,
+			cacheProbation: 1,
+			cacheProtected: 0,
 		});
+	});
+
+	it("evicts unconsumed probation before an actor-validated protected result", async () => {
+		const harness = createHarness({
+			settings: { ...enabledSettings, adaptiveDrafter: false, resourceCacheMaxEntries: 2 },
+			predict: (input) => {
+				if (input.turnID === "seed-protected") return prediction(readCandidate("a.txt"));
+				if (input.turnID === "seed-probation") return prediction(readCandidate("b.txt"));
+				if (input.turnID === "apply-pressure") return prediction(readCandidate("c.txt"));
+				return prediction();
+			},
+			execute: (candidate) => String((candidate.input as { path: string }).path),
+		});
+
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "seed-protected" });
+		await waitFor(() => harness.runtime.inspect("session").pendingPredictions === 0);
+		expect(await harness.runtime.consume(consume("seed-protected", { path: "a.txt" }))).toBe("a.txt");
+		await harness.runtime.finishTurn(consume("seed-protected", {}));
+
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "seed-probation" });
+		await waitFor(() => harness.runtime.inspect("session").pendingPredictions === 0);
+		await harness.runtime.finishTurn(consume("seed-probation", {}));
+
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "apply-pressure" });
+		await waitFor(() => harness.runtime.inspect("session").pendingPredictions === 0);
+		await harness.runtime.finishTurn(consume("apply-pressure", {}));
+
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "check-protected" });
+		await waitFor(() => harness.runtime.inspect("session").pendingPredictions === 0);
+		expect(await harness.runtime.consume(consume("check-protected", { path: "a.txt" }))).toBe("a.txt");
+		await harness.runtime.finishTurn(consume("check-protected", {}));
+
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "check-probation" });
+		await waitFor(() => harness.runtime.inspect("session").pendingPredictions === 0);
+		expect(await harness.runtime.consume(consume("check-probation", { path: "b.txt" }))).toBeUndefined();
+		expect(harness.executions()).toBe(3);
+		expect(harness.events).toContainEqual(
+			expect.objectContaining({ type: "cancelled", reason: "resource_cache_evicted" }),
+		);
+	});
+
+	it("does not promote or refresh a candidate reused only by later predictions", async () => {
+		const harness = createHarness({
+			settings: { ...enabledSettings, adaptiveDrafter: false, resourceCacheMaxEntries: 1 },
+			predict: (input) => {
+				if (input.turnID === "seed") return prediction(readCandidate("a.txt"));
+				if (input.turnID === "prediction-reuse") return prediction(readCandidate("a.txt"));
+				if (input.turnID === "pressure") return prediction(readCandidate("b.txt"));
+				return prediction();
+			},
+			execute: (candidate) => String((candidate.input as { path: string }).path),
+		});
+
+		for (const turnID of ["seed", "prediction-reuse", "pressure"]) {
+			await harness.runtime.startTurn({ sessionID: "session", turnID });
+			await waitFor(() => harness.runtime.inspect("session").pendingPredictions === 0);
+			await harness.runtime.finishTurn(consume(turnID, {}));
+		}
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "check" });
+		await waitFor(() => harness.runtime.inspect("session").pendingPredictions === 0);
+
+		expect(await harness.runtime.consume(consume("check", { path: "a.txt" }))).toBeUndefined();
+		expect(harness.executions()).toBe(2);
 	});
 
 	it("publishes actual fallback duration without creating another speculative miss", async () => {

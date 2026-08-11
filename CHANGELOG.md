@@ -18,6 +18,7 @@
 - Added watcher-backed resource versions with exact-validation fallback, eager invalidation, byte-bounded per-session caches, pooled Git workspaces, and phase-level runtime metrics.
 - Added an indexed per-session tool cache with atomic exact-key registration for cross-turn single-flight reuse.
 - Added production Pi `read` range projection backed by structured realized-output coverage; grep and find remain exact-key-only.
+- Added probation/protected speculative cache tiers: new results remain eviction-first until a successful actor hit promotes them, with bounded protected occupancy by entries and bytes.
 
 ### Changed
 
