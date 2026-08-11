@@ -1,5 +1,6 @@
 export * from "./action-key-projection.ts";
 export * from "./agent-integration.ts";
+export * from "./candidate-lifecycle.ts";
 export * from "./common.ts";
 export * from "./native-sandbox.ts";
 export * from "./pattern-aware.ts";

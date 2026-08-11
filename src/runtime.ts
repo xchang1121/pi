@@ -1,4 +1,10 @@
 import type { ActionProjectionCoverage, ActionProjectionRule } from "./action-key-projection.ts";
+import {
+	CandidateAggregate,
+	CandidateCatalog,
+	type CandidateReuseState,
+	type CandidateRunState,
+} from "./candidate-lifecycle.ts";
 import type { ActionKey, ActionKeyMatch, DrafterToolDefinition, SpeculativeExecution } from "./common.ts";
 import {
 	actionKeyCovers,
@@ -100,23 +106,9 @@ export interface PredictionLease {
 	resolvedActionSeq?: number;
 }
 
-export type SpeculativeJobRun<Output> =
-	| { readonly status: "running" }
-	| { readonly status: "ready"; readonly completedAt: number; readonly executionMs: number; readonly output: Output }
-	| {
-			readonly status: "closed";
-			readonly reason: string;
-			readonly completedAt?: number;
-			readonly executionMs?: number;
-	  };
+export type SpeculativeJobRun<Output> = CandidateRunState<Output>;
 
-export type SpeculativeJobReuse =
-	| { readonly kind: "shared" }
-	| {
-			readonly kind: "exclusive";
-			state: "available" | "claimed" | "adopted";
-			claimTurnID?: string;
-	  };
+export type SpeculativeJobReuse = CandidateReuseState;
 
 export interface SpeculativeCandidate {
 	readonly id: string;
@@ -124,7 +116,7 @@ export interface SpeculativeCandidate {
 	readonly tool: string;
 	readonly input: Readonly<Record<string, unknown>>;
 	readonly reuse: SpeculativeJobReuse;
-	run: SpeculativeJobRun<unknown>;
+	readonly run: SpeculativeJobRun<unknown>;
 	resourceVersion?: unknown;
 	releaseResourceVersion?: () => void;
 	resourceCaptureMs?: number;
@@ -160,7 +152,7 @@ export interface SpeculativeCandidate {
 	scheduling: SpeculativeSchedulingMetadata;
 	utility: number;
 	readonly patternID?: string;
-	readonly leases: PredictionLease[];
+	readonly leases: readonly PredictionLease[];
 	hits: number;
 	authoritativeSequence?: number;
 	schedulerOutcome?: "reused" | "promoted" | "discarded" | "preempted";
@@ -504,19 +496,9 @@ export interface SpeculativeActionRuntime<SessionID, Output, StartInput, Consume
 	readonly inspect: (sessionID?: SessionID) => SpeculativeRuntimeInspection;
 }
 
-interface DeferredState<T> {
-	readonly promise: Promise<T>;
-	readonly resolve: (value: T) => void;
-}
-
-type CandidateExecution<Output> =
-	| { readonly ok: true; readonly output: Output }
-	| { readonly ok: false; readonly error: unknown };
-
 interface RuntimeCandidate<Output> extends SpeculativeCandidate {
-	run: SpeculativeJobRun<Output>;
-	readonly execution: DeferredState<CandidateExecution<Output>>;
-	readonly controller: AbortController;
+	readonly run: SpeculativeJobRun<Output>;
+	readonly lifecycle: CandidateAggregate<Output, PredictionLease>;
 }
 
 interface RankedRuntimeCandidate<Output> {
@@ -537,7 +519,6 @@ interface TurnState<SessionID, Output, StateData> {
 	readonly turnID: string;
 	readonly startInput: TurnInput<SessionID>;
 	readonly startedAt: number;
-	readonly candidates: Map<string, RuntimeCandidate<Output>>;
 	readonly data: StateData;
 	readonly settings: SpeculativeActionSettings;
 	readonly predictionController: AbortController;
@@ -601,7 +582,11 @@ export function makeSpeculativeActionRuntime<
 	const wallTimes = new Map<SessionID, number>();
 	const actionSequences = new Map<SessionID, number>();
 	const schedulers = new Map<SessionID, ToolSpeculationScheduler<RuntimeCandidate<Output>>>();
-	const candidateOwners = new WeakMap<RuntimeCandidate<Output>, TurnState<SessionID, Output, StateData>>();
+	const candidateCatalog = new CandidateCatalog<
+		SessionID,
+		RuntimeCandidate<Output>,
+		TurnState<SessionID, Output, StateData>
+	>();
 	const serviceTimes = new Map<string, { count: number; averageMs: number }>();
 	const executionOverheadTimes = new Map<string, { count: number; averageMs: number }>();
 	const hitOverheadTimes = new Map<string, { count: number; averageMs: number }>();
@@ -812,7 +797,7 @@ export function makeSpeculativeActionRuntime<
 		const candidates = new Map<string, RuntimeCandidate<Output>>();
 		for (const candidate of sessionPersistentCandidates(state.sessionID))
 			candidates.set(candidate.key.key, candidate);
-		for (const candidate of state.candidates.values()) {
+		for (const candidate of candidateCatalog.turnValues(turnKey(state))) {
 			if (candidate.run.status === "closed") continue;
 			candidates.set(candidate.key.key, candidate);
 		}
@@ -989,7 +974,9 @@ export function makeSpeculativeActionRuntime<
 	const availableCandidates = (
 		state: TurnState<SessionID, Output, StateData>,
 	): Map<string, RuntimeCandidate<Output>> => {
-		const candidates = new Map(state.candidates);
+		const candidates = new Map(
+			candidateCatalog.turnValues(turnKey(state)).map((candidate) => [candidate.key.key, candidate]),
+		);
 		for (const candidate of sessionPersistentCandidates(state.sessionID))
 			candidates.set(candidate.key.key, candidate);
 		return candidates;
@@ -1183,8 +1170,7 @@ export function makeSpeculativeActionRuntime<
 	};
 
 	const pruneResolvedLeases = (candidate: RuntimeCandidate<Output>): void => {
-		const unresolved = candidate.leases.filter((lease) => lease.state === "active" || lease.state === "matched");
-		candidate.leases.splice(0, candidate.leases.length, ...unresolved);
+		candidate.lifecycle.pruneLeases((lease) => lease.state === "active" || lease.state === "matched");
 	};
 
 	const closeCandidate = async (
@@ -1195,28 +1181,29 @@ export function makeSpeculativeActionRuntime<
 		publish = false,
 		schedulerOutcome: "preempted" | "discarded" = "discarded",
 	): Promise<boolean> => {
-		if (candidate.run.status === "closed") return false;
 		const completedAt = candidateCompletedAt(candidate);
 		const executionMs = candidateExecutionMs(candidate);
+		if (
+			!candidate.lifecycle.close({
+				reason,
+				...(completedAt !== undefined ? { completedAt } : {}),
+				...(executionMs > 0 ? { executionMs } : {}),
+			})
+		) {
+			return false;
+		}
 		candidate.schedulerOutcome = schedulerOutcome;
-		candidate.run = {
-			status: "closed",
-			reason,
-			...(completedAt !== undefined ? { completedAt } : {}),
-			...(executionMs > 0 ? { executionMs } : {}),
-		};
 		expireDrafterLeases(candidate, undefined, leaseState);
 		await settlePatternLeases(candidate, leaseState, patternResolution(reason));
 		for (const lease of candidate.leases) {
 			if (lease.state === "matched") lease.state = "invalidated";
 		}
 		schedulerFor(state.sessionID).discard(candidate);
-		if (state.candidates.get(candidate.key.key) === candidate) state.candidates.delete(candidate.key.key);
 		removeTurnAdmission(state, candidate);
 		removePersistentCandidate(state, candidate);
 		releaseCandidateResourceVersion(candidate);
-		candidate.controller.abort();
-		candidate.execution.resolve({ ok: false, error: new Error(reason) });
+		candidateCatalog.retire(candidate);
+		candidate.lifecycle.settleClosed();
 		if (publish) await publishCancelled(state, candidate, reason);
 		return true;
 	};
@@ -1227,13 +1214,13 @@ export function makeSpeculativeActionRuntime<
 		outcome: "preempted" | "discarded" = "preempted",
 		publish = true,
 	): Promise<void> => {
-		const owner = candidateOwners.get(candidate);
+		const owner = candidateCatalog.owner(candidate);
 		if (!owner) {
 			candidate.schedulerOutcome = outcome;
-			candidate.run = { status: "closed", reason };
+			candidate.lifecycle.close({ reason });
 			releaseCandidateResourceVersion(candidate);
-			candidate.controller.abort();
-			candidate.execution.resolve({ ok: false, error: new Error(reason) });
+			candidateCatalog.retire(candidate);
+			candidate.lifecycle.settleClosed();
 			return;
 		}
 		await closeCandidate(owner, candidate, reason, "invalidated", publish, outcome);
@@ -1257,13 +1244,12 @@ export function makeSpeculativeActionRuntime<
 		reason = "speculative_action_disabled",
 		publish = true,
 	): Promise<void> => {
-		const candidates = new Set<RuntimeCandidate<Output>>(sessionPersistentCandidates(sessionID));
+		const candidates = new Set<RuntimeCandidate<Output>>(candidateCatalog.sessionValues(sessionID));
 		for (const [key, state] of turns) {
 			if (state.sessionID !== sessionID) continue;
 			state.finished = true;
 			state.terminal = true;
 			state.predictionController.abort();
-			for (const candidate of state.candidates.values()) candidates.add(candidate);
 			turns.delete(key);
 		}
 		for (const candidate of candidates) await preemptCandidate(candidate, reason, "discarded", publish);
@@ -1276,9 +1262,9 @@ export function makeSpeculativeActionRuntime<
 		if (notifiedMasterEnabled) return;
 		const sessions = new Set<SessionID>(schedulers.keys());
 		for (const state of turns.values()) sessions.add(state.sessionID);
-		for (const candidate of persistentCandidates.allValues()) {
-			const owner = candidateOwners.get(candidate);
-			if (owner) sessions.add(owner.sessionID);
+		for (const candidate of candidateCatalog.allValues()) {
+			const record = candidateCatalog.record(candidate);
+			if (record) sessions.add(record.sessionID);
 		}
 		await Promise.all([...sessions].map((sessionID) => disableSession(sessionID)));
 	};
@@ -1389,22 +1375,11 @@ export function makeSpeculativeActionRuntime<
 	};
 
 	const claimCandidate = (candidate: RuntimeCandidate<Output>, turnID: string): boolean => {
-		if (candidate.reuse.kind === "shared") return candidate.run.status !== "closed";
-		if (candidate.reuse.state !== "available") return false;
-		candidate.reuse.state = "claimed";
-		candidate.reuse.claimTurnID = turnID;
-		return true;
+		return candidate.lifecycle.claim(turnID);
 	};
 
 	const releaseCandidateClaim = (candidate: RuntimeCandidate<Output>, turnID: string): void => {
-		if (
-			candidate.reuse.kind === "exclusive" &&
-			candidate.reuse.state === "claimed" &&
-			candidate.reuse.claimTurnID === turnID
-		) {
-			candidate.reuse.state = "available";
-			candidate.reuse.claimTurnID = undefined;
-		}
+		candidate.lifecycle.releaseClaim(turnID);
 	};
 
 	const findReusableCandidate = async (
@@ -1464,7 +1439,7 @@ export function makeSpeculativeActionRuntime<
 			) {
 				return false;
 			}
-			candidate.leases.push({
+			candidate.lifecycle.addLease({
 				id: `${candidate.id}:drafter:${state.turnID}`,
 				source: "drafter",
 				providerTurnID: state.turnID,
@@ -1509,7 +1484,7 @@ export function makeSpeculativeActionRuntime<
 			return true;
 		}
 		const horizon = finiteNonNegativeInteger(draft.horizon);
-		candidate.leases.push({
+		candidate.lifecycle.addLease({
 			id: `${candidate.id}:pattern:${draft.patternID}:${anchorActionSeq}`,
 			source: "pattern_aware",
 			patternID: draft.patternID,
@@ -1711,14 +1686,22 @@ export function makeSpeculativeActionRuntime<
 				state: "active",
 			};
 			const scheduling = schedulingMetadata(draft, action);
+			const lifecycle = new CandidateAggregate<Output, PredictionLease>(
+				action.execution === "resource_cached" ? "shared" : "exclusive",
+				[sourceLease],
+				candidateController,
+			);
 			const candidate: RuntimeCandidate<Output> = {
 				id: callID,
 				key: action,
 				tool: draft.tool,
 				input: concrete,
-				reuse:
-					action.execution === "resource_cached" ? { kind: "shared" } : { kind: "exclusive", state: "available" },
-				run: { status: "running" },
+				get reuse() {
+					return lifecycle.reuse;
+				},
+				get run() {
+					return lifecycle.run;
+				},
 				validationMs: 0,
 				projectionMs: 0,
 				validationBytes: 0,
@@ -1738,15 +1721,17 @@ export function makeSpeculativeActionRuntime<
 				scheduling,
 				utility: expectedUtility(scheduling),
 				...(draft.patternID ? { patternID: draft.patternID } : {}),
-				leases: [sourceLease],
-				execution: deferred<CandidateExecution<Output>>(),
-				controller: candidateController,
+				get leases() {
+					return lifecycle.leases;
+				},
+				lifecycle,
 				hits: 0,
 			};
 			const turnDecision = turnAdmission(state, action.key, candidate.utility);
 			if (!turnDecision.admitted) {
 				candidate.schedulerOutcome = "discarded";
-				candidateController.abort();
+				lifecycle.close({ reason: "candidate_budget_insufficient_expected_benefit" });
+				lifecycle.settleClosed();
 				await publishCancelled(state, candidate, "candidate_budget_insufficient_expected_benefit");
 				continue;
 			}
@@ -1763,7 +1748,8 @@ export function makeSpeculativeActionRuntime<
 				: undefined;
 			const existing = insertion && !insertion.inserted ? insertion.entry : undefined;
 			if (existing) {
-				candidateController.abort();
+				lifecycle.close({ reason: "compatible_candidate_already_exists" });
+				lifecycle.settleClosed();
 				const attached = await attachPredictionLease(state, existing, draft, source, predictionAnchorActionSeq);
 				if (attached) {
 					accepted++;
@@ -1781,14 +1767,14 @@ export function makeSpeculativeActionRuntime<
 			if (!admission.admitted) {
 				if (persistCandidate) persistentCandidates.delete(state.sessionID, candidate);
 				candidate.schedulerOutcome = "discarded";
-				candidateController.abort();
+				lifecycle.close({ reason: `scheduler_${admission.reason}` });
+				lifecycle.settleClosed();
 				await publishCancelled(state, candidate, `scheduler_${admission.reason}`);
 				continue;
 			}
 			if (turnDecision.victim) state.turnAdmissions.delete(turnDecision.victim.key.key);
 			state.turnAdmissions.set(action.key, candidate);
-			state.candidates.set(action.key, candidate);
-			candidateOwners.set(candidate, state);
+			candidateCatalog.register(state.sessionID, turnKey(state), candidate, state);
 			const cacheEvictions = persistCandidate
 				? trimPersistentCandidates(state.sessionID, state.settings, candidate)
 				: [];
@@ -1810,17 +1796,19 @@ export function makeSpeculativeActionRuntime<
 			await publishStarted(state, candidate);
 			let executionStarted = candidate.startedAt;
 			const rejectExecution = async (error: unknown): Promise<void> => {
-				if (candidate.run.status === "closed") {
-					candidate.execution.resolve({ ok: false, error });
-					return;
-				}
+				if (candidate.run.status === "closed") return;
 				const classified =
 					error instanceof SpeculativeJobError
 						? error
 						: new SpeculativeJobError("candidate_execution_failed", error);
 				const completedAt = Date.now();
 				const executionMs = Math.max(0, completedAt - executionStarted);
-				candidate.run = { status: "closed", reason: classified.reason, completedAt, executionMs };
+				candidate.lifecycle.close({
+					reason: classified.reason,
+					error: classified,
+					completedAt,
+					executionMs,
+				});
 				schedulerFor(state.sessionID).discard(candidate);
 				candidate.schedulerOutcome = "discarded";
 				recordDrafterFailure(state, candidate, "source_error");
@@ -1829,13 +1817,13 @@ export function makeSpeculativeActionRuntime<
 				for (const lease of candidate.leases) {
 					if (lease.state === "matched") lease.state = "invalidated";
 				}
-				if (state.candidates.get(candidate.key.key) === candidate) state.candidates.delete(candidate.key.key);
 				removeTurnAdmission(state, candidate);
 				removePersistentCandidate(state, candidate);
 				releaseCandidateResourceVersion(candidate);
+				candidateCatalog.retire(candidate);
 				await publishCancelled(state, candidate, classified.reason, errorDetail(classified));
 				await publishCache(state);
-				candidate.execution.resolve({ ok: false, error: classified });
+				candidate.lifecycle.settleClosed();
 			};
 			void Promise.resolve()
 				.then(async () => {
@@ -1938,13 +1926,7 @@ export function makeSpeculativeActionRuntime<
 					});
 				})
 				.then(async (output) => {
-					if (candidate.run.status === "closed") {
-						candidate.execution.resolve({
-							ok: false,
-							error: new Error(`speculative_${candidate.run.reason}`),
-						});
-						return;
-					}
+					if (candidate.run.status === "closed") return;
 					const completedAt = Date.now();
 					const executionMs = Math.max(0, completedAt - executionStarted);
 					let outputRejection: string | undefined;
@@ -1960,7 +1942,7 @@ export function makeSpeculativeActionRuntime<
 						return;
 					}
 					candidate.projectionCoverage = captureProjectionCoverage(action, output);
-					candidate.run = { status: "ready", completedAt, executionMs, output };
+					if (!candidate.lifecycle.markReady(output, completedAt, executionMs)) return;
 					observeServiceTime(candidate.tool, executionMs);
 					try {
 						const metrics = adapter.candidateExecutionMetrics?.({ output, candidate });
@@ -1992,7 +1974,7 @@ export function makeSpeculativeActionRuntime<
 					}
 					await publishCache(state);
 					await publishCompleted(state, candidate);
-					candidate.execution.resolve({ ok: true, output });
+					if (!candidate.lifecycle.settleReady()) return;
 					if (action.execution !== "sandbox") {
 						await continuePatternCandidate(
 							state,
@@ -2247,7 +2229,6 @@ export function makeSpeculativeActionRuntime<
 			turnID: input.turnID,
 			startInput: input,
 			startedAt: Date.now(),
-			candidates: new Map(),
 			data: await adapter.stateData(input),
 			settings,
 			predictionController: new AbortController(),
@@ -2425,7 +2406,7 @@ export function makeSpeculativeActionRuntime<
 				}
 
 				const waitStarted = Date.now();
-				const execution = await waitForCandidate(candidate.execution.promise, signal);
+				const execution = await waitForCandidate(candidate.lifecycle.completion, signal);
 				totalWaitedMs += Math.max(0, Date.now() - waitStarted);
 				if (!execution || signal?.aborted) {
 					releaseCandidateClaim(candidate, state.turnID);
@@ -2544,20 +2525,12 @@ export function makeSpeculativeActionRuntime<
 			if (candidate.reuse.kind === "shared") {
 				persistentCandidates.recordActorHit(state.sessionID, candidate, cacheLimits(state.settings));
 			} else {
-				candidate.reuse.state = "adopted";
-				candidate.reuse.claimTurnID = undefined;
-				const completedAt = candidateCompletedAt(candidate);
-				candidate.run = {
-					status: "closed",
-					reason: "adopted",
-					...(completedAt !== undefined ? { completedAt } : {}),
-					executionMs,
-				};
+				candidate.lifecycle.markAdopted(executionMs);
 				schedulerFor(state.sessionID).discard(candidate);
-				if (state.candidates.get(candidate.key.key) === candidate) state.candidates.delete(candidate.key.key);
 				removeTurnAdmission(state, candidate);
 				removePersistentCandidate(state, candidate);
 				releaseCandidateResourceVersion(candidate);
+				candidateCatalog.retire(candidate);
 			}
 			await invalidateChangedResources(state, actual, candidate);
 			const matchedLeases = candidate.leases.filter(
@@ -2694,6 +2667,7 @@ export function makeSpeculativeActionRuntime<
 				// Persistence is best-effort.
 			}
 		}
+		candidateCatalog.detachAllFromTurn(turnKey(state));
 		if (!schedulerFor(state.sessionID).snapshot().length) schedulers.delete(state.sessionID);
 	};
 
@@ -2721,10 +2695,11 @@ export function makeSpeculativeActionRuntime<
 		state.finished = true;
 		state.predictionController.abort();
 		turns.delete(turnKey(state));
-		for (const candidate of [...state.candidates.values()]) {
+		for (const candidate of candidateCatalog.turnValues(turnKey(state))) {
 			if (candidate.run.status === "closed") continue;
 			await preemptCandidate(candidate, reason, "discarded");
 		}
+		candidateCatalog.detachAllFromTurn(turnKey(state));
 	};
 
 	const finishTurn = async (input: FinishInput): Promise<void> => {
@@ -2744,7 +2719,7 @@ export function makeSpeculativeActionRuntime<
 		}
 		const settings = await adapter.settings();
 		const stateForEvents = createDisposalState<SessionID, Output, StateData>(sessionID, settings);
-		for (const candidate of sessionPersistentCandidates(sessionID)) {
+		for (const candidate of candidateCatalog.sessionValues(sessionID)) {
 			await closeCandidate(stateForEvents, candidate, "session_disposed", "invalidated", true);
 		}
 		tokenTotals.delete(sessionID);
@@ -2763,9 +2738,9 @@ export function makeSpeculativeActionRuntime<
 		const sessions = new Set<SessionID>();
 		for (const state of turns.values()) sessions.add(state.sessionID);
 		for (const sessionID of tokenTotals.keys()) sessions.add(sessionID);
-		for (const candidate of persistentCandidates.allValues()) {
-			const owner = candidateOwners.get(candidate);
-			if (owner) sessions.add(owner.sessionID);
+		for (const candidate of candidateCatalog.allValues()) {
+			const record = candidateCatalog.record(candidate);
+			if (record) sessions.add(record.sessionID);
 		}
 		for (const sessionID of sessions) await disposeSession(sessionID);
 		schedulers.clear();
@@ -2782,7 +2757,8 @@ export function makeSpeculativeActionRuntime<
 			turnCandidates: states.reduce(
 				(count, state) =>
 					count +
-					[...state.candidates.values()].filter((candidate) => candidate.reuse.kind === "exclusive").length,
+					candidateCatalog.turnValues(turnKey(state)).filter((candidate) => candidate.reuse.kind === "exclusive")
+						.length,
 				0,
 			),
 			resourceCandidates: persistent.filter((candidate) => candidate.reuse.kind === "shared").length,
@@ -2919,7 +2895,6 @@ function createDisposalState<SessionID, Output, StateData>(
 		turnID: "<dispose>",
 		startInput: { sessionID, turnID: "<dispose>" },
 		startedAt: Date.now(),
-		candidates: new Map(),
 		data: undefined as StateData,
 		settings,
 		predictionController: new AbortController(),
@@ -2934,22 +2909,6 @@ function createDisposalState<SessionID, Output, StateData>(
 		finished: true,
 		noCandidateReported: false,
 		predictionPending: false,
-	};
-}
-
-function deferred<T>(): DeferredState<T> {
-	let resolvePromise: (value: T) => void = () => {};
-	let complete = false;
-	const promise = new Promise<T>((resolve) => {
-		resolvePromise = resolve;
-	});
-	return {
-		promise,
-		resolve: (value) => {
-			if (complete) return;
-			complete = true;
-			resolvePromise(value);
-		},
 	};
 }
 
