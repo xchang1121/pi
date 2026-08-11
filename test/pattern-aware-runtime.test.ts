@@ -79,7 +79,9 @@ describe("PatternAware runtime integration", () => {
 		await runtime.consume(call("turn", "find", { pattern: "*" }));
 
 		expect(outcomes).toEqual(["bash:actor_miss"]);
-		expect(events).toContainEqual(expect.objectContaining({ type: "cancelled", reason: "pattern_horizon_expired" }));
+		expect(events).toContainEqual(
+			expect.objectContaining({ type: "cancelled", reason: "prediction_horizon_expired" }),
+		);
 	});
 
 	it("ends future sandbox work when the actor response is terminal", async () => {

@@ -703,7 +703,7 @@ describe("Pi Agent speculative integration", () => {
 		await agent.prompt("Read README.md");
 
 		expect(toolExecutions).toBe(1);
-		expect(events.some((event) => event.type === "miss" && event.reason === "drafter_error")).toBe(true);
+		expect(events.some((event) => event.type === "miss" && event.reason === "prediction_source_error")).toBe(true);
 		expect(events.some((event) => event.type === "hit")).toBe(false);
 		await installed.uninstall();
 	});

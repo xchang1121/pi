@@ -13,6 +13,7 @@ import type {
 	SpeculativeActionSettings,
 	SpeculativeCandidate,
 	SpeculativeDraftCandidate,
+	SpeculativePlanSource,
 	SpeculativePrediction,
 } from "../src/runtime.ts";
 import { makeSpeculativeActionRuntime } from "../src/runtime.ts";
@@ -39,6 +40,13 @@ interface HarnessOptions {
 		signal: AbortSignal,
 		settings: SpeculativeActionSettings,
 	) => Promise<SpeculativePrediction> | SpeculativePrediction;
+	readonly sources?: readonly SpeculativePlanSource<
+		string,
+		string,
+		StartInput,
+		ConsumeInput,
+		{ readonly cwd: string }
+	>[];
 	readonly predictPatternAware?: (
 		input: StartInput,
 		signal: AbortSignal,
@@ -128,6 +136,7 @@ function createHarness(options: HarnessOptions) {
 		{ readonly cwd: string }
 	>({
 		...(options.actionSemantics ? { actionSemantics: options.actionSemantics } : {}),
+		...(options.sources ? { sources: options.sources } : {}),
 		settings: () =>
 			typeof options.settings === "function" ? options.settings() : (options.settings ?? enabledSettings),
 		definitions: () => [
@@ -196,6 +205,8 @@ function createHarness(options: HarnessOptions) {
 	return { runtime, events, executions: () => executions };
 }
 
+type HarnessPlanSource = NonNullable<HarnessOptions["sources"]>[number];
+
 function readCandidate(path = "README.md", offset?: number, limit?: number): SpeculativeDraftCandidate {
 	return { type: "tool_call", tool: "read", input: { path, offset, limit } };
 }
@@ -217,6 +228,285 @@ function consumeTool(turnID: string, tool: string, input: Record<string, unknown
 }
 
 describe("speculative action runtime", () => {
+	it("deduplicates equivalent actions from arbitrary plan sources and returns feedback to both", async () => {
+		const launched: string[] = [];
+		const resolved: string[] = [];
+		const source = (id: string): HarnessPlanSource => ({
+			id,
+			enabled: () => true,
+			propose: () => ({
+				id: `${id}-proposal`,
+				source: id,
+				revision: 0,
+				actions: [
+					{
+						id: "same-read",
+						type: "tool_call",
+						tool: "read",
+						input: { path: "README.md" },
+						feedback: `${id}-token`,
+					},
+				],
+			}),
+			onLaunched: ({ feedback }) => {
+				launched.push(String(feedback));
+			},
+			onResolved: ({ feedback, outcome }) => {
+				resolved.push(`${String(feedback)}:${outcome}`);
+			},
+		});
+		const harness = createHarness({
+			sources: [source("sequence-model"), source("rule-engine")],
+			predict: () => prediction(),
+		});
+
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "source-neutral" });
+		await waitFor(() => harness.runtime.inspect().pendingPredictions === 0);
+		const output = await harness.runtime.consume(consume("source-neutral"));
+
+		expect(output).toBe("prefetched");
+		expect(harness.executions()).toBe(1);
+		expect(launched.sort()).toEqual(["rule-engine-token", "sequence-model-token"]);
+		expect(resolved.sort()).toEqual(["rule-engine-token:consumed", "sequence-model-token:consumed"]);
+		const hit = harness.events.find((event) => event.type === "hit");
+		expect(hit).toMatchObject({ sources: ["sequence-model", "rule-engine"] });
+	});
+
+	it("applies a producer PlanDelta through the same admission path", async () => {
+		const continuations: boolean[] = [];
+		const source: HarnessPlanSource = {
+			id: "sequence-model",
+			enabled: () => true,
+			multiStepEnabled: () => true,
+			propose: () => ({
+				id: "sequence",
+				source: "sequence-model",
+				revision: 0,
+				actions: [{ id: "parent", type: "tool_call", tool: "read", input: { path: "parent.ts" }, feedback: 1 }],
+			}),
+			continue: ({ parentConfirmed }) => {
+				continuations.push(parentConfirmed);
+				if (parentConfirmed) return undefined;
+				return {
+					proposalID: "sequence",
+					source: "sequence-model",
+					revision: 1,
+					upsert: [
+						{
+							id: "child",
+							type: "tool_call",
+							tool: "read",
+							input: { path: "child.ts" },
+							dependsOn: [{ actionID: "parent", condition: "succeeded" }],
+						},
+					],
+				};
+			},
+		};
+		const executed: string[] = [];
+		const harness = createHarness({
+			sources: [source],
+			predict: () => prediction(),
+			execute: (candidate) => {
+				executed.push(String((candidate.input as { path?: string }).path));
+				return `result:${String((candidate.input as { path?: string }).path)}`;
+			},
+		});
+
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "delta" });
+		await waitFor(() => executed.length === 2);
+
+		expect(executed).toEqual(["parent.ts", "child.ts"]);
+		expect(continuations).toContain(false);
+		expect(harness.events.filter((event) => event.type === "started")).toHaveLength(2);
+	});
+
+	it("keeps a live proposal ledger across turns for confirmed continuation", async () => {
+		const source: HarnessPlanSource = {
+			id: "cross-turn-sequence",
+			enabled: () => true,
+			multiStepEnabled: () => true,
+			propose: ({ startInput }) =>
+				startInput.turnID === "first"
+					? {
+							id: "long-plan",
+							source: "cross-turn-sequence",
+							revision: 0,
+							actions: [
+								{
+									id: "parent",
+									type: "tool_call",
+									tool: "read",
+									input: { path: "parent.ts" },
+									horizon: 1,
+								},
+							],
+						}
+					: { id: "second-turn-noop", source: "cross-turn-sequence", revision: 0, actions: [] },
+			continue: ({ parentConfirmed }) =>
+				parentConfirmed
+					? {
+							proposalID: "long-plan",
+							source: "cross-turn-sequence",
+							revision: 1,
+							upsert: [
+								{
+									id: "child",
+									type: "tool_call",
+									tool: "read",
+									input: { path: "child.ts" },
+									dependsOn: [{ actionID: "parent", condition: "succeeded" }],
+								},
+							],
+						}
+					: undefined,
+		};
+		const executed: string[] = [];
+		const harness = createHarness({
+			sources: [source],
+			predict: () => prediction(),
+			execute: (candidate) => {
+				executed.push(String((candidate.input as { path?: string }).path));
+				return "prefetched";
+			},
+		});
+
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "first" });
+		await waitFor(() => executed.length === 1);
+		await harness.runtime.finishTurn({ sessionID: "session", turnID: "first", tool: "read", input: {} });
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "second" });
+		await waitFor(() => harness.runtime.inspect().pendingPredictions === 0);
+		await harness.runtime.consume({
+			sessionID: "session",
+			turnID: "second",
+			tool: "read",
+			input: { path: "parent.ts" },
+		});
+		await waitFor(() => executed.includes("child.ts"));
+
+		expect(executed).toEqual(["parent.ts", "child.ts"]);
+		expect(harness.events).not.toContainEqual(
+			expect.objectContaining({ type: "miss", reason: "invalid_plan_update", detail: "proposal_missing" }),
+		);
+	});
+
+	it("rejects a proposal that claims another source identity", async () => {
+		const source: HarnessPlanSource = {
+			id: "owner",
+			enabled: () => true,
+			propose: () => ({
+				id: "hijack",
+				source: "someone-else",
+				revision: 0,
+				actions: [{ id: "a", type: "tool_call", tool: "read", input: { path: "README.md" } }],
+			}),
+		};
+		const harness = createHarness({ sources: [source], predict: () => prediction() });
+
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "foreign-plan" });
+		await waitFor(() => harness.runtime.inspect().pendingPredictions === 0);
+
+		expect(harness.executions()).toBe(0);
+		expect(harness.events).toContainEqual(
+			expect.objectContaining({
+				type: "miss",
+				reason: "invalid_plan_update",
+				detail: "Plan source does not own this update.",
+			}),
+		);
+	});
+
+	it("isolates one source timeout and continues with the remaining sources", async () => {
+		const slow: HarnessPlanSource = {
+			id: "slow",
+			enabled: () => true,
+			timeoutMs: () => 1,
+			propose: () => new Promise(() => {}),
+		};
+		const healthy: HarnessPlanSource = {
+			id: "healthy",
+			enabled: () => true,
+			propose: () => ({
+				id: "healthy-plan",
+				source: "healthy",
+				revision: 0,
+				actions: [{ id: "read", type: "tool_call", tool: "read", input: { path: "README.md" } }],
+			}),
+		};
+		const harness = createHarness({ sources: [slow, healthy], predict: () => prediction() });
+
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "source-timeout" });
+		await waitFor(() => harness.runtime.inspect().pendingPredictions === 0);
+
+		expect(harness.executions()).toBe(1);
+		expect(harness.events).toContainEqual(
+			expect.objectContaining({
+				type: "miss",
+				reason: "prediction_timeout",
+				detail: expect.stringContaining("slow"),
+			}),
+		);
+	});
+
+	it("carries and invalidates an adaptive batch without relying on a reserved source name", async () => {
+		let proposals = 0;
+		const resolutions: string[] = [];
+		const source: HarnessPlanSource = {
+			id: "sequence-model",
+			enabled: () => true,
+			adaptive: true,
+			propose: () => ({
+				id: `batch-${proposals}`,
+				source: "sequence-model",
+				revision: 0,
+				actions:
+					proposals++ === 0
+						? [
+								{ id: "first", type: "tool_call", tool: "read", input: { path: "a.txt" } },
+								{ id: "second", type: "tool_call", tool: "read", input: { path: "b.txt" } },
+							]
+						: [],
+			}),
+			onResolved: ({ actionID, outcome }) => {
+				resolutions.push(`${actionID}:${outcome}`);
+			},
+		};
+		const harness = createHarness({
+			settings: { ...enabledSettings, adaptiveDrafter: true },
+			sources: [source],
+			predict: () => prediction(),
+			execute: (candidate) => String((candidate.input as { path: string }).path),
+		});
+
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "generic-batch-1" });
+		await waitFor(() => harness.executions() === 2);
+		expect(await harness.runtime.consume(consume("generic-batch-1", { path: "a.txt" }))).toBe("a.txt");
+		await harness.runtime.finishTurn(consume("generic-batch-1", {}));
+
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "generic-batch-2" });
+		await waitFor(() => harness.runtime.inspect().pendingPredictions === 0);
+		expect(proposals).toBe(1);
+		expect(await harness.runtime.consume(consume("generic-batch-2", { path: "unrelated.txt" }))).toBeUndefined();
+		await harness.runtime.finishTurn(consume("generic-batch-2", {}));
+
+		expect(resolutions).toEqual(expect.arrayContaining(["first:consumed", "second:actor_miss"]));
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "generic-batch-3" });
+		await waitFor(() => harness.runtime.inspect().pendingPredictions === 0);
+		expect(proposals).toBe(2);
+	});
+
+	it("rejects duplicate source registrations before starting a turn", () => {
+		const source = (id: string): HarnessPlanSource => ({
+			id,
+			enabled: () => true,
+			propose: () => ({ id: "p", source: id, revision: 0, actions: [] }),
+		});
+
+		expect(() => createHarness({ sources: [source("same"), source("same")], predict: () => prediction() })).toThrow(
+			"duplicate speculative plan source same",
+		);
+	});
+
 	it("runs a host-defined tool from one injected action-semantics definition", async () => {
 		const semantics = new ActionSemanticsRegistry([
 			{

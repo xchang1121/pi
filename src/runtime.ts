@@ -21,6 +21,8 @@ import {
 	PI_ACTION_SEMANTICS,
 } from "./common.ts";
 import type { PatternAwareDependency, PatternAwareResolution, PatternAwareSettings } from "./pattern-aware.ts";
+import type { PlanAction, PlanProposal, PlanUpdate } from "./plan-proposal.ts";
+import { PlanLedger } from "./plan-proposal.ts";
 import {
 	expectedUtility,
 	resourceProfile,
@@ -56,8 +58,14 @@ export interface SpeculativeDraftCandidate {
 	readonly missing?: readonly (readonly (string | number)[])[];
 	readonly execution?: SpeculativeExecution;
 	readonly diagnostic?: string;
-	readonly source?: "drafter" | "pattern_aware";
+	readonly source?: string;
+	readonly proposalID?: string;
+	readonly actionID?: string;
+	readonly feedback?: unknown;
+	readonly dependsOn?: PlanAction["dependsOn"];
+	/** @deprecated Use feedback with a source-owned token. */
 	readonly patternID?: string;
+	/** @deprecated Use feedback with a source-owned token. */
 	readonly patternContext?: unknown;
 	readonly horizon?: number;
 	readonly empiricalProbability?: number;
@@ -97,8 +105,13 @@ export interface ResourceValidationResult {
 
 export interface PredictionLease {
 	readonly id: string;
-	readonly source: "drafter" | "pattern_aware";
+	readonly source: string;
+	readonly proposalID?: string;
+	readonly actionID?: string;
+	feedback?: unknown;
+	/** @deprecated Compatibility for the legacy PatternAware adapter. */
 	readonly patternID?: string;
+	/** @deprecated Compatibility for the legacy PatternAware adapter. */
 	patternContext?: unknown;
 	readonly providerTurnID: string;
 	readonly anchorActionSeq: number;
@@ -148,11 +161,12 @@ export interface SpeculativeCandidate {
 	readonly predictionLatencyMs: number;
 	readonly draftTokens: number;
 	readonly totalDraftTokens: number;
-	readonly source: "drafter" | "pattern_aware";
+	readonly source: string;
 	empiricalProbability?: number;
 	conditionalProbability?: number;
 	depth?: number;
 	readonly dependencies?: ReadonlyArray<PatternAwareDependency>;
+	readonly planDependencies?: PlanAction["dependsOn"];
 	scheduling: SpeculativeSchedulingMetadata;
 	utility: number;
 	readonly patternID?: string;
@@ -205,7 +219,7 @@ export interface SpeculativeLookupDiagnostics {
 }
 
 interface SpeculativeSchedulingEventFields {
-	readonly source: "drafter" | "pattern_aware" | "cache";
+	readonly source: string;
 	readonly patternID?: string;
 	readonly futureHorizon?: number;
 	readonly empiricalProbability?: number;
@@ -325,6 +339,67 @@ interface ActualToolCall {
 
 type MaybePromise<T> = T | Promise<T>;
 
+export type PlanActionResolution = "consumed" | "actor_miss" | "stale" | "system";
+
+export interface SpeculativePlanSource<
+	SessionID,
+	Output,
+	StartInput extends TurnInput<SessionID>,
+	ConsumeInput extends TurnInput<SessionID>,
+	StateData,
+> {
+	readonly id: string;
+	readonly enabled: (settings: SpeculativeActionSettings) => boolean;
+	/** Enables the generic per-source failure backoff used for expensive predictors. */
+	readonly adaptive?: boolean;
+	readonly timeoutMs?: (settings: SpeculativeActionSettings) => number | undefined;
+	readonly multiStepEnabled?: (settings: SpeculativeActionSettings) => boolean;
+	readonly propose: (input: {
+		readonly startInput: StartInput;
+		readonly data: StateData;
+		readonly settings: SpeculativeActionSettings;
+		readonly definitions: readonly DrafterToolDefinition[];
+		readonly candidateNames: readonly string[];
+		readonly signal: AbortSignal;
+	}) => MaybePromise<PlanProposal | readonly PlanProposal[]>;
+	readonly continue?: (input: {
+		readonly startInput: StartInput;
+		readonly data: StateData;
+		readonly settings: SpeculativeActionSettings;
+		readonly candidate: SpeculativeCandidate;
+		readonly proposalID: string;
+		readonly actionID: string;
+		readonly feedback: unknown;
+		readonly output: Output;
+		readonly parentConfirmed: boolean;
+	}) => MaybePromise<PlanUpdate | readonly PlanUpdate[] | undefined>;
+	readonly observe?: (input: {
+		readonly startInput: StartInput;
+		readonly data: StateData;
+		readonly settings: SpeculativeActionSettings;
+		readonly consumeInput: ConsumeInput;
+		readonly action?: ActionKey;
+		readonly tool: string;
+		readonly concrete: Record<string, unknown>;
+		readonly output?: Output;
+		readonly durationMs: number;
+		readonly speculativeHit: boolean;
+		readonly order: number;
+	}) => MaybePromise<PlanUpdate | readonly PlanUpdate[] | undefined>;
+	readonly onLaunched?: (input: {
+		readonly proposalID: string;
+		readonly actionID: string;
+		readonly feedback: unknown;
+	}) => MaybePromise<void>;
+	readonly onResolved?: (input: {
+		readonly proposalID: string;
+		readonly actionID: string;
+		readonly feedback: unknown;
+		readonly outcome: PlanActionResolution;
+	}) => MaybePromise<void>;
+	readonly flush?: () => MaybePromise<void>;
+}
+
 export interface SpeculativeActionRuntimeAdapter<
 	SessionID,
 	Output,
@@ -333,16 +408,19 @@ export interface SpeculativeActionRuntimeAdapter<
 	StateData,
 > {
 	readonly actionSemantics?: ActionSemanticsRegistry;
+	readonly sources?: readonly SpeculativePlanSource<SessionID, Output, StartInput, ConsumeInput, StateData>[];
 	readonly settings: () => MaybePromise<SpeculativeActionSettings>;
 	readonly definitions: (input: StartInput) => readonly DrafterToolDefinition[];
 	readonly stateData: (input: StartInput) => MaybePromise<StateData>;
-	readonly predict: (
+	/** @deprecated Prefer sources. */
+	readonly predict?: (
 		input: StartInput,
 		settings: SpeculativeActionSettings,
 		definitions: readonly DrafterToolDefinition[],
 		candidateNames: readonly string[],
 		signal: AbortSignal,
 	) => MaybePromise<SpeculativePrediction>;
+	/** @deprecated Prefer sources. */
 	readonly predictPatternAware?: (
 		input: StartInput,
 		settings: SpeculativeActionSettings,
@@ -540,11 +618,14 @@ interface TurnState<SessionID, Output, StateData> {
 	readonly preparedHints: Set<string>;
 	readonly pendingActionSequences: Set<number>;
 	readonly turnAdmissions: Map<string, RuntimeCandidate<Output>>;
+	readonly plans: PlanLedger;
+	readonly admittedPlanActions: Set<string>;
+	readonly sourceAttempts: Set<string>;
+	readonly sourceFeedback: Map<string, "success" | "actor_miss" | "source_error">;
+	readonly sourcePlanMismatches: Set<string>;
 	actionSequence: number;
-	drafterAttempted: boolean;
-	drafterFeedback?: "success" | "actor_miss" | "source_error";
-	drafterPlanMismatch?: boolean;
-	pendingDrafterMismatch?: {
+	pendingPlanMismatch?: {
+		readonly sources: readonly string[];
 		readonly key: ActionKey;
 		readonly actualAction: string;
 		readonly predictedAction?: string;
@@ -584,7 +665,180 @@ export function makeSpeculativeActionRuntime<
 	adapter: SpeculativeActionRuntimeAdapter<SessionID, Output, StartInput, ConsumeInput, StateData>,
 ): SpeculativeActionRuntime<SessionID, Output, StartInput, ConsumeInput, FinishInput> {
 	const turns = new Map<string, TurnState<SessionID, Output, StateData>>();
+	const planLedgers = new Map<SessionID, PlanLedger>();
+	const planLedgerFor = (sessionID: SessionID): PlanLedger => {
+		const existing = planLedgers.get(sessionID);
+		if (existing) return existing;
+		const created = new PlanLedger();
+		planLedgers.set(sessionID, created);
+		return created;
+	};
 	const actionSemantics = adapter.actionSemantics ?? PI_ACTION_SEMANTICS;
+	type RuntimePlanSource = SpeculativePlanSource<SessionID, Output, StartInput, ConsumeInput, StateData>;
+	const legacyPatternRevisions = new Map<string, number>();
+	let legacyObservedProposalSequence = 0;
+	const legacyPlanAction = (
+		candidate: SpeculativeDraftCandidate,
+		id: string,
+		dependsOn?: PlanAction["dependsOn"],
+	): PlanAction => ({
+		id,
+		type: candidate.type,
+		tool: candidate.tool,
+		input: candidate.input,
+		...(candidate.missing ? { missing: candidate.missing } : {}),
+		...(candidate.execution ? { execution: candidate.execution } : {}),
+		...(candidate.diagnostic ? { diagnostic: candidate.diagnostic } : {}),
+		...(candidate.horizon !== undefined ? { horizon: candidate.horizon } : {}),
+		...(candidate.empiricalProbability !== undefined ? { empiricalProbability: candidate.empiricalProbability } : {}),
+		...(candidate.conditionalProbability !== undefined
+			? { conditionalProbability: candidate.conditionalProbability }
+			: {}),
+		...(candidate.expectedDurationMs !== undefined ? { expectedDurationMs: candidate.expectedDurationMs } : {}),
+		...(candidate.expectedLatencyBenefitMs !== undefined
+			? { expectedLatencyBenefitMs: candidate.expectedLatencyBenefitMs }
+			: {}),
+		...(candidate.resourceDemand !== undefined ? { resourceDemand: candidate.resourceDemand } : {}),
+		...(candidate.depth !== undefined ? { depth: candidate.depth } : {}),
+		...(dependsOn?.length ? { dependsOn } : {}),
+		feedback: candidate,
+	});
+	const legacyActionID = (candidate: SpeculativeDraftCandidate): string =>
+		`${candidate.patternID ?? "action"}:${fastCandidateID(diagnosticJson({ tool: candidate.tool, input: candidate.input }))}`;
+	const legacyPatternActions = (
+		candidates: readonly SpeculativeDraftCandidate[],
+		dependsOn?: PlanAction["dependsOn"],
+	): readonly PlanAction[] => {
+		const seen = new Set<string>();
+		const actions: PlanAction[] = [];
+		for (const candidate of candidates) {
+			const id = legacyActionID(candidate);
+			if (seen.has(id)) continue;
+			seen.add(id);
+			actions.push(legacyPlanAction(candidate, id, dependsOn));
+		}
+		return actions;
+	};
+	const legacySources = (): RuntimePlanSource[] => {
+		const result: RuntimePlanSource[] = [];
+		if (
+			adapter.predictPatternAware ||
+			adapter.recordAuthoritative ||
+			adapter.continuePatternAware ||
+			adapter.onPatternLaunched ||
+			adapter.onPatternResolved ||
+			adapter.flushPatternStore
+		) {
+			result.push({
+				id: "pattern_aware",
+				enabled: (settings) => settings.patternAware?.enabled ?? false,
+				multiStepEnabled: (settings) => settings.patternAware?.multiStepEnabled ?? true,
+				propose: async ({ startInput, settings, definitions, candidateNames, signal }) => {
+					const proposalID = `legacy:pattern:${String(startInput.sessionID)}:${startInput.turnID}`;
+					legacyPatternRevisions.set(proposalID, 0);
+					const prediction = adapter.predictPatternAware
+						? await adapter.predictPatternAware(startInput, settings, definitions, candidateNames, signal)
+						: { candidates: [], draftTokens: 0 };
+					return {
+						id: proposalID,
+						source: "pattern_aware",
+						revision: 0,
+						actions: legacyPatternActions(prediction.candidates),
+						draftTokens: prediction.draftTokens,
+					};
+				},
+				continue: adapter.continuePatternAware
+					? async ({
+							startInput,
+							data,
+							settings,
+							candidate,
+							proposalID,
+							actionID,
+							feedback,
+							output,
+							parentConfirmed,
+						}) => {
+							const draft = feedback as SpeculativeDraftCandidate;
+							if (!draft.patternID) return undefined;
+							const prediction = await adapter.continuePatternAware?.({
+								startInput,
+								data,
+								settings,
+								candidate,
+								patternID: draft.patternID,
+								patternContext: draft.patternContext,
+								output,
+								parentConfirmed,
+							});
+							if (!prediction?.candidates.length) return undefined;
+							const revision = (legacyPatternRevisions.get(proposalID) ?? 0) + 1;
+							legacyPatternRevisions.set(proposalID, revision);
+							return {
+								proposalID,
+								source: "pattern_aware",
+								revision,
+								upsert: legacyPatternActions(prediction.candidates, [{ actionID, condition: "succeeded" }]),
+								draftTokens: prediction.draftTokens,
+							};
+						}
+					: undefined,
+				observe: adapter.recordAuthoritative
+					? async (input) => {
+							const prediction = await adapter.recordAuthoritative?.(input);
+							if (!prediction?.candidates.length) return undefined;
+							const proposalID = `legacy:pattern:observed:${String(input.consumeInput.sessionID)}:${input.consumeInput.turnID}:${input.order}:${legacyObservedProposalSequence++}`;
+							return {
+								id: proposalID,
+								source: "pattern_aware",
+								revision: 0,
+								actions: legacyPatternActions(prediction.candidates),
+								draftTokens: prediction.draftTokens,
+							};
+						}
+					: undefined,
+				onLaunched: ({ feedback }) => {
+					const draft = feedback as SpeculativeDraftCandidate;
+					if (draft.patternID) return adapter.onPatternLaunched?.(draft.patternID, draft.patternContext);
+				},
+				onResolved: ({ feedback, outcome }) => {
+					const draft = feedback as SpeculativeDraftCandidate;
+					if (draft.patternID) return adapter.onPatternResolved?.(draft.patternID, outcome, draft.patternContext);
+				},
+				flush: adapter.flushPatternStore,
+			});
+		}
+		if (adapter.predict) {
+			result.push({
+				id: "drafter",
+				enabled: (settings) => settings.drafterEnabled ?? DEFAULTS.drafterEnabled,
+				adaptive: true,
+				timeoutMs: (settings) => settings.predictionTimeoutMs,
+				propose: async ({ startInput, settings, definitions, candidateNames, signal }) => {
+					const prediction = await adapter.predict?.(startInput, settings, definitions, candidateNames, signal);
+					return {
+						id: `legacy:drafter:${String(startInput.sessionID)}:${startInput.turnID}`,
+						source: "drafter",
+						revision: 0,
+						actions: (prediction?.candidates ?? []).map((candidate, index) =>
+							legacyPlanAction(candidate, `action:${index}`),
+						),
+						draftTokens: prediction?.draftTokens ?? 0,
+					};
+				},
+			});
+		}
+		return result;
+	};
+	const sources = adapter.sources?.length ? [...adapter.sources] : legacySources();
+	const sourcesByID = new Map<string, SpeculativePlanSource<SessionID, Output, StartInput, ConsumeInput, StateData>>();
+	for (const source of sources) {
+		const id = source.id.trim();
+		if (!id) throw new Error("speculative plan source id must not be empty");
+		if (id !== source.id) throw new Error(`speculative plan source id must be canonical: ${source.id}`);
+		if (sourcesByID.has(id)) throw new Error(`duplicate speculative plan source ${id}`);
+		sourcesByID.set(id, source);
+	}
 	const projectionRuleByID = new Map<string, ActionProjectionRule<Output>>();
 	for (const rule of adapter.projectionRules ?? []) {
 		if (!actionSemantics.supportsProjector(rule.id)) continue;
@@ -610,7 +864,10 @@ export function makeSpeculativeActionRuntime<
 	const hitOverheadTimes = new Map<string, { count: number; averageMs: number }>();
 	const projectionOverheadTimes = new Map<string, { count: number; averageMs: number }>();
 	const actorLeadTimes = new Map<string, { count: number; averageMs: number }>();
-	const drafterBackoff = new Map<SessionID, { actorMisses: number; sourceErrors: number; skips: number }>();
+	const sourceBackoff = new Map<
+		SessionID,
+		Map<string, { actorMisses: number; sourceErrors: number; skips: number }>
+	>();
 	let notifiedMasterEnabled: boolean | undefined;
 
 	const turnKey = (input: TurnInput<SessionID>): string => `${String(input.sessionID)}:${input.turnID}`;
@@ -661,13 +918,14 @@ export function makeSpeculativeActionRuntime<
 	};
 	const masterEnabled = (settings: SpeculativeActionSettings): boolean =>
 		settings.enabled && settings.mode === "predict_action_single_step";
-	const sourceEnabled = (settings: SpeculativeActionSettings, source: "drafter" | "pattern_aware"): boolean =>
-		masterEnabled(settings) &&
-		(source === "drafter"
-			? (settings.drafterEnabled ?? DEFAULTS.drafterEnabled)
-			: (settings.patternAware?.enabled ?? false));
-	const patternMultiStepEnabled = (settings: SpeculativeActionSettings): boolean =>
-		settings.patternAware?.multiStepEnabled ?? true;
+	const sourceEnabled = (settings: SpeculativeActionSettings, sourceID: string): boolean => {
+		if (!masterEnabled(settings)) return false;
+		return sourcesByID.get(sourceID)?.enabled(settings) ?? false;
+	};
+	const sourceMultiStepEnabled = (settings: SpeculativeActionSettings, sourceID: string): boolean => {
+		const source = sourcesByID.get(sourceID);
+		return source?.multiStepEnabled?.(settings) ?? source?.continue !== undefined;
+	};
 	const latestSettings = async (): Promise<SpeculativeActionSettings | undefined> => {
 		try {
 			return await adapter.settings();
@@ -675,27 +933,38 @@ export function makeSpeculativeActionRuntime<
 			return undefined;
 		}
 	};
-	const adaptiveDrafter = (state: TurnState<SessionID, Output, StateData>): boolean =>
+	const flushPredictionSources = async (): Promise<void> => {
+		for (const source of sources) {
+			try {
+				await source.flush?.();
+			} catch {
+				// Persistence is best-effort and isolated per producer.
+			}
+		}
+	};
+	// Keep the historical setting name at the public boundary while applying the
+	// policy uniformly to every source that opts into adaptive backoff.
+	const adaptiveSourceBackoffEnabled = (state: TurnState<SessionID, Output, StateData>): boolean =>
 		state.settings.adaptiveDrafter ?? DEFAULTS.adaptiveDrafter;
 	const candidateLimit = (settings: SpeculativeActionSettings): number =>
 		clampCandidateLimit(settings.candidateLimit ?? settings.maxCandidates ?? DEFAULTS.candidateLimit);
 	const concurrentActionLimit = (settings: SpeculativeActionSettings): number =>
 		clampCandidateLimit(settings.maxConcurrentActions ?? settings.maxCandidates ?? DEFAULTS.maxConcurrentActions);
-	const takeDrafterOpportunity = (sessionID: SessionID): boolean => {
-		const feedback = drafterBackoff.get(sessionID);
+	const takeSourceOpportunity = (sessionID: SessionID, source: string): boolean => {
+		const feedback = sourceBackoff.get(sessionID)?.get(source);
 		if (!feedback?.skips) return true;
 		feedback.skips--;
 		return false;
 	};
-	const recordDrafterFailure = (
+	const recordSourceFailure = (
 		state: TurnState<SessionID, Output, StateData>,
-		candidate?: RuntimeCandidate<Output>,
-		kind: "actor_miss" | "source_error" = "actor_miss",
+		source: string,
+		kind: "actor_miss" | "source_error",
 	): void => {
-		if (!adaptiveDrafter(state) || (!state.drafterAttempted && !candidate) || state.drafterFeedback) return;
-		if (candidate && !candidate.leases.some((lease) => lease.source === "drafter")) return;
-		state.drafterFeedback = kind;
-		const feedback = drafterBackoff.get(state.sessionID) ?? { actorMisses: 0, sourceErrors: 0, skips: 0 };
+		if (state.sourceFeedback.has(source)) return;
+		state.sourceFeedback.set(source, kind);
+		const bySource = sourceBackoff.get(state.sessionID) ?? new Map();
+		const feedback = bySource.get(source) ?? { actorMisses: 0, sourceErrors: 0, skips: 0 };
 		feedback[kind === "actor_miss" ? "actorMisses" : "sourceErrors"]++;
 		const failures = feedback.actorMisses + feedback.sourceErrors;
 		if (failures >= 2) {
@@ -704,7 +973,37 @@ export function makeSpeculativeActionRuntime<
 				Math.min(candidateLimit(state.settings), 2 ** Math.max(0, failures - 2)),
 			);
 		}
-		drafterBackoff.set(state.sessionID, feedback);
+		bySource.set(source, feedback);
+		sourceBackoff.set(state.sessionID, bySource);
+	};
+	const notifyLeaseLaunched = async (lease: PredictionLease): Promise<void> => {
+		const source = sourcesByID.get(lease.source);
+		if (source?.onLaunched && lease.proposalID && lease.actionID) {
+			try {
+				await source.onLaunched({
+					proposalID: lease.proposalID,
+					actionID: lease.actionID,
+					feedback: lease.feedback,
+				});
+			} catch {
+				// Producer feedback must not alter tool semantics.
+			}
+		}
+	};
+	const notifyLeaseResolved = async (lease: PredictionLease, outcome: PlanActionResolution): Promise<void> => {
+		const source = sourcesByID.get(lease.source);
+		if (source?.onResolved && lease.proposalID && lease.actionID) {
+			try {
+				await source.onResolved({
+					proposalID: lease.proposalID,
+					actionID: lease.actionID,
+					feedback: lease.feedback,
+					outcome,
+				});
+			} catch {
+				// Producer feedback must not alter tool semantics.
+			}
+		}
 	};
 	const matchPredictionLeases = async (
 		state: TurnState<SessionID, Output, StateData>,
@@ -719,16 +1018,38 @@ export function makeSpeculativeActionRuntime<
 		for (const lease of matched) {
 			lease.state = "matched";
 			lease.resolvedActionSeq = actionSequence;
-			if (lease.source !== "pattern_aware" || !lease.patternID || !adapter.onPatternResolved) continue;
-			try {
-				await adapter.onPatternResolved(lease.patternID, "consumed", lease.patternContext);
-			} catch {
-				// Pattern feedback must not alter tool semantics.
+			await notifyLeaseResolved(lease, "consumed");
+		}
+		for (const sourceID of new Set(matched.map((lease) => lease.source))) {
+			if (!sourcesByID.get(sourceID)?.adaptive) continue;
+			state.sourceFeedback.set(sourceID, "success");
+			sourceBackoff.get(state.sessionID)?.delete(sourceID);
+		}
+	};
+	const activeAdaptivePlanSources = (
+		candidates: Iterable<RuntimeCandidate<Output>>,
+		actionSequence: number,
+	): Set<string> => {
+		const active = new Set<string>();
+		for (const candidate of candidates) {
+			for (const lease of candidate.leases) {
+				if (
+					lease.state === "active" &&
+					(lease.validThroughActionSeq === undefined || actionSequence <= lease.validThroughActionSeq) &&
+					sourcesByID.get(lease.source)?.adaptive
+				) {
+					active.add(lease.source);
+				}
 			}
 		}
-		if (matched.some((lease) => lease.source === "drafter")) {
-			state.drafterFeedback = "success";
-			drafterBackoff.delete(state.sessionID);
+		return active;
+	};
+	const markPlanMismatches = (
+		state: TurnState<SessionID, Output, StateData>,
+		sourcesToMark: Iterable<string>,
+	): void => {
+		for (const sourceID of sourcesToMark) {
+			if (state.sourceFeedback.get(sourceID) !== "success") state.sourcePlanMismatches.add(sourceID);
 		}
 	};
 
@@ -855,7 +1176,9 @@ export function makeSpeculativeActionRuntime<
 			? { conditionalProbability: candidate.conditionalProbability }
 			: {}),
 		...(candidate.depth !== undefined ? { patternDepth: candidate.depth } : {}),
-		...(candidate.dependencies?.length ? { dependencyEdges: candidate.dependencies.length } : {}),
+		...(candidate.dependencies?.length || candidate.planDependencies?.length
+			? { dependencyEdges: (candidate.dependencies?.length ?? 0) + (candidate.planDependencies?.length ?? 0) }
+			: {}),
 		expectedDurationMs: candidate.scheduling.expectedDurationMs,
 		...(candidate.scheduling.expectedLeadMs !== undefined
 			? { expectedLeadMs: candidate.scheduling.expectedLeadMs }
@@ -1161,9 +1484,9 @@ export function makeSpeculativeActionRuntime<
 		};
 	};
 
-	const patternResolution = (reason: string): Exclude<PatternAwareResolution, "consumed"> => {
+	const planResolution = (reason: string): Exclude<PlanActionResolution, "consumed"> => {
 		if (
-			reason === "pattern_horizon_expired" ||
+			reason === "prediction_horizon_expired" ||
 			reason === "request_finished_without_hit" ||
 			reason === "turn_finished_without_hit"
 		) {
@@ -1181,20 +1504,16 @@ export function makeSpeculativeActionRuntime<
 		return "system";
 	};
 
-	const settlePatternLeases = async (
+	const settlePredictionLeases = async (
 		candidate: RuntimeCandidate<Output>,
 		state: "expired" | "invalidated",
-		outcome: Exclude<PatternAwareResolution, "consumed">,
+		outcome: Exclude<PlanActionResolution, "consumed">,
+		matches: (lease: PredictionLease) => boolean = () => true,
 	): Promise<void> => {
 		for (const lease of candidate.leases) {
-			if (lease.state !== "active" || lease.source !== "pattern_aware") continue;
+			if (lease.state !== "active" || !matches(lease)) continue;
 			lease.state = state;
-			if (!lease.patternID || !adapter.onPatternResolved) continue;
-			try {
-				await adapter.onPatternResolved(lease.patternID, outcome, lease.patternContext);
-			} catch {
-				// Pattern feedback must not alter tool semantics.
-			}
+			await notifyLeaseResolved(lease, outcome);
 		}
 	};
 
@@ -1204,20 +1523,19 @@ export function makeSpeculativeActionRuntime<
 		}
 	};
 
-	const expireDrafterLeases = (
+	const expireTurnBoundSourceLeases = async (
+		state: TurnState<SessionID, Output, StateData>,
 		candidate: RuntimeCandidate<Output>,
-		providerTurnID?: string,
-		state: PredictionLease["state"] = "expired",
-	): void => {
-		for (const lease of candidate.leases) {
-			if (lease.state !== "active" || lease.source !== "drafter") continue;
-			if (providerTurnID !== undefined && lease.providerTurnID !== providerTurnID) continue;
-			lease.state = state;
-		}
-	};
-
-	const expireDrafterPlan = (state: TurnState<SessionID, Output, StateData>): void => {
-		for (const candidate of availableCandidates(state).values()) expireDrafterLeases(candidate);
+		preserveSuccessfulBatch = false,
+	): Promise<void> => {
+		await settlePredictionLeases(candidate, "expired", "actor_miss", (lease) => {
+			return (
+				lease.providerTurnID === state.turnID &&
+				lease.validThroughActionSeq === undefined &&
+				sourcesByID.has(lease.source) &&
+				(!preserveSuccessfulBatch || state.sourceFeedback.get(lease.source) !== "success")
+			);
+		});
 	};
 
 	const pruneResolvedLeases = (candidate: RuntimeCandidate<Output>): void => {
@@ -1244,8 +1562,7 @@ export function makeSpeculativeActionRuntime<
 			return false;
 		}
 		candidate.schedulerOutcome = schedulerOutcome;
-		expireDrafterLeases(candidate, undefined, leaseState);
-		await settlePatternLeases(candidate, leaseState, patternResolution(reason));
+		await settlePredictionLeases(candidate, leaseState, planResolution(reason));
 		for (const lease of candidate.leases) {
 			if (lease.state === "matched") lease.state = "invalidated";
 		}
@@ -1304,7 +1621,8 @@ export function makeSpeculativeActionRuntime<
 			turns.delete(key);
 		}
 		for (const candidate of candidates) await preemptCandidate(candidate, reason, "discarded", publish);
-		drafterBackoff.delete(sessionID);
+		planLedgers.delete(sessionID);
+		sourceBackoff.delete(sessionID);
 		if (!schedulerFor(sessionID).snapshot().length) schedulers.delete(sessionID);
 	};
 
@@ -1326,7 +1644,7 @@ export function makeSpeculativeActionRuntime<
 		wallTimes.delete(sessionID);
 		actionSequences.delete(sessionID);
 		schedulers.delete(sessionID);
-		drafterBackoff.delete(sessionID);
+		sourceBackoff.delete(sessionID);
 	};
 
 	const reconcileCandidateStores = async (state: TurnState<SessionID, Output, StateData>): Promise<void> => {
@@ -1348,7 +1666,7 @@ export function makeSpeculativeActionRuntime<
 		reason: string,
 		detail?: string,
 	): Promise<void> => {
-		expireDrafterLeases(candidate, state.turnID);
+		await expireTurnBoundSourceLeases(state, candidate);
 		if (candidate.reuse.kind === "exclusive" && !hasActivePredictionLease(candidate)) {
 			await closeCandidate(state, candidate, reason);
 		}
@@ -1363,7 +1681,7 @@ export function makeSpeculativeActionRuntime<
 		await closeCandidate(state, candidate, reason);
 	};
 
-	const expirePatternLeasesAfterAction = async (state: TurnState<SessionID, Output, StateData>): Promise<void> => {
+	const expirePredictionLeasesAfterAction = async (state: TurnState<SessionID, Output, StateData>): Promise<void> => {
 		const settledThrough =
 			state.pendingActionSequences.size > 0 ? Math.min(...state.pendingActionSequences) - 1 : state.actionSequence;
 		for (const candidate of availableCandidates(state).values()) {
@@ -1372,7 +1690,6 @@ export function makeSpeculativeActionRuntime<
 			for (const lease of candidate.leases) {
 				if (
 					lease.state !== "active" ||
-					lease.source !== "pattern_aware" ||
 					lease.validThroughActionSeq === undefined ||
 					lease.validThroughActionSeq > settledThrough
 				) {
@@ -1380,15 +1697,10 @@ export function makeSpeculativeActionRuntime<
 				}
 				lease.state = "expired";
 				expired = true;
-				if (!lease.patternID || !adapter.onPatternResolved) continue;
-				try {
-					await adapter.onPatternResolved(lease.patternID, "actor_miss", lease.patternContext);
-				} catch {
-					// Pattern feedback must not alter tool semantics.
-				}
+				await notifyLeaseResolved(lease, "actor_miss");
 			}
 			if (expired && candidate.reuse.kind === "exclusive" && !hasActivePredictionLease(candidate)) {
-				await closeCandidate(state, candidate, "pattern_horizon_expired", "expired", true);
+				await closeCandidate(state, candidate, "prediction_horizon_expired", "expired", true);
 			}
 		}
 	};
@@ -1467,9 +1779,7 @@ export function makeSpeculativeActionRuntime<
 		Math.max(
 			state.actionSequence,
 			...candidate.leases.flatMap((lease) =>
-				lease.source === "pattern_aware" && lease.validThroughActionSeq !== undefined
-					? [lease.validThroughActionSeq]
-					: [],
+				lease.validThroughActionSeq !== undefined ? [lease.validThroughActionSeq] : [],
 			),
 		);
 
@@ -1481,32 +1791,19 @@ export function makeSpeculativeActionRuntime<
 		anchorActionSeq: number,
 	): Promise<boolean> => {
 		pruneResolvedLeases(candidate);
-		if (source === "drafter") {
-			if (
-				candidate.leases.some(
-					(lease) =>
-						lease.state === "active" && lease.source === "drafter" && lease.providerTurnID === state.turnID,
-				)
-			) {
-				return false;
-			}
-			candidate.lifecycle.addLease({
-				id: `${candidate.id}:drafter:${state.turnID}`,
-				source: "drafter",
-				providerTurnID: state.turnID,
-				anchorActionSeq,
-				state: "active",
-			});
-			return true;
-		}
-		if (!draft.patternID) return false;
+		const proposalID = draft.proposalID ?? `${source}:${state.turnID}`;
+		const actionID = draft.actionID ?? draft.patternID ?? candidate.key.hash;
 		const empiricalProbability = finiteProbability(draft.empiricalProbability);
 		const conditionalProbability = finiteProbability(draft.conditionalProbability);
 		const depth = finiteOptionalNonNegativeInteger(draft.depth);
 		const scheduling = schedulingMetadata(draft, candidate.key);
 		const utility = expectedUtility(scheduling);
 		const existingLease = candidate.leases.find(
-			(lease) => lease.state === "active" && lease.patternID === draft.patternID,
+			(lease) =>
+				lease.state === "active" &&
+				lease.source === source &&
+				lease.proposalID === proposalID &&
+				lease.actionID === actionID,
 		);
 		if (existingLease) {
 			const leaseProbabilityIncreased =
@@ -1517,6 +1814,7 @@ export function makeSpeculativeActionRuntime<
 			if (!leaseProbabilityIncreased && !utilityIncreased) return false;
 			if (leaseProbabilityIncreased) {
 				existingLease.empiricalProbability = empiricalProbability;
+				existingLease.feedback = draft.feedback;
 				existingLease.patternContext = draft.patternContext;
 				if (existingLease.continuationExpansion !== "confirmed") {
 					existingLease.continuationExpansion = undefined;
@@ -1534,32 +1832,36 @@ export function makeSpeculativeActionRuntime<
 			}
 			return true;
 		}
-		const horizon = finiteNonNegativeInteger(draft.horizon);
-		candidate.lifecycle.addLease({
-			id: `${candidate.id}:pattern:${draft.patternID}:${anchorActionSeq}`,
-			source: "pattern_aware",
-			patternID: draft.patternID,
+		const horizon = draft.horizon === undefined ? undefined : finiteNonNegativeInteger(draft.horizon);
+		const lease: PredictionLease = {
+			id: `${candidate.id}:${source}:${proposalID}:${actionID}:${anchorActionSeq}`,
+			source,
+			proposalID,
+			actionID,
+			...(draft.feedback !== undefined ? { feedback: draft.feedback } : {}),
+			...(draft.patternID ? { patternID: draft.patternID } : {}),
 			...(draft.patternContext !== undefined ? { patternContext: draft.patternContext } : {}),
 			providerTurnID: state.turnID,
 			anchorActionSeq,
-			horizon,
-			validThroughActionSeq: anchorActionSeq + horizon + 1,
+			...(horizon !== undefined ? { horizon, validThroughActionSeq: anchorActionSeq + horizon + 1 } : {}),
 			...(empiricalProbability !== undefined ? { empiricalProbability } : {}),
 			state: "active",
-		});
-		if (utility > candidate.utility) {
+		};
+		candidate.lifecycle.addLease(lease);
+		if (
+			empiricalProbability !== undefined &&
+			(candidate.empiricalProbability === undefined || empiricalProbability > candidate.empiricalProbability)
+		) {
 			candidate.empiricalProbability = empiricalProbability;
 			candidate.conditionalProbability = conditionalProbability;
 			candidate.depth = depth;
+		}
+		if (utility > candidate.utility) {
 			candidate.scheduling = scheduling;
 			candidate.utility = utility;
 			schedulerFor(state.sessionID).update(candidate, scheduling);
 		}
-		try {
-			await adapter.onPatternLaunched?.(draft.patternID, draft.patternContext);
-		} catch {
-			// Pattern feedback must not alter tool semantics.
-		}
+		await notifyLeaseLaunched(lease);
 		return true;
 	};
 
@@ -1570,7 +1872,7 @@ export function makeSpeculativeActionRuntime<
 		predictionLatencyMs: number,
 		draftTokens: number,
 		totalDraftTokens: number,
-		batchSource: "drafter" | "pattern_aware",
+		batchSource: string,
 		candidateNames: readonly string[],
 		predictionAnchorActionSeq = state.actionSequence,
 	): Promise<number> => {
@@ -1593,8 +1895,7 @@ export function makeSpeculativeActionRuntime<
 			if (state.finished || state.terminal) return accepted;
 			const source = draft.source ?? batchSource;
 			if (
-				source === "pattern_aware" &&
-				!patternMultiStepEnabled(enabled) &&
+				!sourceMultiStepEnabled(enabled, source) &&
 				(draft.type === "preparation_hint" || (draft.horizon ?? 0) > 0 || (draft.depth ?? 1) > 1)
 			) {
 				continue;
@@ -1651,8 +1952,8 @@ export function makeSpeculativeActionRuntime<
 				const attached = await attachPredictionLease(state, reusable, draft, source, predictionAnchorActionSeq);
 				if (!attached) continue;
 				accepted++;
-				if (source === "pattern_aware" && reusable.run.status === "ready") {
-					await continuePatternCandidate(state, input, reusable, reusable.run.output, false);
+				if (reusable.run.status === "ready") {
+					await continuePredictionCandidate(state, input, reusable, reusable.run.output, false);
 				}
 				continue;
 			}
@@ -1714,18 +2015,27 @@ export function makeSpeculativeActionRuntime<
 				);
 				if (!attached) continue;
 				accepted++;
-				if (source === "pattern_aware" && postflightReusable.run.status === "ready") {
-					await continuePatternCandidate(state, input, postflightReusable, postflightReusable.run.output, false);
+				if (postflightReusable.run.status === "ready") {
+					await continuePredictionCandidate(
+						state,
+						input,
+						postflightReusable,
+						postflightReusable.run.output,
+						false,
+					);
 				}
 				continue;
 			}
-			const horizon = source === "pattern_aware" ? finiteNonNegativeInteger(draft.horizon) : undefined;
+			const horizon = draft.horizon === undefined ? undefined : finiteNonNegativeInteger(draft.horizon);
 			const empiricalProbability = finiteProbability(draft.empiricalProbability);
 			const conditionalProbability = finiteProbability(draft.conditionalProbability);
 			const depth = finiteOptionalNonNegativeInteger(draft.depth);
 			const sourceLease: PredictionLease = {
 				id: `${callID}:${source}:${draft.patternID ?? state.turnID}`,
 				source,
+				proposalID: draft.proposalID ?? `${source}:${state.turnID}`,
+				actionID: draft.actionID ?? draft.patternID ?? action.hash,
+				...(draft.feedback !== undefined ? { feedback: draft.feedback } : {}),
 				...(draft.patternID ? { patternID: draft.patternID } : {}),
 				...(draft.patternContext !== undefined ? { patternContext: draft.patternContext } : {}),
 				providerTurnID: state.turnID,
@@ -1733,7 +2043,7 @@ export function makeSpeculativeActionRuntime<
 				...(horizon !== undefined
 					? { horizon, validThroughActionSeq: predictionAnchorActionSeq + horizon + 1 }
 					: {}),
-				...(source === "pattern_aware" && empiricalProbability !== undefined ? { empiricalProbability } : {}),
+				...(empiricalProbability !== undefined ? { empiricalProbability } : {}),
 				state: "active",
 			};
 			const scheduling = schedulingMetadata(draft, action);
@@ -1769,6 +2079,7 @@ export function makeSpeculativeActionRuntime<
 				...(conditionalProbability !== undefined ? { conditionalProbability } : {}),
 				...(depth !== undefined ? { depth } : {}),
 				...(draft.dependencies?.length ? { dependencies: draft.dependencies } : {}),
+				...(draft.dependsOn?.length ? { planDependencies: draft.dependsOn } : {}),
 				scheduling,
 				utility: expectedUtility(scheduling),
 				...(draft.patternID ? { patternID: draft.patternID } : {}),
@@ -1801,8 +2112,8 @@ export function makeSpeculativeActionRuntime<
 				const attached = await attachPredictionLease(state, existing, draft, source, predictionAnchorActionSeq);
 				if (attached) {
 					accepted++;
-					if (source === "pattern_aware" && existing.run.status === "ready") {
-						await continuePatternCandidate(state, input, existing, existing.run.output, false);
+					if (existing.run.status === "ready") {
+						await continuePredictionCandidate(state, input, existing, existing.run.output, false);
 					}
 				}
 				continue;
@@ -1828,13 +2139,7 @@ export function makeSpeculativeActionRuntime<
 				await preemptCandidate(turnDecision.victim, "candidate_budget_preempted");
 			}
 			accepted++;
-			if (source === "pattern_aware" && draft.patternID) {
-				try {
-					await adapter.onPatternLaunched?.(draft.patternID, draft.patternContext);
-				} catch {
-					// Pattern feedback must not alter tool semantics.
-				}
-			}
+			await notifyLeaseLaunched(sourceLease);
 			await publishStarted(state, candidate);
 			let executionStarted = candidate.startedAt;
 			const rejectExecution = async (error: unknown): Promise<void> => {
@@ -1853,9 +2158,12 @@ export function makeSpeculativeActionRuntime<
 				});
 				schedulerFor(state.sessionID).discard(candidate);
 				candidate.schedulerOutcome = "discarded";
-				recordDrafterFailure(state, candidate, "source_error");
-				expireDrafterLeases(candidate, undefined, "invalidated");
-				await settlePatternLeases(candidate, "invalidated", "system");
+				if (adaptiveSourceBackoffEnabled(state)) {
+					for (const sourceID of new Set(candidate.leases.map((lease) => lease.source))) {
+						if (sourcesByID.get(sourceID)?.adaptive) recordSourceFailure(state, sourceID, "source_error");
+					}
+				}
+				await settlePredictionLeases(candidate, "invalidated", "system");
 				for (const lease of candidate.leases) {
 					if (lease.state === "matched") lease.state = "invalidated";
 				}
@@ -2025,7 +2333,7 @@ export function makeSpeculativeActionRuntime<
 					await publishCompleted(state, candidate);
 					if (!candidate.lifecycle.settleReady()) return;
 					if (action.execution !== "sandbox") {
-						await continuePatternCandidate(
+						await continuePredictionCandidate(
 							state,
 							input,
 							candidate,
@@ -2039,7 +2347,109 @@ export function makeSpeculativeActionRuntime<
 		return accepted;
 	};
 
-	const continuePatternCandidate = async (
+	const planActionDraft = (
+		proposal: PlanProposal["id"],
+		source: string,
+		action: PlanAction,
+	): SpeculativeDraftCandidate => ({
+		type: action.type,
+		tool: action.tool,
+		input: action.input,
+		...(action.missing ? { missing: action.missing } : {}),
+		...(action.execution ? { execution: action.execution } : {}),
+		...(action.diagnostic ? { diagnostic: action.diagnostic } : {}),
+		source,
+		proposalID: proposal,
+		actionID: action.id,
+		...(action.feedback !== undefined ? { feedback: action.feedback } : {}),
+		...(action.horizon !== undefined ? { horizon: action.horizon } : {}),
+		...(action.empiricalProbability !== undefined ? { empiricalProbability: action.empiricalProbability } : {}),
+		...(action.conditionalProbability !== undefined ? { conditionalProbability: action.conditionalProbability } : {}),
+		...(action.expectedDurationMs !== undefined ? { expectedDurationMs: action.expectedDurationMs } : {}),
+		...(action.expectedLatencyBenefitMs !== undefined
+			? { expectedLatencyBenefitMs: action.expectedLatencyBenefitMs }
+			: {}),
+		...(action.resourceDemand !== undefined ? { resourceDemand: action.resourceDemand } : {}),
+		...(action.depth !== undefined ? { depth: action.depth } : {}),
+		...(action.dependsOn?.length ? { dependsOn: action.dependsOn } : {}),
+	});
+
+	const removePlanActions = async (
+		state: TurnState<SessionID, Output, StateData>,
+		source: string,
+		proposalID: string,
+		actionIDs: readonly string[],
+	): Promise<void> => {
+		if (!actionIDs.length) return;
+		const removed = new Set(actionIDs);
+		for (const candidate of availableCandidates(state).values()) {
+			let changed = false;
+			for (const lease of candidate.leases) {
+				if (
+					lease.state !== "active" ||
+					lease.source !== source ||
+					lease.proposalID !== proposalID ||
+					!lease.actionID ||
+					!removed.has(lease.actionID)
+				) {
+					continue;
+				}
+				lease.state = "invalidated";
+				changed = true;
+				await notifyLeaseResolved(lease, "system");
+			}
+			if (changed && candidate.reuse.kind === "exclusive" && !hasActivePredictionLease(candidate)) {
+				await closeCandidate(state, candidate, "plan_action_removed", "invalidated", true);
+			}
+		}
+	};
+
+	const admitPlanUpdates = async (
+		state: TurnState<SessionID, Output, StateData>,
+		input: StartInput,
+		source: string,
+		updates: PlanUpdate | readonly PlanUpdate[],
+		predictionLatencyMs: number,
+		candidateNames: readonly string[],
+		predictionAnchorActionSeq = state.actionSequence,
+	): Promise<number> => {
+		let accepted = 0;
+		for (const update of Array.isArray(updates) ? updates : [updates]) {
+			if (update.source !== source) {
+				await publishMiss(state, "invalid_plan_update", undefined, "Plan source does not own this update.");
+				continue;
+			}
+			const result = state.plans.apply(update);
+			if (!result.accepted) {
+				await publishMiss(state, "invalid_plan_update", undefined, result.reason);
+				continue;
+			}
+			await removePlanActions(state, source, result.plan.id, result.removed);
+			const draftTokens = finiteMetric(update.draftTokens);
+			const totalDraftTokens = finiteMetric(tokenTotals.get(state.sessionID)) + draftTokens;
+			tokenTotals.set(state.sessionID, totalDraftTokens);
+			const actions = result.upserted.filter((action) => {
+				const key = `${result.plan.id}:${action.id}:${result.plan.revision}`;
+				if (state.admittedPlanActions.has(key)) return false;
+				state.admittedPlanActions.add(key);
+				return true;
+			});
+			accepted += await admitPredictions(
+				state,
+				input,
+				actions.map((action) => planActionDraft(result.plan.id, source, action)),
+				predictionLatencyMs,
+				draftTokens,
+				totalDraftTokens,
+				source,
+				candidateNames,
+				predictionAnchorActionSeq,
+			);
+		}
+		return accepted;
+	};
+
+	const continuePredictionCandidate = async (
 		state: TurnState<SessionID, Output, StateData>,
 		input: StartInput,
 		candidate: RuntimeCandidate<Output>,
@@ -2047,20 +2457,15 @@ export function makeSpeculativeActionRuntime<
 		parentConfirmed: boolean,
 	): Promise<void> => {
 		const settings = await latestSettings();
-		if (
-			!settings ||
-			!sourceEnabled(settings, "pattern_aware") ||
-			!patternMultiStepEnabled(settings) ||
-			!adapter.continuePatternAware ||
-			state.finished ||
-			state.terminal
-		) {
-			return;
-		}
+		if (!settings || state.finished || state.terminal) return;
 		for (const lease of candidate.leases) {
+			const source = sourcesByID.get(lease.source);
 			if (
-				lease.source !== "pattern_aware" ||
-				!lease.patternID ||
+				!sourceEnabled(settings, lease.source) ||
+				!sourceMultiStepEnabled(settings, lease.source) ||
+				!source?.continue ||
+				!lease.proposalID ||
+				!lease.actionID ||
 				lease.continuationExpansion === "confirmed" ||
 				(!parentConfirmed && lease.continuationExpansion === "speculative") ||
 				lease.state === "expired" ||
@@ -2069,36 +2474,31 @@ export function makeSpeculativeActionRuntime<
 				continue;
 			}
 			lease.continuationExpansion = parentConfirmed ? "confirmed" : "speculative";
-			let prediction: SpeculativePrediction | undefined;
 			try {
-				prediction = await adapter.continuePatternAware({
+				const updates = await source.continue({
 					startInput: input,
 					data: state.data,
 					settings,
 					candidate,
-					patternID: lease.patternID,
-					patternContext: lease.patternContext,
+					proposalID: lease.proposalID,
+					actionID: lease.actionID,
+					feedback: lease.feedback,
 					output,
 					parentConfirmed,
 				});
+				if (updates && !state.finished && !state.terminal) {
+					await admitPlanUpdates(
+						state,
+						input,
+						lease.source,
+						updates,
+						0,
+						candidateToolNames(settings, actionSemantics),
+						continuationAnchorActionSeq(state, candidate),
+					);
+				}
 			} catch {
-				continue;
-			}
-			if (!prediction?.candidates.length || state.finished || state.terminal) continue;
-			try {
-				await admitPredictions(
-					state,
-					input,
-					prediction.candidates,
-					0,
-					0,
-					tokenTotals.get(state.sessionID) ?? 0,
-					"pattern_aware",
-					candidateToolNames(settings, actionSemantics),
-					continuationAnchorActionSeq(state, candidate),
-				);
-			} catch {
-				// Continuation learning is optional and must not alter actor settlement.
+				// Producer continuation is optional and must not alter actor settlement.
 			}
 		}
 	};
@@ -2115,41 +2515,39 @@ export function makeSpeculativeActionRuntime<
 	): Promise<void> => {
 		try {
 			const settings = await latestSettings();
-			if (
-				!adapter.recordAuthoritative ||
-				!settings ||
-				!sourceEnabled(settings, "pattern_aware") ||
-				state.finished ||
-				state.terminal
-			) {
-				return;
-			}
+			if (!settings || state.finished || state.terminal) return;
 			const concrete = asConcreteInput(actualCall.input);
 			if (!concrete) return;
-			const prediction = await adapter.recordAuthoritative({
-				startInput: state.startInput as StartInput,
-				data: state.data,
-				settings,
-				consumeInput,
-				action,
-				tool: actualCall.tool,
-				concrete,
-				output,
-				durationMs: finiteMetric(durationMs),
-				speculativeHit,
-				order,
-			});
-			if (!prediction?.candidates.length || state.finished || state.terminal) return;
-			await admitPredictions(
-				state,
-				state.startInput as StartInput,
-				prediction.candidates,
-				0,
-				0,
-				tokenTotals.get(state.sessionID) ?? 0,
-				"pattern_aware",
-				candidateToolNames(settings, actionSemantics),
-			);
+			for (const source of sources) {
+				if (!source.observe || !sourceEnabled(settings, source.id)) continue;
+				try {
+					const updates = await source.observe({
+						startInput: state.startInput as StartInput,
+						data: state.data,
+						settings,
+						consumeInput,
+						action,
+						tool: actualCall.tool,
+						concrete,
+						output,
+						durationMs: finiteMetric(durationMs),
+						speculativeHit,
+						order,
+					});
+					if (updates && !state.finished && !state.terminal) {
+						await admitPlanUpdates(
+							state,
+							state.startInput as StartInput,
+							source.id,
+							updates,
+							0,
+							candidateToolNames(settings, actionSemantics),
+						);
+					}
+				} catch {
+					// One producer's observation must not affect other producers or actor settlement.
+				}
+			}
 		} catch {
 			// Analyzer bookkeeping is optional and must not alter actor settlement.
 		}
@@ -2163,88 +2561,80 @@ export function makeSpeculativeActionRuntime<
 	): Promise<void> => {
 		let accepted = 0;
 		try {
-			if (adapter.predictPatternAware && sourceEnabled(state.settings, "pattern_aware")) {
+			for (const source of sources) {
+				if (state.finished || state.terminal) return;
+				const current = await latestSettings();
+				if (!current) return;
+				let enabled: boolean;
 				try {
-					const patternPrediction = await adapter.predictPatternAware(
-						input,
-						state.settings,
-						definitions,
-						candidateNames,
-						state.predictionController.signal,
+					enabled = sourceEnabled(current, source.id);
+				} catch (error) {
+					await publishMiss(state, "prediction_source_error", undefined, `${source.id}: ${errorDetail(error)}`);
+					continue;
+				}
+				if (!enabled) continue;
+				if (source.adaptive && adaptiveSourceBackoffEnabled(state)) {
+					const activePlan = [...availableCandidates(state).values()].some(
+						(candidate) =>
+							candidate.reuse.kind === "shared" &&
+							candidate.leases.some((lease) => lease.state === "active" && lease.source === source.id),
 					);
-					accepted += await admitPredictions(
+					if (activePlan || !takeSourceOpportunity(input.sessionID, source.id)) continue;
+				}
+				state.sourceAttempts.add(source.id);
+				const predictionStarted = Date.now();
+				const sourceController = new AbortController();
+				const abortSource = () => sourceController.abort();
+				if (state.predictionController.signal.aborted) sourceController.abort();
+				else state.predictionController.signal.addEventListener("abort", abortSource, { once: true });
+				try {
+					const proposed = Promise.resolve(
+						source.propose({
+							startInput: input,
+							data: state.data,
+							settings: current,
+							definitions,
+							candidateNames,
+							signal: sourceController.signal,
+						}),
+					);
+					const timeout = source.timeoutMs?.(current);
+					const proposals =
+						timeout === undefined
+							? await proposed
+							: await withTimeout(proposed, Math.max(0, timeout), () => sourceController.abort());
+					if (state.finished || state.terminal) return;
+					const sourceAccepted = await admitPlanUpdates(
 						state,
 						input,
-						patternPrediction.candidates,
-						0,
-						0,
-						tokenTotals.get(input.sessionID) ?? 0,
-						"pattern_aware",
+						source.id,
+						proposals,
+						Math.max(0, Date.now() - predictionStarted),
 						candidateNames,
 					);
-				} catch {
-					// Learned predictions are optional; drafter prediction remains available.
+					accepted += sourceAccepted;
+					if (source.adaptive && adaptiveSourceBackoffEnabled(state) && sourceAccepted === 0) {
+						recordSourceFailure(state, source.id, "source_error");
+					}
+				} catch (error) {
+					if (state.finished || state.terminal) return;
+					if (source.adaptive && adaptiveSourceBackoffEnabled(state)) {
+						recordSourceFailure(state, source.id, "source_error");
+					}
+					await publishMiss(
+						state,
+						error instanceof PredictionTimeoutError ? "prediction_timeout" : "prediction_source_error",
+						undefined,
+						`${source.id}: ${errorDetail(error)}`,
+					);
+				} finally {
+					state.predictionController.signal.removeEventListener("abort", abortSource);
 				}
 			}
-			if (state.finished || state.terminal) return;
-			const current = await latestSettings();
-			if (state.finished || state.terminal || !current || !sourceEnabled(current, "drafter")) return;
-			const activeDrafterPlan = [...availableCandidates(state).values()].some(hasActiveSharedDrafterLease);
-			if (adaptiveDrafter(state) && activeDrafterPlan) return;
-			if (adaptiveDrafter(state) && !takeDrafterOpportunity(input.sessionID)) return;
-			state.drafterAttempted = true;
-			const predictionStarted = Date.now();
-			const prediction = await withTimeout(
-				Promise.resolve(
-					adapter.predict(input, current, definitions, candidateNames, state.predictionController.signal),
-				),
-				Math.max(0, state.settings.predictionTimeoutMs),
-				() => state.predictionController.abort(),
-			);
-			const predictionLatencyMs = Math.max(0, Date.now() - predictionStarted);
-			const draftTokens = finiteMetric(prediction.draftTokens);
-			const totalDraftTokens = finiteMetric(tokenTotals.get(input.sessionID)) + draftTokens;
-			tokenTotals.set(input.sessionID, totalDraftTokens);
-			if (state.finished || state.terminal) return;
-			if (!prediction.candidates.length) {
-				recordDrafterFailure(state, undefined, "source_error");
-				if (!accepted) {
-					state.noCandidateReported = true;
-					await publishMiss(state, "no_candidate", undefined, "Drafter returned no tool-call candidates.");
-				}
-				return;
-			}
-			const drafterAccepted = await admitPredictions(
-				state,
-				input,
-				prediction.candidates,
-				predictionLatencyMs,
-				draftTokens,
-				totalDraftTokens,
-				"drafter",
-				candidateNames,
-			);
-			accepted += drafterAccepted;
-			if (!drafterAccepted) recordDrafterFailure(state, undefined, "source_error");
 			if (!accepted && !state.noCandidateReported) {
 				state.noCandidateReported = true;
-				await publishMiss(
-					state,
-					"no_candidate",
-					undefined,
-					"No drafter candidate passed validation, policy, and permission checks.",
-				);
+				await publishMiss(state, "no_candidate", undefined, "No plan action passed validation and admission.");
 			}
-		} catch (error) {
-			if (state.finished || state.terminal) return;
-			state.noCandidateReported = true;
-			recordDrafterFailure(state, undefined, "source_error");
-			await publishMiss(
-				state,
-				error instanceof PredictionTimeoutError ? "prediction_timeout" : "drafter_error",
-				undefined,
-				errorDetail(error),
-			);
 		} finally {
 			state.predictionPending = false;
 		}
@@ -2286,8 +2676,12 @@ export function makeSpeculativeActionRuntime<
 			preparedHints: new Set(),
 			pendingActionSequences: new Set(),
 			turnAdmissions: new Map(),
+			plans: planLedgerFor(input.sessionID),
+			admittedPlanActions: new Set(),
+			sourceAttempts: new Set(),
+			sourceFeedback: new Map(),
+			sourcePlanMismatches: new Set(),
 			actionSequence: actionSequences.get(input.sessionID) ?? 0,
-			drafterAttempted: false,
 			terminal: false,
 			finished: false,
 			noCandidateReported: false,
@@ -2329,9 +2723,9 @@ export function makeSpeculativeActionRuntime<
 			});
 			const actualAction = diagnosticAction(actualCall.tool, actualCall.input, actual);
 			const candidates = [...availableCandidates(state).values()];
-			const activeDrafterPlan = candidates.some(hasActiveDrafterLease);
+			const activePlanSources = activeAdaptivePlanSources(candidates, actionSequence);
 			if (!actual) {
-				if (activeDrafterPlan) state.drafterPlanMismatch = true;
+				markPlanMismatches(state, activePlanSources);
 				await preemptForAuthoritative(state, { class: "global", units: 1 });
 				return undefined;
 			}
@@ -2381,7 +2775,7 @@ export function makeSpeculativeActionRuntime<
 						readonly candidate: RuntimeCandidate<Output>;
 						readonly output: Output;
 						readonly projectionDurationMs: number;
-						readonly matchedDrafterPlan: boolean;
+						readonly matchedPlanSources: ReadonlySet<string>;
 				  }
 				| undefined;
 			const reject = (
@@ -2411,7 +2805,7 @@ export function makeSpeculativeActionRuntime<
 					reject(choice, "candidate_claimed");
 					continue;
 				}
-				const matchedDrafterPlan = hasActiveDrafterLease(candidate);
+				const matchedPlanSources = activeAdaptivePlanSources([candidate], actionSequence);
 				// Prediction feedback measures whether the actor requested an equivalent
 				// action, independently from whether the cached result is still usable.
 				// Preserve that boundary before freshness, authorization, and execution
@@ -2514,7 +2908,7 @@ export function makeSpeculativeActionRuntime<
 					candidate,
 					output: projection.output,
 					projectionDurationMs: projection.durationMs,
-					matchedDrafterPlan,
+					matchedPlanSources,
 				};
 				break;
 			}
@@ -2532,14 +2926,19 @@ export function makeSpeculativeActionRuntime<
 								}
 							: {}),
 					});
-					if (activeDrafterPlan) state.drafterPlanMismatch = true;
+					markPlanMismatches(state, activePlanSources);
 				} else {
 					const predicted = new Map(
-						[...availableCandidates(state)].filter(([, item]) => hasActiveDrafterLease(item)),
+						[...availableCandidates(state)].filter(([, item]) =>
+							[...activeAdaptivePlanSources([item], actionSequence)].some((sourceID) =>
+								activePlanSources.has(sourceID),
+							),
+						),
 					);
 					if (predicted.size > 0) {
-						state.drafterPlanMismatch = true;
-						state.pendingDrafterMismatch = {
+						markPlanMismatches(state, activePlanSources);
+						state.pendingPlanMismatch = {
+							sources: [...activePlanSources].sort(),
 							key: actual,
 							actualAction,
 							predictedAction: candidatesDiagnostic(predicted),
@@ -2551,16 +2950,14 @@ export function makeSpeculativeActionRuntime<
 				return undefined;
 			}
 
-			const { candidate, output, projectionDurationMs, matchedDrafterPlan } = selected;
-			if (activeDrafterPlan && !matchedDrafterPlan) state.drafterPlanMismatch = true;
-			const matchedLease =
-				candidate.leases.find(
-					(lease) =>
-						lease.state === "matched" &&
-						lease.resolvedActionSeq === actionSequence &&
-						lease.source === "pattern_aware",
-				) ??
-				candidate.leases.find((lease) => lease.state === "matched" && lease.resolvedActionSeq === actionSequence);
+			const { candidate, output, projectionDurationMs, matchedPlanSources } = selected;
+			markPlanMismatches(
+				state,
+				[...activePlanSources].filter((sourceID) => !matchedPlanSources.has(sourceID)),
+			);
+			const matchedLease = candidate.leases.find(
+				(lease) => lease.state === "matched" && lease.resolvedActionSeq === actionSequence,
+			);
 			const actorLeadMs = Math.max(0, actorArrivedAt - (candidate.executionStartedAt ?? actorArrivedAt));
 			candidate.actorLeadMs = actorLeadMs;
 			observeLeadTime(candidate.tool, actorLeadMs, matchedLease?.horizon);
@@ -2585,13 +2982,7 @@ export function makeSpeculativeActionRuntime<
 			const matchedLeases = candidate.leases.filter(
 				(lease) => lease.state === "hit" && lease.resolvedActionSeq === actionSequence,
 			);
-			const patternLease = matchedLeases.find((lease) => lease.source === "pattern_aware");
-			const drafterLease = matchedLeases.find((lease) => lease.source === "drafter");
-			const eventSource: SpeculativeSchedulingEventFields["source"] = patternLease
-				? "pattern_aware"
-				: drafterLease
-					? "drafter"
-					: "cache";
+			const eventSource: SpeculativeSchedulingEventFields["source"] = matchedLeases[0]?.source ?? "cache";
 			const eventSources = [...new Set(matchedLeases.map((lease) => lease.source))];
 			await emit({
 				type: "hit",
@@ -2616,11 +3007,11 @@ export function makeSpeculativeActionRuntime<
 			});
 			await recordAndPredict(state, input, actualCall, actual, output, executionMs, true, actionSequence);
 			if (actualCall.id) state.actorCallSequences.delete(actualCall.id);
-			await continuePatternCandidate(state, state.startInput as StartInput, candidate, output, true);
+			await continuePredictionCandidate(state, state.startInput as StartInput, candidate, output, true);
 			return output;
 		} finally {
 			state.pendingActionSequences.delete(actionSequence);
-			await expirePatternLeasesAfterAction(state);
+			await expirePredictionLeasesAfterAction(state);
 		}
 	};
 	const actual = async (
@@ -2676,45 +3067,50 @@ export function makeSpeculativeActionRuntime<
 		} catch {
 			// Analyzer lifecycle must not alter actor semantics.
 		}
-		const activeDrafterCandidate = [...availableCandidates(state).values()].find(hasActiveDrafterLease);
-		const drafterPlanMissed = state.drafterPlanMismatch === true && state.drafterFeedback !== "success";
-		if (drafterPlanMissed) {
-			recordDrafterFailure(state, activeDrafterCandidate);
-			if (state.pendingDrafterMismatch) {
-				await publishMiss(state, "key_mismatch", state.pendingDrafterMismatch.key, undefined, {
-					predictedAction: state.pendingDrafterMismatch.predictedAction,
-					actualAction: state.pendingDrafterMismatch.actualAction,
-					lookup: state.pendingDrafterMismatch.lookup,
-				});
+		const missedPlanSources = new Set(
+			[...state.sourcePlanMismatches].filter((sourceID) => state.sourceFeedback.get(sourceID) !== "success"),
+		);
+		if (adaptiveSourceBackoffEnabled(state)) {
+			for (const sourceID of missedPlanSources) recordSourceFailure(state, sourceID, "actor_miss");
+		}
+		if (state.pendingPlanMismatch?.sources.some((sourceID) => missedPlanSources.has(sourceID))) {
+			await publishMiss(state, "key_mismatch", state.pendingPlanMismatch.key, undefined, {
+				predictedAction: state.pendingPlanMismatch.predictedAction,
+				actualAction: state.pendingPlanMismatch.actualAction,
+				lookup: state.pendingPlanMismatch.lookup,
+			});
+		}
+		for (const sourceID of state.sourceAttempts) {
+			if (
+				adaptiveSourceBackoffEnabled(state) &&
+				sourcesByID.get(sourceID)?.adaptive &&
+				!state.sourceFeedback.has(sourceID)
+			) {
+				recordSourceFailure(state, sourceID, "actor_miss");
 			}
 		}
-		if (drafterPlanMissed) expireDrafterPlan(state);
 		for (const candidate of availableCandidates(state).values()) {
 			if (candidate.run.status === "closed") continue;
+			if (missedPlanSources.size > 0) {
+				await settlePredictionLeases(candidate, "expired", "actor_miss", (lease) =>
+					missedPlanSources.has(lease.source),
+				);
+			}
 			if (terminal) {
-				expireDrafterLeases(candidate, undefined, "invalidated");
-				await settlePatternLeases(candidate, "invalidated", "actor_miss");
+				await settlePredictionLeases(candidate, "invalidated", "actor_miss");
 				if (candidate.reuse.kind === "shared") continue;
 				await closeCandidate(state, candidate, "request_finished_without_hit", "invalidated", true);
 				continue;
 			}
-			if (candidate.reuse.kind === "shared") {
-				if (state.drafterAttempted && state.drafterFeedback !== "success") {
-					expireDrafterLeases(candidate, state.turnID);
-				}
-				continue;
-			}
-			expireDrafterLeases(candidate, state.turnID);
+			await expireTurnBoundSourceLeases(state, candidate, true);
+			if (candidate.reuse.kind === "shared") continue;
 			if (hasActivePredictionLease(candidate)) continue;
 			await cancelCandidate(state, candidate, "turn_finished_without_hit");
 		}
 		await publishCache(state);
 		if (terminal) {
-			try {
-				await adapter.flushPatternStore?.();
-			} catch {
-				// Persistence is best-effort.
-			}
+			await flushPredictionSources();
+			planLedgers.delete(state.sessionID);
 		}
 		candidateCatalog.detachAllFromTurn(turnKey(state));
 		if (!schedulerFor(state.sessionID).snapshot().length) schedulers.delete(state.sessionID);
@@ -2727,15 +3123,12 @@ export function makeSpeculativeActionRuntime<
 			if (candidate.reuse.kind === "exclusive") {
 				await closeCandidate(state, candidate, "request_finished_without_hit", "invalidated", true);
 			} else {
-				await settlePatternLeases(candidate, "invalidated", "actor_miss");
+				await settlePredictionLeases(candidate, "invalidated", "actor_miss");
 			}
 		}
 		if (candidates.length) await publishCache(state);
-		try {
-			await adapter.flushPatternStore?.();
-		} catch {
-			// Persistence is best-effort.
-		}
+		await flushPredictionSources();
+		planLedgers.delete(sessionID);
 		if (!schedulerFor(sessionID).snapshot().length) schedulers.delete(sessionID);
 	};
 
@@ -2775,12 +3168,9 @@ export function makeSpeculativeActionRuntime<
 		wallTimes.delete(sessionID);
 		actionSequences.delete(sessionID);
 		schedulers.delete(sessionID);
-		drafterBackoff.delete(sessionID);
-		try {
-			await adapter.flushPatternStore?.();
-		} catch {
-			// Persistence is best-effort.
-		}
+		sourceBackoff.delete(sessionID);
+		planLedgers.delete(sessionID);
+		await flushPredictionSources();
 	};
 
 	const dispose = async (): Promise<void> => {
@@ -2793,7 +3183,8 @@ export function makeSpeculativeActionRuntime<
 		}
 		for (const sessionID of sessions) await disposeSession(sessionID);
 		schedulers.clear();
-		drafterBackoff.clear();
+		sourceBackoff.clear();
+		planLedgers.clear();
 		actionSequences.clear();
 	};
 
@@ -2837,17 +3228,9 @@ function hasActivePredictionLease(candidate: SpeculativeCandidate): boolean {
 	return candidate.leases.some((lease) => lease.state === "active");
 }
 
-function hasActiveDrafterLease(candidate: SpeculativeCandidate): boolean {
-	return candidate.leases.some((lease) => lease.state === "active" && lease.source === "drafter");
-}
-
-function hasActiveSharedDrafterLease(candidate: SpeculativeCandidate): boolean {
-	return candidate.reuse.kind === "shared" && hasActiveDrafterLease(candidate);
-}
-
 function candidateFutureHorizon(candidate: SpeculativeCandidate): number | undefined {
 	return candidate.leases.find(
-		(lease) => lease.source === "pattern_aware" && (lease.state === "active" || lease.state === "hit"),
+		(lease) => lease.horizon !== undefined && (lease.state === "active" || lease.state === "hit"),
 	)?.horizon;
 }
 
@@ -2951,8 +3334,12 @@ function createDisposalState<SessionID, Output, StateData>(
 		preparedHints: new Set(),
 		pendingActionSequences: new Set(),
 		turnAdmissions: new Map(),
+		plans: new PlanLedger(),
+		admittedPlanActions: new Set(),
+		sourceAttempts: new Set(),
+		sourceFeedback: new Map(),
+		sourcePlanMismatches: new Set(),
 		actionSequence: 0,
-		drafterAttempted: false,
 		terminal: true,
 		finished: true,
 		noCandidateReported: false,

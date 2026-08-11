@@ -24,7 +24,9 @@ import {
 	acquirePatternAwareStore,
 	asPatternAwareRuntimeContext,
 	PATTERN_AWARE_DEFAULTS,
+	type PatternAwareCandidate,
 	type PatternAwareEventInput,
+	type PatternAwareRuntimeContext,
 	type PatternAwareSettings,
 	type PatternAwareStore,
 	type PatternAwareStoreLease,
@@ -32,6 +34,7 @@ import {
 	patternAwareSettings,
 	projectPatternAwareObservation,
 } from "./pattern-aware.ts";
+import type { PlanAction, PlanProposal } from "./plan-proposal.ts";
 import {
 	captureResourceVersion,
 	releaseResourceVersion,
@@ -43,7 +46,7 @@ import type {
 	SpeculativeActionEvent,
 	SpeculativeActionRuntime,
 	SpeculativeActionSettings,
-	SpeculativeDraftCandidate,
+	SpeculativePlanSource,
 } from "./runtime.ts";
 import {
 	candidateExecutionMs,
@@ -255,26 +258,48 @@ export function installSpeculativeAction(
 			...(signal ? { signal } : {}),
 		});
 	};
-
-	const runtime = makeSpeculativeActionRuntime<
+	type AgentPlanSource = SpeculativePlanSource<
 		string,
 		SettleToolCallResult,
 		AgentStartInput,
 		AgentConsumeInput,
-		AgentConsumeInput,
 		AgentStateData
-	>({
-		actionSemantics,
-		settings: resolveSettings,
-		definitions: (input) =>
-			input.tools.map((tool) => ({ name: tool.name, description: tool.description, inputSchema: tool.parameters })),
-		stateData: (input) => ({
-			tools: new Map(input.tools.map((tool) => [tool.name, tool])),
-			schemaHashes: definitionSchemaHashes(
-				input.tools.map((tool) => ({ name: tool.name, inputSchema: tool.parameters })),
-			),
-		}),
-		predict: async (input, settings, _definitions, candidateNames, signal) => {
+	>;
+	type PatternPlanFeedback = PatternAwareRuntimeContext & { readonly patternID: string };
+	const patternPlanRevisions = new Map<string, number>();
+	const asPatternPlanFeedback = (value: unknown): PatternPlanFeedback | undefined => {
+		const context = asPatternAwareRuntimeContext(value);
+		if (!context || typeof (value as { patternID?: unknown })?.patternID !== "string") return undefined;
+		return { ...context, patternID: (value as { patternID: string }).patternID };
+	};
+	const patternPlanAction = (
+		candidate: PatternAwareCandidate,
+		store: PatternAwareStore,
+		id: string,
+		dependsOn?: PlanAction["dependsOn"],
+	): PlanAction => ({
+		id,
+		type: candidate.type,
+		tool: candidate.tool,
+		input: candidate.input,
+		missing: candidate.missing,
+		diagnostic: candidate.diagnostic,
+		horizon: candidate.horizon,
+		empiricalProbability: candidate.empiricalProbability,
+		conditionalProbability: candidate.conditionalProbability,
+		expectedDurationMs: candidate.expectedDurationMs,
+		depth: candidate.depth,
+		...(dependsOn?.length ? { dependsOn } : {}),
+		feedback: { ...patternAwareRuntimeContext(store, candidate), patternID: candidate.patternID },
+	});
+	const patternActionID = (candidate: PatternAwareCandidate): string =>
+		`${candidate.patternID}:${stableHash({ tool: candidate.tool, input: candidate.input }).slice(0, 16)}`;
+	const drafterSource: AgentPlanSource = {
+		id: "drafter",
+		enabled: (settings) => settings.drafterEnabled ?? DEFAULTS.drafterEnabled,
+		adaptive: true,
+		timeoutMs: (settings) => settings.predictionTimeoutMs,
+		propose: async ({ startInput: input, settings, candidateNames, signal }): Promise<PlanProposal> => {
 			const draftModel =
 				typeof options.draftModel === "function"
 					? await options.draftModel(input.actorModel)
@@ -294,7 +319,6 @@ export function installSpeculativeAction(
 						reasoning: undefined,
 						sessionId: `${sessionID}:speculative`,
 					};
-			const draftOptions = { ...configuredDraftOptions, signal };
 			const enabledTools = new Set(candidateNames);
 			const stream = await baseStream(
 				draftModel,
@@ -308,7 +332,7 @@ export function installSpeculativeAction(
 					messages: input.context.messages,
 					tools: (input.context.tools ?? []).filter((tool) => enabledTools.has(tool.name)),
 				},
-				draftOptions,
+				{ ...configuredDraftOptions, signal },
 			);
 			for await (const _event of stream) {
 				// Draining drives every StreamFn implementation to its terminal event.
@@ -318,33 +342,142 @@ export function installSpeculativeAction(
 				throw new Error(message.errorMessage ?? `Drafter stopped with ${message.stopReason}`);
 			}
 			return {
-				candidates: message.content
+				id: `drafter:${input.turnID}`,
+				source: "drafter",
+				revision: 0,
+				actions: message.content
 					.filter((item): item is AgentToolCall => item.type === "toolCall")
-					.map(
-						(call): SpeculativeDraftCandidate => ({
-							type: "tool_call",
-							tool: call.name,
-							input: call.arguments,
-							diagnostic: JSON.stringify(
-								{ toolCallID: call.id, tool: call.name, input: call.arguments },
-								null,
-								2,
-							),
-						}),
-					),
+					.map((call, index) => ({
+						id: `${index}:${call.id}`,
+						type: "tool_call" as const,
+						tool: call.name,
+						input: call.arguments,
+						diagnostic: JSON.stringify({ toolCallID: call.id, tool: call.name, input: call.arguments }, null, 2),
+					})),
 				draftTokens: usageTokenCount(message.usage),
 			};
 		},
-		predictPatternAware: async (input, settings, definitions) => {
-			if (!settings.patternAware?.enabled) return { candidates: [], draftTokens: 0 };
+	};
+	const patternSource: AgentPlanSource = {
+		id: "pattern_aware",
+		enabled: (settings) => settings.patternAware?.enabled ?? false,
+		multiStepEnabled: (settings) => settings.patternAware?.multiStepEnabled ?? true,
+		propose: async ({ startInput, settings, definitions }) => {
+			if (!settings.patternAware?.enabled) {
+				return { id: `pattern:${startInput.turnID}`, source: "pattern_aware", revision: 0, actions: [] };
+			}
 			const store = await resolvePatternStore(settings);
+			const proposalID = `pattern:${startInput.turnID}`;
+			patternPlanRevisions.set(proposalID, 0);
+			const candidates = store.predict(startInput.sessionID, definitionSchemaHashes(definitions));
 			return {
-				candidates: store
-					.predict(input.sessionID, definitionSchemaHashes(definitions))
-					.map((candidate) => ({ ...candidate, patternContext: patternAwareRuntimeContext(store, candidate) })),
-				draftTokens: 0,
+				id: proposalID,
+				source: "pattern_aware",
+				revision: 0,
+				actions: candidates.map((candidate) => patternPlanAction(candidate, store, patternActionID(candidate))),
 			};
 		},
+		continue: async ({ startInput, data, candidate, proposalID, actionID, feedback, output, parentConfirmed }) => {
+			const context = asPatternPlanFeedback(feedback);
+			if (!context) return undefined;
+			const observation = projectPatternAwareObservation(
+				output.result,
+				extractOutputPaths(candidate.key.tool, output.result),
+				options.cwd,
+			);
+			const next = context.store.continue(
+				context.continuation,
+				{
+					sessionID: startInput.sessionID,
+					turnID: startInput.turnID,
+					tool: candidate.key.tool,
+					input: structuredClone(candidate.key.input) as Record<string, unknown>,
+					outcome: output.isError ? "failure" : "success",
+					...observation,
+					durationMs: candidateExecutionMs(candidate),
+					schemaHash: candidate.key.schemaHash,
+					...(typeof candidate.key.input.operation === "string"
+						? { operation: candidate.key.input.operation }
+						: {}),
+					learnTarget: false,
+				},
+				data.schemaHashes,
+				parentConfirmed,
+			);
+			if (!next.length) return undefined;
+			const revision = (patternPlanRevisions.get(proposalID) ?? 0) + 1;
+			patternPlanRevisions.set(proposalID, revision);
+			return {
+				proposalID,
+				source: "pattern_aware",
+				revision,
+				upsert: next.map((item) =>
+					patternPlanAction(item, context.store, patternActionID(item), [{ actionID, condition: "succeeded" }]),
+				),
+			};
+		},
+		observe: async ({ startInput, settings, consumeInput, action, tool, concrete, output, durationMs, order }) => {
+			if (!settings.patternAware?.enabled) return undefined;
+			const definition = startInput.tools.find((item) => item.name === tool);
+			const observation = projectPatternAwareObservation(
+				output?.result,
+				extractOutputPaths(tool, output?.result),
+				options.cwd,
+			);
+			const key = authoritativeBatchKey(consumeInput.sessionID, consumeInput.turnID);
+			const batch = authoritativeBatches.get(key) ?? new Map();
+			batch.set(order, {
+				sessionID: consumeInput.sessionID,
+				turnID: consumeInput.turnID,
+				tool,
+				input: action ? (structuredClone(action.input) as Record<string, unknown>) : concrete,
+				outcome: output?.isError ? "failure" : "success",
+				...observation,
+				durationMs,
+				...(typeof concrete.operation === "string" ? { operation: concrete.operation } : {}),
+				...(definition ? { schemaHash: stableHash(definition.parameters) } : {}),
+				learnTarget: candidateToolNames(settings, actionSemantics).includes(tool),
+			});
+			authoritativeBatches.set(key, batch);
+			return undefined;
+		},
+		onLaunched: ({ feedback }) => {
+			const context = asPatternPlanFeedback(feedback);
+			context?.store.launched(context.patternID);
+		},
+		onResolved: ({ feedback, outcome }) => {
+			const context = asPatternPlanFeedback(feedback);
+			context?.store.resolved(context.patternID, outcome);
+		},
+		flush: async () => {
+			try {
+				if (openedPatternStore) await (await openedPatternStore).store.flush();
+				if (options.patternStore) await (await options.patternStore).flush();
+			} finally {
+				patternPlanRevisions.clear();
+			}
+		},
+	};
+
+	const runtime = makeSpeculativeActionRuntime<
+		string,
+		SettleToolCallResult,
+		AgentStartInput,
+		AgentConsumeInput,
+		AgentConsumeInput,
+		AgentStateData
+	>({
+		actionSemantics,
+		sources: [patternSource, drafterSource],
+		settings: resolveSettings,
+		definitions: (input) =>
+			input.tools.map((tool) => ({ name: tool.name, description: tool.description, inputSchema: tool.parameters })),
+		stateData: (input) => ({
+			tools: new Map(input.tools.map((tool) => [tool.name, tool])),
+			schemaHashes: definitionSchemaHashes(
+				input.tools.map((tool) => ({ name: tool.name, inputSchema: tool.parameters })),
+			),
+		}),
 		actionKey: (toolName, input, context) => {
 			if (context.type === "consume") {
 				const tool = agent.state.tools.find((candidate) => candidate.name === toolName);
@@ -460,92 +593,10 @@ export function installSpeculativeAction(
 				return undefined;
 			}
 		},
-		continuePatternAware: async ({ startInput, data, candidate, patternContext, output, parentConfirmed }) => {
-			const context = asPatternAwareRuntimeContext(patternContext);
-			if (!context) return undefined;
-			const observation = projectPatternAwareObservation(
-				output.result,
-				extractOutputPaths(candidate.key.tool, output.result),
-				options.cwd,
-			);
-			const candidates = context.store.continue(
-				context.continuation,
-				{
-					sessionID: startInput.sessionID,
-					turnID: startInput.turnID,
-					tool: candidate.key.tool,
-					input: structuredClone(candidate.key.input) as Record<string, unknown>,
-					outcome: output.isError ? "failure" : "success",
-					...observation,
-					durationMs: candidateExecutionMs(candidate),
-					schemaHash: candidate.key.schemaHash,
-					...(typeof candidate.key.input.operation === "string"
-						? { operation: candidate.key.input.operation }
-						: {}),
-					learnTarget: false,
-				},
-				data.schemaHashes,
-				parentConfirmed,
-			);
-			return {
-				candidates: candidates.map((next) => ({
-					...next,
-					patternContext: patternAwareRuntimeContext(context.store, next),
-				})),
-				draftTokens: 0,
-			};
-		},
-		recordAuthoritative: async ({
-			startInput,
-			settings,
-			consumeInput,
-			action,
-			tool,
-			concrete,
-			output,
-			durationMs,
-			order,
-		}) => {
-			if (!settings.patternAware?.enabled) return undefined;
-			const definition = startInput.tools.find((item) => item.name === tool);
-			const observation = projectPatternAwareObservation(
-				output?.result,
-				extractOutputPaths(tool, output?.result),
-				options.cwd,
-			);
-			const key = authoritativeBatchKey(consumeInput.sessionID, consumeInput.turnID);
-			const batch = authoritativeBatches.get(key) ?? new Map();
-			batch.set(order, {
-				sessionID: consumeInput.sessionID,
-				turnID: consumeInput.turnID,
-				tool,
-				input: action ? (structuredClone(action.input) as Record<string, unknown>) : concrete,
-				outcome: output?.isError ? "failure" : "success",
-				...observation,
-				durationMs,
-				...(typeof concrete.operation === "string" ? { operation: concrete.operation } : {}),
-				...(definition ? { schemaHash: stableHash(definition.parameters) } : {}),
-				learnTarget: candidateToolNames(settings, actionSemantics).includes(tool),
-			});
-			authoritativeBatches.set(key, batch);
-			return { candidates: [], draftTokens: 0 };
-		},
 		prepareCandidate: async ({ candidate, signal }) => {
 			if (candidate.execution !== "sandbox" && actionSemantics.execution(candidate.tool) !== "sandbox") return;
 			if (!options.sandbox?.supports(candidate.tool)) throw new Error(`Sandbox unavailable for ${candidate.tool}`);
 			await prepareSandbox([candidate.tool], signal);
-		},
-		onPatternLaunched: (patternID, context) => {
-			const store = asPatternAwareRuntimeContext(context)?.store ?? (isPatternStore(context) ? context : undefined);
-			store?.launched(patternID);
-		},
-		onPatternResolved: (patternID, outcome, context) => {
-			const store = asPatternAwareRuntimeContext(context)?.store ?? (isPatternStore(context) ? context : undefined);
-			store?.resolved(patternID, outcome);
-		},
-		flushPatternStore: async () => {
-			if (openedPatternStore) await (await openedPatternStore).store.flush();
-			if (options.patternStore) await (await options.patternStore).flush();
 		},
 		onTurnStarted: async ({ startInput, settings, signal }) => {
 			authoritativeBatches.delete(authoritativeBatchKey(startInput.sessionID, startInput.turnID));
@@ -780,17 +831,6 @@ function extractOutputPaths(tool: string, result: AgentToolResult<unknown> | und
 		})
 		.filter((item): item is string => typeof item === "string" && item.length > 0);
 	return paths.length ? [...new Set(paths)] : undefined;
-}
-
-function isPatternStore(value: unknown): value is PatternAwareStore {
-	return (
-		typeof value === "object" &&
-		value !== null &&
-		"launched" in value &&
-		typeof value.launched === "function" &&
-		"resolved" in value &&
-		typeof value.resolved === "function"
-	);
 }
 
 function normalizeTimeout(value: unknown): number {
