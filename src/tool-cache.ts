@@ -1,4 +1,4 @@
-import type { ActionKey, ActionKeyMatch, ActionKeyProjector } from "./common.ts";
+import type { ActionKey, ActionKeyMatch, ActionKeyProjector, ProjectedActionKeyMatch } from "./common.ts";
 import { actionKeyMatch, actionKeyProjectionPartitions } from "./common.ts";
 
 export interface ToolCacheEntry {
@@ -19,6 +19,10 @@ export interface ToolCacheLookup<Entry> {
 	readonly entry: Entry;
 	readonly match: ActionKeyMatch;
 	readonly state: ToolCacheEntryState;
+}
+
+export interface ToolCacheInsertResult<Entry> extends ToolCacheLookup<Entry> {
+	readonly inserted: boolean;
 }
 
 export interface ToolCacheSnapshot {
@@ -56,10 +60,42 @@ export class ToolCache<Scope, Entry extends ToolCacheEntry> {
 		const state = this.ensureScope(scope);
 		const existing = state.entries.get(entry.key.key);
 		if (existing) return existing.entry;
-		const record: CachedToolEntry<Entry> = { entry, state: "probation" };
-		state.entries.set(entry.key.key, record);
-		this.addToPartitions(state, record);
+		this.insertRecord(state, entry);
 		return undefined;
+	}
+
+	/**
+	 * Atomically insert or reuse an existing directed-compatible job. Exact conflicts always preserve
+	 * the existing single-flight owner; `canReuseProjected` decides whether a projected match is safe
+	 * to coalesce in its current lifecycle state.
+	 */
+	insertOrGetCompatible(
+		scope: Scope,
+		entry: Entry,
+		canReuseProjected: (existing: Entry, match: ProjectedActionKeyMatch) => boolean = () => true,
+	): ToolCacheInsertResult<Entry> {
+		const state = this.ensureScope(scope);
+		const exact = state.entries.get(entry.key.key);
+		if (exact) {
+			return {
+				entry: exact.entry,
+				match: { kind: "exact", distance: 0 },
+				state: exact.state,
+				inserted: false,
+			};
+		}
+		for (const candidate of this.lookupRecords(state, entry.key)) {
+			if (candidate.match.kind === "exact") return { ...candidate, inserted: false };
+			if (!canReuseProjected(candidate.entry, candidate.match)) continue;
+			return { ...candidate, inserted: false };
+		}
+		const inserted = this.insertRecord(state, entry);
+		return {
+			entry,
+			match: { kind: "exact", distance: 0 },
+			state: inserted.state,
+			inserted: true,
+		};
 	}
 
 	getExact(scope: Scope, action: ActionKey): Entry | undefined {
@@ -69,7 +105,10 @@ export class ToolCache<Scope, Entry extends ToolCacheEntry> {
 	/** Return compatible jobs from tightest to broadest without changing authoritative recency. */
 	lookup(scope: Scope, action: ActionKey): readonly ToolCacheLookup<Entry>[] {
 		const state = this.sessions.get(scope);
-		if (!state) return [];
+		return state ? this.lookupRecords(state, action) : [];
+	}
+
+	private lookupRecords(state: ScopedToolCache<Entry>, action: ActionKey): readonly RankedToolCacheEntry<Entry>[] {
 		const candidates = new Set<CachedToolEntry<Entry>>();
 		const exact = state.entries.get(action.key);
 		if (exact) candidates.add(exact);
@@ -91,7 +130,7 @@ export class ToolCache<Scope, Entry extends ToolCacheEntry> {
 			});
 		}
 		ranked.sort((left, right) => left.match.distance - right.match.distance || right.recency - left.recency);
-		return ranked.map(({ entry, match, state: entryState }) => ({ entry, match, state: entryState }));
+		return ranked;
 	}
 
 	matching(scope: Scope, action: ActionKey): readonly Entry[] {
@@ -189,6 +228,13 @@ export class ToolCache<Scope, Entry extends ToolCacheEntry> {
 		const created: ScopedToolCache<Entry> = { entries: new Map(), partitions: new Map() };
 		this.sessions.set(scope, created);
 		return created;
+	}
+
+	private insertRecord(state: ScopedToolCache<Entry>, entry: Entry): CachedToolEntry<Entry> {
+		const record: CachedToolEntry<Entry> = { entry, state: "probation" };
+		state.entries.set(entry.key.key, record);
+		this.addToPartitions(state, record);
+		return record;
 	}
 
 	private rebalanceProtected(state: ScopedToolCache<Entry>, limits: ToolCacheLimits): readonly Entry[] {

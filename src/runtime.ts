@@ -1730,7 +1730,15 @@ export function makeSpeculativeActionRuntime<
 				continue;
 			}
 			const persistCandidate = candidate.reuse.kind === "shared" || source === "pattern_aware";
-			const existing = persistCandidate ? persistentCandidates.insert(state.sessionID, candidate) : undefined;
+			const insertion = persistCandidate
+				? persistentCandidates.insertOrGetCompatible(state.sessionID, candidate, (existing, match) => {
+						const rule = projectionRuleByID.get(match.projector);
+						return (
+							existing.run.status === "running" && rule?.canShareInFlight?.(existing.key, candidate.key) === true
+						);
+					})
+				: undefined;
+			const existing = insertion && !insertion.inserted ? insertion.entry : undefined;
 			if (existing) {
 				candidateController.abort();
 				const attached = await attachPredictionLease(state, existing, draft, source, predictionAnchorActionSeq);

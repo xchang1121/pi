@@ -46,6 +46,85 @@ describe("ToolCache probation/protected lifecycle", () => {
 		expect(cache.values("session")).toEqual([broad, tight, other]);
 	});
 
+	it("atomically preserves one exact single-flight owner and its current tier", () => {
+		const cache = new ToolCache<string, Entry>();
+		const owner = entry("owner", "a.txt", 1, 20);
+		const duplicate = entry("duplicate", "a.txt", 1, 20);
+		const first = cache.insertOrGetCompatible("session", owner);
+		cache.recordActorHit("session", owner);
+		let projectedPredicateCalls = 0;
+		const second = cache.insertOrGetCompatible("session", duplicate, () => {
+			projectedPredicateCalls++;
+			return false;
+		});
+
+		expect(first).toEqual({
+			entry: owner,
+			inserted: true,
+			match: { kind: "exact", distance: 0 },
+			state: "probation",
+		});
+		expect(second).toEqual({
+			entry: owner,
+			inserted: false,
+			match: { kind: "exact", distance: 0 },
+			state: "protected",
+		});
+		expect(projectedPredicateCalls).toBe(0);
+		expect(cache.values("session")).toEqual([owner]);
+	});
+
+	it("coalesces projected insertion only in the source-to-request direction", () => {
+		const broad = entry("broad", "a.txt", 1, 200);
+		const narrow = entry("narrow", "a.txt", 100, 10);
+		const broadFirst = new ToolCache<string, Entry>([READ_RANGE_ACTION_KEY_PROJECTOR]);
+		broadFirst.insertOrGetCompatible("session", broad);
+
+		expect(
+			broadFirst.insertOrGetCompatible("session", narrow, (_existing, match) => match.kind === "projected"),
+		).toMatchObject({
+			entry: broad,
+			inserted: false,
+			match: { kind: "projected", projector: "read.range" },
+			state: "probation",
+		});
+		expect(broadFirst.values("session")).toEqual([broad]);
+
+		const narrowFirst = new ToolCache<string, Entry>([READ_RANGE_ACTION_KEY_PROJECTOR]);
+		narrowFirst.insertOrGetCompatible("session", narrow);
+		expect(narrowFirst.insertOrGetCompatible("session", broad, () => true)).toEqual({
+			entry: broad,
+			inserted: true,
+			match: { kind: "exact", distance: 0 },
+			state: "probation",
+		});
+		expect(narrowFirst.values("session")).toEqual([narrow, broad]);
+	});
+
+	it("keeps a projected request separate when lifecycle compatibility rejects every source", () => {
+		const cache = new ToolCache<string, Entry>([READ_RANGE_ACTION_KEY_PROJECTOR]);
+		const broad = entry("broad", "a.txt", 1, 200);
+		const tight = entry("tight", "a.txt", 80, 80);
+		const requested = entry("requested", "a.txt", 100, 10);
+		cache.insert("session", broad);
+		cache.insert("session", tight);
+		const visited: string[] = [];
+
+		const result = cache.insertOrGetCompatible("session", requested, (existing) => {
+			visited.push(existing.id);
+			return false;
+		});
+
+		expect(visited).toEqual(["tight", "broad"]);
+		expect(result).toEqual({
+			entry: requested,
+			inserted: true,
+			match: { kind: "exact", distance: 0 },
+			state: "probation",
+		});
+		expect(cache.values("session")).toEqual([broad, tight, requested]);
+	});
+
 	it("does not let prediction-only lookup refresh recency or protection", () => {
 		const cache = new ToolCache<string, Entry>();
 		const first = entry("first", "a.txt", 1, 20, 4);

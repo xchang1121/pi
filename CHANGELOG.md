@@ -28,6 +28,7 @@
 - Renamed read-only execution telemetry and settings to `resource_cached`/`resourceCached`; the Agent installer still accepts legacy `liveReadonly` input.
 - Pattern-aware and drafter predictions now deduplicate onto shared jobs, learned actions can be admitted immediately after authoritative results, and in-flight work is preempted by explicit utility and per-session cache budgets.
 - Actor lookup now ranks compatible results by expected net latency saved and cascades across authorization, staleness, execution, adoption, and projection failures before falling back to real execution.
+- Compatible cache insertion is now atomic and directed, so a broader running read can single-flight a narrower request without ever coalescing in the unsafe reverse direction.
 - Native sandbox protocol v3 now forwards the configured shell and requires an explicit process-isolation attestation; Linux recursively enforces read-only host mounts and readiness probes verify mount isolation.
 - K(a) remains a uniform canonical action key; registered projection rules now require both a potential key relation and validated realized-output coverage before reconstructing an actor result.
 

@@ -1151,6 +1151,106 @@ describe("speculative action runtime", () => {
 		expect(harness.events.filter((event) => event.type === "started")).toHaveLength(1);
 	});
 
+	it("atomically coalesces a narrower turn onto a broader read after concurrent preflight", async () => {
+		const releasePreflight = deferred<CandidatePreflight>();
+		const broadExecution = deferred<string>();
+		let preflights = 0;
+		const harness = createHarness({
+			predict: (input) =>
+				input.turnID === "turn-broad-race"
+					? prediction(readCandidate("race.txt", 1, 200))
+					: input.turnID === "turn-narrow-race"
+						? prediction(readCandidate("race.txt", 100, 10))
+						: prediction(),
+			preflight: async () => {
+				preflights++;
+				return releasePreflight.promise;
+			},
+			execute: () => broadExecution.promise,
+			projectOutput: (output) => `projected:${output}`,
+		});
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-broad-race" });
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-narrow-race" });
+		await waitFor(() => preflights === 2);
+		releasePreflight.resolve({ ok: true });
+		await waitFor(() => harness.runtime.inspect("session").pendingPredictions === 0);
+		await waitFor(() => harness.executions() >= 1);
+
+		const result = harness.runtime.consume(consume("turn-narrow-race", { path: "race.txt", offset: 100, limit: 10 }));
+		broadExecution.resolve("broad-result");
+		expect(await result).toBe("projected:broad-result");
+		expect(harness.executions()).toBe(1);
+		expect(harness.events.filter((event) => event.type === "started")).toHaveLength(1);
+	});
+
+	it("never coalesces a broader read onto a narrower concurrent in-flight job", async () => {
+		const releasePreflight = deferred<CandidatePreflight>();
+		const narrowExecution = deferred<string>();
+		const broadExecution = deferred<string>();
+		const startedLimits: number[] = [];
+		let preflights = 0;
+		const harness = createHarness({
+			predict: (input) =>
+				input.turnID === "turn-narrow-first"
+					? prediction(readCandidate("race.txt", 100, 10))
+					: input.turnID === "turn-broad-second"
+						? prediction(readCandidate("race.txt", 1, 200))
+						: prediction(),
+			preflight: async () => {
+				preflights++;
+				return releasePreflight.promise;
+			},
+			execute: (candidate) => {
+				const limit = (candidate.input as { limit: number }).limit;
+				startedLimits.push(limit);
+				return limit === 10 ? narrowExecution.promise : broadExecution.promise;
+			},
+			projectOutput: (output) => `projected:${output}`,
+		});
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-narrow-first" });
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-broad-second" });
+		await waitFor(() => preflights === 2);
+		releasePreflight.resolve({ ok: true });
+		await waitFor(() => harness.executions() >= 2);
+
+		const result = harness.runtime.consume(consume("turn-broad-second", { path: "race.txt", offset: 1, limit: 200 }));
+		narrowExecution.resolve("narrow-result");
+		broadExecution.resolve("broad-result");
+		expect(await result).toBe("broad-result");
+		expect(startedLimits).toEqual([10, 200]);
+		expect(harness.events.filter((event) => event.type === "started")).toHaveLength(2);
+	});
+
+	it("does not coalesce onto a completed read whose realized coverage rejects projection", async () => {
+		const harness = createHarness({
+			predict: (input) =>
+				input.turnID === "turn-short-coverage"
+					? prediction(readCandidate("partial.txt", 1, 200))
+					: input.turnID === "turn-uncovered-request"
+						? prediction(readCandidate("partial.txt", 100, 10))
+						: prediction(),
+			execute: (candidate) => {
+				const input = candidate.input as { offset: number; limit: number };
+				return `${input.offset}:${input.limit}`;
+			},
+			captureProjectionCoverage: () => ({ end: 50, complete: false }),
+			projectOutput: (output) => `projected:${output}`,
+		});
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-short-coverage" });
+		await waitFor(() => harness.events.filter((event) => event.type === "completed").length === 1);
+		await harness.runtime.finishTurn(consume("turn-short-coverage", {}));
+
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-uncovered-request" });
+		await waitFor(() => harness.executions() >= 2);
+		expect(
+			await harness.runtime.consume(
+				consume("turn-uncovered-request", { path: "partial.txt", offset: 100, limit: 10 }),
+			),
+		).toBe("100:10");
+		expect(harness.executions()).toBe(2);
+		expect(harness.events.filter((event) => event.type === "started")).toHaveLength(2);
+	});
+
 	it("reuses a containing read candidate from the same draft batch", async () => {
 		let projector: string | undefined;
 		const harness = createHarness({
