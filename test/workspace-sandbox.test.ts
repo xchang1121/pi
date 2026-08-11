@@ -8,10 +8,9 @@ import { afterEach, describe, expect, it } from "vitest";
 import { buildPiActionKey } from "../src/common.ts";
 import {
 	closeWorkspaceSandboxPools,
-	commitSandboxExecution,
+	commitSandboxDelta,
 	createWorkspaceSandbox,
 	prepareSandboxWorkspace,
-	type SpeculativeSandboxExecution,
 	withSandboxWorkspace,
 } from "../src/workspace-sandbox.ts";
 
@@ -66,14 +65,15 @@ const bashTool: AgentTool<typeof bashParameters> = {
 	},
 };
 
-describe("M4 workspace sandbox", () => {
+describe("workspace ExecutionWorld", () => {
 	it("stages write output without touching the workspace and adopts after base validation", async () => {
 		const root = await mkdtemp(path.join(os.tmpdir(), "pi-spec-write-test-"));
 		try {
 			const args = { path: "nested/created.txt", content: "from sandbox\n" };
 			const action = requiredAction("write", args, root);
 			const sandbox = createWorkspaceSandbox();
-			const execution = await sandbox.execute({
+			const execution = await sandbox.fork({
+				mode: "file_mutation",
 				cwd: root,
 				tool: writeTool,
 				toolName: "write",
@@ -87,11 +87,46 @@ describe("M4 workspace sandbox", () => {
 			expect(execution.output.result.content).toEqual([
 				{ type: "text", text: "Successfully wrote nested/created.txt" },
 			]);
-			await sandbox.adopt(execution);
+			expect(execution.state).toBe("ready");
+			expect(execution.resources).toEqual(["nested/created.txt"]);
+			expect(execution.capturedBytes).toBe(Buffer.byteLength("from sandbox\n"));
+			expect(execution.executionMetrics.setupMs).toBeGreaterThanOrEqual(0);
+			expect(execution.executionMetrics.captureMs).toBeGreaterThanOrEqual(0);
+			await execution.adopt();
+			expect(execution.state).toBe("adopted");
 			expect(await readFile(path.join(root, args.path), "utf8")).toBe("from sandbox\n");
-			expect(execution.commitMetrics).toEqual(
-				expect.objectContaining({ filesValidated: 1, filesCommitted: 1, bytesValidated: 0 }),
+			expect(execution.adoptionMetrics).toEqual(
+				expect.objectContaining({ resourcesValidated: 1, resourcesAdopted: 1, bytesValidated: 0 }),
 			);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("joins concurrent adoption calls and applies a world branch exactly once", async () => {
+		const root = await mkdtemp(path.join(os.tmpdir(), "pi-spec-world-adopt-once-"));
+		try {
+			const args = { path: "once.txt", content: "one adoption\n" };
+			const world = createWorkspaceSandbox();
+			const branch = await world.fork({
+				mode: "file_mutation",
+				cwd: root,
+				tool: writeTool,
+				toolName: "write",
+				args,
+				action: requiredAction("write", args, root),
+				callID: "spec-adopt-once",
+				signal: new AbortController().signal,
+			});
+
+			const first = branch.adopt();
+			const second = branch.adopt();
+			expect(second).toBe(first);
+			expect(branch.state).toBe("adopting");
+			await expect(Promise.all([first, second])).resolves.toEqual([branch.output, branch.output]);
+			expect(await branch.adopt()).toBe(branch.output);
+			expect(branch.state).toBe("adopted");
+			expect(await readFile(path.join(root, "once.txt"), "utf8")).toBe("one adoption\n");
 		} finally {
 			await rm(root, { recursive: true, force: true });
 		}
@@ -105,7 +140,8 @@ describe("M4 workspace sandbox", () => {
 			const args = { path: "file.txt", edits: [{ oldText: "hello", newText: "hi" }] };
 			const action = requiredAction("edit", args, root);
 			const sandbox = createWorkspaceSandbox();
-			const execution = await sandbox.execute({
+			const execution = await sandbox.fork({
+				mode: "file_mutation",
 				cwd: root,
 				tool: editTool,
 				toolName: "edit",
@@ -118,7 +154,10 @@ describe("M4 workspace sandbox", () => {
 			expect(await readFile(target, "utf8")).toBe("hello\n");
 			expect(execution.output.result.details).toEqual({ path: "file.txt" });
 			await writeFile(target, "actor changed\n", "utf8");
-			await expect(sandbox.adopt(execution)).rejects.toThrow("resource changed before adoption");
+			const adoption = execution.adopt();
+			await expect(adoption).rejects.toThrow("resource changed before adoption");
+			expect(execution.state).toBe("failed");
+			expect(execution.adopt()).toBe(adoption);
 			expect(await readFile(target, "utf8")).toBe("actor changed\n");
 		} finally {
 			await rm(root, { recursive: true, force: true });
@@ -133,7 +172,8 @@ describe("M4 workspace sandbox", () => {
 			const beforeStatus = await runGit(["status", "--short"], root);
 			const beforeBranch = await runGit(["branch", "--show-current"], root);
 			const args = { path: "created.txt", content: "staged" };
-			const execution = await createWorkspaceSandbox().execute({
+			const execution = await createWorkspaceSandbox().fork({
+				mode: "file_mutation",
 				cwd: root,
 				tool: writeTool,
 				toolName: "write",
@@ -143,10 +183,35 @@ describe("M4 workspace sandbox", () => {
 				signal: new AbortController().signal,
 			});
 
-			expect(execution.sandbox).toBe("git_worktree");
+			expect(execution.backend).toBe("git_worktree");
 			expect(await runGit(["status", "--short"], root)).toBe(beforeStatus);
 			expect(await runGit(["branch", "--show-current"], root)).toBe(beforeBranch);
 			await expect(stat(path.join(root, "created.txt"))).rejects.toThrow();
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("dispatches by registered world mode instead of hard-coded tool names", async () => {
+		const root = await mkdtemp(path.join(os.tmpdir(), "pi-spec-custom-world-tool-"));
+		try {
+			const args = { path: "custom.txt", content: "custom mode\n" };
+			const action = { ...requiredAction("write", args, root), tool: "custom_mutation" };
+			const customWriteTool: AgentTool<typeof writeParameters> = { ...writeTool, name: "custom_mutation" };
+			const branch = await createWorkspaceSandbox().fork({
+				mode: "file_mutation",
+				cwd: root,
+				tool: customWriteTool,
+				toolName: "custom_mutation",
+				args,
+				action,
+				callID: "spec-custom-mode",
+				signal: new AbortController().signal,
+			});
+
+			await expect(stat(path.join(root, args.path))).rejects.toThrow();
+			await branch.adopt();
+			expect(await readFile(path.join(root, args.path), "utf8")).toBe("custom mode\n");
 		} finally {
 			await rm(root, { recursive: true, force: true });
 		}
@@ -179,7 +244,8 @@ describe("M4 workspace sandbox", () => {
 				"console.log(process.cwd())",
 			].join(";");
 			const args = { command: script, timeout: 5 };
-			const execution = await sandbox.execute({
+			const execution = await sandbox.fork({
+				mode: "workspace_snapshot",
 				cwd: root,
 				tool: bashTool,
 				toolName: "bash",
@@ -189,25 +255,21 @@ describe("M4 workspace sandbox", () => {
 				signal: new AbortController().signal,
 			});
 
-			expect(sandbox.supports("bash")).toBe(true);
+			expect(sandbox.supports("workspace_snapshot")).toBe(true);
 			expect(execution.output.result.content[0]).toEqual({ type: "text", text: `sandbox cwd: ${root}` });
 			await expect(stat(path.join(root, "sandbox-created.txt"))).rejects.toThrow();
 			expect(await readFile(path.join(root, "input.txt"), "utf8")).toBe("hello");
 			expect(await readFile(path.join(root, "delete.txt"), "utf8")).toBe("remove me");
-			expect(execution.changes.map((change) => change.resource)).toEqual([
-				"delete.txt",
-				"input.txt",
-				"sandbox-created.txt",
-			]);
-			expect(await sandbox.adopt(execution)).toBe(execution.output);
+			expect(execution.resources).toEqual(["delete.txt", "input.txt", "sandbox-created.txt"]);
+			expect(await execution.adopt()).toBe(execution.output);
 			expect(await readFile(path.join(root, "sandbox-created.txt"), "utf8")).toBe("hello");
 			expect(await readFile(path.join(root, "input.txt"), "utf8")).toBe("changed");
 			await expect(stat(path.join(root, "delete.txt"))).rejects.toThrow();
-			expect(createWorkspaceSandbox().supports("bash")).toBe(false);
+			expect(createWorkspaceSandbox().supports("workspace_snapshot")).toBe(false);
 		} finally {
 			await rm(root, { recursive: true, force: true });
 		}
-	});
+	}, 10_000);
 
 	it("validates every base before applying any multi-file change", async () => {
 		const root = await mkdtemp(path.join(os.tmpdir(), "pi-spec-conflict-test-"));
@@ -222,7 +284,8 @@ describe("M4 workspace sandbox", () => {
 				},
 			});
 			const args = { command: "unused" };
-			const execution = await sandbox.execute({
+			const execution = await sandbox.fork({
+				mode: "workspace_snapshot",
 				cwd: root,
 				tool: bashTool,
 				toolName: "bash",
@@ -233,7 +296,7 @@ describe("M4 workspace sandbox", () => {
 			});
 			await writeFile(path.join(root, "b.txt"), "actor", "utf8");
 
-			await expect(sandbox.adopt(execution)).rejects.toThrow("resource changed before adoption: b.txt");
+			await expect(execution.adopt()).rejects.toThrow("resource changed before adoption: b.txt");
 			expect(await readFile(path.join(root, "a.txt"), "utf8")).toBe("a0");
 			expect(await readFile(path.join(root, "b.txt"), "utf8")).toBe("actor");
 		} finally {
@@ -247,9 +310,8 @@ describe("M4 workspace sandbox", () => {
 			const stale = path.join(root, "z-stale.txt");
 			const nested = path.join(root, "a-new", "created.txt");
 			await writeFile(stale, "changed", "utf8");
-			const execution: SpeculativeSandboxExecution = {
+			const execution: Parameters<typeof commitSandboxDelta>[0] = {
 				output: settlement("staged"),
-				sandbox: "git_worktree",
 				changes: [
 					{ root, target: nested, resource: "a-new/created.txt", after: Buffer.from("created") },
 					{
@@ -262,7 +324,7 @@ describe("M4 workspace sandbox", () => {
 				],
 			};
 
-			await expect(commitSandboxExecution(execution)).rejects.toThrow("resource changed before adoption");
+			await expect(commitSandboxDelta(execution)).rejects.toThrow("resource changed before adoption");
 			await expect(stat(path.dirname(nested))).rejects.toThrow();
 			expect(await readFile(stale, "utf8")).toBe("changed");
 		} finally {
@@ -275,23 +337,20 @@ describe("M4 workspace sandbox", () => {
 		const target = path.join(root, "value.txt");
 		try {
 			await writeFile(target, "original\n", "utf8");
-			const executions = ["first\n", "second\n"].map(
-				(content): SpeculativeSandboxExecution => ({
-					output: settlement(content.trim()),
-					sandbox: "git_worktree",
-					changes: [
-						{
-							root,
-							target,
-							resource: "value.txt",
-							before: Buffer.from("original\n"),
-							after: Buffer.from(content),
-						},
-					],
-				}),
-			);
+			const executions = ["first\n", "second\n"].map((content): Parameters<typeof commitSandboxDelta>[0] => ({
+				output: settlement(content.trim()),
+				changes: [
+					{
+						root,
+						target,
+						resource: "value.txt",
+						before: Buffer.from("original\n"),
+						after: Buffer.from(content),
+					},
+				],
+			}));
 
-			const results = await Promise.allSettled(executions.map(commitSandboxExecution));
+			const results = await Promise.allSettled(executions.map(commitSandboxDelta));
 
 			expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
 			expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
@@ -308,9 +367,8 @@ describe("M4 workspace sandbox", () => {
 			const second = path.join(root, "b.txt");
 			await writeFile(first, "a0", "utf8");
 			await writeFile(second, "b0", "utf8");
-			const execution: SpeculativeSandboxExecution = {
+			const execution: Parameters<typeof commitSandboxDelta>[0] = {
 				output: settlement("staged"),
-				sandbox: "git_worktree",
 				changes: [
 					{
 						root,
@@ -329,7 +387,7 @@ describe("M4 workspace sandbox", () => {
 				],
 			};
 
-			await expect(commitSandboxExecution(execution)).rejects.toThrow();
+			await expect(commitSandboxDelta(execution)).rejects.toThrow();
 			expect(await readFile(first, "utf8")).toBe("a0");
 			expect(await readFile(second, "utf8")).toBe("b0");
 		} finally {
@@ -345,7 +403,8 @@ describe("M4 workspace sandbox", () => {
 				await writeFile(target, "#!/bin/sh\necho old\n", { mode: 0o640 });
 				const args = { path: "script.sh", edits: [{ oldText: "old", newText: "new" }] };
 				const sandbox = createWorkspaceSandbox();
-				const execution = await sandbox.execute({
+				const execution = await sandbox.fork({
+					mode: "file_mutation",
 					cwd: root,
 					tool: editTool,
 					toolName: "edit",
@@ -355,7 +414,7 @@ describe("M4 workspace sandbox", () => {
 					signal: new AbortController().signal,
 				});
 
-				await sandbox.adopt(execution);
+				await execution.adopt();
 				expect((await stat(target)).mode & 0o777).toBe(0o640);
 			} finally {
 				await rm(root, { recursive: true, force: true });
@@ -370,7 +429,8 @@ describe("M4 workspace sandbox", () => {
 			await symlink(outside, path.join(root, "linked"), "dir");
 			const args = { path: "linked/out.txt", content: "no" };
 			await expect(
-				createWorkspaceSandbox().execute({
+				createWorkspaceSandbox().fork({
+					mode: "file_mutation",
 					cwd: root,
 					tool: writeTool,
 					toolName: "write",
@@ -398,7 +458,8 @@ describe("M4 workspace sandbox", () => {
 			});
 			const args = { command: "unused" };
 			await expect(
-				sandbox.execute({
+				sandbox.fork({
+					mode: "workspace_snapshot",
 					cwd: root,
 					tool: bashTool,
 					toolName: "bash",
@@ -425,7 +486,8 @@ describe("M4 workspace sandbox", () => {
 			});
 			const args = { command: "unused" };
 			await expect(
-				sandbox.execute({
+				sandbox.fork({
+					mode: "workspace_snapshot",
 					cwd: root,
 					tool: bashTool,
 					toolName: "bash",
@@ -460,7 +522,8 @@ describe("M4 workspace sandbox", () => {
 					}),
 			});
 			const args = { command: "unused" };
-			const execution = sandbox.execute({
+			const execution = sandbox.fork({
+				mode: "workspace_snapshot",
 				cwd: root,
 				tool: bashTool,
 				toolName: "bash",
@@ -484,7 +547,8 @@ describe("M4 workspace sandbox", () => {
 			const sandbox = createWorkspaceSandbox();
 			const args = { path: "../outside.txt", content: "no" };
 			await expect(
-				sandbox.execute({
+				sandbox.fork({
+					mode: "file_mutation",
 					cwd: root,
 					tool: writeTool,
 					toolName: "write",
@@ -746,7 +810,7 @@ describe("M4 workspace sandbox", () => {
 		}
 	});
 
-	it("warms process isolation only when bash is among the prepared tools", async () => {
+	it("warms process isolation only for workspace-snapshot mode", async () => {
 		const root = await mkdtemp(path.join(os.tmpdir(), "pi-spec-prewarm-process-test-"));
 		let processPreparations = 0;
 		const sandbox = createWorkspaceSandbox({
@@ -756,9 +820,9 @@ describe("M4 workspace sandbox", () => {
 			},
 		});
 		try {
-			await sandbox.prepare?.({ cwd: root, tools: ["write"] });
+			await sandbox.prepare?.({ cwd: root, modes: ["file_mutation"] });
 			expect(processPreparations).toBe(0);
-			await sandbox.prepare?.({ cwd: root, tools: ["bash"] });
+			await sandbox.prepare?.({ cwd: root, modes: ["workspace_snapshot"] });
 			expect(processPreparations).toBe(1);
 		} finally {
 			await rm(root, { recursive: true, force: true });

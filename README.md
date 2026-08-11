@@ -169,6 +169,8 @@ The native sandbox provides platform-specific isolation:
 - macOS: a Seatbelt profile, source/home/network restrictions, and process-tree supervision.
 - Windows: a zero-capability AppContainer, restricted token, private desktop, and Job supervision.
 
+`ExecutionWorld` is the isolation boundary used by the Agent adapter. `ActionSemanticsRegistry` selects a world mode (`file_mutation` or `workspace_snapshot`); the world does not maintain a second hard-coded tool list. A completed `WorldBranch` seals the tool output and promotable filesystem delta together. Process-local cwd/environment state and blocked network effects are never promoted. Concurrent consumers join one conflict-checked, transactional adoption, while an unadopted branch cannot change the actor's world.
+
 If the broker is missing, incompatible, fails integrity validation, or does not attest process isolation, Bash speculation fails closed and the actor falls back to normal Bash execution.
 
 ## Verify that speculation is active
@@ -323,6 +325,6 @@ If the Drafter uses a different provider from the actor, use `getDraftOptions` t
 
 ## Implementation overview
 
-The actor and Drafter run concurrently. Candidates pass schema validation, preflight, resource-version capture, and execution-strategy selection. Completed candidates enter a session cache with entry and memory limits. When the actor emits a tool call, Pi Agent's `settleToolCall` hook tries to reuse an exact match or a conservatively projected result. PatternAware persists its templates and bounded PPM count trie by workspace hash, retains a small expected-benefit beam, and leaves DAG execution, freshness, and resource scheduling to the source-neutral runtime.
+The actor and Drafter run concurrently. Candidates pass schema validation, preflight, resource-version capture, and execution-strategy selection. Completed candidates enter either `ResultCache` or `BranchStore`; isolated effects are represented by a sealed `WorldBranch`. When the actor emits a tool call, Pi Agent's `settleToolCall` hook tries to reuse an exact match or a conservatively projected result. PatternAware persists its templates and bounded PPM count trie by workspace hash, retains a small expected-benefit beam, and leaves DAG execution, freshness, and resource scheduling to the source-neutral runtime.
 
 Hits, misses, cancellation, actual execution, draft tokens, cache state, and sandbox-stage timings are exposed as typed events for experiment collection and visualization.

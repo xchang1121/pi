@@ -7,6 +7,14 @@ import path from "node:path";
 import type { AgentTool, SettleToolCallResult } from "@earendil-works/pi-agent-core";
 import type { ActionKey } from "./common.ts";
 import { asRecord, contains, slash } from "./common.ts";
+import type {
+	ExecutionWorld,
+	ExecutionWorldMode,
+	WorldAdoptionMetrics,
+	WorldBranch,
+	WorldBranchState,
+	WorldExecutionMetrics,
+} from "./execution-world.ts";
 import { ResourceVersionManager, type ResourceVersionToken } from "./resource-version.ts";
 
 export interface SandboxFileChange {
@@ -24,24 +32,17 @@ interface RegularFileState {
 	readonly mode: number;
 }
 
-export interface SpeculativeSandboxExecution {
+export interface SandboxExecutionDelta {
 	readonly output: SettleToolCallResult;
 	readonly changes: readonly SandboxFileChange[];
-	readonly sandbox: "git_worktree";
-	readonly setupMs?: number;
-	readonly changeCollectionMs?: number;
-	commitMetrics?: SandboxCommitMetrics;
 }
 
-export interface SandboxCommitMetrics {
-	readonly durationMs: number;
-	readonly validationMs: number;
-	readonly bytesValidated: number;
-	readonly filesValidated: number;
-	readonly filesCommitted: number;
+interface WorkspaceExecutionSnapshot extends SandboxExecutionDelta {
+	readonly executionMetrics: WorldExecutionMetrics;
 }
 
 export interface SpeculativeSandboxExecuteContext {
+	readonly mode: ExecutionWorldMode;
 	readonly cwd: string;
 	readonly tool: AgentTool;
 	readonly toolName: string;
@@ -51,22 +52,7 @@ export interface SpeculativeSandboxExecuteContext {
 	readonly signal: AbortSignal;
 }
 
-export interface SpeculativeAgentSandbox {
-	/** Return true only when this instance can isolate the named tool. */
-	readonly supports: (toolName: string) => boolean;
-	/** Best-effort workspace/process warm-up used before a speculative action is concrete. */
-	readonly prepare?: (input: {
-		readonly cwd: string;
-		readonly tools: readonly string[];
-		readonly signal?: AbortSignal;
-	}) => Promise<void>;
-	/** Execute without changing the real workspace. */
-	readonly execute: (context: SpeculativeSandboxExecuteContext) => Promise<SpeculativeSandboxExecution>;
-	/** Revalidate and atomically adopt an execution, rolling back partial writes on failure. */
-	readonly adopt: (execution: SpeculativeSandboxExecution) => Promise<SettleToolCallResult>;
-	/** Release pooled workspace resources owned by this sandbox instance. */
-	readonly dispose?: () => Promise<void>;
-}
+export type SpeculativeAgentSandbox = ExecutionWorld<SpeculativeSandboxExecuteContext, SettleToolCallResult>;
 
 export interface SandboxProcessRunnerInput {
 	readonly command: string;
@@ -83,7 +69,7 @@ export type SandboxProcessRunner = (input: SandboxProcessRunnerInput) => Promise
 
 export interface WorkspaceSandboxOptions {
 	/**
-	 * Process isolation provider used for bash. The provider must prevent access to sourceRoot;
+	 * Process isolation provider used for workspace-snapshot actions. The provider must prevent access to sourceRoot;
 	 * a detached worktree alone is not a process security boundary.
 	 */
 	readonly processRunner?: SandboxProcessRunner;
@@ -153,33 +139,34 @@ const SANDBOX_AUTHOR_ENVIRONMENT = {
 	GIT_COMMITTER_EMAIL: "speculative-action@localhost",
 } as const;
 
-/** Create M4's private Git snapshot sandbox with transactional multi-file adoption. */
+/** Create a copy-on-write execution world with transactional multi-file adoption. */
 export function createWorkspaceSandbox(options: WorkspaceSandboxOptions = {}): SpeculativeAgentSandbox {
 	const roots = new Set<string>();
+	const supports = (mode: ExecutionWorldMode) =>
+		mode === "file_mutation" || (mode === "workspace_snapshot" && !!options.processRunner);
 	return {
-		supports: (toolName) =>
-			toolName === "write" || toolName === "edit" || (toolName === "bash" && !!options.processRunner),
-		prepare: async ({ cwd, tools, signal }) => {
-			const supported = tools.filter(
-				(toolName) =>
-					toolName === "write" || toolName === "edit" || (toolName === "bash" && !!options.processRunner),
-			);
-			if (!supported.length) return;
+		supports,
+		prepare: async ({ cwd, modes, signal }) => {
+			const supported = modes.filter(supports);
+			if (supported.length === 0) return;
 			roots.add(path.resolve(cwd));
 			await prepareSandboxWorkspace(cwd, { ...(options.gitBinary ? { gitBinary: options.gitBinary } : {}), signal });
-			if (supported.includes("bash") && options.prepareProcess) await options.prepareProcess({ signal });
+			if (supported.includes("workspace_snapshot") && options.prepareProcess)
+				await options.prepareProcess({ signal });
 		},
-		execute: async (context) => {
+		fork: async (context) => {
+			if (!supports(context.mode)) throw new Error(`Execution world does not support mode ${context.mode}`);
 			roots.add(path.resolve(context.cwd));
-			if (context.toolName === "write" || context.toolName === "edit") {
-				return executeMutation(context, options.gitBinary);
+			let snapshot: WorkspaceExecutionSnapshot;
+			if (context.mode === "file_mutation") {
+				snapshot = await executeMutation(context, options.gitBinary);
+			} else if (context.mode === "workspace_snapshot" && options.processRunner) {
+				snapshot = await executeWorkspaceSnapshot(context, options.processRunner, options.gitBinary, options.shell);
+			} else {
+				throw new Error(`Execution world does not support mode ${context.mode}`);
 			}
-			if (context.toolName === "bash" && options.processRunner) {
-				return executeBash(context, options.processRunner, options.gitBinary, options.shell);
-			}
-			throw new Error(`Sandbox does not support tool ${context.toolName}`);
+			return new GitWorldBranch(snapshot);
 		},
-		adopt: commitSandboxExecution,
 		dispose: async () => {
 			const ownedRoots = [...roots];
 			roots.clear();
@@ -188,7 +175,62 @@ export function createWorkspaceSandbox(options: WorkspaceSandboxOptions = {}): S
 	};
 }
 
-export async function commitSandboxExecution(execution: SpeculativeSandboxExecution): Promise<SettleToolCallResult> {
+class GitWorldBranch implements WorldBranch<SettleToolCallResult> {
+	readonly backend = "git_worktree" as const;
+	readonly output: SettleToolCallResult;
+	readonly resources: readonly string[];
+	readonly capturedBytes: number;
+	readonly executionMetrics: WorkspaceExecutionSnapshot["executionMetrics"];
+	private readonly changes: readonly SandboxFileChange[];
+	private stateValue: WorldBranchState = "ready";
+	private adoptionMetricsValue?: WorldAdoptionMetrics;
+	private adoption?: Promise<SettleToolCallResult>;
+
+	constructor(snapshot: WorkspaceExecutionSnapshot) {
+		this.output = snapshot.output;
+		this.changes = Object.freeze([...snapshot.changes]);
+		this.resources = Object.freeze([...new Set(this.changes.map((change) => change.resource))]);
+		this.capturedBytes = this.changes.reduce(
+			(total, change) => total + (change.before?.byteLength ?? 0) + (change.after?.byteLength ?? 0),
+			0,
+		);
+		this.executionMetrics = Object.freeze({ ...snapshot.executionMetrics });
+	}
+
+	get state(): WorldBranchState {
+		return this.stateValue;
+	}
+
+	get adoptionMetrics(): WorldAdoptionMetrics | undefined {
+		return this.adoptionMetricsValue;
+	}
+
+	readonly adopt = (): Promise<SettleToolCallResult> => {
+		if (this.adoption) return this.adoption;
+		this.stateValue = "adopting";
+		this.adoption = adoptSandboxExecution({ output: this.output, changes: this.changes }).then(
+			({ output, metrics }) => {
+				this.adoptionMetricsValue = metrics;
+				this.stateValue = "adopted";
+				return output;
+			},
+			(error) => {
+				this.stateValue = "failed";
+				throw error;
+			},
+		);
+		return this.adoption;
+	};
+}
+
+/** Low-level transactional adoption primitive for execution-world implementations. */
+export async function commitSandboxDelta(delta: SandboxExecutionDelta): Promise<SettleToolCallResult> {
+	return (await adoptSandboxExecution(delta)).output;
+}
+
+async function adoptSandboxExecution(
+	execution: SandboxExecutionDelta,
+): Promise<{ readonly output: SettleToolCallResult; readonly metrics: WorldAdoptionMetrics }> {
 	const started = performance.now();
 	const changes = deduplicateChanges(execution.changes);
 	return withTargetLocks(
@@ -201,7 +243,7 @@ export async function commitSandboxExecution(execution: SpeculativeSandboxExecut
 			const createdDirectories: string[] = [];
 			let bytesValidated = 0;
 			let validationMs = 0;
-			let filesCommitted = 0;
+			let resourcesAdopted = 0;
 			try {
 				for (const change of changes) await assertAdoptionTarget(change);
 				for (const change of changes) {
@@ -231,7 +273,7 @@ export async function commitSandboxExecution(execution: SpeculativeSandboxExecut
 					} else {
 						await rm(change.target, { force: true });
 					}
-					filesCommitted++;
+					resourcesAdopted++;
 				}
 			} catch (error) {
 				try {
@@ -250,14 +292,16 @@ export async function commitSandboxExecution(execution: SpeculativeSandboxExecut
 					[...staged.values()].map((temporary) => rm(temporary, { force: true }).catch(() => undefined)),
 				);
 			}
-			execution.commitMetrics = {
-				durationMs: Math.max(0, performance.now() - started),
-				validationMs,
-				bytesValidated,
-				filesValidated: changes.length,
-				filesCommitted,
+			return {
+				output: execution.output,
+				metrics: {
+					durationMs: Math.max(0, performance.now() - started),
+					validationMs,
+					bytesValidated,
+					resourcesValidated: changes.length,
+					resourcesAdopted,
+				},
 			};
-			return execution.output;
 		},
 	);
 }
@@ -294,7 +338,7 @@ export async function prepareSandboxWorkspace(
 async function executeMutation(
 	context: SpeculativeSandboxExecuteContext,
 	gitBinary?: string,
-): Promise<SpeculativeSandboxExecution> {
+): Promise<WorkspaceExecutionSnapshot> {
 	const args = asRecord(context.args);
 	if (!args || typeof args.path !== "string") throw new Error(`${context.toolName}.path must be a string`);
 	const sourceRoot = path.resolve(context.cwd);
@@ -325,23 +369,21 @@ async function executeMutation(
 				isError: false,
 			},
 			changes,
-			sandbox: "git_worktree",
-			setupMs,
-			changeCollectionMs,
+			executionMetrics: { setupMs, captureMs: changeCollectionMs },
 		};
 	});
 }
 
-async function executeBash(
+async function executeWorkspaceSnapshot(
 	context: SpeculativeSandboxExecuteContext,
 	runner: SandboxProcessRunner,
 	gitBinary?: string,
 	shell?: string,
-): Promise<SpeculativeSandboxExecution> {
+): Promise<WorkspaceExecutionSnapshot> {
 	const args = asRecord(context.args);
-	if (!args || typeof args.command !== "string") throw new Error("bash.command must be a string");
+	if (!args || typeof args.command !== "string") throw new Error(`${context.toolName}.command must be a string`);
 	if (args.timeout !== undefined && (typeof args.timeout !== "number" || !Number.isFinite(args.timeout))) {
-		throw new Error("bash.timeout must be a finite number");
+		throw new Error(`${context.toolName}.timeout must be a finite number`);
 	}
 	const sourceRoot = path.resolve(context.cwd);
 	const command = args.command;
@@ -362,9 +404,10 @@ async function executeBash(
 		return {
 			output: replacePaths(output, [[workspace.sandboxRoot, sourceRoot]]),
 			changes,
-			sandbox: "git_worktree",
-			setupMs,
-			changeCollectionMs: Math.max(0, performance.now() - collectionStarted),
+			executionMetrics: {
+				setupMs,
+				captureMs: Math.max(0, performance.now() - collectionStarted),
+			},
 		};
 	});
 }

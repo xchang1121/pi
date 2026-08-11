@@ -20,6 +20,7 @@ import {
 	PI_ACTION_SEMANTICS,
 	usageTokenCount,
 } from "./common.ts";
+import type { ExecutionWorldMode, WorldBranch } from "./execution-world.ts";
 import {
 	acquirePatternAwareStore,
 	asPatternAwareRuntimeContext,
@@ -54,7 +55,7 @@ import {
 	estimateValueBytes,
 	makeSpeculativeActionRuntime,
 } from "./runtime.ts";
-import type { SpeculativeAgentSandbox, SpeculativeSandboxExecution } from "./workspace-sandbox.ts";
+import type { SpeculativeAgentSandbox } from "./workspace-sandbox.ts";
 
 export interface SpeculativeAgentSettingsInput {
 	readonly enabled?: boolean;
@@ -171,7 +172,11 @@ export function installSpeculativeAction(
 	const previousActual = agent.actualToolCall;
 	const actionSemantics = options.actionSemantics ?? PI_ACTION_SEMANTICS;
 	const projectionRules = (options.projectionRules ?? []).filter((rule) => actionSemantics.supportsProjector(rule.id));
-	const sandboxExecutions = new WeakMap<SettleToolCallResult, SpeculativeSandboxExecution>();
+	const worldBranches = new WeakMap<SettleToolCallResult, WorldBranch<SettleToolCallResult>>();
+	const executionWorldMode = (tool: string): ExecutionWorldMode | undefined => {
+		const mode = actionSemantics.sandboxMode(tool);
+		return mode === "file_mutation" || mode === "workspace_snapshot" ? mode : undefined;
+	};
 	const patternActionSemantics = {
 		actionKey: (tool: string, input: Readonly<Record<string, unknown>>, schemaHash?: string) =>
 			actionSemantics.buildKey(tool, input, options.cwd, schemaHash),
@@ -250,11 +255,18 @@ export function installSpeculativeAction(
 		}
 	};
 	const prepareSandbox = async (tools: readonly string[], signal?: AbortSignal): Promise<void> => {
-		const supported = tools.filter((tool) => options.sandbox?.supports(tool));
-		if (!supported.length) return;
+		const modes = [
+			...new Set(
+				tools.flatMap((tool) => {
+					const mode = executionWorldMode(tool);
+					return mode && options.sandbox?.supports(mode) ? [mode] : [];
+				}),
+			),
+		];
+		if (!modes.length) return;
 		await options.sandbox?.prepare?.({
 			cwd: options.cwd,
-			tools: supported,
+			modes,
 			...(signal ? { signal } : {}),
 		});
 	};
@@ -502,7 +514,8 @@ export function installSpeculativeAction(
 			if (!tool || !options.preflight) return { ok: false, reason: "permission_or_policy" };
 			const args = validateCandidateArguments(tool, toolName, concrete, callID);
 			if (args === undefined) return { ok: false, reason: "invalid_tool_call_input" };
-			if (action.execution === "sandbox" && !options.sandbox?.supports(toolName)) {
+			const mode = executionWorldMode(toolName);
+			if (action.execution === "sandbox" && (!mode || !options.sandbox?.supports(mode))) {
 				return { ok: false, reason: "sandbox_unavailable" };
 			}
 			const result = await options.preflight({ tool, toolName, args, action, signal });
@@ -535,8 +548,10 @@ export function installSpeculativeAction(
 			const args = validateCandidateArguments(tool, toolName, concrete, callID);
 			if (args === undefined) return errorSettlement(`Invalid arguments for tool ${toolName}`);
 			if (action.execution === "sandbox") {
-				if (!options.sandbox?.supports(toolName)) throw new Error(`Sandbox unavailable for tool ${toolName}`);
-				const execution = await options.sandbox.execute({
+				const mode = executionWorldMode(toolName);
+				if (!mode || !options.sandbox?.supports(mode)) throw new Error(`Sandbox unavailable for tool ${toolName}`);
+				const branch = await options.sandbox.fork({
+					mode,
 					cwd: options.cwd,
 					tool,
 					toolName,
@@ -545,8 +560,8 @@ export function installSpeculativeAction(
 					callID,
 					signal,
 				});
-				sandboxExecutions.set(execution.output, execution);
-				return execution.output;
+				worldBranches.set(branch.output, branch);
+				return branch.output;
 			}
 			try {
 				return { result: await tool.execute(callID, args as never, signal), isError: false };
@@ -555,19 +570,16 @@ export function installSpeculativeAction(
 			}
 		},
 		candidateSizeBytes: ({ output }) => {
-			const execution = sandboxExecutions.get(output);
-			return (
-				estimateValueBytes(output) +
-				(execution?.changes.reduce(
-					(total, change) => total + (change.before?.byteLength ?? 0) + (change.after?.byteLength ?? 0),
-					0,
-				) ?? 0)
-			);
+			const branch = worldBranches.get(output);
+			return estimateValueBytes(output) + (branch?.capturedBytes ?? 0);
 		},
 		candidateExecutionMetrics: ({ output }) => {
-			const execution = sandboxExecutions.get(output);
-			return execution
-				? { sandboxSetupMs: execution.setupMs, changeCollectionMs: execution.changeCollectionMs }
+			const branch = worldBranches.get(output);
+			return branch
+				? {
+						sandboxSetupMs: branch.executionMetrics.setupMs,
+						changeCollectionMs: branch.executionMetrics.captureMs,
+					}
 				: {};
 		},
 		rejectCandidateOutput: ({ output }) => (output.isError ? "tool_error_result" : undefined),
@@ -579,16 +591,16 @@ export function installSpeculativeAction(
 		projectionRules,
 		adoptCandidate: async ({ action, candidate, output }) => {
 			if (action.execution !== "sandbox") return output;
-			const execution = sandboxExecutions.get(output);
-			if (!execution || !options.sandbox) return undefined;
+			const branch = worldBranches.get(output);
+			if (!branch || !options.sandbox) return undefined;
 			const started = performance.now();
 			try {
-				const adopted = await options.sandbox.adopt(execution);
-				candidate.commitMs = execution.commitMetrics?.durationMs ?? Math.max(0, performance.now() - started);
-				candidate.commitValidationMs = execution.commitMetrics?.validationMs;
-				candidate.commitValidationFiles = execution.commitMetrics?.filesValidated;
-				candidate.commitValidationBytes = execution.commitMetrics?.bytesValidated;
-				candidate.changedResources = execution.changes.map((change) => change.resource);
+				const adopted = await branch.adopt();
+				candidate.commitMs = branch.adoptionMetrics?.durationMs ?? Math.max(0, performance.now() - started);
+				candidate.commitValidationMs = branch.adoptionMetrics?.validationMs;
+				candidate.commitValidationFiles = branch.adoptionMetrics?.resourcesValidated;
+				candidate.commitValidationBytes = branch.adoptionMetrics?.bytesValidated;
+				candidate.changedResources = [...branch.resources];
 				return adopted;
 			} catch {
 				return undefined;
@@ -596,7 +608,8 @@ export function installSpeculativeAction(
 		},
 		prepareCandidate: async ({ candidate, signal }) => {
 			if (candidate.execution !== "sandbox" && actionSemantics.execution(candidate.tool) !== "sandbox") return;
-			if (!options.sandbox?.supports(candidate.tool)) throw new Error(`Sandbox unavailable for ${candidate.tool}`);
+			const mode = executionWorldMode(candidate.tool);
+			if (!mode || !options.sandbox?.supports(mode)) throw new Error(`Sandbox unavailable for ${candidate.tool}`);
 			await prepareSandbox([candidate.tool], signal);
 		},
 		onTurnStarted: async ({ startInput, settings, signal }) => {

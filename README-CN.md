@@ -169,6 +169,8 @@ export PI_SPECULATIVE_SANDBOX_NATIVE_BIN=/absolute/path/to/pi-sandbox-native
 - macOS：Seatbelt profile、源目录/用户目录/网络限制和进程树监管。
 - Windows：零 capability AppContainer、受限 token、私有 desktop 和 Job 管理。
 
+`ExecutionWorld` 是 Agent adapter 使用的隔离边界。`ActionSemanticsRegistry` 选择 world mode（`file_mutation` 或 `workspace_snapshot`），world 不再维护第二份硬编码工具列表。完成的 `WorldBranch` 会把工具输出和可提升的文件系统 delta 一起封存；进程内 cwd/环境状态以及被阻断的网络副作用不会被提升。并发消费者会合并到同一次经过冲突校验的事务式 adoption，而未被采用的 branch 无法改变 Actor 所在的 world。
+
 若 broker 缺失、版本不匹配、完整性校验失败或未明确证明进程隔离，Bash 投机会 fail closed，并回退到 Actor 的正常 Bash 执行。
 
 ## 如何判断功能是否生效
@@ -323,6 +325,6 @@ await installed.uninstall();
 
 ## 实现概览
 
-Actor 与 Drafter 并行运行，候选依次经过 schema 校验、preflight、资源版本捕获和执行策略选择。完成的候选进入带容量和内存上限的 session cache；Actor 发出工具调用时，Pi Agent 的 `settleToolCall` hook 尝试复用完全匹配或安全可投影的结果。PatternAware 按 workspace hash 持久化模板和有界 PPM 计数 trie，只保留少量预期收益最高的 beam；DAG 执行、新鲜度和资源调度仍由来源无关的 runtime 统一负责。
+Actor 与 Drafter 并行运行，候选依次经过 schema 校验、preflight、资源版本捕获和执行策略选择。完成的候选进入 `ResultCache` 或 `BranchStore`，隔离副作用由封存的 `WorldBranch` 表示；Actor 发出工具调用时，Pi Agent 的 `settleToolCall` hook 尝试复用完全匹配或安全可投影的结果。PatternAware 按 workspace hash 持久化模板和有界 PPM 计数 trie，只保留少量预期收益最高的 beam；DAG 执行、新鲜度和资源调度仍由来源无关的 runtime 统一负责。
 
 所有命中、未命中、取消、实际执行、草稿 token、缓存和沙箱阶段耗时均以 typed event 暴露，供实验记录与可视化使用。

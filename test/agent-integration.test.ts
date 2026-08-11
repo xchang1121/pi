@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
@@ -15,6 +15,7 @@ import { EventStream } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
 import { READ_RANGE_COVERAGE_DETAILS_KEY, type ReadRangeCoverage } from "../src/action-key-projection.ts";
+import { ActionSemanticsRegistry, PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { installSpeculativeAction, type SpeculativeAgentSettingsInput } from "../src/agent-integration.ts";
 import { PATTERN_AWARE_DEFAULTS, type PatternAwareEventInput, PatternAwareStore } from "../src/pattern-aware.ts";
 import { PI_READ_RANGE_PROJECTION_RULE } from "../src/pi-read-projection.ts";
@@ -203,10 +204,9 @@ describe("Pi Agent speculative integration", () => {
 		let disposeCalls = 0;
 		const sandbox: SpeculativeAgentSandbox = {
 			supports: () => false,
-			execute: async () => {
+			fork: async () => {
 				throw new Error("unused sandbox");
 			},
-			adopt: async (execution) => execution.output,
 			dispose: async () => {
 				disposeCalls++;
 				throw new Error("simulated cleanup failure");
@@ -715,7 +715,7 @@ describe("Pi Agent speculative integration", () => {
 		const root = await mkdtemp(path.join(os.tmpdir(), "pi-agent-spec-write-"));
 		try {
 			let executions = 0;
-			const preparedTools: string[][] = [];
+			const preparedModes: string[][] = [];
 			const tool: WriteTool = {
 				name: "write",
 				label: "Write",
@@ -743,7 +743,7 @@ describe("Pi Agent speculative integration", () => {
 			const sandbox = {
 				...baseSandbox,
 				prepare: async (input: Parameters<NonNullable<typeof baseSandbox.prepare>>[0]) => {
-					preparedTools.push([...input.tools]);
+					preparedModes.push([...input.modes]);
 					await baseSandbox.prepare?.(input);
 				},
 			};
@@ -761,7 +761,7 @@ describe("Pi Agent speculative integration", () => {
 			await agent.prompt("Create the file");
 
 			expect(executions).toBe(1);
-			expect(preparedTools.some((tools) => tools.includes("write"))).toBe(true);
+			expect(preparedModes.some((modes) => modes.includes("file_mutation"))).toBe(true);
 			expect(await readFile(path.join(root, "created.txt"), "utf8")).toBe("from speculation\n");
 			const result = agent.state.messages.find((message) => message.role === "toolResult");
 			expect(result?.role === "toolResult" ? result.content : undefined).toEqual([
@@ -772,6 +772,118 @@ describe("Pi Agent speculative integration", () => {
 			await rm(root, { recursive: true, force: true });
 		}
 	});
+
+	it("derives execution-world dispatch from custom action semantics instead of tool names", async () => {
+		const root = await mkdtemp(path.join(os.tmpdir(), "pi-agent-spec-custom-world-"));
+		try {
+			let executions = 0;
+			const tool: WriteTool = {
+				name: "custom_write",
+				label: "Custom write",
+				description: "Write through a custom action semantic",
+				parameters: writeSchema,
+				async execute(_callID, args) {
+					executions++;
+					await mkdir(path.dirname(path.resolve(root, args.path)), { recursive: true });
+					await writeFile(path.resolve(root, args.path), args.content, "utf8");
+					return { content: [{ type: "text", text: "custom write" }], details: { target: args.path } };
+				},
+			};
+			const args = { path: "custom.txt", content: "from custom semantics\n" };
+			const streams = createStreamHarness({
+				toolName: "custom_write",
+				toolArgs: args,
+				draftOnlyFirst: true,
+				actorDelayMs: 100,
+			});
+			const writeDefinition = PI_ACTION_SEMANTICS.definition("write");
+			if (!writeDefinition) throw new Error("write semantics unavailable");
+			const actionSemantics = new ActionSemanticsRegistry([
+				{ ...writeDefinition, tool: "custom_write", epoch: "test.custom-write.v1" },
+			]);
+			const agent = new Agent({ initialState: { model: createModel(), tools: [tool] }, streamFn: streams.stream });
+			const installed = installSpeculativeAction(agent, {
+				cwd: root,
+				actionSemantics,
+				getSettings: () => ({
+					enabled: true,
+					patternAware: { enabled: false },
+					tools: { resourceCached: [], sandbox: ["custom_write"] },
+				}),
+				preflight: () => true,
+				sandbox: createWorkspaceSandbox(),
+			});
+
+			await agent.prompt("Create the custom file");
+
+			expect(executions).toBe(1);
+			expect(await readFile(path.join(root, "custom.txt"), "utf8")).toBe("from custom semantics\n");
+			await installed.uninstall();
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("joins an in-flight world branch when the actor reaches the same action", async () => {
+		const root = await mkdtemp(path.join(os.tmpdir(), "pi-agent-spec-inflight-world-"));
+		const speculativeStarted = deferred<void>();
+		const releaseSpeculation = deferred<void>();
+		try {
+			let executions = 0;
+			const tool: WriteTool = {
+				name: "write",
+				label: "Write",
+				description: "Write a file",
+				parameters: writeSchema,
+				async execute(_callID, args) {
+					executions++;
+					if (path.isAbsolute(args.path)) {
+						speculativeStarted.resolve();
+						await releaseSpeculation.promise;
+					}
+					await writeFile(path.resolve(root, args.path), args.content, "utf8");
+					return { content: [{ type: "text", text: "joined write" }], details: { target: args.path } };
+				},
+			};
+			const args = { path: "joined.txt", content: "joined branch\n" };
+			const streams = createStreamHarness({
+				toolName: "write",
+				toolArgs: args,
+				draftOnlyFirst: true,
+				actorDelayMs: 25,
+			});
+			const events: SpeculativeActionEvent<string>[] = [];
+			const agent = new Agent({ initialState: { model: createModel(), tools: [tool] }, streamFn: streams.stream });
+			const installed = installSpeculativeAction(agent, {
+				cwd: root,
+				getSettings: () => ({
+					enabled: true,
+					patternAware: { enabled: false },
+					tools: { resourceCached: [], sandbox: ["write"] },
+				}),
+				preflight: () => true,
+				sandbox: createWorkspaceSandbox(),
+				onEvent: (event) => {
+					events.push(event);
+				},
+			});
+
+			const prompt = agent.prompt("Create the joined file");
+			await speculativeStarted.promise;
+			await new Promise((resolve) => setTimeout(resolve, 50));
+			await expect(stat(path.join(root, "joined.txt"))).rejects.toThrow();
+			releaseSpeculation.resolve();
+			await prompt;
+
+			expect(executions).toBe(1);
+			expect(await readFile(path.join(root, "joined.txt"), "utf8")).toBe("joined branch\n");
+			expect(events.some((event) => event.type === "hit" && event.waitedMs > 0)).toBe(true);
+			await installed.uninstall();
+		} finally {
+			releaseSpeculation.resolve();
+			await rm(root, { recursive: true, force: true });
+		}
+	}, 10_000);
 
 	it("falls back to the real write when sandbox adoption detects a base conflict", async () => {
 		const root = await mkdtemp(path.join(os.tmpdir(), "pi-agent-spec-conflict-"));
