@@ -8,7 +8,7 @@ This is tool-action speculation, not token-level LLM speculative decoding. It cu
 
 - `read`, `grep`, and `find`: result caching and reuse with resource-version validation.
 - `write` and `edit`: pre-execution in a private Git workspace, followed by transactional adoption on a hit.
-- `bash`: pre-execution in a private Git workspace and native process sandbox, followed by output reuse and change adoption on a hit.
+- `bash`: pre-execution in a private Git workspace and isolated OCI worker, followed by output reuse and change adoption on a hit.
 - PatternAware: learns historical tool sequences and predicts immediate or multi-step future actions.
 - Drafter: runs alongside the actor to propose candidates for the current turn.
 
@@ -61,7 +61,7 @@ Inside Pi, run:
 Once enabled, the footer shows information similar to:
 
 ```text
-spec: on · native · 3/4 hits · 1.2s saved · 5/512 cached
+spec: on · container · 3/4 hits · 1.2s saved · 5/512 cached
 ```
 
 Hit rate may be low on the first run or before PatternAware has learned a workflow. Complete several tasks with repeated `read`, `grep`, `find`, or `bash` sequences, then inspect `Hits`, `Saved`, and `End-to-end speedup` again.
@@ -74,7 +74,7 @@ Hit rate may be low on the first run or before PatternAware has learned a workfl
 | `/speculative-action on` | Enable speculative execution |
 | `/speculative-action off` | Disable speculative execution and use the baseline path |
 | `/speculative-action status` | Show configuration, sandbox health, hit counts, and timing metrics |
-| `/speculative-action refresh` | Probe the native Bash sandbox again and show its status |
+| `/speculative-action refresh` | Probe the configured Bash isolation backend again and show its status |
 | `/speculative-action reset` | Remove settings from the active scope and restore defaults; the default master switch is off |
 
 ## Defaults
@@ -95,8 +95,9 @@ The master switch is off by default. After `/speculative-action on`, the followi
 | Prediction timeout | 300 seconds | Maximum lifecycle of one prediction round |
 | Resource-cached tools | `read`, `grep`, `find` | Reusable after resource validation |
 | Sandbox-staged tools | `bash`, `write`, `edit` | Pre-executed in an isolated workspace |
+| Isolation backend | `auto` | Prefer an OCI worker; on Linux/macOS only, fall back to the native broker |
 
-`bash` is included in the default candidate tools, but speculative Bash execution only starts after the native process sandbox passes its health check. If the sandbox is unavailable, actor-requested Bash still runs through Pi's normal path.
+`bash` is included in the default candidate tools, but speculative Bash execution only starts after the selected process backend passes its health check. If isolation is unavailable, actor-requested Bash still runs through Pi's normal path.
 
 ## Configuration files
 
@@ -121,6 +122,11 @@ Complete example:
     "resourceCacheMaxBytes": 268435456,
     "predictionTimeoutMs": 300000,
     "adaptiveDrafter": true,
+    "isolation": {
+      "backend": "auto",
+      "runtime": "auto",
+      "image": "pi-speculative-worker:latest"
+    },
     "patternAware": {
       "enabled": true,
       "multiStepEnabled": true,
@@ -139,11 +145,13 @@ Omit `draftModel` to use the active actor model. To use another model, specify a
 
 ## Enable speculative Bash
 
-`write` and `edit` rely on private Git snapshot/worktree isolation. `bash` additionally requires native process isolation. This repository currently does not commit platform prebuilds, so build the Rust broker on each target machine before using speculative Bash:
+`write` and `edit` rely on private Git snapshot/worktree isolation. `bash` additionally requires process isolation. The preferred cross-platform backend is a persistent Docker or Podman worker pool. Build the bundled Linux worker image once:
 
 ```bash
-npm run build:native --workspace @earendil-works/pi-speculative-action
+npm run build:worker --workspace @earendil-works/pi-speculative-action
 ```
+
+Pi never pulls images implicitly. The default image is `pi-speculative-worker:latest`; select a different immutable image through the settings panel, JSON, or `PI_SPECULATIVE_WORKER_IMAGE`. `runtime: "auto"` probes Docker and then Podman, or set `PI_SPECULATIVE_WORKER_RUNTIME=podman`. Use `PI_SPECULATIVE_WORKER_RUNTIME_BIN` for an explicitly trusted runtime binary and `PI_SPECULATIVE_WORKER_SHELL` for a custom guest shell.
 
 Probe it again inside Pi:
 
@@ -154,24 +162,29 @@ Probe it again inside Pi:
 The status should contain:
 
 ```text
-Sandbox: native ready (...)
+Sandbox: container ready (...)
 ```
 
-To use an explicitly trusted broker built elsewhere, set:
+The worker pool keeps empty containers warm, but every speculative branch receives its own private workspace mount and disposable container. After each command, the complete container is removed and replaced before the slot is reused. This prevents an unadopted process tree, root-filesystem change, or temporary file from leaking into another branch. The source workspace is never mounted; only the branch copy is visible, with networking disabled. Linux workers additionally use a read-only root filesystem, dropped capabilities, `no-new-privileges`, a PID limit, and the host UID/GID when available.
+
+The bundled image uses Linux Bash and works through Docker Desktop on Windows as well as native Docker/Podman on Linux and macOS. If exact Git-for-Windows behavior is required, supply a Windows container image and set `guestShell` to `C:\\Program Files\\Git\\bin\\bash.exe`. The configured image ID, OS, architecture, runtime, and guest shell are part of K(a)'s execution-world fingerprint, so changing them invalidates prior speculative results.
+
+Linux and macOS may use the existing native broker as an explicit backend or automatic fallback. Build it with:
 
 ```bash
-export PI_SPECULATIVE_SANDBOX_NATIVE_BIN=/absolute/path/to/pi-sandbox-native
+npm run build:native --workspace @earendil-works/pi-speculative-action
 ```
 
-The native sandbox provides platform-specific isolation:
+To use an explicitly trusted broker built elsewhere, set `PI_SPECULATIVE_SANDBOX_NATIVE_BIN=/absolute/path/to/pi-sandbox-native` and select `backend: "native"`. The native sandbox provides:
 
 - Linux: namespaces, a read-only host mount, seccomp, capability removal, and process-tree supervision.
 - macOS: a Seatbelt profile, source/home/network restrictions, and process-tree supervision.
-- Windows: a zero-capability AppContainer, private desktop, process mitigations, and Job supervision.
+
+Windows does not automatically fall back to the native broker: mandatory AppContainer ASLR is incompatible with the fork model used by MSYS2/Git Bash. Use the OCI worker for speculative Bash on Windows.
 
 `ExecutionWorld` is the isolation boundary used by the Agent adapter. `ActionSemanticsRegistry` selects a world mode (`file_mutation` or `workspace_snapshot`); the world does not maintain a second hard-coded tool list. A completed `WorldBranch` seals the tool output and promotable filesystem delta together. Process-local cwd/environment state and blocked network effects are never promoted. Concurrent consumers join one conflict-checked, transactional adoption, while an unadopted branch cannot change the actor's world.
 
-If the broker is missing, incompatible, fails integrity validation, or does not attest process isolation, Bash speculation fails closed and the actor falls back to normal Bash execution.
+If no configured backend is ready, Bash speculation fails closed and the actor falls back to normal Bash execution.
 
 ## Verify that speculation is active
 
@@ -188,7 +201,7 @@ Run `/speculative-action status` and inspect these fields:
 | `End-to-end speedup` | Session metric computed from observed wall time and saved time |
 | `Draft tokens` | Total drafter token usage |
 | `Cache` | Current entries, capacity, memory, and in-flight jobs |
-| `Sandbox` | Whether native Bash isolation is ready |
+| `Sandbox` | Whether the configured Bash isolation backend is ready |
 
 To establish real performance impact, compare paired baseline/full wall-clock measurements under the same tasks, model, and environment. Do not infer end-to-end acceleration from `Saved` alone.
 
@@ -261,7 +274,7 @@ Use an independent Pi state directory or clear PatternAware learning state betwe
 - Adoption validates every base file again. Any resource change rejects the commit.
 - Changes are applied as a complete set, and already-written paths are rolled back if a later write fails.
 - Workspace escapes and symlink paths fail closed.
-- Bash requires native process isolation. Copying a directory alone is not considered a security boundary.
+- Bash requires an attested process-isolation backend. Copying a directory alone is not considered a security boundary.
 
 ## SDK integration
 
@@ -269,7 +282,7 @@ You can install the feature directly on an `Agent` without using the coding-agen
 
 ```ts
 import {
-  createNativeSandboxProcessRunner,
+  createContainerSandboxProcessBackend,
   createWorkspaceSandbox,
   installSpeculativeAction,
 } from "@earendil-works/pi-speculative-action";
@@ -302,7 +315,7 @@ const installed = installSpeculativeAction(agent, {
   }),
   preflight: ({ toolName }) => allowedTools.has(toolName),
   sandbox: createWorkspaceSandbox({
-    processRunner: createNativeSandboxProcessRunner(),
+    processBackend: createContainerSandboxProcessBackend(),
   }),
   onEvent: (event) => console.debug(event),
 });
@@ -316,7 +329,7 @@ If the Drafter uses a different provider from the actor, use `getDraftOptions` t
 ## Troubleshooting
 
 - `Enabled: Off`: run `/speculative-action on`.
-- `Sandbox: bash unavailable`: build the native broker, then run `/speculative-action refresh`.
+- `Sandbox: bash unavailable`: build the worker image, confirm Docker or Podman can inspect it, then run `/speculative-action refresh`.
 - Enabled but no candidates: verify project trust and Drafter authentication, and make sure the Drafter and PatternAware are not both disabled.
 - Candidates but no hits: the predicted tool name and normalized arguments must match the actor call; resource changes also invalidate candidates.
 - No early PatternAware benefit: it needs repeated workflows before it can learn useful templates; cold starts rely mainly on the Drafter.

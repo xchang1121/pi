@@ -5,6 +5,8 @@ import { describe, expect, test } from "vitest";
 import {
 	acquirePatternAwareStore,
 	captureResourceVersion,
+	createContainerSandboxProcessBackend,
+	createFallbackSandboxProcessBackend,
 	createWorkspaceSandbox,
 	installSpeculativeAction,
 	makeSpeculativeActionRuntime,
@@ -23,6 +25,8 @@ describe("speculative action package boundary", () => {
 			acquirePatternAwareStore,
 			captureResourceVersion,
 			releaseResourceVersion,
+			createContainerSandboxProcessBackend,
+			createFallbackSandboxProcessBackend,
 			createWorkspaceSandbox,
 			prepareSandboxWorkspace,
 		]) {
@@ -36,7 +40,7 @@ describe("speculative action package boundary", () => {
 			files: string[];
 		};
 		expect(Object.keys(manifest.exports).sort()).toEqual([".", "./package.json"]);
-		expect(manifest.files).toEqual(expect.arrayContaining(["dist", "native/sandbox"]));
+		expect(manifest.files).toEqual(expect.arrayContaining(["dist", "native/sandbox", "native/worker"]));
 
 		const agentManifest = JSON.parse(
 			await fs.readFile(path.join(workspaceRoot, "packages/agent/package.json"), "utf8"),

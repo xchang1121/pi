@@ -100,7 +100,7 @@ class ContainerSandboxBackend implements SandboxProcessBackend {
 	constructor(options: ContainerSandboxOptions) {
 		this.options = options;
 		this.invoke = options.invoker ?? invokeContainerRuntime;
-		this.maxWorkers = Math.max(1, Math.min(32, Math.floor(options.maxWorkers ?? 1)));
+		this.maxWorkers = Math.max(1, Math.min(32, Math.floor(options.maxWorkers ?? 8)));
 	}
 
 	readonly check = async (input: { readonly refresh?: boolean } = {}): Promise<SandboxProcessBackendStatus> => {
@@ -369,7 +369,7 @@ async function probeRuntime(
 		try {
 			const version = await invoke({
 				binaryPath: candidate.binaryPath,
-				args: ["version", "--format", "{{.Server.Version}}"],
+				args: ["version"],
 				timeoutMs: CHECK_TIMEOUT_MS,
 				maxOutputBytes: LIFECYCLE_OUTPUT_BYTES,
 			});

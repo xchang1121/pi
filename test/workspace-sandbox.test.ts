@@ -9,6 +9,7 @@ import { buildPiActionKey } from "../src/common.ts";
 import {
 	closeWorkspaceSandboxPools,
 	commitSandboxDelta,
+	createFallbackSandboxProcessBackend,
 	createWorkspaceSandbox,
 	prepareSandboxWorkspace,
 	type SandboxProcessBackend,
@@ -68,6 +69,48 @@ const bashTool: AgentTool<typeof bashParameters> = {
 };
 
 describe("workspace ExecutionWorld", () => {
+	it("selects one ready process backend and delegates its complete lifecycle", async () => {
+		const calls: string[] = [];
+		const unavailable: SandboxProcessBackend = {
+			...testProcessBackend(async () => settlement("unused")),
+			check: async () => ({ backend: "first", state: "unavailable", source: "test", detail: "first failed" }),
+			dispose: async () => {
+				calls.push("dispose:first");
+			},
+		};
+		const ready: SandboxProcessBackend = {
+			...testProcessBackend(
+				async () => settlement("unused"),
+				async () => {
+					calls.push("prepare:second");
+				},
+			),
+			check: async () => ({
+				backend: "second",
+				state: "ready",
+				source: "test",
+				detail: "second ready",
+				fingerprint: "second:v1",
+			}),
+			fingerprint: async () => {
+				calls.push("fingerprint:second");
+				return "second:v1";
+			},
+			dispose: async () => {
+				calls.push("dispose:second");
+			},
+		};
+		const backend = createFallbackSandboxProcessBackend([unavailable, ready]);
+
+		expect(await backend.check()).toMatchObject({ backend: "second", state: "ready" });
+		expect(await backend.fingerprint()).toBe("second:v1");
+		await backend.prepare({});
+		await backend.dispose();
+		await backend.dispose();
+
+		expect(calls).toEqual(["fingerprint:second", "prepare:second", "dispose:first", "dispose:second"]);
+	});
+
 	it("stages write output without touching the workspace and adopts after base validation", async () => {
 		const root = await mkdtemp(path.join(os.tmpdir(), "pi-spec-write-test-"));
 		try {

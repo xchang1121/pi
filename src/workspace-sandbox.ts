@@ -103,6 +103,55 @@ export interface WorkspaceSandboxOptions {
 	readonly gitBinary?: string;
 }
 
+/** Select the first ready process backend once, keeping Scheduler and tool semantics backend-agnostic. */
+export function createFallbackSandboxProcessBackend(backends: readonly SandboxProcessBackend[]): SandboxProcessBackend {
+	let selection:
+		| Promise<{ readonly backend: SandboxProcessBackend; readonly status: SandboxProcessBackendStatus }>
+		| undefined;
+	let disposed = false;
+	const select = (refresh = false) => {
+		if (refresh) selection = undefined;
+		selection ??= (async () => {
+			const failures: string[] = [];
+			for (const backend of backends) {
+				const status = await backend.check({ refresh });
+				if (status.state === "ready") return { backend, status };
+				failures.push(status.detail);
+			}
+			throw new Error(failures.join("; ") || "No speculative process backend is configured.");
+		})();
+		return selection;
+	};
+	return {
+		check: async ({ refresh = false } = {}) => {
+			try {
+				return (await select(refresh)).status;
+			} catch (error) {
+				return {
+					backend: "workspace",
+					state: "unavailable",
+					source: "none",
+					detail: error instanceof Error ? error.message : String(error),
+				};
+			}
+		},
+		fingerprint: async () => (await select()).backend.fingerprint(),
+		prepare: async (input) => {
+			if (disposed) throw new Error("Speculative process backend is disposed.");
+			await (await select()).backend.prepare(input);
+		},
+		open: async (input) => {
+			if (disposed) throw new Error("Speculative process backend is disposed.");
+			return (await select()).backend.open(input);
+		},
+		dispose: async () => {
+			if (disposed) return;
+			disposed = true;
+			await Promise.all(backends.map((backend) => backend.dispose()));
+		},
+	};
+}
+
 export interface SandboxWorkspaceContext {
 	readonly sourceRoot: string;
 	readonly sandboxRoot: string;

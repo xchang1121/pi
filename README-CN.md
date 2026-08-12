@@ -8,7 +8,7 @@ Pi 的工具动作投机执行功能。它在 Actor 模型思考期间预测接�
 
 - `read`、`grep`、`find`：资源版本校验后的结果缓存与复用。
 - `write`、`edit`：在私有 Git 工作区预执行，命中后事务式提交变更。
-- `bash`：在私有 Git 工作区和原生进程沙箱中预执行，命中后复用输出并提交变更。
+- `bash`：在私有 Git 工作区和隔离 OCI worker 中预执行，命中后复用输出并提交变更。
 - PatternAware：从历史工具序列学习模板，并预测未来一步或多步动作。
 - Drafter：与 Actor 并行调用模型，生成当前回合的候选动作。
 
@@ -61,7 +61,7 @@ npm run hydrate:model-data
 成功开启后，底部状态栏会出现类似信息：
 
 ```text
-spec: on · native · 3/4 hits · 1.2s saved · 5/512 cached
+spec: on · container · 3/4 hits · 1.2s saved · 5/512 cached
 ```
 
 首次运行或模板尚未学习时，命中率可能较低。完成若干包含重复 `read`、`grep`、`find` 或 `bash` 工作流的任务后，再观察 `Hits`、`Saved` 和 `End-to-end speedup`。
@@ -74,7 +74,7 @@ spec: on · native · 3/4 hits · 1.2s saved · 5/512 cached
 | `/speculative-action on` | 开启投机执行 |
 | `/speculative-action off` | 关闭投机执行，作为 baseline |
 | `/speculative-action status` | 查看配置、沙箱健康状态、命中和时间指标 |
-| `/speculative-action refresh` | 重新探测原生 Bash 沙箱并显示状态 |
+| `/speculative-action refresh` | 重新探测已配置的 Bash 隔离后端并显示状态 |
 | `/speculative-action reset` | 删除当前作用域配置，恢复默认值；默认总开关为关闭 |
 
 ## 默认配置
@@ -95,8 +95,9 @@ spec: on · native · 3/4 hits · 1.2s saved · 5/512 cached
 | Prediction timeout | 300 秒 | 单轮预测生命周期上限 |
 | Resource-cached tools | `read`, `grep`, `find` | 资源校验后可复用 |
 | Sandbox-staged tools | `bash`, `write`, `edit` | 在隔离工作区中预执行 |
+| Isolation backend | `auto` | 优先使用 OCI worker；仅在 Linux/macOS 上回退原生 broker |
 
-`bash` 默认在候选工具列表中，但只有原生进程沙箱健康检查通过后才会投机执行。沙箱不可用时，Actor 发出的 Bash 仍按 Pi 原生路径正常运行。
+`bash` 默认在候选工具列表中，但只有所选进程后端健康检查通过后才会投机执行。隔离不可用时，Actor 发出的 Bash 仍按 Pi 原生路径正常运行。
 
 ## 配置文件
 
@@ -121,6 +122,11 @@ spec: on · native · 3/4 hits · 1.2s saved · 5/512 cached
     "resourceCacheMaxBytes": 268435456,
     "predictionTimeoutMs": 300000,
     "adaptiveDrafter": true,
+    "isolation": {
+      "backend": "auto",
+      "runtime": "auto",
+      "image": "pi-speculative-worker:latest"
+    },
     "patternAware": {
       "enabled": true,
       "multiStepEnabled": true,
@@ -139,11 +145,13 @@ spec: on · native · 3/4 hits · 1.2s saved · 5/512 cached
 
 ## 启用 Bash 投机
 
-`write` 和 `edit` 依靠私有 Git snapshot/worktree 隔离；`bash` 还必须具备原生进程隔离。仓库当前没有提交平台预编译资产，因此首次使用 Bash 投机前，需要在目标机器构建 Rust broker：
+`write` 和 `edit` 依靠私有 Git snapshot/worktree 隔离；`bash` 还必须具备进程隔离。推荐的跨平台后端是持久化 Docker/Podman worker 池。先构建一次仓库内置的 Linux worker 镜像：
 
 ```bash
-npm run build:native --workspace @earendil-works/pi-speculative-action
+npm run build:worker --workspace @earendil-works/pi-speculative-action
 ```
+
+Pi 不会隐式拉取镜像。默认镜像是 `pi-speculative-worker:latest`；可以通过设置面板、JSON 或 `PI_SPECULATIVE_WORKER_IMAGE` 选择其他不可变镜像。`runtime: "auto"` 会先探测 Docker、再探测 Podman；也可以设置 `PI_SPECULATIVE_WORKER_RUNTIME=podman`。`PI_SPECULATIVE_WORKER_RUNTIME_BIN` 用于指定明确受信任的 runtime 可执行文件，`PI_SPECULATIVE_WORKER_SHELL` 用于指定 guest shell。
 
 然后在 Pi 中重新检查：
 
@@ -154,24 +162,29 @@ npm run build:native --workspace @earendil-works/pi-speculative-action
 状态中应出现：
 
 ```text
-Sandbox: native ready (...)
+Sandbox: container ready (...)
 ```
 
-如果需要使用自行构建且明确受信任的 broker，可以设置：
+worker 池会保持空容器处于 warm 状态，但每个投机 branch 都拥有独立工作区挂载和一次性容器。每条命令结束后会删除整个容器，并在复用 slot 前创建新容器，因此未采纳的进程树、根文件系统修改和临时文件不会泄漏到其他 branch。源工作区从不挂载进容器；worker 只能看到 branch 副本，且网络被禁用。Linux worker 还使用只读根文件系统、删除全部 capability、`no-new-privileges`、PID 上限，并在可用时使用宿主 UID/GID。
+
+内置镜像运行 Linux Bash，可通过 Windows 上的 Docker Desktop，以及 Linux/macOS 上的 Docker/Podman 使用。如果必须精确复现 Git for Windows 行为，可提供 Windows 容器镜像，并把 `guestShell` 设置为 `C:\\Program Files\\Git\\bin\\bash.exe`。配置的镜像 ID、OS、架构、runtime 和 guest shell 都会进入 K(a) 的 execution-world fingerprint，改变任一项都会使旧投机结果失效。
+
+Linux 和 macOS 可以显式使用现有原生 broker，也可以在 `auto` 下把它作为回退。构建命令为：
 
 ```bash
-export PI_SPECULATIVE_SANDBOX_NATIVE_BIN=/absolute/path/to/pi-sandbox-native
+npm run build:native --workspace @earendil-works/pi-speculative-action
 ```
 
-原生沙箱按平台提供以下隔离：
+若使用在别处构建且明确受信任的 broker，设置 `PI_SPECULATIVE_SANDBOX_NATIVE_BIN=/absolute/path/to/pi-sandbox-native` 并选择 `backend: "native"`。原生沙箱提供：
 
 - Linux：namespace、只读宿主挂载、seccomp、capability 移除和进程树监管。
 - macOS：Seatbelt profile、源目录/用户目录/网络限制和进程树监管。
-- Windows：零 capability AppContainer、受限 token、私有 desktop 和 Job 管理。
+
+Windows 不会自动回退原生 broker：AppContainer 强制 ASLR 与 MSYS2/Git Bash 使用的 fork 模型不兼容。在 Windows 上应使用 OCI worker 执行 Bash 投机。
 
 `ExecutionWorld` 是 Agent adapter 使用的隔离边界。`ActionSemanticsRegistry` 选择 world mode（`file_mutation` 或 `workspace_snapshot`），world 不再维护第二份硬编码工具列表。完成的 `WorldBranch` 会把工具输出和可提升的文件系统 delta 一起封存；进程内 cwd/环境状态以及被阻断的网络副作用不会被提升。并发消费者会合并到同一次经过冲突校验的事务式 adoption，而未被采用的 branch 无法改变 Actor 所在的 world。
 
-若 broker 缺失、版本不匹配、完整性校验失败或未明确证明进程隔离，Bash 投机会 fail closed，并回退到 Actor 的正常 Bash 执行。
+若所有已配置后端都不可用，Bash 投机会 fail closed，并回退到 Actor 的正常 Bash 执行。
 
 ## 如何判断功能是否生效
 
@@ -188,7 +201,7 @@ export PI_SPECULATIVE_SANDBOX_NATIVE_BIN=/absolute/path/to/pi-sandbox-native
 | `End-to-end speedup` | 根据观测墙钟时间和 saved 时间计算的会话内指标 |
 | `Draft tokens` | Drafter 累计 token 用量 |
 | `Cache` | 当前缓存项、容量、内存占用和运行中任务数 |
-| `Sandbox` | Bash 原生隔离是否可用 |
+| `Sandbox` | 已配置的 Bash 隔离后端是否可用 |
 
 判断真实收益时，应以相同任务、模型和环境下的 baseline/full 配对墙钟时间为准，不应只根据 `Saved` 推断端到端加速。
 
@@ -261,7 +274,7 @@ export PI_SPECULATIVE_SANDBOX_NATIVE_BIN=/absolute/path/to/pi-sandbox-native
 - 命中时会再次逐文件校验 base 内容；任何资源变化都会拒绝提交。
 - 提交变更采用完整 change set，部分写入失败时回滚已经写入的路径。
 - 路径逃逸和 symlink 路径 fail closed。
-- Bash 必须通过原生进程隔离，单纯复制目录不被视为安全边界。
+- Bash 必须通过可证明的进程隔离后端，单纯复制目录不被视为安全边界。
 
 ## SDK 集成
 
@@ -269,7 +282,7 @@ export PI_SPECULATIVE_SANDBOX_NATIVE_BIN=/absolute/path/to/pi-sandbox-native
 
 ```ts
 import {
-  createNativeSandboxProcessRunner,
+  createContainerSandboxProcessBackend,
   createWorkspaceSandbox,
   installSpeculativeAction,
 } from "@earendil-works/pi-speculative-action";
@@ -302,7 +315,7 @@ const installed = installSpeculativeAction(agent, {
   }),
   preflight: ({ toolName }) => allowedTools.has(toolName),
   sandbox: createWorkspaceSandbox({
-    processRunner: createNativeSandboxProcessRunner(),
+    processBackend: createContainerSandboxProcessBackend(),
   }),
   onEvent: (event) => console.debug(event),
 });
@@ -316,7 +329,7 @@ await installed.uninstall();
 ## 故障排查
 
 - `Enabled: Off`：运行 `/speculative-action on`。
-- `Sandbox: bash unavailable`：构建 native broker，然后运行 `/speculative-action refresh`。
+- `Sandbox: bash unavailable`：构建 worker 镜像，确认 Docker 或 Podman 可以 inspect 该镜像，然后运行 `/speculative-action refresh`。
 - 已开启但一直没有候选：确认项目已信任、Drafter 已认证，并检查是否关闭了 Drafter 和 PatternAware。
 - 有候选但没有命中：预测动作必须与 Actor 的工具名和规范化参数匹配；资源变化也会让候选失效。
 - PatternAware 初期没有效果：它需要先观察重复工作流；冷启动阶段主要依赖 Drafter。
