@@ -21,13 +21,16 @@ afterEach(async () => {
 	await closeWorkspaceSandboxPools();
 });
 
+function directoryLink(target: string, link: string): Promise<void> {
+	return symlink(target, link, process.platform === "win32" ? "junction" : "dir");
+}
+
 const writeParameters = Type.Object({ path: Type.String(), content: Type.String() });
 const editParameters = Type.Object({
 	path: Type.String(),
 	edits: Type.Array(Type.Object({ oldText: Type.String(), newText: Type.String() })),
 });
 const bashParameters = Type.Object({ command: Type.String(), timeout: Type.Optional(Type.Number()) });
-const itWithSymlink = process.platform === "win32" ? it.skip : it;
 const itWithPosixShell = process.platform === "win32" ? it.skip : it;
 
 const writeTool: AgentTool<typeof writeParameters> = {
@@ -534,11 +537,11 @@ describe("workspace ExecutionWorld", () => {
 		});
 	}
 
-	itWithSymlink("fails closed on source symlinks before invoking a mutation tool", async () => {
+	it("fails closed on source symlinks before invoking a mutation tool", async () => {
 		const root = await mkdtemp(path.join(os.tmpdir(), "pi-spec-symlink-test-"));
 		const outside = await mkdtemp(path.join(os.tmpdir(), "pi-spec-symlink-outside-"));
 		try {
-			await symlink(outside, path.join(root, "linked"), "dir");
+			await directoryLink(outside, path.join(root, "linked"));
 			const args = { path: "linked/out.txt", content: "no" };
 			await expect(
 				createWorkspaceSandbox().fork({
@@ -559,12 +562,15 @@ describe("workspace ExecutionWorld", () => {
 		}
 	});
 
-	itWithSymlink("rejects a symlink created inside the staged workspace", async () => {
+	it("rejects a symlink created inside the staged workspace", async () => {
 		const root = await mkdtemp(path.join(os.tmpdir(), "pi-spec-created-symlink-test-"));
 		try {
 			const sandbox = createWorkspaceSandbox({
 				processBackend: testProcessBackend(async ({ cwd }) => {
-					await symlink("missing-target", path.join(cwd, "created-link"));
+					await mkdir(path.join(cwd, "new-directory"));
+					const target = path.join(cwd, "link-target");
+					if (process.platform === "win32") await mkdir(target);
+					await directoryLink(target, path.join(cwd, "new-directory", "created-link"));
 					return settlement("created symlink");
 				}),
 			});
@@ -785,14 +791,13 @@ describe("workspace ExecutionWorld", () => {
 		}
 	});
 
-	itWithPosixShell(
-		"batches large incremental path lists before invoking git add",
-		async () => {
-			const root = await mkdtemp(path.join(os.tmpdir(), "pi-spec-path-batch-test-"));
-			const wrapper = path.join(root, "git-wrapper");
-			try {
+	it("batches large incremental path lists before invoking git add", async () => {
+		const root = await mkdtemp(path.join(os.tmpdir(), "pi-spec-path-batch-test-"));
+		const gitBinary = process.platform === "win32" ? "git" : path.join(root, "git-wrapper");
+		try {
+			if (process.platform !== "win32") {
 				await writeFile(
-					wrapper,
+					gitBinary,
 					[
 						"#!/bin/sh",
 						"bytes=0",
@@ -810,29 +815,28 @@ describe("workspace ExecutionWorld", () => {
 					].join("\n"),
 					"utf8",
 				);
-				await chmod(wrapper, 0o700);
-				const files = Array.from(
-					{ length: 700 },
-					(_, index) => `files/path-${String(index).padStart(4, "0")}-${"deliberately-long-".repeat(4)}name.txt`,
-				);
-				await mkdir(path.join(root, "files"));
-				await Promise.all(files.map((file) => writeFile(path.join(root, file), "before\n")));
-				await prepareSandboxWorkspace(root, { gitBinary: wrapper });
-				await Promise.all(files.map((file) => writeFile(path.join(root, file), "after\n")));
-
-				await withSandboxWorkspace(
-					root,
-					async (workspace) => {
-						expect(await readFile(path.join(workspace.sandboxRoot, files.at(-1)!), "utf8")).toBe("after\n");
-					},
-					wrapper,
-				);
-			} finally {
-				await rm(root, { recursive: true, force: true });
+				await chmod(gitBinary, 0o700);
 			}
-		},
-		15_000,
-	);
+			const files = Array.from(
+				{ length: 700 },
+				(_, index) => `files/path-${String(index).padStart(4, "0")}-${"deliberately-long-".repeat(4)}name.txt`,
+			);
+			await mkdir(path.join(root, "files"));
+			await Promise.all(files.map((file) => writeFile(path.join(root, file), "before\n")));
+			await prepareSandboxWorkspace(root, { gitBinary });
+			await Promise.all(files.map((file) => writeFile(path.join(root, file), "after\n")));
+
+			await withSandboxWorkspace(
+				root,
+				async (workspace) => {
+					expect(await readFile(path.join(workspace.sandboxRoot, files.at(-1)!), "utf8")).toBe("after\n");
+				},
+				gitBinary,
+			);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	}, 15_000);
 
 	itWithPosixShell("retries incremental staging when an untracked file disappears during git add", async () => {
 		const root = await mkdtemp(path.join(os.tmpdir(), "pi-spec-transient-path-test-"));

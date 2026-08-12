@@ -21,6 +21,11 @@ import {
 	patternPlanActionID,
 	type SpeculativeAgentSettingsInput,
 } from "../src/agent-integration.ts";
+import {
+	type ContainerRuntimeInvocation,
+	type ContainerRuntimeInvocationResult,
+	createContainerSandboxProcessBackend,
+} from "../src/container-sandbox.ts";
 import { PATTERN_AWARE_DEFAULTS, type PatternAwareEventInput, PatternAwareStore } from "../src/pattern-aware.ts";
 import { PI_READ_RANGE_PROJECTION_RULE } from "../src/pi-read-projection.ts";
 import type { SpeculativeActionEvent } from "../src/runtime.ts";
@@ -1078,6 +1083,89 @@ describe("Pi Agent speculative integration", () => {
 		expect(events).toContainEqual(expect.objectContaining({ type: "hit", source: "pattern_aware" }));
 		await installed.uninstall();
 	});
+
+	it("deduplicates Drafter and PatternAware Bash through the OCI workspace backend", async () => {
+		const root = await mkdtemp(path.join(os.tmpdir(), "pi-agent-container-sources-"));
+		try {
+			const command = "printf speculative-container";
+			const store = new PatternAwareStore(PATTERN_AWARE_DEFAULTS);
+			for (const sessionID of ["container-one", "container-two", "container-three", "container-four"]) {
+				store.observe(patternInput(sessionID, "grep", { pattern: "container" }, ["README.md"]));
+				store.observeTurn({ sessionID, turnID: `${sessionID}:turn`, phase: "start", model: "openai/mock" });
+				store.observe(patternInput(sessionID, "bash", { command }));
+			}
+			const calls: ContainerRuntimeInvocation[] = [];
+			const backend = createContainerSandboxProcessBackend({
+				runtime: "docker",
+				invoker: async (input) => {
+					calls.push(input);
+					if (input.args[0] === "version") return containerResult("25.0");
+					if (input.args[0] === "image") return containerResult("sha256:worker|linux|x86_64");
+					return containerResult(input.args[0] === "exec" ? "speculative-container" : "");
+				},
+			});
+			const bashSchema = Type.Object({ command: Type.String() });
+			let actorExecutions = 0;
+			const tool: AgentTool<typeof bashSchema> = {
+				name: "bash",
+				label: "Bash",
+				description: "Run Bash",
+				parameters: bashSchema,
+				resolveInvocation: ({ command: resolvedCommand }) => ({
+					executor: "pi.bash.local.v2",
+					process: {
+						command: resolvedCommand,
+						cwd: root,
+						environment: { PATH: "C:\\Program Files\\Git\\usr\\bin" },
+						shell: "C:\\Program Files\\Git\\bin\\bash.exe",
+						shellArgs: ["-c"],
+						commandTransport: "argv",
+					},
+				}),
+				async execute() {
+					actorExecutions++;
+					return { content: [{ type: "text", text: "actor fallback" }], details: undefined };
+				},
+			};
+			const events: SpeculativeActionEvent<string>[] = [];
+			const streams = createStreamHarness({
+				toolName: "bash",
+				toolArgs: { command },
+				actorDelayMs: 1_500,
+				draftOnlyFirst: true,
+			});
+			const agent = new Agent({ initialState: { model: createModel(), tools: [tool] }, streamFn: streams.stream });
+			const installed = installSpeculativeAction(agent, {
+				cwd: root,
+				patternStore: store,
+				getSettings: () => ({ enabled: true, tools: { resourceCached: [], sandbox: ["bash"] } }),
+				preflight: () => true,
+				sandbox: createWorkspaceSandbox({ processBackend: backend }),
+				onEvent: (event) => {
+					events.push(event);
+				},
+			});
+			try {
+				store.observe(patternInput(installed.sessionID, "grep", { pattern: "container" }, ["README.md"]));
+
+				await agent.prompt("Run the container command");
+
+				expect(actorExecutions).toBe(0);
+				expect(calls.filter((call) => call.args[0] === "exec")).toHaveLength(1);
+				expect(events).toContainEqual(
+					expect.objectContaining({ type: "hit", sources: expect.arrayContaining(["drafter", "pattern_aware"]) }),
+				);
+				const result = agent.state.messages.find((message) => message.role === "toolResult");
+				expect(result?.role === "toolResult" ? result.content : undefined).toEqual([
+					{ type: "text", text: "speculative-container" },
+				]);
+			} finally {
+				await installed.uninstall();
+			}
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
 });
 
 function trainPattern(store: PatternAwareStore, sessionID: string, path: string): void {
@@ -1101,6 +1189,10 @@ function patternInput(
 		durationMs: 10,
 		...(outputPaths ? { outputPaths } : {}),
 	};
+}
+
+function containerResult(output: string): ContainerRuntimeInvocationResult {
+	return { exitCode: 0, stdout: output, stderr: "", output, timedOut: false, truncated: false };
 }
 
 function deferred<T>(): { readonly promise: Promise<T>; readonly resolve: (value: T) => void } {

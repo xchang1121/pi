@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
-import { chmod, type FileHandle, lstat, mkdir, mkdtemp, open, rename, rm, rmdir } from "node:fs/promises";
+import { chmod, type FileHandle, lstat, mkdir, mkdtemp, open, readdir, rename, rm, rmdir } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { AgentTool, AgentToolInvocation, SettleToolCallResult } from "@earendil-works/pi-agent-core";
@@ -1008,6 +1008,16 @@ async function collectSandboxChanges(workspace: PrivateGitWorkspace): Promise<re
 		["-C", workspace.sandboxRoot, "ls-files", "--others", "-z", "--"],
 		workspace.sandboxRoot,
 	);
+	if (process.platform === "win32") {
+		const untrackedRoots = await git(
+			workspace.gitBinary,
+			["-C", workspace.sandboxRoot, "ls-files", "--others", "--directory", "-z", "--"],
+			workspace.sandboxRoot,
+		);
+		for (const resource of parseNullList(untrackedRoots)) {
+			if (slash(resource).endsWith("/")) await assertNoDirectoryLinks(workspace.sandboxRoot, resource);
+		}
+	}
 	const resources = [...new Set([...parseNullList(tracked), ...parseNullList(untracked)])]
 		.filter((resource) => !isSnapshotExcluded(slash(resource)))
 		.sort();
@@ -1094,6 +1104,19 @@ async function assertNoSymlinkPath(root: string, target: string): Promise<void> 
 			if (isMissing(error)) break;
 			throw error;
 		}
+	}
+}
+
+async function assertNoDirectoryLinks(root: string, relative: string): Promise<void> {
+	const normalized = slash(relative).replace(/\/+$/, "");
+	if (!normalized || isSnapshotExcluded(normalized)) return;
+	const target = path.resolve(root, normalized);
+	await assertNoSymlinkPath(root, target);
+	for (const entry of await readdir(target, { withFileTypes: true })) {
+		const child = slash(path.join(normalized, entry.name));
+		if (isSnapshotExcluded(child)) continue;
+		if (entry.isSymbolicLink()) throw new Error(`sandbox path contains symlink: ${child}`);
+		if (entry.isDirectory()) await assertNoDirectoryLinks(root, child);
 	}
 }
 
