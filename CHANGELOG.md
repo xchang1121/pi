@@ -10,11 +10,12 @@
 
 ### Added
 
-- Added a speculative tool runtime with Pi Agent integration, conservative action keys, resource validation, lifecycle events, and running or ready result reuse.
+- Added a speculative tool runtime with a host adapter, conservative action keys, resource validation, lifecycle events, and running or ready result reuse.
 - Added canonical sandbox keys, an explicit sandbox host boundary, temporary `write`/`edit` execution, verified adoption, and opt-in bash process execution.
 - Added private Git worktree snapshots, multi-file bash change capture, transactional adoption with rollback, and normalized cache/actual telemetry.
 - Added a source-built Rust sandbox backend for Linux, macOS, and Windows, plus a versioned TypeScript broker, hash-verified packaged asset discovery, and fail-closed native process execution.
-- Added coding-agent host integration support for persistent settings, native health reporting, and runtime event status.
+- Added an installable zero-modification Pi package that uses public lifecycle events, same-name tool overrides, public stock tool factories, and package-owned settings.
+- Added a hierarchical Pi TUI for prediction, scheduling/cache, tool policy, and isolation, with configured, active, OCI, and native backend health reported separately.
 - Added PatternAware online action-pattern learning with late-bound templates, future-gap leases, compact persistence, preparation hints, and utility-based resource scheduling.
 - Added gap-weighted and decayed PatternAware inference, suffix backoff, collection mappers, retryable persisted analyzers, multi-step frontiers, and adaptive drafter suppression.
 - Added watcher-backed resource versions with exact-validation fallback, eager invalidation, byte-bounded per-session caches, pooled Git workspaces, and phase-level runtime metrics.
@@ -25,7 +26,7 @@
 
 ### Changed
 
-- Read projection now reuses the shared agent-core truncation implementation and compact, in-memory coverage descriptors; projected single-flight reuse also requires explicit opt-in.
+- Read projection now reuses Pi coding-agent's public truncation contract and compact, in-memory coverage descriptors; projected single-flight reuse also requires explicit opt-in.
 - Workspace adoption now serializes overlapping targets, uses staged atomic replacement, preserves file modes, and removes newly created directories during rollback.
 - Drafter candidates now reuse exact and containing-read cache entries, deduplicate in-flight work, and replace stale resource entries before execution.
 - Resource candidates now use probation/protected, value-aware eviction, and sandbox failures fall back without mutating the real workspace.
@@ -39,6 +40,9 @@
 ### Fixed
 
 - Tool error settlements are discarded before they can become reusable speculative cache entries.
-- Agent uninstall now releases owned workspace sandbox pools immediately instead of retaining Windows file watchers until the idle timeout.
-- Native release manifests and smoke requests now use protocol v3 and verify the isolation attestation.
+- Package shutdown now releases owned workspace sandbox pools immediately instead of retaining Windows file watchers until the idle timeout.
+- Native release manifests and smoke requests now use protocol v4 and verify the isolation attestation.
 - Shell dispatch recognizes Windows-style executable paths even when protocol tests run on a non-Windows host.
+- Missing Docker or Podman no longer produces a global sandbox warning when the native fallback is ready.
+- Cache lookup, telemetry, and speculative cleanup failures can no longer replace an authoritative stock Pi tool result.
+- Same-name tools registered during normal extension initialization now remain authoritative and are excluded from speculation regardless of load order; stock tool renderers are preserved for both TUI and HTML output.

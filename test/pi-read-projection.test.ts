@@ -1,8 +1,8 @@
-import type { SettleToolCallResult } from "@earendil-works/pi-agent-core";
 import { describe, expect, it } from "vitest";
 import { READ_RANGE_COVERAGE_DETAILS_KEY, type ReadRangeCoverage } from "../src/action-key-projection.ts";
 import { actionKeyMatch, buildPiActionKey } from "../src/common.ts";
 import { PI_READ_RANGE_PROJECTION_RULE } from "../src/pi-read-projection.ts";
+import type { ToolSettlement } from "../src/tool-settlement.ts";
 
 const cwd = "/workspace";
 
@@ -34,7 +34,7 @@ function coverage(
 	};
 }
 
-function settlement(snapshot?: unknown, text = "speculative output", isError = false): SettleToolCallResult {
+function settlement(snapshot?: unknown, text = "speculative output", isError = false): ToolSettlement {
 	return {
 		result: {
 			content: [{ type: "text", text }],
@@ -48,14 +48,14 @@ function coveredSettlement(
 	lines: readonly string[],
 	options: Parameters<typeof coverage>[1] = {},
 	isError = false,
-): SettleToolCallResult {
+): ToolSettlement {
 	return settlement(coverage(lines, options), lines.join("\n"), isError);
 }
 
 async function project(
 	speculative: ReturnType<typeof readKey>,
 	actor: ReturnType<typeof readKey>,
-	output: SettleToolCallResult,
+	output: ToolSettlement,
 ) {
 	const keyMatch = actionKeyMatch(speculative, actor, [PI_READ_RANGE_PROJECTION_RULE]);
 	if (keyMatch?.kind !== "projected") throw new Error("Expected a projected read-key match");
@@ -70,7 +70,7 @@ async function project(
 	});
 }
 
-function outputText(output: SettleToolCallResult | undefined): string | undefined {
+function outputText(output: ToolSettlement | undefined): string | undefined {
 	const content = output?.result.content[0];
 	return content?.type === "text" ? content.text : undefined;
 }

@@ -2511,7 +2511,11 @@ describe("speculative action runtime", () => {
 
 	it("falls back when candidate execution fails", async () => {
 		const harness = createHarness({
-			predict: () => prediction(readCandidate()),
+			settings: {
+				...enabledSettings,
+				tools: { resourceCached: [], sandbox: ["bash"] },
+			},
+			predict: () => prediction(bashCandidate("git status")),
 			execute: () => {
 				throw new Error("candidate failed");
 			},
@@ -2519,7 +2523,7 @@ describe("speculative action runtime", () => {
 		await harness.runtime.startTurn({ sessionID: "session", turnID: "turn-1" });
 		await waitFor(() => harness.runtime.inspect().pendingPredictions === 0);
 
-		expect(await harness.runtime.consume(consume("turn-1"))).toBeUndefined();
+		expect(await harness.runtime.consume(consumeTool("turn-1", "bash", { command: "git status" }))).toBeUndefined();
 		expect(
 			harness.events.some((event) => event.type === "cancelled" && event.reason === "candidate_execution_failed"),
 		).toBe(true);

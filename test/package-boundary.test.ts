@@ -7,8 +7,9 @@ import {
 	captureResourceVersion,
 	createContainerSandboxProcessBackend,
 	createFallbackSandboxProcessBackend,
+	createSpeculativeActionExtension,
+	createSpeculativeActionHost,
 	createWorkspaceSandbox,
-	installSpeculativeAction,
 	makeSpeculativeActionRuntime,
 	prepareSandboxWorkspace,
 	releaseResourceVersion,
@@ -21,7 +22,8 @@ describe("speculative action package boundary", () => {
 	test("exports the runtime, integration, learning, resource, and sandbox entry points", () => {
 		for (const exported of [
 			makeSpeculativeActionRuntime,
-			installSpeculativeAction,
+			createSpeculativeActionHost,
+			createSpeculativeActionExtension,
 			acquirePatternAwareStore,
 			captureResourceVersion,
 			releaseResourceVersion,
@@ -34,13 +36,21 @@ describe("speculative action package boundary", () => {
 		}
 	});
 
-	test("publishes one package entry point without coupling agent-core back to speculation", async () => {
+	test("publishes an installable Pi extension without coupling Pi core back to speculation", async () => {
 		const manifest = JSON.parse(await fs.readFile(path.join(packageRoot, "package.json"), "utf8")) as {
 			exports: Record<string, unknown>;
 			files: string[];
+			pi?: { extensions?: string[] };
+			peerDependencies?: Record<string, string>;
 		};
-		expect(Object.keys(manifest.exports).sort()).toEqual([".", "./package.json"]);
+		expect(Object.keys(manifest.exports).sort()).toEqual([".", "./extension", "./package.json"]);
 		expect(manifest.files).toEqual(expect.arrayContaining(["dist", "native/sandbox", "native/worker"]));
+		expect(manifest.pi?.extensions).toEqual(["./dist/extension.js"]);
+		expect(manifest.peerDependencies).toMatchObject({
+			"@earendil-works/pi-agent-core": "*",
+			"@earendil-works/pi-ai": "*",
+			"@earendil-works/pi-coding-agent": "*",
+		});
 
 		const agentManifest = JSON.parse(
 			await fs.readFile(path.join(workspaceRoot, "packages/agent/package.json"), "utf8"),
@@ -50,17 +60,14 @@ describe("speculative action package boundary", () => {
 		expect(agentSources).not.toContain("@earendil-works/pi-speculative-action");
 	});
 
-	test("keeps the coding-agent adapter on the public package API", async () => {
-		const sources = await Promise.all(
-			[
-				"packages/coding-agent/src/core/settings-manager.ts",
-				"packages/coding-agent/src/extensions/speculative-action/index.ts",
-			].map((file) => fs.readFile(path.join(workspaceRoot, file), "utf8")),
-		);
-		const combined = sources.join("\n");
-		expect(combined).toContain('from "@earendil-works/pi-speculative-action"');
-		expect(combined).not.toMatch(/pi-speculative-action\//);
-		expect(combined).not.toContain("packages/speculative-action/src");
+	test("leaves the upstream coding-agent source and manifest unaware of speculation", async () => {
+		const codingSources = await readTypeScript(path.join(workspaceRoot, "packages/coding-agent/src"));
+		expect(codingSources).not.toContain("pi-speculative-action");
+		expect(codingSources).not.toContain("speculative-action");
+		const codingManifest = JSON.parse(
+			await fs.readFile(path.join(workspaceRoot, "packages/coding-agent/package.json"), "utf8"),
+		) as { dependencies?: Record<string, string> };
+		expect(codingManifest.dependencies).not.toHaveProperty("@earendil-works/pi-speculative-action");
 	});
 });
 

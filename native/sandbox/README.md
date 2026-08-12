@@ -2,18 +2,16 @@
 
 This crate is the source-built process-isolation backend for the
 `@earendil-works/pi-speculative-action` package. It implements one versioned
-JSON protocol on the platforms where a compact native boundary is available:
+JSON protocol on every supported platform:
 
 - Linux: user, mount, network, PID, IPC, and UTS namespaces; a read-only host
   view; a writable staged workspace; seccomp; capability removal; and
   process-tree supervision.
 - macOS: an in-process Seatbelt profile with source/home/network denial,
   staged-workspace writes, and process-tree supervision.
-
-Windows uses the package's OCI worker backend. AppContainer mandatory ASLR is
-incompatible with the fork model used by MSYS2/Git Bash, so retaining a second
-Windows-native implementation would not satisfy the Bash tool's execution
-contract.
+- Windows: a per-user, zero-capability AppContainer; package-SID access only
+  to the staged workspace; a private desktop; process mitigations; explicit
+  handle inheritance; and kill-on-close Jobs.
 
 The package build helper compiles this crate, hashes the result, and records a
 platform asset in `prebuilds/manifest.json`. The TypeScript broker verifies
@@ -37,3 +35,8 @@ cargo test --manifest-path native/sandbox/Cargo.toml --all-targets
 
 Set `PI_NATIVE_SANDBOX_REQUIRED=1` to make platform integration tests fail
 instead of skip when the host cannot provide its native isolation API.
+
+The Windows backend deliberately passes the configured shell and command
+through without a Git Bash allowlist. Commands that work inside AppContainer
+can be adopted; process-start or MSYS fork failures are ordinary failed
+speculative candidates and are discarded by the Scheduler.

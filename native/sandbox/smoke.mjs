@@ -2,10 +2,17 @@ import { spawn } from "node:child_process";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 const binaryArgument = process.argv.find((argument) => argument.startsWith("--binary="));
-if (!binaryArgument) throw new Error("usage: node smoke.mjs --binary=FILE");
-const binary = path.resolve(binaryArgument.slice("--binary=".length));
+const binary = binaryArgument
+	? path.resolve(binaryArgument.slice("--binary=".length))
+	: path.join(
+			path.dirname(fileURLToPath(import.meta.url)),
+			"target",
+			"release",
+			process.platform === "win32" ? "pi-sandbox-native.exe" : "pi-sandbox-native",
+		);
 const protocolVersion = 4;
 const check = await invoke(["--native-sandbox", "check"]);
 if (check.status !== 0 || check.json.version !== protocolVersion || check.json.ready !== true) {

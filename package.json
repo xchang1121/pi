@@ -1,7 +1,7 @@
 {
 	"name": "@earendil-works/pi-speculative-action",
 	"version": "0.84.1",
-	"description": "Speculative tool pre-execution runtime and Pi Agent integration",
+	"description": "Zero-modification speculative-action package for Pi",
 	"type": "module",
 	"main": "./dist/index.js",
 	"types": "./dist/index.d.ts",
@@ -10,13 +10,23 @@
 			"types": "./dist/index.d.ts",
 			"import": "./dist/index.js"
 		},
+		"./extension": {
+			"types": "./dist/extension.d.ts",
+			"import": "./dist/extension.js"
+		},
 		"./package.json": "./package.json"
+	},
+	"pi": {
+		"extensions": [
+			"./dist/extension.js"
+		]
 	},
 	"files": [
 		"dist",
 		"native/sandbox",
 		"native/worker",
 		"README.md",
+		"README-CN.md",
 		"CHANGELOG.md"
 	],
 	"scripts": {
@@ -29,9 +39,10 @@
 		"test": "vitest --run",
 		"prepublishOnly": "npm run clean && npm run build"
 	},
-	"dependencies": {
-		"@earendil-works/pi-agent-core": "^0.84.1",
-		"@earendil-works/pi-ai": "^0.84.1"
+	"peerDependencies": {
+		"@earendil-works/pi-agent-core": "*",
+		"@earendil-works/pi-ai": "*",
+		"@earendil-works/pi-coding-agent": "*"
 	},
 	"devDependencies": {
 		"@types/node": "24.12.4",
@@ -40,6 +51,7 @@
 		"vitest": "4.1.9"
 	},
 	"keywords": [
+		"pi-package",
 		"ai",
 		"agent",
 		"speculative-execution",

@@ -12,10 +12,13 @@ const targets = [
 	{ platform: "linux", arch: "arm64", libc: "gnu", directory: "linux-arm64-gnu" },
 	{ platform: "darwin", arch: "x64", directory: "darwin-x64" },
 	{ platform: "darwin", arch: "arm64", directory: "darwin-arm64" },
+	{ platform: "win32", arch: "x64", directory: "win32-x64" },
+	{ platform: "win32", arch: "arm64", directory: "win32-arm64" },
 ];
 const assets = [];
 for (const target of targets) {
-	const file = `${target.directory}/pi-sandbox-native`;
+	const executable = target.platform === "win32" ? "pi-sandbox-native.exe" : "pi-sandbox-native";
+	const file = `${target.directory}/${executable}`;
 	const absolute = path.join(assetRoot, file);
 	if (!(await isFile(absolute))) {
 		if (allowPartial) continue;

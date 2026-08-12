@@ -1,16 +1,6 @@
 import { createHash } from "node:crypto";
-import type {
-	ActualToolCallContext,
-	Agent,
-	AgentTool,
-	AgentToolCall,
-	AgentToolInvocation,
-	AgentToolResult,
-	SettleToolCallContext,
-	SettleToolCallResult,
-	StreamFn,
-} from "@earendil-works/pi-agent-core";
-import type { Api, Context, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
+import type { AgentTool, AgentToolCall, AgentToolResult } from "@earendil-works/pi-agent-core";
+import type { Api, AssistantMessage, Context, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
 import { validateToolArguments } from "@earendil-works/pi-ai";
 import type { ActionProjectionRule } from "./action-key-projection.ts";
 import type { ActionKey, ActionSemanticsRegistry } from "./common.ts";
@@ -51,6 +41,7 @@ import type {
 	SpeculativePlanSource,
 } from "./runtime.ts";
 import { candidateExecutionMs, candidateToolNames, makeSpeculativeActionRuntime } from "./runtime.ts";
+import type { ToolInvocation, ToolSettlement } from "./tool-settlement.ts";
 import type { SpeculativeAgentSandbox } from "./workspace-sandbox.ts";
 
 export interface SpeculativeAgentSettingsInput {
@@ -84,7 +75,7 @@ export interface DraftOptionsContext {
 	readonly signal: AbortSignal;
 }
 
-export interface InstallSpeculativeActionOptions {
+export interface CreateSpeculativeActionHostOptions {
 	/** Workspace root used for action canonicalization and resource validation. */
 	readonly cwd: string;
 	/** Runtime settings. The feature remains disabled when omitted. */
@@ -93,6 +84,13 @@ export interface InstallSpeculativeActionOptions {
 	readonly draftModel?: Model<Api> | ((actorModel: Model<Api>) => Model<Api> | Promise<Model<Api>>);
 	/** Resolve drafter request options, including credentials when using a different provider. */
 	readonly getDraftOptions?: (context: DraftOptionsContext) => SimpleStreamOptions | Promise<SimpleStreamOptions>;
+	/** Provider completion used by the drafter. */
+	readonly complete: (model: Model<Api>, context: Context, options?: SimpleStreamOptions) => Promise<AssistantMessage>;
+	/** Resolve the concrete executor identity used by both speculative and actor calls. */
+	readonly resolveInvocation?: (
+		tool: string,
+		input: unknown,
+	) => ToolInvocation | undefined | Promise<ToolInvocation | undefined>;
 	/**
 	 * Non-interactive permission and policy check for speculative execution.
 	 * Candidates are rejected when this callback is absent.
@@ -103,7 +101,7 @@ export interface InstallSpeculativeActionOptions {
 	/** Canonical K(a), reuse, projection, versioning, and sandbox policy for this host. */
 	readonly actionSemantics?: ActionSemanticsRegistry;
 	/** Lossless Π rules; each rule owns key relation, realized coverage, and output reconstruction. */
-	readonly projectionRules?: readonly ActionProjectionRule<SettleToolCallResult>[];
+	readonly projectionRules?: readonly ActionProjectionRule<ToolSettlement>[];
 	/** Required capability for every tool configured under tools.sandbox. */
 	readonly sandbox?: SpeculativeAgentSandbox;
 	/** Optional persistence root for workspace-hashed PatternAware state. */
@@ -111,6 +109,27 @@ export interface InstallSpeculativeActionOptions {
 	/** Optional injected store, primarily for embedding and deterministic tests. */
 	readonly patternStore?: PatternAwareStore | Promise<PatternAwareStore>;
 	readonly onEvent?: (event: SpeculativeActionEvent<string>) => void | Promise<void>;
+}
+
+export interface SpeculativeActionHost {
+	readonly sessionID: string;
+	readonly runtime: SpeculativeActionRuntime<
+		string,
+		ToolSettlement,
+		AgentStartInput,
+		AgentConsumeInput,
+		AgentConsumeInput
+	>;
+	readonly startTurn: (input: Omit<AgentStartInput, "sessionID">, signal?: AbortSignal) => Promise<void>;
+	readonly consume: (
+		input: Omit<AgentConsumeInput, "sessionID">,
+		signal?: AbortSignal,
+	) => Promise<ToolSettlement | undefined>;
+	readonly actual: (
+		input: Omit<AgentConsumeInput, "sessionID"> & { readonly durationMs: number; readonly output?: ToolSettlement },
+	) => Promise<void>;
+	readonly finishTurn: (turnID: string, terminal?: boolean) => Promise<void>;
+	readonly dispose: () => Promise<void>;
 }
 
 interface AgentStartInput {
@@ -128,6 +147,7 @@ interface AgentConsumeInput {
 	readonly id?: string;
 	readonly tool: string;
 	readonly args: unknown;
+	readonly tools: readonly AgentTool[];
 	readonly terminal?: boolean;
 }
 
@@ -136,36 +156,17 @@ interface AgentStateData {
 	readonly schemaHashes: Readonly<Record<string, string>>;
 }
 
-export interface InstalledSpeculativeAction {
-	readonly sessionID: string;
-	readonly runtime: SpeculativeActionRuntime<
-		string,
-		SettleToolCallResult,
-		AgentStartInput,
-		AgentConsumeInput,
-		AgentConsumeInput
-	>;
-	readonly uninstall: () => Promise<void>;
-}
-
 export function patternPlanActionID(actionIdentity: string, parentActionID = "root"): string {
 	return `pattern:${stableHash({ actionIdentity, parentActionID }).slice(0, 16)}`;
 }
 
 /**
- * Install source-neutral speculative plan execution on an Agent.
- *
- * The installer wraps the actor stream to start the drafter concurrently and composes with any
- * existing settlement hook. Call `uninstall()` before discarding the Agent.
+ * Build source-neutral speculative plan execution for a host. The host owns lifecycle and tool interception.
  */
-export function installSpeculativeAction(
-	agent: Agent,
-	options: InstallSpeculativeActionOptions,
-): InstalledSpeculativeAction {
-	const sessionID = agent.sessionId ?? `pi_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
-	const baseStream = agent.streamFunction;
-	const previousSettlement = agent.settleToolCall;
-	const previousActual = agent.actualToolCall;
+export function createSpeculativeActionHost(
+	sessionID: string,
+	options: CreateSpeculativeActionHostOptions,
+): SpeculativeActionHost {
 	const actionSemantics = options.actionSemantics ?? PI_ACTION_SEMANTICS;
 	const projectionRules = (options.projectionRules ?? []).filter((rule) => actionSemantics.supportsProjector(rule.id));
 	const executionWorldMode = (tool: string): ExecutionWorldMode | undefined => {
@@ -260,7 +261,7 @@ export function installSpeculativeAction(
 	};
 	type AgentPlanSource = SpeculativePlanSource<
 		string,
-		SettleToolCallResult,
+		ToolSettlement,
 		AgentStartInput,
 		AgentConsumeInput,
 		AgentStateData
@@ -320,7 +321,7 @@ export function installSpeculativeAction(
 						sessionId: `${sessionID}:speculative`,
 					};
 			const enabledTools = new Set(candidateNames);
-			const stream = await baseStream(
+			const message = await options.complete(
 				draftModel,
 				{
 					systemPrompt: [
@@ -334,10 +335,6 @@ export function installSpeculativeAction(
 				},
 				{ ...configuredDraftOptions, signal },
 			);
-			for await (const _event of stream) {
-				// Draining drives every StreamFn implementation to its terminal event.
-			}
-			const message = await stream.result();
 			if (message.stopReason === "error" || message.stopReason === "aborted") {
 				throw new Error(message.errorMessage ?? `Drafter stopped with ${message.stopReason}`);
 			}
@@ -468,7 +465,7 @@ export function installSpeculativeAction(
 
 	const runtime = makeSpeculativeActionRuntime<
 		string,
-		SettleToolCallResult,
+		ToolSettlement,
 		AgentStartInput,
 		AgentConsumeInput,
 		AgentConsumeInput,
@@ -489,7 +486,7 @@ export function installSpeculativeAction(
 			let tool: AgentTool | undefined;
 			let validated: unknown;
 			if (context.type === "consume") {
-				tool = agent.state.tools.find((candidate) => candidate.name === toolName);
+				tool = context.consumeInput.tools.find((candidate) => candidate.name === toolName);
 				validated = input;
 			} else {
 				tool = context.data.tools.get(toolName);
@@ -498,10 +495,10 @@ export function installSpeculativeAction(
 				if (validated === undefined) return undefined;
 			}
 			if (!tool) return undefined;
-			let invocation: AgentToolInvocation | undefined;
+			let invocation: ToolInvocation | undefined;
 			let worldFingerprint: string | undefined;
 			try {
-				invocation = await tool.resolveInvocation?.(validated as never);
+				invocation = await options.resolveInvocation?.(toolName, validated);
 				const mode = actionSemantics.sandboxMode(toolName);
 				if (mode && mode !== "none" && options.sandbox?.fingerprint) {
 					worldFingerprint = await options.sandbox.fingerprint(mode);
@@ -534,7 +531,7 @@ export function installSpeculativeAction(
 			if (action.execution === "sandbox" && (!mode || !options.sandbox?.supports(mode))) {
 				return { ok: false, reason: "sandbox_unavailable" };
 			}
-			if (mode === "workspace_snapshot" && !asAgentToolInvocation(action.executionContext)?.process) {
+			if (mode === "workspace_snapshot" && !asToolInvocation(action.executionContext)?.process) {
 				return { ok: false, reason: "execution_context_unavailable" };
 			}
 			const result = await options.preflight({ tool, toolName, args, action, signal });
@@ -576,7 +573,7 @@ export function installSpeculativeAction(
 					toolName,
 					args,
 					action,
-					invocation: asAgentToolInvocation(action.executionContext),
+					invocation: asToolInvocation(action.executionContext),
 					callID,
 					signal,
 				});
@@ -641,106 +638,17 @@ export function installSpeculativeAction(
 		onEvent: options.onEvent,
 	});
 
-	let currentTurnID: string | undefined;
-	let turnSequence = 0;
-	const wrappedStream: StreamFn = async (model, context, actorOptions) => {
-		const turnID = `turn_${++turnSequence}`;
-		currentTurnID = turnID;
-		try {
-			await runtime.startTurn(
-				{
-					sessionID,
-					turnID,
-					actorModel: model,
-					context,
-					actorOptions,
-					tools: agent.state.tools.slice(),
-				},
-				actorOptions?.signal,
-			);
-		} catch {
-			// Speculation is optional; the actor request must remain available.
-		}
-		return baseStream(model, context, actorOptions);
-	};
-
-	const installedSettlement = async (
-		context: SettleToolCallContext,
-		signal?: AbortSignal,
-	): Promise<SettleToolCallResult | undefined> => {
-		const previous = await previousSettlement?.(context, signal);
-		if (previous) return previous;
-		if (!currentTurnID) return undefined;
-		return runtime.consume(
-			{
-				sessionID,
-				turnID: currentTurnID,
-				id: context.toolCall.id,
-				tool: context.toolCall.name,
-				args: context.args,
-			},
-			signal,
-		);
-	};
-
-	const installedActual = async (context: ActualToolCallContext, signal?: AbortSignal): Promise<void> => {
-		try {
-			await previousActual?.(context, signal);
-		} catch {
-			// Telemetry observers compose independently.
-		}
-		if (!currentTurnID) return;
-		try {
-			await runtime.actual({
-				sessionID,
-				turnID: currentTurnID,
-				id: context.toolCall.id,
-				tool: context.toolCall.name,
-				args: context.args,
-				durationMs: context.durationMs,
-				output: { result: context.result, isError: context.isError },
-			});
-		} catch {
-			// Speculative telemetry must never alter real tool execution.
-		}
-	};
-
-	agent.streamFunction = wrappedStream;
-	agent.settleToolCall = installedSettlement;
-	agent.actualToolCall = installedActual;
-	let lastTurnID: string | undefined;
-	const unsubscribe = agent.subscribe(async (event) => {
-		if (event.type === "turn_end" && currentTurnID) {
-			const finishedTurnID = currentTurnID;
-			currentTurnID = undefined;
-			lastTurnID = finishedTurnID;
-			await runtime.finishTurn({ sessionID, turnID: finishedTurnID, tool: "", args: {} });
-			return;
-		}
-		if (event.type !== "agent_end") return;
-		const terminalTurnID = currentTurnID ?? lastTurnID;
-		currentTurnID = undefined;
-		lastTurnID = undefined;
-		if (terminalTurnID) {
-			await runtime.finishTurn({
-				sessionID,
-				turnID: terminalTurnID,
-				tool: "",
-				args: {},
-				terminal: true,
-			});
-		}
-		await finishPatternSession();
-	});
-
 	return {
 		sessionID,
 		runtime,
-		uninstall: async () => {
-			unsubscribe();
-			if (agent.streamFunction === wrappedStream) agent.streamFunction = baseStream;
-			if (agent.settleToolCall === installedSettlement) agent.settleToolCall = previousSettlement;
-			if (agent.actualToolCall === installedActual) agent.actualToolCall = previousActual;
+		startTurn: (input, signal) => runtime.startTurn({ ...input, sessionID }, signal),
+		consume: (input, signal) => runtime.consume({ ...input, sessionID }, signal),
+		actual: (input) => runtime.actual({ ...input, sessionID }),
+		finishTurn: async (turnID, terminal = false) => {
+			await runtime.finishTurn({ sessionID, turnID, tool: "", args: {}, tools: [], terminal });
+			if (terminal) await finishPatternSession();
+		},
+		dispose: async () => {
 			try {
 				await runtime.releaseSession(sessionID);
 				await finishPatternSession();
@@ -765,9 +673,9 @@ export function installSpeculativeAction(
 	};
 }
 
-function asAgentToolInvocation(value: unknown): AgentToolInvocation | undefined {
+function asToolInvocation(value: unknown): ToolInvocation | undefined {
 	if (!value || typeof value !== "object" || typeof (value as { executor?: unknown }).executor !== "string") return;
-	return value as AgentToolInvocation;
+	return value as ToolInvocation;
 }
 
 function validateCandidateArguments(
@@ -790,7 +698,7 @@ function validateCandidateArguments(
 	}
 }
 
-function errorSettlement(message: string): SettleToolCallResult {
+function errorSettlement(message: string): ToolSettlement {
 	const result: AgentToolResult<unknown> = {
 		content: [{ type: "text", text: message }],
 		details: {},

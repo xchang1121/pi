@@ -4,7 +4,7 @@ import { constants as fsConstants } from "node:fs";
 import { chmod, type FileHandle, lstat, mkdir, mkdtemp, open, readdir, rename, rm, rmdir } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import type { AgentTool, AgentToolInvocation, SettleToolCallResult } from "@earendil-works/pi-agent-core";
+import type { AgentTool } from "@earendil-works/pi-agent-core";
 import type { ActionKey } from "./common.ts";
 import { asRecord, contains, slash } from "./common.ts";
 import type {
@@ -16,6 +16,7 @@ import type {
 	WorldExecutionMetrics,
 } from "./execution-world.ts";
 import { ResourceVersionManager, type ResourceVersionToken } from "./resource-version.ts";
+import type { ToolInvocation, ToolSettlement } from "./tool-settlement.ts";
 
 export interface SandboxFileChange {
 	readonly root: string;
@@ -33,7 +34,7 @@ interface RegularFileState {
 }
 
 export interface SandboxExecutionDelta {
-	readonly output: SettleToolCallResult;
+	readonly output: ToolSettlement;
 	readonly changes: readonly SandboxFileChange[];
 }
 
@@ -48,12 +49,12 @@ export interface SpeculativeSandboxExecuteContext {
 	readonly toolName: string;
 	readonly args: unknown;
 	readonly action: ActionKey;
-	readonly invocation?: AgentToolInvocation;
+	readonly invocation?: ToolInvocation;
 	readonly callID: string;
 	readonly signal: AbortSignal;
 }
 
-export type SpeculativeAgentSandbox = ExecutionWorld<SpeculativeSandboxExecuteContext, SettleToolCallResult>;
+export type SpeculativeAgentSandbox = ExecutionWorld<SpeculativeSandboxExecuteContext, ToolSettlement>;
 
 export interface SandboxProcessRunnerInput {
 	readonly command: string;
@@ -69,7 +70,7 @@ export interface SandboxProcessRunnerInput {
 	readonly signal: AbortSignal;
 }
 
-export type SandboxProcessRunner = (input: SandboxProcessRunnerInput) => Promise<SettleToolCallResult>;
+export type SandboxProcessRunner = (input: SandboxProcessRunnerInput) => Promise<ToolSettlement>;
 
 export interface SandboxProcessBackendStatus {
 	readonly backend: string;
@@ -247,16 +248,16 @@ function requireProcessBackend(options: WorkspaceSandboxOptions): SandboxProcess
 	return options.processBackend;
 }
 
-class GitWorldBranch implements WorldBranch<SettleToolCallResult> {
+class GitWorldBranch implements WorldBranch<ToolSettlement> {
 	readonly backend = "git_worktree" as const;
-	readonly output: SettleToolCallResult;
+	readonly output: ToolSettlement;
 	readonly resources: readonly string[];
 	readonly capturedBytes: number;
 	readonly executionMetrics: WorkspaceExecutionSnapshot["executionMetrics"];
 	private readonly changes: readonly SandboxFileChange[];
 	private stateValue: WorldBranchState = "ready";
 	private adoptionMetricsValue?: WorldAdoptionMetrics;
-	private adoption?: Promise<SettleToolCallResult>;
+	private adoption?: Promise<ToolSettlement>;
 
 	constructor(snapshot: WorkspaceExecutionSnapshot) {
 		this.output = snapshot.output;
@@ -277,7 +278,7 @@ class GitWorldBranch implements WorldBranch<SettleToolCallResult> {
 		return this.adoptionMetricsValue;
 	}
 
-	readonly adopt = (): Promise<SettleToolCallResult> => {
+	readonly adopt = (): Promise<ToolSettlement> => {
 		if (this.adoption) return this.adoption;
 		this.stateValue = "adopting";
 		this.adoption = adoptSandboxExecution({ output: this.output, changes: this.changes }).then(
@@ -296,13 +297,13 @@ class GitWorldBranch implements WorldBranch<SettleToolCallResult> {
 }
 
 /** Low-level transactional adoption primitive for execution-world implementations. */
-export async function commitSandboxDelta(delta: SandboxExecutionDelta): Promise<SettleToolCallResult> {
+export async function commitSandboxDelta(delta: SandboxExecutionDelta): Promise<ToolSettlement> {
 	return (await adoptSandboxExecution(delta)).output;
 }
 
 async function adoptSandboxExecution(
 	execution: SandboxExecutionDelta,
-): Promise<{ readonly output: SettleToolCallResult; readonly metrics: WorldAdoptionMetrics }> {
+): Promise<{ readonly output: ToolSettlement; readonly metrics: WorldAdoptionMetrics }> {
 	const started = performance.now();
 	const changes = deduplicateChanges(execution.changes);
 	return withTargetLocks(

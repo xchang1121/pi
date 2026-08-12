@@ -1,89 +1,27 @@
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
-import { Agent } from "@earendil-works/pi-agent-core";
-import type {
-	Api,
-	AssistantMessage,
-	AssistantMessageEvent,
-	Context,
-	Model,
-	SimpleStreamOptions,
-} from "@earendil-works/pi-ai";
-import { EventStream } from "@earendil-works/pi-ai";
+import type { AssistantMessage, Model } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
-import { describe, expect, it } from "vitest";
-import { READ_RANGE_COVERAGE_DETAILS_KEY, type ReadRangeCoverage } from "../src/action-key-projection.ts";
-import { ActionSemanticsRegistry, PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
-import {
-	installSpeculativeAction,
-	patternPlanActionID,
-	type SpeculativeAgentSettingsInput,
-} from "../src/agent-integration.ts";
-import {
-	type ContainerRuntimeInvocation,
-	type ContainerRuntimeInvocationResult,
-	createContainerSandboxProcessBackend,
-} from "../src/container-sandbox.ts";
-import { PATTERN_AWARE_DEFAULTS, type PatternAwareEventInput, PatternAwareStore } from "../src/pattern-aware.ts";
+import { afterEach, describe, expect, it } from "vitest";
+import { READ_RANGE_COVERAGE_DETAILS_KEY } from "../src/action-key-projection.ts";
+import { createSpeculativeActionHost, patternPlanActionID } from "../src/agent-integration.ts";
 import { PI_READ_RANGE_PROJECTION_RULE } from "../src/pi-read-projection.ts";
 import type { SpeculativeActionEvent } from "../src/runtime.ts";
-import { createWorkspaceSandbox, type SpeculativeAgentSandbox } from "../src/workspace-sandbox.ts";
+import type { SpeculativeAgentSandbox } from "../src/workspace-sandbox.ts";
 
+const roots: string[] = [];
 const readSchema = Type.Object({
 	path: Type.String(),
 	offset: Type.Optional(Type.Number()),
 	limit: Type.Optional(Type.Number()),
 });
 
-type ReadTool = AgentTool<typeof readSchema, { source: string }>;
-
-interface ProjectionReadDetails {
-	readonly source: string;
-	readonly [READ_RANGE_COVERAGE_DETAILS_KEY]: ReadRangeCoverage;
-}
-
-type ProjectionReadTool = AgentTool<typeof readSchema, ProjectionReadDetails>;
-
-const reorderedReadSchema = Type.Object({
-	limit: Type.Optional(Type.Number()),
-	path: Type.String(),
-	offset: Type.Optional(Type.Number()),
-});
-type ReorderedReadTool = AgentTool<typeof reorderedReadSchema, { source: string }>;
-
-const changedReadSchema = Type.Object({
-	path: Type.String(),
-	offset: Type.Optional(Type.Number()),
-	limit: Type.Optional(Type.Number()),
-	encoding: Type.Optional(Type.String()),
-});
-type ChangedReadTool = AgentTool<typeof changedReadSchema, { source: string }>;
-
-const writeSchema = Type.Object({ path: Type.String(), content: Type.String() });
-type WriteTool = AgentTool<typeof writeSchema, { target: string }>;
-
-const findSchema = Type.Object({ pattern: Type.String() });
-type FindTool = AgentTool<typeof findSchema, undefined>;
-
-class MockAssistantStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
-	constructor() {
-		super(
-			(event) => event.type === "done" || event.type === "error",
-			(event) => {
-				if (event.type === "done") return event.message;
-				if (event.type === "error") return event.error;
-				throw new Error("Unexpected event type");
-			},
-		);
-	}
-}
-
-function createModel(id = "mock"): Model<"openai-responses"> {
+function model(): Model<"openai-responses"> {
 	return {
-		id,
-		name: id,
+		id: "mock",
+		name: "mock",
 		api: "openai-responses",
 		provider: "openai",
 		baseUrl: "https://example.invalid",
@@ -95,10 +33,7 @@ function createModel(id = "mock"): Model<"openai-responses"> {
 	};
 }
 
-function assistantMessage(
-	content: AssistantMessage["content"],
-	stopReason: AssistantMessage["stopReason"],
-): AssistantMessage {
+function assistant(content: AssistantMessage["content"], stopReason: AssistantMessage["stopReason"]): AssistantMessage {
 	return {
 		role: "assistant",
 		content,
@@ -118,1095 +53,187 @@ function assistantMessage(
 	};
 }
 
-function createStreamHarness(
-	options: {
-		readonly draftMode?: "tool" | "text" | "error";
-		readonly draftOnlyFirst?: boolean;
-		readonly toolName?: string;
-		readonly toolArgs?: Record<string, unknown>;
-		readonly draftToolArgs?: Record<string, unknown>;
-		readonly actorDelayMs?: number;
-	} = {},
-) {
-	let actorRequests = 0;
-	let draftRequests = 0;
-	const draftModels: string[] = [];
-	const draftOptions: (SimpleStreamOptions | undefined)[] = [];
-	const draftTools: string[][] = [];
-	const stream = (model: Model<Api>, context: Context, streamOptions?: SimpleStreamOptions): MockAssistantStream => {
-		const response = new MockAssistantStream();
-		const isDraft = context.systemPrompt?.includes("Dispatch tool calls only") === true;
-		if (isDraft) {
-			draftRequests++;
-			draftModels.push(model.id);
-			draftOptions.push(streamOptions);
-			draftTools.push((context.tools ?? []).map((tool) => tool.name));
-		}
-		const publish = () => {
-			if (isDraft) {
-				if (options.draftOnlyFirst && draftRequests > 1) {
-					const message = assistantMessage([{ type: "text", text: "No second candidate" }], "stop");
-					response.push({ type: "done", reason: "stop", message });
-					return;
-				}
-				if (options.draftMode === "text") {
-					const message = assistantMessage([{ type: "text", text: "No tool call" }], "stop");
-					response.push({ type: "done", reason: "stop", message });
-					return;
-				}
-				if (options.draftMode === "error") {
-					const error = {
-						...assistantMessage([{ type: "text", text: "Drafter failed" }], "error"),
-						errorMessage: "Drafter failed",
-					};
-					response.push({ type: "error", reason: "error", error });
-					return;
-				}
-				const message = assistantMessage(
-					[
-						{
-							type: "toolCall",
-							id: `draft-${draftRequests}`,
-							name: options.toolName ?? "read",
-							arguments: options.draftToolArgs ?? options.toolArgs ?? { path: "README.md" },
-						},
-					],
-					"toolUse",
-				);
-				response.push({ type: "done", reason: "toolUse", message });
-				return;
-			}
+function drafterCall(input: Record<string, unknown>): AssistantMessage {
+	return assistant([{ type: "toolCall", id: "draft-1", name: "read", arguments: input }], "toolUse");
+}
 
-			actorRequests++;
-			const message =
-				actorRequests === 1
-					? assistantMessage(
-							[
-								{
-									type: "toolCall",
-									id: "actor-1",
-									name: options.toolName ?? "read",
-									arguments: options.toolArgs ?? { path: "README.md" },
-								},
-							],
-							"toolUse",
-						)
-					: assistantMessage([{ type: "text", text: "done" }], "stop");
-			response.push({ type: "done", reason: message.stopReason === "toolUse" ? "toolUse" : "stop", message });
-		};
-		if (!isDraft && options.actorDelayMs) setTimeout(publish, options.actorDelayMs);
-		else queueMicrotask(publish);
-		return response;
-	};
+function settings() {
 	return {
-		stream,
-		actorRequests: () => actorRequests,
-		draftRequests: () => draftRequests,
-		draftModels: () => draftModels,
-		draftOptions: () => draftOptions,
-		draftTools: () => draftTools,
+		enabled: true,
+		drafterEnabled: true,
+		adaptiveDrafter: false,
+		candidateLimit: 1,
+		maxConcurrentActions: 1,
+		tools: { resourceCached: ["read"], sandbox: [] },
+		patternAware: { enabled: false },
 	};
 }
 
-describe("Pi Agent speculative integration", () => {
-	it("keeps K(a)-equivalent execution reusable while qualifying plan support by its parent path", () => {
-		const leftParent = patternPlanActionID("left-parent");
-		const rightParent = patternPlanActionID("right-parent");
+function startInput(tool: AgentTool) {
+	return {
+		turnID: "turn-1",
+		actorModel: model(),
+		context: { systemPrompt: "system", messages: [], tools: [tool] },
+		actorOptions: undefined,
+		tools: [tool],
+	};
+}
 
-		expect(patternPlanActionID("shared-action", leftParent)).toBe(patternPlanActionID("shared-action", leftParent));
-		expect(patternPlanActionID("shared-action", leftParent)).not.toBe(
-			patternPlanActionID("shared-action", rightParent),
-		);
-	});
+async function temporaryWorkspace(): Promise<string> {
+	const root = await mkdtemp(path.join(os.tmpdir(), "pi-spec-host-"));
+	roots.push(root);
+	await writeFile(path.join(root, "notes.txt"), "one\ntwo\nthree\nfour", "utf8");
+	return root;
+}
 
-	it("disposes sandbox resources without changing uninstall semantics", async () => {
-		let disposeCalls = 0;
-		const sandbox: SpeculativeAgentSandbox = {
-			supports: () => false,
-			fork: async () => {
-				throw new Error("unused sandbox");
-			},
-			dispose: async () => {
-				disposeCalls++;
-				throw new Error("simulated cleanup failure");
-			},
-		};
-		const streams = createStreamHarness();
-		const agent = new Agent({ initialState: { model: createModel(), tools: [] }, streamFn: streams.stream });
-		const installed = installSpeculativeAction(agent, {
-			cwd: "/workspace",
-			sandbox,
-			getSettings: () => ({ enabled: false }),
-		});
+afterEach(async () => {
+	await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+});
 
-		await expect(installed.uninstall()).resolves.toBeUndefined();
-		expect(disposeCalls).toBe(1);
-	});
-
-	it("runs the drafter beside the actor and settles the real call from one pre-execution", async () => {
-		const execution = deferred<void>();
-		let toolExecutions = 0;
+describe("speculative action host", () => {
+	it("satisfies an actor call without modifying or wrapping an Agent instance", async () => {
+		const cwd = await temporaryWorkspace();
+		let executions = 0;
 		const events: SpeculativeActionEvent<string>[] = [];
-		const tool: ReadTool = {
+		const tool: AgentTool<typeof readSchema> = {
 			name: "read",
-			label: "Read",
-			description: "Read a file",
+			label: "read",
+			description: "read",
 			parameters: readSchema,
-			async execute() {
-				toolExecutions++;
-				await execution.promise;
-				return { content: [{ type: "text", text: "prefetched README" }], details: { source: "tool" } };
+			execute: async () => {
+				executions++;
+				return { content: [{ type: "text", text: "one\ntwo\nthree\nfour" }], details: {} };
 			},
 		};
-		const streams = createStreamHarness({ actorDelayMs: 100 });
-		const agent = new Agent({
-			initialState: { model: createModel(), systemPrompt: "Act as a coding agent", tools: [tool] },
-			streamFn: streams.stream,
-		});
-		const installed = installSpeculativeAction(agent, {
-			cwd: "/workspace",
-			getSettings: () => ({
-				enabled: true,
-				predictionTimeoutMs: 1000,
-				patternAware: { enabled: false },
-				tools: { resourceCached: ["read"] },
-			}),
+		const host = createSpeculativeActionHost("session", {
+			cwd,
+			getSettings: settings,
+			complete: async () => drafterCall({ path: "notes.txt" }),
 			preflight: () => true,
 			onEvent: (event) => {
 				events.push(event);
 			},
 		});
 
-		const prompt = agent.prompt("Read README.md");
-		await waitFor(() => toolExecutions === 1);
-		execution.resolve();
-		await prompt;
-
-		expect(toolExecutions).toBe(1);
-		expect(streams.actorRequests()).toBe(2);
-		expect(streams.draftRequests()).toBe(2);
-		expect(events.some((event) => event.type === "hit" && event.tool === "read")).toBe(true);
-		expect(events.some((event) => event.type === "actual")).toBe(false);
-		const result = agent.state.messages.find((message) => message.role === "toolResult");
-		expect(result?.role === "toolResult" ? result.content : undefined).toEqual([
-			{ type: "text", text: "prefetched README" },
-		]);
-		await installed.uninstall();
-	});
-
-	it("exposes only enabled speculative tools to the drafter", async () => {
-		let readExecutions = 0;
-		const read: ReadTool = {
-			name: "read",
-			label: "Read",
-			description: "Read a file",
-			parameters: readSchema,
-			async execute() {
-				readExecutions++;
-				return { content: [{ type: "text", text: "README" }], details: { source: "read" } };
-			},
-		};
-		const find: FindTool = {
-			name: "find",
-			label: "Find",
-			description: "Find files",
-			parameters: findSchema,
-			async execute() {
-				return { content: [{ type: "text", text: "README.md" }], details: undefined };
-			},
-		};
-		const streams = createStreamHarness({ actorDelayMs: 100 });
-		const agent = new Agent({
-			initialState: { model: createModel(), tools: [read, find] },
-			streamFn: streams.stream,
-		});
-		const installed = installSpeculativeAction(agent, {
-			cwd: "/workspace",
-			getSettings: () => ({
-				enabled: true,
-				patternAware: { enabled: false },
-				tools: { resourceCached: ["read"] },
-			}),
-			preflight: () => true,
+		await host.startTurn(startInput(tool));
+		await waitFor(() => events.some((event) => event.type === "completed"));
+		const hit = await host.consume({
+			turnID: "turn-1",
+			id: "actor-1",
+			tool: "read",
+			args: { path: "notes.txt" },
+			tools: [tool],
 		});
 
-		await agent.prompt("Read README.md");
-
-		expect(readExecutions).toBe(1);
-		expect(streams.draftTools()).toEqual([["read"], ["read"]]);
-		await installed.uninstall();
+		expect(hit?.result.content).toEqual([{ type: "text", text: "one\ntwo\nthree\nfour" }]);
+		expect(executions).toBe(1);
+		expect(events.some((event) => event.type === "hit")).toBe(true);
+		await host.dispose();
 	});
 
-	it("never reuses a speculative tool error as the actor's authoritative settlement", async () => {
-		let toolExecutions = 0;
-		const events: SpeculativeActionEvent<string>[] = [];
-		const tool: ReadTool = {
+	it("projects a wider read result only when its realized coverage proves containment", async () => {
+		const cwd = await temporaryWorkspace();
+		const tool: AgentTool<typeof readSchema> = {
 			name: "read",
-			label: "Read",
-			description: "Read a file",
+			label: "read",
+			description: "read",
 			parameters: readSchema,
-			async execute() {
-				toolExecutions++;
-				throw new Error("transient read failure");
-			},
-		};
-		const streams = createStreamHarness({ actorDelayMs: 100, draftOnlyFirst: true });
-		const agent = new Agent({ initialState: { model: createModel(), tools: [tool] }, streamFn: streams.stream });
-		const installed = installSpeculativeAction(agent, {
-			cwd: "/workspace",
-			getSettings: () => ({
-				enabled: true,
-				patternAware: { enabled: false },
-				tools: { resourceCached: ["read"] },
-			}),
-			preflight: () => true,
-			onEvent: (event) => {
-				events.push(event);
-			},
-		});
-
-		await agent.prompt("Read README.md");
-
-		expect(toolExecutions).toBe(2);
-		expect(events.some((event) => event.type === "hit")).toBe(false);
-		expect(events.some((event) => event.type === "cancelled" && event.reason === "tool_error_result")).toBe(true);
-		expect(events.some((event) => event.type === "actual" && event.tool === "read")).toBe(true);
-		expect(installed.runtime.inspect(installed.sessionID).resourceCandidates).toBe(0);
-		await installed.uninstall();
-	});
-
-	it("keeps a speculative hit when a live tool is replaced by a schema-equivalent definition", async () => {
-		let speculativeExecutions = 0;
-		let replacementExecutions = 0;
-		const events: SpeculativeActionEvent<string>[] = [];
-		const original: ReadTool = {
-			name: "read",
-			label: "Read",
-			description: "Read a file",
-			parameters: readSchema,
-			async execute() {
-				speculativeExecutions++;
-				return { content: [{ type: "text", text: "cached README" }], details: { source: "original" } };
-			},
-		};
-		const replacement: ReorderedReadTool = {
-			name: "read",
-			label: "Read",
-			description: "Read a file",
-			parameters: reorderedReadSchema,
-			async execute() {
-				replacementExecutions++;
-				return { content: [{ type: "text", text: "replacement README" }], details: { source: "replacement" } };
-			},
-		};
-		const streams = createStreamHarness({ actorDelayMs: 100, draftOnlyFirst: true });
-		const agent = new Agent({ initialState: { model: createModel(), tools: [original] }, streamFn: streams.stream });
-		const installed = installSpeculativeAction(agent, {
-			cwd: "/workspace",
-			getSettings: () => ({
-				enabled: true,
-				patternAware: { enabled: false },
-				tools: { resourceCached: ["read"] },
-			}),
-			preflight: () => true,
-			onEvent: (event) => {
-				events.push(event);
-			},
-		});
-
-		const prompt = agent.prompt("Read README.md");
-		await waitFor(() => speculativeExecutions === 1);
-		agent.state.tools = [replacement];
-		await prompt;
-
-		expect(speculativeExecutions).toBe(1);
-		expect(replacementExecutions).toBe(0);
-		expect(events.some((event) => event.type === "hit" && event.tool === "read")).toBe(true);
-		expect(events.some((event) => event.type === "actual")).toBe(false);
-		await installed.uninstall();
-	});
-
-	it("rejects a cached result when a live tool schema changes before the actor call", async () => {
-		let originalToolExecutions = 0;
-		let replacementToolExecutions = 0;
-		const events: SpeculativeActionEvent<string>[] = [];
-		const original: ReadTool = {
-			name: "read",
-			label: "Read",
-			description: "Read a file",
-			parameters: readSchema,
-			async execute() {
-				originalToolExecutions++;
-				return { content: [{ type: "text", text: "stale schema result" }], details: { source: "original" } };
-			},
-		};
-		const replacement: ChangedReadTool = {
-			name: "read",
-			label: "Read",
-			description: "Read a file with encoding",
-			parameters: changedReadSchema,
-			async execute() {
-				replacementToolExecutions++;
-				return { content: [{ type: "text", text: "current schema result" }], details: { source: "replacement" } };
-			},
-		};
-		const streams = createStreamHarness({ actorDelayMs: 100, draftOnlyFirst: true });
-		const agent = new Agent({ initialState: { model: createModel(), tools: [original] }, streamFn: streams.stream });
-		const installed = installSpeculativeAction(agent, {
-			cwd: "/workspace",
-			getSettings: () => ({
-				enabled: true,
-				patternAware: { enabled: false },
-				tools: { resourceCached: ["read"] },
-			}),
-			preflight: () => true,
-			onEvent: (event) => {
-				events.push(event);
-			},
-		});
-
-		const prompt = agent.prompt("Read README.md");
-		await waitFor(() => originalToolExecutions === 1);
-		agent.state.tools = [replacement];
-		await prompt;
-
-		// The normal Agent loop snapshots tools at prompt start, so rejecting the
-		// speculative entry falls back to that authoritative snapshot. The replacement
-		// only changes the live schema used to decide whether reuse is still safe.
-		expect(originalToolExecutions).toBe(2);
-		expect(replacementToolExecutions).toBe(0);
-		expect(events.some((event) => event.type === "hit")).toBe(false);
-		expect(events.some((event) => event.type === "actual" && event.tool === "read")).toBe(true);
-		expect(events.some((event) => event.type === "miss" && event.reason === "key_mismatch")).toBe(true);
-		await installed.uninstall();
-	});
-
-	it("projects a broad production read into the actor's exact narrow result", async () => {
-		let toolExecutions = 0;
-		const lines = Array.from({ length: 10 }, (_, index) => `line-${index + 1}`);
-		const tool: ProjectionReadTool = {
-			name: "read",
-			label: "Read",
-			description: "Read a file",
-			parameters: readSchema,
-			async execute() {
-				toolExecutions++;
-				return {
-					content: [{ type: "text", text: lines.join("\n") }],
-					details: {
-						source: "tool",
-						[READ_RANGE_COVERAGE_DETAILS_KEY]: {
-							kind: "text",
-							startLine: 1,
-							endLineExclusive: 11,
-							totalLines: 10,
-							payloadTextLength: lines.join("\n").length,
-							maxLines: 2000,
-							maxBytes: 50 * 1024,
-						},
+			execute: async () => ({
+				content: [{ type: "text", text: "one\ntwo\nthree\nfour" }],
+				details: {
+					[READ_RANGE_COVERAGE_DETAILS_KEY]: {
+						kind: "text",
+						startLine: 1,
+						endLineExclusive: 5,
+						totalLines: 4,
+						payloadTextLength: 18,
+						maxLines: 2000,
+						maxBytes: 50 * 1024,
 					},
-				};
-			},
-		};
-		const streams = createStreamHarness({
-			actorDelayMs: 100,
-			draftOnlyFirst: true,
-			draftToolArgs: { path: "README.md", offset: 1, limit: 10 },
-			toolArgs: { path: "README.md", offset: 3, limit: 2 },
-		});
-		const agent = new Agent({ initialState: { model: createModel(), tools: [tool] }, streamFn: streams.stream });
-		const installed = installSpeculativeAction(agent, {
-			cwd: "/workspace",
-			getSettings: () => ({
-				enabled: true,
-				predictionTimeoutMs: 1000,
-				patternAware: { enabled: false },
-				tools: { resourceCached: ["read"] },
+				},
 			}),
+		};
+		const host = createSpeculativeActionHost("session", {
+			cwd,
+			getSettings: settings,
+			complete: async () => drafterCall({ path: "notes.txt", offset: 1, limit: 4 }),
 			preflight: () => true,
 			projectionRules: [PI_READ_RANGE_PROJECTION_RULE],
 		});
 
-		await agent.prompt("Read lines 3-4 of README.md");
-
-		expect(toolExecutions).toBe(1);
-		const result = agent.state.messages.find((message) => message.role === "toolResult");
-		expect(result?.role === "toolResult" ? result.content : undefined).toEqual([
-			{ type: "text", text: "line-3\nline-4\n\n[6 more lines in file. Use offset=5 to continue.]" },
-		]);
-		await installed.uninstall();
-	});
-
-	it("makes no drafter request when disabled and preserves normal execution", async () => {
-		let toolExecutions = 0;
-		const tool: ReadTool = {
-			name: "read",
-			label: "Read",
-			description: "Read a file",
-			parameters: readSchema,
-			async execute() {
-				toolExecutions++;
-				return { content: [{ type: "text", text: "normal README" }], details: { source: "tool" } };
-			},
-		};
-		const streams = createStreamHarness();
-		const agent = new Agent({
-			initialState: { model: createModel(), tools: [tool] },
-			streamFn: streams.stream,
-		});
-		const installed = installSpeculativeAction(agent, {
-			cwd: "/workspace",
-			getSettings: () => ({ enabled: false }),
-		});
-
-		await agent.prompt("Read README.md");
-
-		expect(toolExecutions).toBe(1);
-		expect(streams.actorRequests()).toBe(2);
-		expect(streams.draftRequests()).toBe(0);
-		expect(installed.runtime.inspect()).toEqual({
-			activeTurns: 0,
-			turnCandidates: 0,
-			resourceCandidates: 0,
-			pendingPredictions: 0,
-			deferredPlanActions: 0,
-			activePlanActions: 0,
-			blockedPlanActions: 0,
-		});
-		await installed.uninstall();
-	});
-
-	it("fails closed without speculative preflight and uses the normal tool path", async () => {
-		let toolExecutions = 0;
-		let previousActualCalls = 0;
-		const events: SpeculativeActionEvent<string>[] = [];
-		const tool: ReadTool = {
-			name: "read",
-			label: "Read",
-			description: "Read a file",
-			parameters: readSchema,
-			async execute() {
-				toolExecutions++;
-				return { content: [{ type: "text", text: "normal README" }], details: { source: "tool" } };
-			},
-		};
-		const streams = createStreamHarness();
-		const agent = new Agent({
-			initialState: { model: createModel(), tools: [tool] },
-			streamFn: streams.stream,
-			actualToolCall: async () => {
-				previousActualCalls++;
-			},
-		});
-		const installed = installSpeculativeAction(agent, {
-			cwd: "/workspace",
-			getSettings: () => ({ enabled: true, predictionTimeoutMs: 100, tools: { resourceCached: ["read"] } }),
-			onEvent: (event) => {
-				events.push(event);
-			},
-		});
-
-		await agent.prompt("Read README.md");
-
-		expect(toolExecutions).toBe(1);
-		expect(streams.draftRequests()).toBe(2);
-		expect(previousActualCalls).toBe(1);
-		expect(events.some((event) => event.type === "hit")).toBe(false);
-		expect(events.find((event) => event.type === "actual")).toMatchObject({
-			type: "actual",
+		await host.startTurn(startInput(tool));
+		await waitFor(() => host.runtime.inspect("session").resourceCandidates === 1);
+		const hit = await host.consume({
+			turnID: "turn-1",
 			tool: "read",
-			execution: "resource_cached",
-			actualDurationMs: expect.any(Number),
-			actualAction: expect.any(String),
+			args: { path: "notes.txt", offset: 2, limit: 2 },
+			tools: [tool],
 		});
-		await installed.uninstall();
+
+		expect(hit?.result.content[0]).toEqual({
+			type: "text",
+			text: "two\nthree\n\n[1 more lines in file. Use offset=4 to continue.]",
+		});
+		await host.dispose();
 	});
 
-	it("isolates a drafter error and preserves normal execution", async () => {
-		let toolExecutions = 0;
-		const events: SpeculativeActionEvent<string>[] = [];
-		const tool: ReadTool = {
-			name: "read",
-			label: "Read",
-			description: "Read a file",
-			parameters: readSchema,
-			async execute() {
-				toolExecutions++;
-				return { content: [{ type: "text", text: "normal README" }], details: { source: "tool" } };
+	it("reports authoritative misses and keeps cleanup failures out of actor lifecycle", async () => {
+		const cwd = await temporaryWorkspace();
+		const actualEvents: SpeculativeActionEvent<string>[] = [];
+		let disposed = 0;
+		const sandbox: SpeculativeAgentSandbox = {
+			supports: () => false,
+			fork: async () => {
+				throw new Error("unused");
+			},
+			dispose: async () => {
+				disposed++;
+				throw new Error("cleanup failed");
 			},
 		};
-		const streams = createStreamHarness({ draftMode: "error" });
-		const agent = new Agent({ initialState: { model: createModel(), tools: [tool] }, streamFn: streams.stream });
-		const installed = installSpeculativeAction(agent, {
-			cwd: "/workspace",
-			getSettings: () => ({ enabled: true, predictionTimeoutMs: 100, tools: { resourceCached: ["read"] } }),
+		const tool: AgentTool<typeof readSchema> = {
+			name: "read",
+			label: "read",
+			description: "read",
+			parameters: readSchema,
+			execute: async () => ({ content: [{ type: "text", text: "actor" }], details: {} }),
+		};
+		const host = createSpeculativeActionHost("session", {
+			cwd,
+			getSettings: settings,
+			complete: async () => assistant([{ type: "text", text: "no prediction" }], "stop"),
 			preflight: () => true,
+			sandbox,
 			onEvent: (event) => {
-				events.push(event);
+				actualEvents.push(event);
 			},
 		});
-
-		await agent.prompt("Read README.md");
-
-		expect(toolExecutions).toBe(1);
-		expect(events.some((event) => event.type === "miss" && event.reason === "prediction_source_error")).toBe(true);
-		expect(events.some((event) => event.type === "hit")).toBe(false);
-		await installed.uninstall();
-	});
-
-	it("adopts a staged write through the Agent settlement path without executing against the real path first", async () => {
-		const root = await mkdtemp(path.join(os.tmpdir(), "pi-agent-spec-write-"));
-		try {
-			let executions = 0;
-			const preparedModes: string[][] = [];
-			const tool: WriteTool = {
-				name: "write",
-				label: "Write",
-				description: "Write a file",
-				parameters: writeSchema,
-				async execute(_callID, args) {
-					executions++;
-					await mkdir(path.dirname(path.resolve(root, args.path)), { recursive: true });
-					await writeFile(path.resolve(root, args.path), args.content, "utf8");
-					return {
-						content: [{ type: "text", text: `wrote ${args.path}` }],
-						details: { target: args.path },
-					};
-				},
-			};
-			const args = { path: "created.txt", content: "from speculation\n" };
-			const streams = createStreamHarness({
-				toolName: "write",
-				toolArgs: args,
-				draftOnlyFirst: true,
-				actorDelayMs: 100,
-			});
-			const agent = new Agent({ initialState: { model: createModel(), tools: [tool] }, streamFn: streams.stream });
-			const baseSandbox = createWorkspaceSandbox();
-			const sandbox = {
-				...baseSandbox,
-				prepare: async (input: Parameters<NonNullable<typeof baseSandbox.prepare>>[0]) => {
-					preparedModes.push([...input.modes]);
-					await baseSandbox.prepare?.(input);
-				},
-			};
-			const installed = installSpeculativeAction(agent, {
-				cwd: root,
-				getSettings: () => ({
-					enabled: true,
-					patternAware: { enabled: false },
-					tools: { resourceCached: [], sandbox: ["write"] },
-				}),
-				preflight: () => true,
-				sandbox,
-			});
-
-			await agent.prompt("Create the file");
-
-			expect(executions).toBe(1);
-			expect(preparedModes.some((modes) => modes.includes("file_mutation"))).toBe(true);
-			expect(await readFile(path.join(root, "created.txt"), "utf8")).toBe("from speculation\n");
-			const result = agent.state.messages.find((message) => message.role === "toolResult");
-			expect(result?.role === "toolResult" ? result.content : undefined).toEqual([
-				{ type: "text", text: "wrote created.txt" },
-			]);
-			await installed.uninstall();
-		} finally {
-			await rm(root, { recursive: true, force: true });
-		}
-	});
-
-	it("derives execution-world dispatch from custom action semantics instead of tool names", async () => {
-		const root = await mkdtemp(path.join(os.tmpdir(), "pi-agent-spec-custom-world-"));
-		try {
-			let executions = 0;
-			const tool: WriteTool = {
-				name: "custom_write",
-				label: "Custom write",
-				description: "Write through a custom action semantic",
-				parameters: writeSchema,
-				async execute(_callID, args) {
-					executions++;
-					await mkdir(path.dirname(path.resolve(root, args.path)), { recursive: true });
-					await writeFile(path.resolve(root, args.path), args.content, "utf8");
-					return { content: [{ type: "text", text: "custom write" }], details: { target: args.path } };
-				},
-			};
-			const args = { path: "custom.txt", content: "from custom semantics\n" };
-			const streams = createStreamHarness({
-				toolName: "custom_write",
-				toolArgs: args,
-				draftOnlyFirst: true,
-				actorDelayMs: 100,
-			});
-			const writeDefinition = PI_ACTION_SEMANTICS.definition("write");
-			if (!writeDefinition) throw new Error("write semantics unavailable");
-			const actionSemantics = new ActionSemanticsRegistry([
-				{ ...writeDefinition, tool: "custom_write", epoch: "test.custom-write.v1" },
-			]);
-			const agent = new Agent({ initialState: { model: createModel(), tools: [tool] }, streamFn: streams.stream });
-			const installed = installSpeculativeAction(agent, {
-				cwd: root,
-				actionSemantics,
-				getSettings: () => ({
-					enabled: true,
-					patternAware: { enabled: false },
-					tools: { resourceCached: [], sandbox: ["custom_write"] },
-				}),
-				preflight: () => true,
-				sandbox: createWorkspaceSandbox(),
-			});
-
-			await agent.prompt("Create the custom file");
-
-			expect(executions).toBe(1);
-			expect(await readFile(path.join(root, "custom.txt"), "utf8")).toBe("from custom semantics\n");
-			await installed.uninstall();
-		} finally {
-			await rm(root, { recursive: true, force: true });
-		}
-	});
-
-	it("joins an in-flight world branch when the actor reaches the same action", async () => {
-		const root = await mkdtemp(path.join(os.tmpdir(), "pi-agent-spec-inflight-world-"));
-		const speculativeStarted = deferred<void>();
-		const releaseSpeculation = deferred<void>();
-		try {
-			let executions = 0;
-			const tool: WriteTool = {
-				name: "write",
-				label: "Write",
-				description: "Write a file",
-				parameters: writeSchema,
-				async execute(_callID, args) {
-					executions++;
-					if (path.isAbsolute(args.path)) {
-						speculativeStarted.resolve();
-						await releaseSpeculation.promise;
-					}
-					await writeFile(path.resolve(root, args.path), args.content, "utf8");
-					return { content: [{ type: "text", text: "joined write" }], details: { target: args.path } };
-				},
-			};
-			const args = { path: "joined.txt", content: "joined branch\n" };
-			const streams = createStreamHarness({
-				toolName: "write",
-				toolArgs: args,
-				draftOnlyFirst: true,
-				actorDelayMs: 25,
-			});
-			const events: SpeculativeActionEvent<string>[] = [];
-			const agent = new Agent({ initialState: { model: createModel(), tools: [tool] }, streamFn: streams.stream });
-			const installed = installSpeculativeAction(agent, {
-				cwd: root,
-				getSettings: () => ({
-					enabled: true,
-					patternAware: { enabled: false },
-					tools: { resourceCached: [], sandbox: ["write"] },
-				}),
-				preflight: () => true,
-				sandbox: createWorkspaceSandbox(),
-				onEvent: (event) => {
-					events.push(event);
-				},
-			});
-
-			const prompt = agent.prompt("Create the joined file");
-			await speculativeStarted.promise;
-			await new Promise((resolve) => setTimeout(resolve, 50));
-			await expect(stat(path.join(root, "joined.txt"))).rejects.toThrow();
-			releaseSpeculation.resolve();
-			await prompt;
-
-			expect(executions).toBe(1);
-			expect(await readFile(path.join(root, "joined.txt"), "utf8")).toBe("joined branch\n");
-			expect(events.some((event) => event.type === "hit" && event.waitedMs > 0)).toBe(true);
-			await installed.uninstall();
-		} finally {
-			releaseSpeculation.resolve();
-			await rm(root, { recursive: true, force: true });
-		}
-	}, 10_000);
-
-	it("falls back to the real write when sandbox adoption detects a base conflict", async () => {
-		const root = await mkdtemp(path.join(os.tmpdir(), "pi-agent-spec-conflict-"));
-		try {
-			const staged = deferred<void>();
-			let executions = 0;
-			const tool: WriteTool = {
-				name: "write",
-				label: "Write",
-				description: "Write a file",
-				parameters: writeSchema,
-				async execute(_callID, args) {
-					executions++;
-					if (path.isAbsolute(args.path)) await staged.promise;
-					await mkdir(path.dirname(path.resolve(root, args.path)), { recursive: true });
-					await writeFile(path.resolve(root, args.path), args.content, "utf8");
-					return { content: [{ type: "text", text: `wrote ${args.path}` }], details: { target: args.path } };
-				},
-			};
-			const args = { path: "conflict.txt", content: "actor result\n" };
-			const streams = createStreamHarness({
-				toolName: "write",
-				toolArgs: args,
-				draftOnlyFirst: true,
-				actorDelayMs: 100,
-			});
-			const events: SpeculativeActionEvent<string>[] = [];
-			const agent = new Agent({ initialState: { model: createModel(), tools: [tool] }, streamFn: streams.stream });
-			const installed = installSpeculativeAction(agent, {
-				cwd: root,
-				getSettings: () => ({
-					enabled: true,
-					patternAware: { enabled: false },
-					tools: { resourceCached: [], sandbox: ["write"] },
-				}),
-				preflight: () => true,
-				sandbox: createWorkspaceSandbox(),
-				onEvent: (event) => {
-					events.push(event);
-				},
-			});
-
-			const prompt = agent.prompt("Create the file");
-			await waitFor(() => executions === 1);
-			await writeFile(path.join(root, "conflict.txt"), "concurrent change\n", "utf8");
-			staged.resolve();
-			await prompt;
-
-			expect(executions).toBe(2);
-			expect(await readFile(path.join(root, "conflict.txt"), "utf8")).toBe("actor result\n");
-			expect(events.some((event) => event.type === "miss" && event.reason === "adoption_failed")).toBe(true);
-			await installed.uninstall();
-		} finally {
-			await rm(root, { recursive: true, force: true });
-		}
-	});
-
-	it("fails closed for configured sandbox tools when the host capability is absent", async () => {
-		const root = await mkdtemp(path.join(os.tmpdir(), "pi-agent-spec-no-sandbox-"));
-		try {
-			let executions = 0;
-			const events: SpeculativeActionEvent<string>[] = [];
-			const tool: WriteTool = {
-				name: "write",
-				label: "Write",
-				description: "Write a file",
-				parameters: writeSchema,
-				async execute(_callID, args) {
-					executions++;
-					await writeFile(path.join(root, args.path), args.content, "utf8");
-					return { content: [{ type: "text", text: "normal write" }], details: { target: args.path } };
-				},
-			};
-			const args = { path: "normal.txt", content: "normal\n" };
-			const streams = createStreamHarness({ toolName: "write", toolArgs: args, draftOnlyFirst: true });
-			const agent = new Agent({ initialState: { model: createModel(), tools: [tool] }, streamFn: streams.stream });
-			const installed = installSpeculativeAction(agent, {
-				cwd: root,
-				getSettings: () => ({ enabled: true, tools: { resourceCached: [], sandbox: ["write"] } }),
-				preflight: () => true,
-				onEvent: (event) => {
-					events.push(event);
-				},
-			});
-
-			await agent.prompt("Write normally");
-
-			expect(executions).toBe(1);
-			expect(events.some((event) => event.type === "hit")).toBe(false);
-			await installed.uninstall();
-		} finally {
-			await rm(root, { recursive: true, force: true });
-		}
-	});
-
-	it("fails closed before preflight when the drafter emits schema-invalid arguments", async () => {
-		const executedCallIDs: string[] = [];
-		let preflightCalls = 0;
-		const events: SpeculativeActionEvent<string>[] = [];
-		const tool: ReadTool = {
-			name: "read",
-			label: "Read",
-			description: "Read a file",
-			parameters: readSchema,
-			async execute(callID) {
-				executedCallIDs.push(callID);
-				return { content: [{ type: "text", text: "normal README" }], details: { source: "tool" } };
-			},
-		};
-		const streams = createStreamHarness({
-			toolArgs: { path: "README.md" },
-			draftToolArgs: {},
-			draftOnlyFirst: true,
-		});
-		const agent = new Agent({ initialState: { model: createModel(), tools: [tool] }, streamFn: streams.stream });
-		const installed = installSpeculativeAction(agent, {
-			cwd: "/workspace",
-			getSettings: () => ({ enabled: true, tools: { resourceCached: ["read"] } }),
-			preflight: () => {
-				preflightCalls++;
-				return true;
-			},
-			onEvent: (event) => {
-				events.push(event);
-			},
+		await host.startTurn(startInput(tool));
+		await host.actual({
+			turnID: "turn-1",
+			tool: "read",
+			args: { path: "notes.txt" },
+			tools: [tool],
+			durationMs: 12,
+			output: { result: await tool.execute("actor", { path: "notes.txt" }), isError: false },
 		});
 
-		await agent.prompt("Read README.md");
-
-		expect(executedCallIDs).toEqual(["actor-1"]);
-		expect(preflightCalls).toBe(0);
-		expect(events.some((event) => event.type === "miss" && event.reason === "unsupported_tool_or_input")).toBe(true);
-		expect(events.some((event) => event.type === "hit")).toBe(false);
-		await installed.uninstall();
+		expect(actualEvents.some((event) => event.type === "actual" && event.actualDurationMs === 12)).toBe(true);
+		await expect(host.dispose()).resolves.toBeUndefined();
+		expect(disposed).toBe(1);
 	});
 
-	it("treats an invalid enabled setting as disabled", async () => {
-		let executions = 0;
-		const tool: ReadTool = {
-			name: "read",
-			label: "Read",
-			description: "Read a file",
-			parameters: readSchema,
-			async execute() {
-				executions++;
-				return { content: [{ type: "text", text: "normal README" }], details: { source: "tool" } };
-			},
-		};
-		const streams = createStreamHarness();
-		const agent = new Agent({ initialState: { model: createModel(), tools: [tool] }, streamFn: streams.stream });
-		const invalidSettings = { enabled: "true" } as unknown as SpeculativeAgentSettingsInput;
-		const installed = installSpeculativeAction(agent, {
-			cwd: "/workspace",
-			getSettings: () => invalidSettings,
-			preflight: () => true,
-		});
-
-		await agent.prompt("Read README.md");
-
-		expect(executions).toBe(1);
-		expect(streams.draftRequests()).toBe(0);
-		await installed.uninstall();
-	});
-
-	it("records authoritative output paths and schema metadata in the PatternAware store", async () => {
-		class RecordingStore extends PatternAwareStore {
-			readonly observed: PatternAwareEventInput[] = [];
-			readonly batches: ReadonlyArray<PatternAwareEventInput>[] = [];
-
-			override observeBatch(
-				inputs: ReadonlyArray<PatternAwareEventInput>,
-				schemaHashes: Readonly<Record<string, string>> = {},
-			) {
-				this.batches.push(inputs);
-				this.observed.push(...inputs);
-				return super.observeBatch(inputs, schemaHashes);
-			}
-		}
-		const store = new RecordingStore(PATTERN_AWARE_DEFAULTS);
-		const tool: FindTool = {
-			name: "find",
-			label: "Find",
-			description: "Find files",
-			parameters: findSchema,
-			async execute() {
-				return {
-					content: [{ type: "text", text: "src/a.ts\nsrc/b.ts" }],
-					details: undefined,
-				};
-			},
-		};
-		const streams = createStreamHarness({
-			draftMode: "text",
-			toolName: "find",
-			toolArgs: { pattern: "src/*.ts" },
-		});
-		const agent = new Agent({ initialState: { model: createModel(), tools: [tool] }, streamFn: streams.stream });
-		const installed = installSpeculativeAction(agent, {
-			cwd: "/workspace",
-			patternStore: store,
-			getSettings: () => ({ enabled: true, tools: { resourceCached: ["find"] } }),
-			preflight: () => true,
-		});
-
-		await agent.prompt("Find TypeScript files");
-
-		const event = store.observed.find((item) => item.tool === "find");
-		expect(event).toMatchObject({
-			tool: "find",
-			input: { pattern: "src/*.ts" },
-			outcome: "success",
-			outputPaths: ["src/a.ts", "src/b.ts"],
-			learnTarget: true,
-		});
-		expect(event?.schemaHash).toMatch(/^[a-f0-9]{32}$/);
-		expect(store.batches).toHaveLength(1);
-		expect(store.batches[0]?.map((item) => item.tool)).toEqual(["find"]);
-		await installed.uninstall();
-	});
-
-	it("uses a learned PatternAware candidate while keeping drafter arbitration active", async () => {
-		const store = new PatternAwareStore(PATTERN_AWARE_DEFAULTS);
-		trainPattern(store, "one", "README.md");
-		trainPattern(store, "two", "README.md");
-		let executions = 0;
-		const events: SpeculativeActionEvent<string>[] = [];
-		const tool: ReadTool = {
-			name: "read",
-			label: "Read",
-			description: "Read a file",
-			parameters: readSchema,
-			async execute() {
-				executions++;
-				return { content: [{ type: "text", text: "README" }], details: { source: "tool" } };
-			},
-		};
-		const streams = createStreamHarness({ draftMode: "text", actorDelayMs: 100 });
-		const agent = new Agent({ initialState: { model: createModel(), tools: [tool] }, streamFn: streams.stream });
-		const installed = installSpeculativeAction(agent, {
-			cwd: "/workspace",
-			patternStore: store,
-			getSettings: () => ({ enabled: true, tools: { resourceCached: ["read"] } }),
-			preflight: () => true,
-			onEvent: (event) => {
-				events.push(event);
-			},
-		});
-		store.observe(patternInput(installed.sessionID, "grep", { pattern: "README" }, ["README.md"]));
-
-		await agent.prompt("Read README.md");
-
-		expect(executions).toBe(1);
-		expect(streams.draftRequests()).toBe(2);
-		expect(events).toContainEqual(expect.objectContaining({ type: "hit", source: "pattern_aware" }));
-		await installed.uninstall();
-	});
-
-	it("deduplicates Drafter and PatternAware Bash through the OCI workspace backend", async () => {
-		const root = await mkdtemp(path.join(os.tmpdir(), "pi-agent-container-sources-"));
-		try {
-			const command = "printf speculative-container";
-			const store = new PatternAwareStore(PATTERN_AWARE_DEFAULTS);
-			for (const sessionID of ["container-one", "container-two", "container-three", "container-four"]) {
-				store.observe(patternInput(sessionID, "grep", { pattern: "container" }, ["README.md"]));
-				store.observeTurn({ sessionID, turnID: `${sessionID}:turn`, phase: "start", model: "openai/mock" });
-				store.observe(patternInput(sessionID, "bash", { command }));
-			}
-			const calls: ContainerRuntimeInvocation[] = [];
-			const backend = createContainerSandboxProcessBackend({
-				runtime: "docker",
-				invoker: async (input) => {
-					calls.push(input);
-					if (input.args[0] === "version") return containerResult("25.0");
-					if (input.args[0] === "image") return containerResult("sha256:worker|linux|x86_64");
-					return containerResult(input.args[0] === "exec" ? "speculative-container" : "");
-				},
-			});
-			const bashSchema = Type.Object({ command: Type.String() });
-			let actorExecutions = 0;
-			const tool: AgentTool<typeof bashSchema> = {
-				name: "bash",
-				label: "Bash",
-				description: "Run Bash",
-				parameters: bashSchema,
-				resolveInvocation: ({ command: resolvedCommand }) => ({
-					executor: "pi.bash.local.v2",
-					process: {
-						command: resolvedCommand,
-						cwd: root,
-						environment: { PATH: "C:\\Program Files\\Git\\usr\\bin" },
-						shell: "C:\\Program Files\\Git\\bin\\bash.exe",
-						shellArgs: ["-c"],
-						commandTransport: "argv",
-					},
-				}),
-				async execute() {
-					actorExecutions++;
-					return { content: [{ type: "text", text: "actor fallback" }], details: undefined };
-				},
-			};
-			const events: SpeculativeActionEvent<string>[] = [];
-			const streams = createStreamHarness({
-				toolName: "bash",
-				toolArgs: { command },
-				actorDelayMs: 1_500,
-				draftOnlyFirst: true,
-			});
-			const agent = new Agent({ initialState: { model: createModel(), tools: [tool] }, streamFn: streams.stream });
-			const installed = installSpeculativeAction(agent, {
-				cwd: root,
-				patternStore: store,
-				getSettings: () => ({ enabled: true, tools: { resourceCached: [], sandbox: ["bash"] } }),
-				preflight: () => true,
-				sandbox: createWorkspaceSandbox({ processBackend: backend }),
-				onEvent: (event) => {
-					events.push(event);
-				},
-			});
-			try {
-				store.observe(patternInput(installed.sessionID, "grep", { pattern: "container" }, ["README.md"]));
-
-				await agent.prompt("Run the container command");
-
-				expect(actorExecutions).toBe(0);
-				expect(calls.filter((call) => call.args[0] === "exec")).toHaveLength(1);
-				expect(events).toContainEqual(
-					expect.objectContaining({ type: "hit", sources: expect.arrayContaining(["drafter", "pattern_aware"]) }),
-				);
-				const result = agent.state.messages.find((message) => message.role === "toolResult");
-				expect(result?.role === "toolResult" ? result.content : undefined).toEqual([
-					{ type: "text", text: "speculative-container" },
-				]);
-			} finally {
-				await installed.uninstall();
-			}
-		} finally {
-			await rm(root, { recursive: true, force: true });
-		}
+	it("names equal actions under different parent paths independently", () => {
+		const left = patternPlanActionID("shared", patternPlanActionID("left"));
+		const right = patternPlanActionID("shared", patternPlanActionID("right"));
+		expect(left).not.toBe(right);
 	});
 });
 
-function trainPattern(store: PatternAwareStore, sessionID: string, path: string): void {
-	store.observe(patternInput(sessionID, "grep", { pattern: "README" }, [path]));
-	store.observeTurn({ sessionID, turnID: `${sessionID}:turn`, phase: "start", model: "openai/mock" });
-	store.observe(patternInput(sessionID, "read", { path }));
-}
-
-function patternInput(
-	sessionID: string,
-	tool: string,
-	input: Record<string, unknown>,
-	outputPaths?: readonly string[],
-): PatternAwareEventInput {
-	return {
-		sessionID,
-		turnID: `${sessionID}:turn`,
-		tool,
-		input,
-		outcome: "success",
-		durationMs: 10,
-		...(outputPaths ? { outputPaths } : {}),
-	};
-}
-
-function containerResult(output: string): ContainerRuntimeInvocationResult {
-	return { exitCode: 0, stdout: output, stderr: "", output, timedOut: false, truncated: false };
-}
-
-function deferred<T>(): { readonly promise: Promise<T>; readonly resolve: (value: T) => void } {
-	let resolvePromise: (value: T) => void = () => {};
-	const promise = new Promise<T>((resolve) => {
-		resolvePromise = resolve;
-	});
-	return { promise, resolve: resolvePromise };
-}
-
-async function waitFor(predicate: () => boolean): Promise<void> {
-	const deadline = Date.now() + 5000;
+async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
 	while (!predicate()) {
-		if (Date.now() >= deadline) throw new Error("Timed out waiting for test condition");
-		await new Promise((resolve) => setTimeout(resolve, 1));
+		if (Date.now() >= deadline) throw new Error("timed out waiting for speculative runtime");
+		await new Promise((resolve) => setTimeout(resolve, 5));
 	}
 }

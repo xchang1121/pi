@@ -1,4 +1,12 @@
-import { formatSize, type SettleToolCallResult, truncateHead } from "@earendil-works/pi-agent-core";
+import type { AgentToolResult } from "@earendil-works/pi-agent-core";
+import {
+	DEFAULT_MAX_BYTES,
+	DEFAULT_MAX_LINES,
+	formatSize,
+	type ReadToolDetails,
+	type ReadToolInput,
+	truncateHead,
+} from "@earendil-works/pi-coding-agent";
 import {
 	type ActionProjectionRule,
 	READ_RANGE_ACTION_KEY_PROJECTOR,
@@ -6,9 +14,10 @@ import {
 	type ReadRangeCoverage,
 } from "./action-key-projection.ts";
 import { READ_DEFAULT_LIMIT, readActionRange } from "./common.ts";
+import type { ToolSettlement } from "./tool-settlement.ts";
 
 /** Production Pi read projection. Other tools remain exact-only. */
-export const PI_READ_RANGE_PROJECTION_RULE: ActionProjectionRule<SettleToolCallResult> = {
+export const PI_READ_RANGE_PROJECTION_RULE: ActionProjectionRule<ToolSettlement> = {
 	...READ_RANGE_ACTION_KEY_PROJECTOR,
 	captureCoverage: (action, output) => {
 		if (action.tool !== "read" || output.isError) return undefined;
@@ -130,13 +139,79 @@ function readCoverageValue(details: unknown): unknown {
 	return (details as { readonly [READ_RANGE_COVERAGE_DETAILS_KEY]?: unknown })[READ_RANGE_COVERAGE_DETAILS_KEY];
 }
 
-function readCoverageLines(output: SettleToolCallResult, coverage: ReadRangeCoverage): readonly string[] | undefined {
+function readCoverageLines(output: ToolSettlement, coverage: ReadRangeCoverage): readonly string[] | undefined {
 	const content = output.result.content[0];
 	if (!content || content.type !== "text" || coverage.payloadTextLength > content.text.length) return undefined;
 	const payload = content.text.slice(0, coverage.payloadTextLength);
 	const lineCount = coverage.endLineExclusive - coverage.startLine;
 	const lines = lineCount === 0 ? [] : payload.split("\n");
 	return lines.length === lineCount ? lines : undefined;
+}
+
+/** Attach lossless in-memory range evidence to an unmodified Pi read result. */
+export function withPiReadCoverage(
+	input: ReadToolInput,
+	result: AgentToolResult<ReadToolDetails | undefined>,
+): AgentToolResult<ReadToolDetails | undefined> {
+	const coverage = inferPiReadCoverage(input, result);
+	if (!coverage) return result;
+	const details: ReadToolDetails & { [READ_RANGE_COVERAGE_DETAILS_KEY]: ReadRangeCoverage } = {
+		...(result.details ?? {}),
+		[READ_RANGE_COVERAGE_DETAILS_KEY]: coverage,
+	};
+	return {
+		...result,
+		details,
+	};
+}
+
+function inferPiReadCoverage(
+	input: ReadToolInput,
+	result: AgentToolResult<ReadToolDetails | undefined>,
+): ReadRangeCoverage | undefined {
+	if (result.content.length !== 1 || result.content[0]?.type !== "text") return undefined;
+	const text = result.content[0].text;
+	const startLine = Math.max(1, Math.floor(input.offset ?? 1));
+	const truncation = result.details?.truncation;
+	if (truncation?.firstLineExceedsLimit) return undefined;
+
+	if (truncation?.truncated) {
+		const totalLines = totalLinesFromTruncationNotice(text);
+		if (totalLines === undefined || !text.startsWith(truncation.content)) return undefined;
+		return {
+			kind: "text",
+			startLine,
+			endLineExclusive: startLine + truncation.outputLines,
+			totalLines,
+			payloadTextLength: truncation.content.length,
+			maxLines: truncation.maxLines,
+			maxBytes: truncation.maxBytes,
+		};
+	}
+
+	const limited = /\n\n\[(\d+) more lines in file\. Use offset=\d+ to continue\.\]$/.exec(text);
+	const remaining = limited ? Number(limited[1]) : 0;
+	const payload = limited ? text.slice(0, limited.index) : text;
+	const requestedLimit = input.limit === undefined ? undefined : Math.max(0, Math.floor(input.limit));
+	const lineCount = payload === "" && requestedLimit === 0 ? 0 : payload.split("\n").length;
+	const totalLines = startLine - 1 + lineCount + remaining;
+	if (totalLines < 1) return undefined;
+	return {
+		kind: "text",
+		startLine,
+		endLineExclusive: startLine + lineCount,
+		totalLines,
+		payloadTextLength: payload.length,
+		maxLines: DEFAULT_MAX_LINES,
+		maxBytes: DEFAULT_MAX_BYTES,
+	};
+}
+
+function totalLinesFromTruncationNotice(text: string): number | undefined {
+	const match = /\[Showing lines \d+-\d+ of (\d+)(?:\.| \()/.exec(text);
+	if (!match) return undefined;
+	const total = Number(match[1]);
+	return Number.isSafeInteger(total) && total > 0 ? total : undefined;
 }
 
 function finiteInteger(value: unknown): number | undefined {

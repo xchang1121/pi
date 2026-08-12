@@ -14,7 +14,7 @@ const target = {
 	libc: requested.libc ?? (process.platform === "linux" ? detectLinuxLibc() : undefined),
 };
 if (!isSupportedPlatform(target.os) || (target.arch !== "arm64" && target.arch !== "x64")) {
-	throw new Error("Native sandbox supports Linux and macOS on arm64 or x64; use the OCI worker on Windows.");
+	throw new Error("Native sandbox supports linux, darwin, and win32 on arm64 or x64.");
 }
 if (target.os === "linux" && target.libc === undefined) {
 	throw new Error("Cross-building a Linux native sandbox requires --libc=gnu or --libc=musl.");
@@ -28,7 +28,7 @@ const native =
 	target.os === process.platform &&
 	target.arch === process.arch &&
 	(target.os !== "linux" || target.libc === detectLinuxLibc());
-	const executable = "pi-sandbox-native";
+const executable = target.os === "win32" ? "pi-sandbox-native.exe" : "pi-sandbox-native";
 const command = [...(rust.toolchain ? [`+${rust.toolchain}`] : []), "build", "--release", ...(native ? [] : ["--target", rust.triple])];
 const cargo = spawnSync("cargo", command, {
 	cwd: crate,
@@ -83,6 +83,44 @@ function parseArguments(args) {
 }
 
 function rustTarget(target) {
+	if (target.os === "win32") {
+		const configured = process.env.PI_WINDOWS_RUST_ABI;
+		const gnu = configured === "gnu" || (configured !== "msvc" && process.platform === "win32" && !hasCommand("link.exe"));
+		if (target.arch === "x64" && gnu) {
+			const toolchain = "stable-x86_64-pc-windows-gnu";
+			const targetLibdir = spawnSync("rustc", [`+${toolchain}`, "--print", "target-libdir"], {
+				encoding: "utf8",
+			});
+			if (targetLibdir.status !== 0) throw new Error(`Failed to inspect ${toolchain}.`);
+			const targetRoot = path.dirname(targetLibdir.stdout.trim());
+			const rustBin = path.join(targetRoot, "bin");
+			const foundLlvmDlltool = findCommand("llvm-dlltool.exe");
+			const llvmBin = process.env.LLVM_MINGW_BIN ?? (foundLlvmDlltool ? path.dirname(foundLlvmDlltool) : undefined);
+			const llvmDlltool = llvmBin ? path.join(llvmBin, "llvm-dlltool.exe") : undefined;
+			return {
+				triple: "x86_64-pc-windows-gnu",
+				toolchain,
+				environment: {
+					PATH: [llvmBin, rustBin, path.join(rustBin, "self-contained"), process.env.PATH]
+						.filter(Boolean)
+						.join(path.delimiter),
+					CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: path.join(rustBin, "rust-lld.exe"),
+					RUSTFLAGS: [
+						process.env.RUSTFLAGS,
+						"-C link-self-contained=yes",
+						...(llvmDlltool ? [`-C dlltool=${llvmDlltool}`] : []),
+					]
+						.filter(Boolean)
+						.join(" "),
+				},
+			};
+		}
+		return {
+			triple: target.arch === "arm64" ? "aarch64-pc-windows-msvc" : "x86_64-pc-windows-msvc",
+			toolchain: undefined,
+			environment: {},
+		};
+	}
 	if (target.os === "darwin") {
 		return {
 			triple: target.arch === "arm64" ? "aarch64-apple-darwin" : "x86_64-apple-darwin",
@@ -112,5 +150,15 @@ function detectLinuxLibc() {
 }
 
 function isSupportedPlatform(value) {
-	return value === "linux" || value === "darwin";
+	return value === "linux" || value === "darwin" || value === "win32";
+}
+
+function hasCommand(command) {
+	return findCommand(command) !== undefined;
+}
+
+function findCommand(command) {
+	const locator = process.platform === "win32" ? "where" : "which";
+	const result = spawnSync(locator, [command], { encoding: "utf8" });
+	return result.status === 0 ? result.stdout.trim().split(/\r?\n/, 1)[0] : undefined;
 }

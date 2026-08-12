@@ -4,7 +4,8 @@
 		"outDir": "./dist",
 		"paths": {
 			"@earendil-works/pi-ai": ["../ai/dist/index.d.ts"],
-			"@earendil-works/pi-agent-core": ["../agent/dist/index.d.ts"]
+			"@earendil-works/pi-agent-core": ["../agent/dist/index.d.ts"],
+			"@earendil-works/pi-coding-agent": ["../coding-agent/dist/index.d.ts"]
 		},
 		"rootDir": "./src"
 	},

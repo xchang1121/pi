@@ -8,7 +8,7 @@ Pi 的工具动作投机执行功能。它在 Actor 模型思考期间预测接�
 
 - `read`、`grep`、`find`：资源版本校验后的结果缓存与复用。
 - `write`、`edit`：在私有 Git 工作区预执行，命中后事务式提交变更。
-- `bash`：在私有 Git 工作区和隔离 OCI worker 中预执行，命中后复用输出并提交变更。
+- `bash`：在私有 Git 工作区和隔离进程后端中预执行，命中后复用输出并提交变更。
 - PatternAware：从历史工具序列学习模板，并预测未来一步或多步动作。
 - Drafter：与 Actor 并行调用模型，生成当前回合的候选动作。
 
@@ -16,32 +16,33 @@ Pi 的工具动作投机执行功能。它在 Actor 模型思考期间预测接�
 
 ## 快速开始
 
-投机功能已经作为 Pi 内置插件接入本仓库，无需另外安装 extension。官方发布版 Pi 暂不包含本分支的代码，因此需要从包含该功能的仓库或发布包启动 Pi。
+Speculative Action 现在是普通的 Pi package，只使用公开 extension API，不修改 `pi-agent-core`、`pi-coding-agent` 或 Pi 的 settings schema。
 
 ### 1. 从源码启动
 
-要求 Node.js 22.19 或更高版本，以及 Git。把下面的仓库地址替换成实际 GitHub 地址：
+要求 Node.js 22.19 或更高版本，以及 Git。构建 package 后，可以把它安装到任意兼容且未修改的 Pi：
 
 ```bash
-git clone <your-github-repository> pi-speculative
+git clone --branch speculative-action https://github.com/xchang1121/pi.git pi-speculative
 cd pi-speculative
-git switch feature/speculative-action
 npm install --ignore-scripts
 npm run hydrate:model-data
-./pi-test.sh
+npm run build --workspace @earendil-works/pi-coding-agent
+npm run build --workspace @earendil-works/pi-speculative-action
+pi install ./packages/speculative-action
 ```
 
-`hydrate:model-data` 会获取 Pi 构建和运行所需的模型目录。如果使用包含模型快照的 release source，可以跳过该步骤并使用 `npm run build:offline`。
+`hydrate:model-data` 会获取 monorepo 构建所需的模型目录。已经构建好的发布包会包含 `dist`，不需要这一步源码构建。
 
-也可以保留原有 `pi` 命令，直接从任意项目目录调用这个仓库中的脚本：
+如果只想临时试用一个会话而不写入 Pi 设置：
 
 ```bash
-/path/to/pi-speculative/pi-test.sh
+pi -e /absolute/path/to/pi-speculative/packages/speculative-action
 ```
 
 ### 2. 信任当前项目
 
-内置插件只会在受信任项目中预执行候选动作。交互模式下可运行：
+package 只会在受信任项目中预执行候选动作。交互模式下可运行：
 
 ```text
 /trust
@@ -61,7 +62,7 @@ npm run hydrate:model-data
 成功开启后，底部状态栏会出现类似信息：
 
 ```text
-spec: on · container · 3/4 hits · 1.2s saved · 5/512 cached
+spec: on · Windows AppContainer · 3/4 hits · 1.2s saved · 5/512 results
 ```
 
 首次运行或模板尚未学习时，命中率可能较低。完成若干包含重复 `read`、`grep`、`find` 或 `bash` 工作流的任务后，再观察 `Hits`、`Saved` 和 `End-to-end speedup`。
@@ -95,7 +96,7 @@ spec: on · container · 3/4 hits · 1.2s saved · 5/512 cached
 | Prediction timeout | 300 秒 | 单轮预测生命周期上限 |
 | Resource-cached tools | `read`, `grep`, `find` | 资源校验后可复用 |
 | Sandbox-staged tools | `bash`, `write`, `edit` | 在隔离工作区中预执行 |
-| Isolation backend | `auto` | 优先使用 OCI worker；仅在 Linux/macOS 上回退原生 broker |
+| Isolation backend | `auto` | 优先使用 OCI worker；不可用时回退原生 OS broker |
 
 `bash` 默认在候选工具列表中，但只有所选进程后端健康检查通过后才会投机执行。隔离不可用时，Actor 发出的 Bash 仍按 Pi 原生路径正常运行。
 
@@ -105,38 +106,36 @@ spec: on · container · 3/4 hits · 1.2s saved · 5/512 cached
 
 | 文件 | 作用域 |
 |---|---|
-| `~/.pi/agent/settings.json` | 全局配置 |
-| `.pi/settings.json` | 当前项目配置，覆盖全局配置 |
+| `~/.pi/agent/speculative-action.json` | 全局配置 |
+| `.pi/speculative-action.json` | 当前项目配置，覆盖全局配置 |
 
 完整示例：
 
 ```json
 {
-  "speculativeAction": {
+  "enabled": true,
+  "drafterEnabled": true,
+  "draftModel": "provider/model",
+  "candidateLimit": 8,
+  "maxConcurrentActions": 8,
+  "resourceCacheMaxEntries": 512,
+  "resourceCacheMaxBytes": 268435456,
+  "predictionTimeoutMs": 300000,
+  "adaptiveDrafter": true,
+  "isolation": {
+    "backend": "auto",
+    "runtime": "auto",
+    "image": "pi-speculative-worker:latest"
+  },
+  "patternAware": {
     "enabled": true,
-    "drafterEnabled": true,
-    "draftModel": "provider/model",
-    "candidateLimit": 8,
-    "maxConcurrentActions": 8,
-    "resourceCacheMaxEntries": 512,
-    "resourceCacheMaxBytes": 268435456,
-    "predictionTimeoutMs": 300000,
-    "adaptiveDrafter": true,
-    "isolation": {
-      "backend": "auto",
-      "runtime": "auto",
-      "image": "pi-speculative-worker:latest"
-    },
-    "patternAware": {
-      "enabled": true,
-      "multiStepEnabled": true,
-      "beamWidth": 4,
-      "maxPredictionDepth": 6
-    },
-    "tools": {
-      "resourceCached": ["read", "grep", "find"],
-      "sandbox": ["bash", "write", "edit"]
-    }
+    "multiStepEnabled": true,
+    "beamWidth": 4,
+    "maxPredictionDepth": 6
+  },
+  "tools": {
+    "resourceCached": ["read", "grep", "find"],
+    "sandbox": ["bash", "write", "edit"]
   }
 }
 ```
@@ -145,13 +144,17 @@ spec: on · container · 3/4 hits · 1.2s saved · 5/512 cached
 
 ## 启用 Bash 投机
 
-`write` 和 `edit` 依靠私有 Git snapshot/worktree 隔离；`bash` 还必须具备进程隔离。推荐的跨平台后端是持久化 Docker/Podman worker 池。先构建一次仓库内置的 Linux worker 镜像：
+`write` 和 `edit` 依靠私有 Git snapshot/worktree 隔离；`bash` 还必须具备进程隔离。推荐的跨平台后端是持久化 Docker/Podman worker 池。
+
+在 TUI 中启用 speculative action 时，package 会分别探测两个后端。`auto` 会在 OCI 可用时使用 OCI，否则回退到原生 OS 沙箱。面板分别显示 **Configured backend**、**Active backend**、**OCI worker** 和 **Native sandbox**，因此 Docker 不存在但 AppContainer 或其他原生后端可用时，不会再误报为全局沙箱不可用。只有两个后端都不可用时，才会自动给出 Docker/Podman 安装选项；任何系统包安装都必须先确认。即使当前正在使用原生回退，仍可从 **Tools & sandbox → Install or repair OCI dependencies** 主动配置 OCI。
+
+手动配置时，先构建一次仓库内置的 Linux worker 镜像：
 
 ```bash
 npm run build:worker --workspace @earendil-works/pi-speculative-action
 ```
 
-Pi 不会隐式拉取镜像。默认镜像是 `pi-speculative-worker:latest`；可以通过设置面板、JSON 或 `PI_SPECULATIVE_WORKER_IMAGE` 选择其他不可变镜像。`runtime: "auto"` 会先探测 Docker、再探测 Podman；也可以设置 `PI_SPECULATIVE_WORKER_RUNTIME=podman`。`PI_SPECULATIVE_WORKER_RUNTIME_BIN` 用于指定明确受信任的 runtime 可执行文件，`PI_SPECULATIVE_WORKER_SHELL` 用于指定 guest shell。
+Pi 不会隐式拉取自定义镜像。默认镜像是 `pi-speculative-worker:latest`；可以通过设置面板、JSON 或 `PI_SPECULATIVE_WORKER_IMAGE` 选择其他不可变镜像。`runtime: "auto"` 会先探测 Docker、再探测 Podman；也可以设置 `PI_SPECULATIVE_WORKER_RUNTIME=podman`。`PI_SPECULATIVE_WORKER_RUNTIME_BIN` 用于指定明确受信任的 runtime 可执行文件，`PI_SPECULATIVE_WORKER_SHELL` 用于指定 guest shell。
 
 然后在 Pi 中重新检查：
 
@@ -159,17 +162,20 @@ Pi 不会隐式拉取镜像。默认镜像是 `pi-speculative-worker:latest`；�
 /speculative-action refresh
 ```
 
-状态中应出现：
+根据宿主平台，状态中可能出现：
 
 ```text
-Sandbox: container ready (...)
+Configured isolation: auto
+Active sandbox: Windows AppContainer ready (...)
+OCI worker: unavailable (...)
+Native sandbox: Windows AppContainer ready (...)
 ```
 
 worker 池会保持空容器处于 warm 状态，但每个投机 branch 都拥有独立工作区挂载和一次性容器。每条命令结束后会删除整个容器，并在复用 slot 前创建新容器，因此未采纳的进程树、根文件系统修改和临时文件不会泄漏到其他 branch。源工作区从不挂载进容器；worker 只能看到 branch 副本，且网络被禁用。Linux worker 还使用只读根文件系统、删除全部 capability、`no-new-privileges`、PID 上限，并在可用时使用宿主 UID/GID。
 
 内置镜像运行 Linux Bash，可通过 Windows 上的 Docker Desktop，以及 Linux/macOS 上的 Docker/Podman 使用。如果必须精确复现 Git for Windows 行为，可提供 Windows 容器镜像，并把 `guestShell` 设置为 `C:\\Program Files\\Git\\bin\\bash.exe`。配置的镜像 ID、OS、架构、runtime 和 guest shell 都会进入 K(a) 的 execution-world fingerprint，改变任一项都会使旧投机结果失效。
 
-Linux 和 macOS 可以显式使用现有原生 broker，也可以在 `auto` 下把它作为回退。构建命令为：
+Linux、macOS 和 Windows 都可以显式使用原生 broker，也可以在 `auto` 下把它作为回退。构建命令为：
 
 ```bash
 npm run build:native --workspace @earendil-works/pi-speculative-action
@@ -179,8 +185,9 @@ npm run build:native --workspace @earendil-works/pi-speculative-action
 
 - Linux：namespace、只读宿主挂载、seccomp、capability 移除和进程树监管。
 - macOS：Seatbelt profile、源目录/用户目录/网络限制和进程树监管。
+- Windows：零 capability AppContainer、仅授予暂存工作区的 package-SID 权限、私有 desktop 和 kill-on-close Job 监管。
 
-Windows 不会自动回退原生 broker：AppContainer 强制 ASLR 与 MSYS2/Git Bash 使用的 fork 模型不兼容。在 Windows 上应使用 OCI worker 执行 Bash 投机。
+Windows 的 `auto` 会先尝试 OCI，再回退 AppContainer。AppContainer 会原样执行配置的 shell 与命令，不设 Bash 命令白名单；因此兼容的 Git Bash 命令可以命中，而 MSYS fork 或其他执行失败会由 Scheduler 丢弃，Actor 再按正常路径执行。Bash 后端失败不会影响 `write`、`edit` 和资源缓存类投机。
 
 `ExecutionWorld` 是 Agent adapter 使用的隔离边界。`ActionSemanticsRegistry` 选择 world mode（`file_mutation` 或 `workspace_snapshot`），world 不再维护第二份硬编码工具列表。完成的 `WorldBranch` 会把工具输出和可提升的文件系统 delta 一起封存；进程内 cwd/环境状态以及被阻断的网络副作用不会被提升。并发消费者会合并到同一次经过冲突校验的事务式 adoption，而未被采用的 branch 无法改变 Actor 所在的 world。
 
@@ -201,7 +208,10 @@ Windows 不会自动回退原生 broker：AppContainer 强制 ASLR 与 MSYS2/Git
 | `End-to-end speedup` | 根据观测墙钟时间和 saved 时间计算的会话内指标 |
 | `Draft tokens` | Drafter 累计 token 用量 |
 | `Cache` | 当前缓存项、容量、内存占用和运行中任务数 |
-| `Sandbox` | 已配置的 Bash 隔离后端是否可用 |
+| `Configured isolation` | 用户请求的后端策略及 OCI runtime/image 配置 |
+| `Active sandbox` | Scheduler 当前实际可以使用的后端 |
+| `OCI worker` | Docker/Podman worker 健康状态，与原生状态独立 |
+| `Native sandbox` | AppContainer/Seatbelt/Linux 原生沙箱状态，与 OCI 状态独立 |
 
 判断真实收益时，应以相同任务、模型和环境下的 baseline/full 配对墙钟时间为准，不应只根据 `Saved` 推断端到端加速。
 
@@ -269,67 +279,23 @@ Windows 不会自动回退原生 broker：AppContainer 强制 ASLR 与 MSYS2/Git
 ## 安全模型
 
 - 所有候选参数先经过真实工具 schema 校验和非交互式 preflight。
-- 内置插件只允许受信任项目中的已知工具进入投机路径。
+- package 只允许受信任项目中的已知工具进入投机路径。
 - `write`、`edit` 和 `bash` 在独立 Git snapshot/worktree 中预执行，不直接修改真实工作区。
 - 命中时会再次逐文件校验 base 内容；任何资源变化都会拒绝提交。
 - 提交变更采用完整 change set，部分写入失败时回滚已经写入的路径。
 - 路径逃逸和 symlink 路径 fail closed。
 - Bash 必须通过可证明的进程隔离后端，单纯复制目录不被视为安全边界。
 
-## SDK 集成
+## 零修改边界
 
-不使用 Pi coding-agent 内置插件时，也可以直接安装到 `Agent`。通用 SDK 默认关闭投机，并且必须提供非交互式 `preflight`；缺少该回调时只生成预测，不执行候选。
+package 只通过 Pi 原生公开 API 接入：生命周期事件提供模型上下文，`registerCommand()` 提供 TUI，同名 `registerTool()` 定义包装 Pi 公开的 `read`、`bash`、`edit`、`write`、`grep` 和 `find` 工厂。命中时返回缓存 settlement；未命中时委托给未修改的原生工具。package 自己管理配置，不进入 Pi settings schema。删除 package 后即可恢复 baseline，不需要回退任何 Pi 源文件。
 
-```ts
-import {
-  createContainerSandboxProcessBackend,
-  createWorkspaceSandbox,
-  installSpeculativeAction,
-} from "@earendil-works/pi-speculative-action";
-
-const allowedTools = new Set(["read", "grep", "find", "bash", "write", "edit"]);
-
-const installed = installSpeculativeAction(agent, {
-  cwd: process.cwd(),
-  getSettings: () => ({
-    enabled: true,
-    drafterEnabled: true,
-    candidateLimit: 4,
-    maxConcurrentActions: 4,
-    resourceCacheMaxEntries: 256,
-    resourceCacheMaxBytes: 256 * 1024 * 1024,
-    predictionTimeoutMs: 1_000,
-    adaptiveDrafter: true,
-    patternAware: {
-      enabled: true,
-      multiStepEnabled: true,
-      beamWidth: 4,
-      maxPredictionDepth: 6,
-      futureGapCoverage: 0.9,
-      decayHalfLifeEvents: 2048,
-    },
-    tools: {
-      resourceCached: ["read", "grep", "find"],
-      sandbox: ["bash", "write", "edit"],
-    },
-  }),
-  preflight: ({ toolName }) => allowedTools.has(toolName),
-  sandbox: createWorkspaceSandbox({
-    processBackend: createContainerSandboxProcessBackend(),
-  }),
-  onEvent: (event) => console.debug(event),
-});
-
-// 在销毁 Agent 前调用。
-await installed.uninstall();
-```
-
-如果 Drafter 与 Actor 使用不同 provider，应通过 `getDraftOptions` 提供正确的认证和请求选项。投机异常应继续保持可回退语义，不要在 `preflight` 中显示交互式授权界面。
+引擎仍通过 `createSpeculativeActionHost()` 支持非 Pi adapter，但普通 Pi 用户应安装 package，而不是修改 `Agent` 实例。
 
 ## 故障排查
 
 - `Enabled: Off`：运行 `/speculative-action on`。
-- `Sandbox: bash unavailable`：构建 worker 镜像，确认 Docker 或 Podman 可以 inspect 该镜像，然后运行 `/speculative-action refresh`。
+- `Active sandbox: unavailable`：查看独立的 OCI/native 状态行。OCI 可使用 **Tools & sandbox → Install or repair OCI dependencies**；原生后端可构建或指定 broker，然后运行 `/speculative-action refresh`。
 - 已开启但一直没有候选：确认项目已信任、Drafter 已认证，并检查是否关闭了 Drafter 和 PatternAware。
 - 有候选但没有命中：预测动作必须与 Actor 的工具名和规范化参数匹配；资源变化也会让候选失效。
 - PatternAware 初期没有效果：它需要先观察重复工作流；冷启动阶段主要依赖 Drafter。
@@ -338,6 +304,6 @@ await installed.uninstall();
 
 ## 实现概览
 
-Actor 与 Drafter 并行运行，候选依次经过 schema 校验、preflight、资源版本捕获和执行策略选择。完成的候选进入 `ResultCache` 或仅支持精确匹配的 `ActionStore`，隔离副作用由封存的 `WorldBranch` 表示；Actor 发出工具调用时，Pi Agent 的 `settleToolCall` hook 尝试复用完全匹配或安全可投影的结果。PatternAware 按 workspace hash 持久化模板和有界 PPM 计数 trie，只保留少量预期收益最高的 beam；DAG 执行、新鲜度和资源调度仍由来源无关的 runtime 统一负责。
+Actor 与 Drafter 并行运行，候选依次经过 schema 校验、preflight、资源版本捕获和执行策略选择。完成的候选进入 `ResultCache` 或仅支持精确匹配的 `ActionStore`，隔离副作用由封存的 `WorldBranch` 表示；Actor 调用被包装的原生工具时，package 尝试复用完全匹配或安全可投影的结果，未命中则委托给该原生工具。PatternAware 按 workspace hash 持久化模板和有界 PPM 计数 trie，只保留少量预期收益最高的 beam；DAG 执行、新鲜度和资源调度仍由来源无关的 runtime 统一负责。
 
 所有命中、未命中、取消、实际执行、草稿 token、缓存和沙箱阶段耗时均以 typed event 暴露，供实验记录与可视化使用。

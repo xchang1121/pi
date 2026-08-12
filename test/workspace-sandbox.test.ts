@@ -2,10 +2,11 @@ import { execFile } from "node:child_process";
 import { chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import type { AgentTool, SettleToolCallResult } from "@earendil-works/pi-agent-core";
+import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it } from "vitest";
 import { buildPiActionKey } from "../src/common.ts";
+import type { ToolSettlement } from "../src/tool-settlement.ts";
 import {
 	closeWorkspaceSandboxPools,
 	commitSandboxDelta,
@@ -1001,14 +1002,14 @@ function resolvedInvocation(command: string, cwd: string, timeout?: number) {
 	};
 }
 
-function settlement(text: string): SettleToolCallResult {
+function settlement(text: string): ToolSettlement {
 	return {
 		result: { content: [{ type: "text", text }], details: undefined },
 		isError: false,
 	};
 }
 
-function runNodeScript(command: string, cwd: string, signal: AbortSignal): Promise<SettleToolCallResult> {
+function runNodeScript(command: string, cwd: string, signal: AbortSignal): Promise<ToolSettlement> {
 	return new Promise((resolve, reject) => {
 		execFile(process.execPath, ["-e", command], { cwd, signal }, (error, stdout, stderr) => {
 			if (error) {

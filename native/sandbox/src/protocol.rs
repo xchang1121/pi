@@ -233,7 +233,12 @@ fn platform_check() -> CheckResponse {
     crate::macos::check()
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(windows)]
+fn platform_check() -> CheckResponse {
+    crate::windows_native::check()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn platform_check() -> CheckResponse {
     CheckResponse {
         version: PROTOCOL_VERSION,
@@ -253,7 +258,12 @@ fn platform_execute(request: &ExecuteRequest) -> Result<ExecuteResponse> {
     crate::macos::execute(request)
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(windows)]
+fn platform_execute(request: &ExecuteRequest) -> Result<ExecuteResponse> {
+    crate::windows_native::execute(request)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn platform_execute(_request: &ExecuteRequest) -> Result<ExecuteResponse> {
     bail!("unsupported platform")
 }
