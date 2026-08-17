@@ -93,6 +93,7 @@ fn run_with_shell(
         environment: std::env::vars().collect(),
         cwd: sandbox.to_path_buf(),
         sandbox_root: sandbox.to_path_buf(),
+        workspace_root: sandbox.to_path_buf(),
         source_root: source.to_path_buf(),
         timeout_ms,
         max_output_bytes,
@@ -165,7 +166,8 @@ fn rejects_junction_escape_before_sandbox_setup() {
         command_transport: CommandTransport::Argv,
         environment: std::env::vars().collect(),
         cwd: junction,
-        sandbox_root: sandbox,
+        sandbox_root: sandbox.clone(),
+        workspace_root: sandbox,
         source_root: source,
         timeout_ms: 1_000,
         max_output_bytes: 16 * 1024,
@@ -179,7 +181,7 @@ fn rejects_junction_escape_before_sandbox_setup() {
         .unwrap();
     assert!(!output.status.success());
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("canonical cwd escapes sandboxRoot"),
+        String::from_utf8_lossy(&output.stderr).contains("canonical cwd escapes workspaceRoot"),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
@@ -341,6 +343,7 @@ fn terminating_the_broker_kills_descendants() {
         environment: std::env::vars().collect(),
         cwd: sandbox.clone(),
         sandbox_root: sandbox.clone(),
+        workspace_root: sandbox.clone(),
         source_root: source,
         timeout_ms: 30_000,
         max_output_bytes: 16 * 1024,

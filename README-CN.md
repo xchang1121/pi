@@ -171,7 +171,7 @@ OCI worker: unavailable (...)
 Native sandbox: Windows AppContainer ready (...)
 ```
 
-worker 池会保持空容器处于 warm 状态，但每个投机 branch 都拥有独立工作区挂载和一次性容器。每条命令结束后会删除整个容器，并在复用 slot 前创建新容器，因此未采纳的进程树、根文件系统修改和临时文件不会泄漏到其他 branch。源工作区从不挂载进容器；worker 只能看到 branch 副本，且网络被禁用。Linux worker 还使用只读根文件系统、删除全部 capability、`no-new-privileges`、PID 上限，并在可用时使用宿主 UID/GID。
+worker 池会预先准备执行 slot，并在 branch 工作区及其 Actor 逻辑路径确定后创建一次性容器。每条命令结束后会删除整个容器再复用 slot，因此未采纳的进程树、根文件系统修改和临时文件不会泄漏到其他 branch。源工作区从不挂载进容器；worker 只能看到 branch 副本，且网络被禁用。在兼容的 OCI guest 中，该副本会挂载到 Actor 的逻辑工作区路径，原命令中的绝对路径无需改写即可保持语义。Linux worker 还使用只读根文件系统、删除全部 capability、`no-new-privileges`、PID 上限，并在可用时使用宿主 UID/GID。
 
 内置镜像运行 Linux Bash，可通过 Windows 上的 Docker Desktop，以及 Linux/macOS 上的 Docker/Podman 使用。如果必须精确复现 Git for Windows 行为，可提供 Windows 容器镜像，并把 `guestShell` 设置为 `C:\\Program Files\\Git\\bin\\bash.exe`。配置的镜像 ID、OS、架构、runtime 和 guest shell 都会进入 K(a) 的 execution-world fingerprint，改变任一项都会使旧投机结果失效。
 
@@ -189,7 +189,7 @@ npm run build:native --workspace @earendil-works/pi-speculative-action
 
 Windows 的 `auto` 会先尝试 OCI，再回退 AppContainer。AppContainer 会原样执行配置的 shell 与命令，不设 Bash 命令白名单；因此兼容的 Git Bash 命令可以命中，而 MSYS fork 或其他执行失败会由 Scheduler 丢弃，Actor 再按正常路径执行。Bash 后端失败不会影响 `write`、`edit` 和资源缓存类投机。
 
-`ExecutionWorld` 是 Agent adapter 使用的隔离边界。`ActionSemanticsRegistry` 选择 world mode（`file_mutation` 或 `workspace_snapshot`），world 不再维护第二份硬编码工具列表。完成的 `WorldBranch` 会把工具输出和可提升的文件系统 delta 一起封存；进程内 cwd/环境状态以及被阻断的网络副作用不会被提升。并发消费者会合并到同一次经过冲突校验的事务式 adoption，而未被采用的 branch 无法改变 Actor 所在的 world。
+`ExecutionWorld` 是 Agent adapter 使用的隔离边界。`ActionSemanticsRegistry` 选择 world mode（`file_mutation` 或 `workspace_snapshot`），world 不再维护第二份硬编码工具列表。完成的 `WorldBranch` 会把工具输出、可提升的文件系统 delta 和不可变 checkpoint 一起封存。与来源无关的 Scheduler 可以在 Actor 采纳前从 checkpoint 派生后续沙箱动作，但真正匹配时仍要求祖先动作按 Actor 顺序完成采纳。进程内 cwd/环境状态以及被阻断的网络副作用不会被提升；并发消费者会合并到同一次经过冲突校验的事务式 adoption，而未被采用的 branch 无法改变 Actor 所在的 world。Linux 原生隔离还会在 mount namespace 内把私有 branch 投影到 Actor 的逻辑工作区路径。
 
 若所有已配置后端都不可用，Bash 投机会 fail closed，并回退到 Actor 的正常 Bash 执行。
 

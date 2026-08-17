@@ -6,6 +6,7 @@ import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it } from "vitest";
 import { buildPiActionKey } from "../src/common.ts";
+import { createNativeSandboxProcessBackend } from "../src/native-sandbox.ts";
 import type { ToolSettlement } from "../src/tool-settlement.ts";
 import {
 	closeWorkspaceSandboxPools,
@@ -33,6 +34,8 @@ const editParameters = Type.Object({
 });
 const bashParameters = Type.Object({ command: Type.String(), timeout: Type.Optional(Type.Number()) });
 const itWithPosixShell = process.platform === "win32" ? it.skip : it;
+const nativeBroker = process.env.PI_SPECULATIVE_SANDBOX_NATIVE_BIN;
+const itWithNativeBroker = nativeBroker ? it : it.skip;
 
 const writeTool: AgentTool<typeof writeParameters> = {
 	name: "write",
@@ -181,6 +184,131 @@ describe("workspace ExecutionWorld", () => {
 		}
 	});
 
+	it("derives a child checkpoint before actor adoption and commits only the child delta", async () => {
+		const root = await mkdtemp(path.join(os.tmpdir(), "pi-spec-world-lineage-"));
+		try {
+			const target = path.join(root, "lineage.txt");
+			await writeFile(target, "base\n", "utf8");
+			const world = createWorkspaceSandbox();
+			const parentArgs = { path: "lineage.txt", content: "parent\n" };
+			const parent = await world.fork({
+				mode: "file_mutation",
+				cwd: root,
+				tool: writeTool,
+				toolName: "write",
+				args: parentArgs,
+				action: requiredAction("write", parentArgs, root),
+				callID: "spec-lineage-parent",
+				signal: new AbortController().signal,
+			});
+			const childArgs = {
+				path: "lineage.txt",
+				edits: [{ oldText: "parent", newText: "child" }],
+			};
+			const child = await world.fork({
+				mode: "file_mutation",
+				cwd: root,
+				tool: editTool,
+				toolName: "edit",
+				args: childArgs,
+				action: requiredAction("edit", childArgs, root),
+				callID: "spec-lineage-child",
+				signal: new AbortController().signal,
+				parentCheckpoint: parent.checkpoint,
+			});
+
+			expect(child.checkpoint?.lineage).toBe(parent.checkpoint?.lineage);
+			expect(child.checkpoint?.depth).toBe(1);
+			expect(await readFile(target, "utf8")).toBe("base\n");
+			await parent.adopt();
+			expect(await readFile(target, "utf8")).toBe("parent\n");
+			await child.adopt();
+			expect(await readFile(target, "utf8")).toBe("child\n");
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	itWithNativeBroker(
+		"runs a real multi-step process world before ordered adoption",
+		async () => {
+			const root = await mkdtemp(path.join(os.tmpdir(), "pi-spec-native-lineage-"));
+			const shell =
+				process.env.PI_SPECULATIVE_TEST_SHELL ??
+				(process.platform === "win32" ? (process.env.ComSpec ?? "cmd.exe") : "/bin/bash");
+			const commandShell = path.basename(shell).toLowerCase();
+			const usesCmd = commandShell === "cmd" || commandShell === "cmd.exe";
+			const environment = Object.fromEntries(
+				Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined),
+			);
+			const parentCommand = usesCmd ? "> state.txt echo parent" : "printf 'parent\\n' > state.txt";
+			const childCommand = usesCmd
+				? 'findstr /x /c:"parent" state.txt >nul && > state.txt echo child'
+				: "grep -qx 'parent' state.txt && printf 'child\\n' > state.txt";
+			const grandchildCommand = usesCmd
+				? 'findstr /x /c:"child" state.txt >nul && > state.txt echo grandchild'
+				: "grep -qx 'child' state.txt && printf 'grandchild\\n' > state.txt";
+			const expectedLine = (value: string) => (usesCmd ? `${value}\r\n` : `${value}\n`);
+			const world = createWorkspaceSandbox({
+				processBackend: createNativeSandboxProcessBackend({ binaryPath: nativeBroker! }),
+			});
+			const fork = (
+				command: string,
+				callID: string,
+				parentCheckpoint?: Parameters<typeof world.fork>[0]["parentCheckpoint"],
+			) => {
+				const args = { command, timeout: 20 };
+				return world.fork({
+					mode: "workspace_snapshot",
+					cwd: root,
+					tool: bashTool,
+					toolName: "bash",
+					args,
+					action: requiredAction("bash", args, root),
+					invocation: {
+						executor: "native-lineage-test",
+						process: {
+							command,
+							cwd: root,
+							environment,
+							shell,
+							shellArgs: usesCmd ? ["/d", "/s", "/c"] : ["--noprofile", "--norc", "-c"],
+							commandTransport: "argv",
+							timeout: 20,
+						},
+					},
+					callID,
+					signal: new AbortController().signal,
+					...(parentCheckpoint ? { parentCheckpoint } : {}),
+				});
+			};
+			try {
+				await writeFile(path.join(root, "state.txt"), "base\n", "utf8");
+				const parent = await fork(parentCommand, "native-parent");
+				expect(parent.output.isError).toBe(false);
+				expect(parent.resources).toEqual(["state.txt"]);
+				const child = await fork(childCommand, "native-child", parent.checkpoint);
+				expect(child.output.isError).toBe(false);
+				expect(child.checkpoint?.lineage).toBe(parent.checkpoint?.lineage);
+				const grandchild = await fork(grandchildCommand, "native-grandchild", child.checkpoint);
+				expect(grandchild.output.isError).toBe(false);
+				expect(grandchild.checkpoint?.depth).toBe(2);
+				expect(await readFile(path.join(root, "state.txt"), "utf8")).toBe("base\n");
+
+				await parent.adopt();
+				expect(await readFile(path.join(root, "state.txt"), "utf8")).toBe(expectedLine("parent"));
+				await child.adopt();
+				expect(await readFile(path.join(root, "state.txt"), "utf8")).toBe(expectedLine("child"));
+				await grandchild.adopt();
+				expect(await readFile(path.join(root, "state.txt"), "utf8")).toBe(expectedLine("grandchild"));
+			} finally {
+				await world.dispose?.();
+				await rm(root, { recursive: true, force: true });
+			}
+		},
+		60_000,
+	);
+
 	it("stages edit output but rejects adoption after a concurrent real-file change", async () => {
 		const root = await mkdtemp(path.join(os.tmpdir(), "pi-spec-edit-test-"));
 		try {
@@ -281,6 +409,7 @@ describe("workspace ExecutionWorld", () => {
 						environment,
 						cwd,
 						processRoot,
+						workspaceRoot,
 						sourceRoot,
 						signal,
 					}) => {
@@ -289,6 +418,7 @@ describe("workspace ExecutionWorld", () => {
 						expect(commandTransport).toBe("argv");
 						expect(environment).toEqual({ PATH: "/resolved/bin", PI_TEST: "visible" });
 						expect(path.dirname(cwd)).toBe(processRoot);
+						expect(workspaceRoot).toBe(cwd);
 						expect(sourceRoot).toBe(root);
 						expect(processRoot).not.toBe(root);
 						await runNodeScript(command, cwd, signal);

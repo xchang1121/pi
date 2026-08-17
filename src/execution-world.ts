@@ -20,6 +20,14 @@ export interface WorldAdoptionMetrics {
 	readonly resourcesAdopted: number;
 }
 
+/** Immutable execution state from which a later speculative action may derive. */
+export interface WorldCheckpoint {
+	readonly backend: string;
+	readonly id: string;
+	readonly lineage: string;
+	readonly depth: number;
+}
+
 /**
  * A sealed speculative execution.
  *
@@ -30,6 +38,7 @@ export interface WorldAdoptionMetrics {
 export interface WorldBranch<Output> {
 	readonly output: Output;
 	readonly backend: string;
+	readonly checkpoint?: WorldCheckpoint;
 	readonly resources: readonly string[];
 	/** Captured persistent-effect bytes, excluding the serialized tool output. */
 	readonly capturedBytes: number;

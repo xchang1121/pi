@@ -61,7 +61,12 @@ interface HarnessOptions {
 	) => Promise<TestPrediction> | TestPrediction;
 	readonly sources?: readonly HarnessPlanSource[];
 	readonly patternPropose?: (input: StartInput, signal: AbortSignal) => Promise<TestPrediction> | TestPrediction;
-	readonly execute?: (candidate: SpeculativeDraftCandidate, signal: AbortSignal) => Promise<string> | string;
+	readonly execute?: (
+		candidate: SpeculativeDraftCandidate,
+		signal: AbortSignal,
+		parentWorld?: WorldBranch<string>,
+	) => Promise<string> | string;
+	readonly worldResources?: (candidate: SpeculativeDraftCandidate) => readonly string[];
 	readonly preflight?: (
 		candidate: SpeculativeDraftCandidate,
 		signal: AbortSignal,
@@ -111,6 +116,7 @@ const enabledSettings: SpeculativeActionSettings = {
 function createHarness(options: HarnessOptions) {
 	const events: SpeculativeActionEvent<string>[] = [];
 	let executions = 0;
+	let worldSequence = 0;
 	const projectionRules: readonly ActionProjectionRule<string>[] = options.projectOutput
 		? [
 				{
@@ -230,12 +236,20 @@ function createHarness(options: HarnessOptions) {
 				}
 			: {}),
 		...(options.prepare ? { prepareCandidate: ({ candidate, signal }) => options.prepare?.(candidate, signal) } : {}),
-		executeCandidate: async ({ candidate, signal }) => {
+		executeCandidate: async ({ candidate, signal, parentWorld }) => {
 			executions++;
-			const output = (await options.execute?.(candidate, signal)) ?? "prefetched";
+			const output = (await options.execute?.(candidate, signal, parentWorld)) ?? "prefetched";
 			const execution =
 				candidate.execution ?? (options.actionSemantics ?? PI_ACTION_SEMANTICS).execution(candidate.tool);
-			return execution === "sandbox" ? testWorldBranch(output, options.adopt) : output;
+			return execution === "sandbox"
+				? testWorldBranch(
+						output,
+						`test-world-${++worldSequence}`,
+						options.adopt,
+						parentWorld,
+						options.worldResources?.(candidate) ?? [],
+					)
+				: output;
 		},
 		...(options.captureResourceVersion ? { captureResourceVersion: () => options.captureResourceVersion?.() } : {}),
 		...(options.releaseResourceVersion
@@ -265,19 +279,44 @@ function bashCandidate(command: string): SpeculativeDraftCandidate {
 	return { type: "tool_call", tool: "bash", input: { command } };
 }
 
-function testWorldBranch(output: string, adopt?: HarnessOptions["adopt"]): WorldBranch<string> {
+function testWorldBranch(
+	output: string,
+	id: string,
+	adopt?: HarnessOptions["adopt"],
+	parent?: WorldBranch<string>,
+	resources: readonly string[] = [],
+): WorldBranch<string> {
+	let state: WorldBranch<string>["state"] = "ready";
 	return {
 		output,
 		backend: "test",
-		resources: [],
+		checkpoint: {
+			backend: "test",
+			id,
+			lineage: parent?.checkpoint?.lineage ?? id,
+			depth: (parent?.checkpoint?.depth ?? -1) + 1,
+		},
+		resources,
 		capturedBytes: 0,
 		executionMetrics: {},
-		state: "ready",
+		get state() {
+			return state;
+		},
 		adopt: async () => {
-			if (!adopt) return output;
-			const adopted = await adopt(output);
-			if (adopted === undefined) throw new Error("test world adoption failed");
-			return adopted;
+			state = "adopting";
+			try {
+				if (!adopt) {
+					state = "adopted";
+					return output;
+				}
+				const adopted = await adopt(output);
+				if (adopted === undefined) throw new Error("test world adoption failed");
+				state = "adopted";
+				return adopted;
+			} catch (error) {
+				state = "failed";
+				throw error;
+			}
 		},
 	};
 }
@@ -430,7 +469,7 @@ describe("speculative action runtime", () => {
 		expect(harness.events.filter((event) => event.type === "started")).toHaveLength(2);
 	});
 
-	it("keeps arbitrary bash descendants deferred until the actor adopts the sandbox branch", async () => {
+	it("defers a non-sandbox descendant until its mutating world parent is adopted", async () => {
 		const command = 'npm test -- --runInBand && echo "$CI"';
 		const source: HarnessPlanSource = {
 			id: "sandbox-sequence",
@@ -473,6 +512,7 @@ describe("speculative action runtime", () => {
 				adopted.push(output);
 				return output;
 			},
+			worldResources: (candidate) => (candidate.tool === "bash" ? ["after-bash.ts"] : []),
 		});
 
 		await harness.runtime.startTurn({ sessionID: "session", turnID: "sandbox-barrier" });
@@ -485,6 +525,66 @@ describe("speculative action runtime", () => {
 
 		expect(adopted).toEqual(["bash:result"]);
 		expect(executed).toEqual([`bash:${command}`, "read:after-bash.ts"]);
+	});
+
+	it("executes a sandbox lineage ahead and adopts it in actor order", async () => {
+		const source: HarnessPlanSource = {
+			id: "world-lineage",
+			enabled: () => true,
+			multiStepEnabled: () => true,
+			propose: () => ({
+				id: "world-lineage-plan",
+				source: "world-lineage",
+				revision: 0,
+				actions: [
+					{ id: "prepare", type: "tool_call", tool: "bash", input: { command: "prepare" } },
+					{
+						id: "verify",
+						type: "tool_call",
+						tool: "bash",
+						input: { command: "verify" },
+						expectedDurationMs: 3_000,
+						dependsOn: [{ actionID: "prepare", condition: "succeeded" }],
+					},
+				],
+			}),
+		};
+		const executed: string[] = [];
+		const parentCheckpoints: Array<string | undefined> = [];
+		const adopted: string[] = [];
+		const harness = createHarness({
+			sources: [source],
+			settings: {
+				...enabledSettings,
+				tools: { resourceCached: [], sandbox: ["bash"] },
+			},
+			predict: () => prediction(),
+			execute: (candidate, _signal, parentWorld) => {
+				executed.push(String((candidate.input as { command: string }).command));
+				parentCheckpoints.push(parentWorld?.checkpoint?.id);
+				return `${candidate.tool}:${String((candidate.input as { command: string }).command)}`;
+			},
+			adopt: (output) => {
+				adopted.push(output);
+				return output;
+			},
+			worldResources: () => ["state.txt"],
+		});
+
+		await harness.runtime.startTurn({ sessionID: "session", turnID: "world-lineage" });
+		await waitFor(() => executed.length === 2);
+
+		expect(executed).toEqual(["prepare", "verify"]);
+		expect(parentCheckpoints[0]).toBeUndefined();
+		expect(parentCheckpoints[1]).toBe("test-world-1");
+		expect(await harness.runtime.consume(consumeTool("world-lineage", "bash", { command: "prepare" }))).toBe(
+			"bash:prepare",
+		);
+		expect(await harness.runtime.consume(consumeTool("world-lineage", "bash", { command: "verify" }))).toBe(
+			"bash:verify",
+		);
+		expect(adopted).toEqual(["bash:prepare", "bash:verify"]);
+		expect(harness.events.filter((event) => event.type === "hit")).toHaveLength(2);
 	});
 
 	it("blocks a sandbox descendant when branch adoption fails", async () => {
@@ -502,7 +602,7 @@ describe("speculative action runtime", () => {
 						type: "tool_call",
 						tool: "read",
 						input: { path: "must-not-run.ts" },
-						dependsOn: [{ actionID: "parent", condition: "completed" }],
+						dependsOn: [{ actionID: "parent", condition: "succeeded" }],
 					},
 				],
 			}),
@@ -520,6 +620,7 @@ describe("speculative action runtime", () => {
 				return "sandbox-output";
 			},
 			adopt: () => undefined,
+			worldResources: () => ["must-not-run.ts"],
 		});
 
 		await harness.runtime.startTurn({ sessionID: "session", turnID: "failed-adoption" });

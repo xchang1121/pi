@@ -34,7 +34,7 @@ for (const target of targets) {
 }
 await writeFile(
 	path.join(assetRoot, "manifest.json"),
-	`${JSON.stringify({ version: 1, protocolVersion: 4, assets }, undefined, "\t")}\n`,
+	`${JSON.stringify({ version: 1, protocolVersion: 5, assets }, undefined, "\t")}\n`,
 );
 
 async function isFile(file) {

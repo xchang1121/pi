@@ -426,6 +426,7 @@ export interface SpeculativeActionRuntimeAdapter<
 		readonly callID: string;
 		readonly index: number;
 		readonly signal: AbortSignal;
+		readonly parentWorld?: WorldBranch<Output>;
 	}) => MaybePromise<Output | WorldBranch<Output>>;
 	readonly prepareCandidate?: (input: {
 		readonly startInput: StartInput;
@@ -507,6 +508,7 @@ interface RuntimeCandidate<Output> extends SpeculativeCandidate {
 	readonly run: SpeculativeJobRun<Output>;
 	readonly lifecycle: CandidateAggregate<Output, PredictionLease>;
 	worldBranch?: WorldBranch<Output>;
+	worldParent?: RuntimeCandidate<Output>;
 }
 
 interface CandidateOwner<SessionID> {
@@ -606,10 +608,11 @@ export function makeSpeculativeActionRuntime<
 			}
 		>
 	>();
+	const planCandidates = new Map<SessionID, Map<string, RuntimeCandidate<Output>>>();
 	const planStateFor = (sessionID: SessionID): PlanState => {
 		const existing = planStates.get(sessionID);
 		if (existing) return existing;
-		const created = new PlanState((action) => actionSemantics.execution(action.tool));
+		const created = new PlanState();
 		planStates.set(sessionID, created);
 		return created;
 	};
@@ -631,10 +634,10 @@ export function makeSpeculativeActionRuntime<
 	}
 	const projectionRules = [...projectionRuleByID.values()];
 	const keyProjectors = projectionRules;
-	const jobs = new ActionStore<SessionID, RuntimeCandidate<Output>>(keyProjectors);
+	const jobs = new ActionStore<SessionID, RuntimeCandidate<Output>>(keyProjectors, true);
 	const results = new ResultCache<SessionID, RuntimeCandidate<Output>>(keyProjectors, candidateCacheValue);
 	// Exclusive branches are deliberately exact-only; projections are for shareable results.
-	const branches = new ActionStore<SessionID, RuntimeCandidate<Output>>();
+	const branches = new ActionStore<SessionID, RuntimeCandidate<Output>>([], true);
 	const tokenTotals = new Map<SessionID, number>();
 	const wallTimes = new Map<SessionID, number>();
 	const actionSequences = new Map<SessionID, number>();
@@ -1086,8 +1089,8 @@ export function makeSpeculativeActionRuntime<
 
 	const availableCandidates = (
 		state: TurnState<SessionID, Output, StateData>,
-	): Map<string, RuntimeCandidate<Output>> => {
-		return new Map(sessionCandidates(state.sessionID).map((candidate) => [candidate.key.key, candidate]));
+	): Map<RuntimeCandidate<Output>, RuntimeCandidate<Output>> => {
+		return new Map(sessionCandidates(state.sessionID).map((candidate) => [candidate, candidate]));
 	};
 
 	const expectedNetSavedMs = (
@@ -1333,7 +1336,6 @@ export function makeSpeculativeActionRuntime<
 		publish = false,
 		schedulerOutcome: "preempted" | "discarded" = "discarded",
 	): Promise<boolean> => {
-		const wasRunning = candidate.run.status === "running";
 		const completedAt = candidateCompletedAt(candidate);
 		const executionMs = candidateExecutionMs(candidate);
 		if (
@@ -1345,7 +1347,8 @@ export function makeSpeculativeActionRuntime<
 		) {
 			return false;
 		}
-		if (wasRunning) markCandidatePlanFailed(state, candidate);
+		markCandidatePlanFailed(state, candidate);
+		const descendants = sessionCandidates(state.sessionID).filter((entry) => entry.worldParent === candidate);
 		candidate.schedulerOutcome = schedulerOutcome;
 		await settlePredictionLeases(candidate, leaseState, planResolution(reason));
 		for (const lease of candidate.leases) {
@@ -1357,6 +1360,9 @@ export function makeSpeculativeActionRuntime<
 		candidateOwners.delete(candidate);
 		candidate.lifecycle.settleClosed();
 		if (publish) await publishCancelled(state, candidate, reason);
+		for (const descendant of descendants) {
+			await closeCandidate(state, descendant, "world_parent_invalidated", "invalidated", publish, "discarded");
+		}
 		return true;
 	};
 
@@ -1427,6 +1433,7 @@ export function makeSpeculativeActionRuntime<
 		for (const candidate of candidates) await preemptCandidate(candidate, reason, "discarded", publish);
 		planStates.delete(sessionID);
 		planLaunchContexts.delete(sessionID);
+		planCandidates.delete(sessionID);
 		sourceBackoff.delete(sessionID);
 		if (!schedulerFor(sessionID).snapshot().length) schedulers.delete(sessionID);
 	};
@@ -1540,6 +1547,14 @@ export function makeSpeculativeActionRuntime<
 		if (candidate.run.status === "closed") return false;
 		if (candidate.reuse.kind === "shared") return true;
 		if (candidate.reuse.state !== "available") return false;
+		if (
+			candidate.worldParent &&
+			(candidate.worldParent.reuse.kind !== "exclusive" ||
+				candidate.worldParent.reuse.state !== "adopted" ||
+				candidate.worldParent.worldBranch?.state !== "adopted")
+		) {
+			return false;
+		}
 		return candidate.leases.some(
 			(lease) =>
 				lease.state === "active" &&
@@ -1558,10 +1573,12 @@ export function makeSpeculativeActionRuntime<
 	const findReusableCandidate = async (
 		state: TurnState<SessionID, Output, StateData>,
 		action: ActionKey,
+		worldParent?: RuntimeCandidate<Output>,
 	): Promise<RuntimeCandidate<Output> | undefined> => {
 		for (const { candidate, match } of matchingCandidates(state, action)) {
 			if (candidate.run.status === "closed") continue;
 			if (candidate.reuse.kind === "exclusive" && candidate.reuse.state !== "available") continue;
+			if (action.execution === "sandbox" && candidate.worldParent !== worldParent) continue;
 			if (await isExpired(adapter, state, undefined, action, candidate)) {
 				await expireCandidate(state, candidate, "candidate_resource_expired");
 				continue;
@@ -1599,6 +1616,55 @@ export function makeSpeculativeActionRuntime<
 				lease.actionID !== undefined &&
 				(lease.state === "active" || lease.state === "matched" || lease.state === "hit"),
 		);
+	const indexPlanCandidate = (
+		state: TurnState<SessionID, Output, StateData>,
+		candidate: RuntimeCandidate<Output>,
+		proposalID: string | undefined,
+		actionID: string | undefined,
+	): void => {
+		if (!proposalID || !actionID) return;
+		const index = planCandidates.get(state.sessionID) ?? new Map<string, RuntimeCandidate<Output>>();
+		index.set(planActionIdentity(proposalID, actionID), candidate);
+		planCandidates.set(state.sessionID, index);
+	};
+	type PendingWorldParents =
+		| { readonly ok: true; readonly parents: readonly RuntimeCandidate<Output>[] }
+		| { readonly ok: false; readonly reason: "world_parent_unavailable" };
+	const pendingWorldParents = (
+		state: TurnState<SessionID, Output, StateData>,
+		proposalID: string | undefined,
+		dependencies: PlanAction["dependsOn"],
+	): PendingWorldParents => {
+		if (!proposalID) return { ok: true, parents: [] };
+		const parents: RuntimeCandidate<Output>[] = [];
+		for (const dependency of dependencies ?? []) {
+			const node = state.plan.get(proposalID, dependency.actionID);
+			if (!node || node.state !== "succeeded" || actionSemantics.execution(node.action.tool) !== "sandbox") {
+				continue;
+			}
+			const candidate = planCandidates
+				.get(state.sessionID)
+				?.get(planActionIdentity(proposalID, dependency.actionID));
+			if (!candidate || candidate.run.status === "closed" || !candidate.worldBranch?.checkpoint) {
+				return { ok: false, reason: "world_parent_unavailable" };
+			}
+			parents.push(candidate);
+		}
+		return { ok: true, parents: [...new Set(parents)] };
+	};
+	const resolveWorldParent = (
+		state: TurnState<SessionID, Output, StateData>,
+		draft: SpeculativeDraftCandidate,
+		execution: SpeculativeExecution,
+	):
+		| { readonly ok: true; readonly parent?: RuntimeCandidate<Output> }
+		| { readonly ok: false; readonly reason: "world_parent_unavailable" | "world_parent_ambiguous" } => {
+		if (execution !== "sandbox") return { ok: true };
+		const pending = pendingWorldParents(state, draft.proposalID, draft.dependsOn);
+		if (!pending.ok) return pending;
+		if (pending.parents.length > 1) return { ok: false, reason: "world_parent_ambiguous" };
+		return pending.parents[0] ? { ok: true, parent: pending.parents[0] } : { ok: true };
+	};
 	const markCandidatePlanSucceeded = (
 		state: TurnState<SessionID, Output, StateData>,
 		candidate: RuntimeCandidate<Output>,
@@ -1672,6 +1738,7 @@ export function makeSpeculativeActionRuntime<
 				lease.actionID === actionID,
 		);
 		if (existingLease) {
+			indexPlanCandidate(state, candidate, proposalID, actionID);
 			const leaseProbabilityIncreased =
 				empiricalProbability !== undefined &&
 				(existingLease.empiricalProbability === undefined ||
@@ -1711,6 +1778,7 @@ export function makeSpeculativeActionRuntime<
 			state: "active",
 		};
 		candidate.lifecycle.addLease(lease);
+		indexPlanCandidate(state, candidate, proposalID, actionID);
 		if (
 			empiricalProbability !== undefined &&
 			(candidate.empiricalProbability === undefined || empiricalProbability > candidate.empiricalProbability)
@@ -1813,18 +1881,6 @@ export function makeSpeculativeActionRuntime<
 				accepted++;
 				continue;
 			}
-			const callID = `spec_${fastCandidateID(`${input.turnID}:${source}:${index}:${action.key}`)}`;
-			const reusable = await findReusableCandidate(state, action);
-			if (reusable) {
-				const attached = await attachPredictionLease(state, reusable, draft, source, predictionAnchorActionSeq);
-				if (!attached) continue;
-				accepted++;
-				if (reusable.run.status === "ready") {
-					markCandidatePlanSucceeded(state, reusable);
-					await continuePredictionCandidate(state, input, reusable, reusable.run.output, false);
-				}
-				continue;
-			}
 			const execution = draft.execution ?? actionSemantics.execution(draft.tool);
 			const reuse = actionSemantics.reuse(draft.tool);
 			if (
@@ -1833,6 +1889,24 @@ export function makeSpeculativeActionRuntime<
 				(reuse === "shared_result") !== (action.execution === "resource_cached")
 			) {
 				await publishMiss(state, "execution_mismatch", action, undefined, { draftCandidate, predictedAction });
+				continue;
+			}
+			const parentResolution = resolveWorldParent(state, draft, execution);
+			if (!parentResolution.ok) {
+				await publishMiss(state, parentResolution.reason, action, undefined, { draftCandidate, predictedAction });
+				continue;
+			}
+			const worldParent = parentResolution.parent;
+			const callID = `spec_${fastCandidateID(`${input.turnID}:${source}:${index}:${action.key}`)}`;
+			const reusable = await findReusableCandidate(state, action, worldParent);
+			if (reusable) {
+				const attached = await attachPredictionLease(state, reusable, draft, source, predictionAnchorActionSeq);
+				if (!attached) continue;
+				accepted++;
+				if (reusable.run.status === "ready") {
+					markCandidatePlanSucceeded(state, reusable);
+					await continuePredictionCandidate(state, input, reusable, reusable.run.output, false);
+				}
 				continue;
 			}
 			const candidateController = new AbortController();
@@ -1872,7 +1946,7 @@ export function makeSpeculativeActionRuntime<
 				candidateController.abort();
 				return accepted;
 			}
-			const postflightReusable = await findReusableCandidate(state, action);
+			const postflightReusable = await findReusableCandidate(state, action, worldParent);
 			if (postflightReusable) {
 				candidateController.abort();
 				const attached = await attachPredictionLease(
@@ -1954,15 +2028,21 @@ export function makeSpeculativeActionRuntime<
 				},
 				lifecycle,
 				hits: 0,
+				...(worldParent ? { worldParent } : {}),
 			};
-			const insertion = jobs.insertOrGetCompatible(state.sessionID, candidate, (existing, match) => {
-				const rule = projectionRuleByID.get(match.projector);
-				return (
-					existing.run.status === "running" &&
-					!!rule &&
-					actionKeyCovers(existing.key, candidate.key, keyProjectors)
-				);
-			});
+			const insertion = jobs.insertOrGetCompatible(
+				state.sessionID,
+				candidate,
+				(existing, match) => {
+					const rule = projectionRuleByID.get(match.projector);
+					return (
+						existing.run.status === "running" &&
+						!!rule &&
+						actionKeyCovers(existing.key, candidate.key, keyProjectors)
+					);
+				},
+				(existing) => existing.reuse.kind === "shared" || existing.worldParent === candidate.worldParent,
+			);
 			const existing = insertion.inserted ? undefined : insertion.entry;
 			if (existing) {
 				lifecycle.close({ reason: "compatible_candidate_already_exists" });
@@ -2001,6 +2081,7 @@ export function makeSpeculativeActionRuntime<
 				turnID: state.turnID,
 				settings: state.settings,
 			});
+			indexPlanCandidate(state, candidate, sourceLease.proposalID, sourceLease.actionID);
 			for (const victim of schedulerVictims) await preemptCandidate(victim);
 			accepted++;
 			await notifyLeaseLaunched(sourceLease);
@@ -2136,6 +2217,7 @@ export function makeSpeculativeActionRuntime<
 						callID,
 						index,
 						signal: candidateController.signal,
+						...(candidate.worldParent?.worldBranch ? { parentWorld: candidate.worldParent.worldBranch } : {}),
 					});
 				})
 				.then(async (execution) => {
@@ -2202,16 +2284,14 @@ export function makeSpeculativeActionRuntime<
 					await publishCompleted(state, candidate);
 					if (!candidate.lifecycle.settleReady()) return;
 					await dispatchReadyPlanActions(state, input);
-					if (action.execution !== "sandbox") {
-						await continuePredictionCandidate(
-							state,
-							input,
-							candidate,
-							output,
-							candidate.hits > 0 ||
-								candidate.leases.some((lease) => lease.state === "matched" || lease.state === "hit"),
-						);
-					}
+					await continuePredictionCandidate(
+						state,
+						input,
+						candidate,
+						output,
+						candidate.hits > 0 ||
+							candidate.leases.some((lease) => lease.state === "matched" || lease.state === "hit"),
+					);
 				}, rejectExecution);
 		}
 		return accepted;
@@ -2252,6 +2332,8 @@ export function makeSpeculativeActionRuntime<
 		const retired = new Set(nodes.map((node) => planActionIdentity(node.proposalID, node.action.id)));
 		const contexts = planLaunchContexts.get(state.sessionID);
 		for (const identity of retired) contexts?.delete(identity);
+		const indexed = planCandidates.get(state.sessionID);
+		for (const identity of retired) indexed?.delete(identity);
 		for (const candidate of availableCandidates(state).values()) {
 			let changed = false;
 			for (const lease of candidate.leases) {
@@ -2292,6 +2374,7 @@ export function makeSpeculativeActionRuntime<
 		);
 		const contexts = planLaunchContexts.get(state.sessionID);
 		if (contexts?.size === 0) planLaunchContexts.delete(state.sessionID);
+		if (planCandidates.get(state.sessionID)?.size === 0) planCandidates.delete(state.sessionID);
 		if (
 			state.plan.values().length === 0 &&
 			![...turns.values()].some((turn) => turn.sessionID === state.sessionID && turn.plan === state.plan)
@@ -2345,6 +2428,14 @@ export function makeSpeculativeActionRuntime<
 			averageStepMs: actorStepTimes.get(state.sessionID)?.averageMs ?? 1_000,
 			expectedDurationMs: durationMs,
 		});
+	};
+	const planNodeWorldReady = (state: TurnState<SessionID, Output, StateData>, node: PlanExecutionNode): boolean => {
+		const pending = pendingWorldParents(state, node.proposalID, node.action.dependsOn);
+		if (!pending.ok) return false;
+		if (pending.parents.length === 0) return true;
+		const execution = node.action.execution ?? actionSemantics.execution(node.action.tool);
+		if (execution === "sandbox") return pending.parents.length === 1;
+		return pending.parents.every((parent) => parent.worldBranch?.resources.length === 0);
 	};
 	const clearPlanDispatchTimer = (state: TurnState<SessionID, Output, StateData>): void => {
 		if (state.planDispatchTimer) clearTimeout(state.planDispatchTimer);
@@ -2430,7 +2521,10 @@ export function makeSpeculativeActionRuntime<
 		clearPlanDispatchTimer(state);
 		const names = candidateNames ?? candidateToolNames(state.settings, actionSemantics);
 		const ready = [
-			...state.plan.takeReady(state.actionSequence, (node) => planNodeLaunchDelay(state, node) <= 0),
+			...state.plan.takeReady(
+				state.actionSequence,
+				(node) => planNodeLaunchDelay(state, node) <= 0 && planNodeWorldReady(state, node),
+			),
 		].sort(
 			(left, right) =>
 				draftPriority(planActionDraft(right.proposalID, right.source, right.action)) -
@@ -2458,7 +2552,12 @@ export function makeSpeculativeActionRuntime<
 		}
 		await reportBlockedPlanActions(state);
 		await compactPlanState(state);
-		const nextDelay = Math.min(...state.plan.launchable().map((node) => planNodeLaunchDelay(state, node)));
+		const nextDelay = Math.min(
+			...state.plan
+				.launchable()
+				.filter((node) => planNodeWorldReady(state, node))
+				.map((node) => planNodeLaunchDelay(state, node)),
+		);
 		if (Number.isFinite(nextDelay) && nextDelay > 0) {
 			clearPlanDispatchTimer(state);
 			state.planDispatchTimer = setTimeout(() => {
@@ -2499,6 +2598,7 @@ export function makeSpeculativeActionRuntime<
 				left.node.action.id.localeCompare(right.node.action.id),
 		);
 		for (const { node } of matches) {
+			if (!planNodeWorldReady(state, node)) continue;
 			const promotion = state.plan.promote(node.proposalID, node.action.id);
 			if (promotion.status !== "claimed") continue;
 			await preemptForAuthoritative(
@@ -3107,7 +3207,7 @@ export function makeSpeculativeActionRuntime<
 							sources: [...activePlanSources].sort(),
 							key: actual,
 							actualAction,
-							predictedAction: candidatesDiagnostic(predicted),
+							predictedAction: candidatesDiagnostic(predicted.values()),
 							lookup: lookupDiagnostics(),
 						};
 					}
@@ -3296,6 +3396,7 @@ export function makeSpeculativeActionRuntime<
 			await flushPredictionSources();
 			planStates.delete(state.sessionID);
 			planLaunchContexts.delete(state.sessionID);
+			planCandidates.delete(state.sessionID);
 		}
 		if (!schedulerFor(state.sessionID).snapshot().length) schedulers.delete(state.sessionID);
 	};
@@ -3315,6 +3416,7 @@ export function makeSpeculativeActionRuntime<
 		await flushPredictionSources();
 		planStates.delete(sessionID);
 		planLaunchContexts.delete(sessionID);
+		planCandidates.delete(sessionID);
 		if (!schedulerFor(sessionID).snapshot().length) schedulers.delete(sessionID);
 	};
 
@@ -3364,6 +3466,7 @@ export function makeSpeculativeActionRuntime<
 		sourceBackoff.delete(sessionID);
 		planStates.delete(sessionID);
 		planLaunchContexts.delete(sessionID);
+		planCandidates.delete(sessionID);
 		await flushPredictionSources();
 	};
 
@@ -3377,6 +3480,7 @@ export function makeSpeculativeActionRuntime<
 		sourceBackoff.clear();
 		planStates.clear();
 		planLaunchContexts.clear();
+		planCandidates.clear();
 		actionSequences.clear();
 		actorStepTimes.clear();
 	};
@@ -3608,9 +3712,9 @@ function asWorldBranch<Output>(value: Output | WorldBranch<Output>): WorldBranch
 		: undefined;
 }
 
-function candidatesDiagnostic<Output>(candidates: Map<string, RuntimeCandidate<Output>>): string {
+function candidatesDiagnostic<Output>(candidates: Iterable<RuntimeCandidate<Output>>): string {
 	return diagnosticJson(
-		[...candidates.values()].map((candidate) => ({
+		[...candidates].map((candidate) => ({
 			tool: candidate.key.tool,
 			actionKey: candidate.key.key,
 			actionKeyHash: candidate.key.hash,

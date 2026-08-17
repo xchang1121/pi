@@ -53,6 +53,24 @@ describe("ActionStore", () => {
 		expect(store.values("session")).toEqual([newest]);
 		expect(store.snapshot("session")).toEqual({ entries: 1, bytes: 16 });
 	});
+
+	it("keeps distinct exact owners when their execution contexts cannot be reused", () => {
+		const store = new ActionStore<string, Entry>([], true);
+		const root = entry("root", "same.ts");
+		const derived = entry("derived", "same.ts");
+		expect(store.insertOrGetCompatible("session", root).inserted).toBe(true);
+		expect(
+			store.insertOrGetCompatible(
+				"session",
+				derived,
+				() => false,
+				() => false,
+			).inserted,
+		).toBe(true);
+		expect(store.lookup("session", root.key).map((item) => item.entry.id)).toEqual(["derived", "root"]);
+		expect(store.delete("session", root)).toBe(true);
+		expect(store.getExact("session", derived.key)).toBe(derived);
+	});
 });
 
 describe("ResultCache", () => {

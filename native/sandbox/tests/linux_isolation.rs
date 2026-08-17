@@ -50,6 +50,7 @@ fn run(
         environment: std::env::vars().collect(),
         cwd: sandbox.to_path_buf(),
         sandbox_root: sandbox.to_path_buf(),
+        workspace_root: sandbox.to_path_buf(),
         source_root: source.to_path_buf(),
         timeout_ms,
         max_output_bytes,
@@ -119,6 +120,36 @@ fn isolates_source_environment_network_and_host_writes() {
         "source-secret"
     );
     assert!(!Path::new(&marker).exists());
+}
+
+#[test]
+fn projects_the_private_workspace_to_the_actor_logical_path() {
+    if !available() {
+        return;
+    }
+    let (_root, source, sandbox) = workspace();
+    fs::write(source.join("value.txt"), "actor").unwrap();
+    fs::write(sandbox.join("value.txt"), "private").unwrap();
+    let logical = source.display();
+    let response = run(
+        &source,
+        &sandbox,
+        format!(
+            "cd '{logical}' && test \"$PWD\" = \"{logical}\" && test \"$(cat '{logical}/value.txt')\" = private && printf changed > '{logical}/value.txt' && pwd"
+        ),
+        10_000,
+        16 * 1024,
+    );
+    assert_eq!(response.exit, 0, "{}", response.output);
+    assert!(response.output.contains(&logical.to_string()));
+    assert_eq!(
+        fs::read_to_string(source.join("value.txt")).unwrap(),
+        "actor"
+    );
+    assert_eq!(
+        fs::read_to_string(sandbox.join("value.txt")).unwrap(),
+        "changed"
+    );
 }
 
 #[test]
@@ -202,6 +233,7 @@ fn terminating_the_broker_kills_descendants() {
         environment: std::env::vars().collect(),
         cwd: sandbox.clone(),
         sandbox_root: sandbox.clone(),
+        workspace_root: sandbox.clone(),
         source_root: source,
         timeout_ms: 30_000,
         max_output_bytes: 16 * 1024,

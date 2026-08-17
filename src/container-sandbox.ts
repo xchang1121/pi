@@ -75,13 +75,7 @@ interface WorkerSlot {
 	ready: Promise<void>;
 }
 
-/**
- * Create a warm OCI worker pool.
- *
- * A slot path is persistent, but its container is destroyed after every branch. This keeps
- * image/runtime startup warm without allowing processes, /tmp, or writable image state from an
- * unadopted branch to leak into the next branch.
- */
+/** Create an OCI worker pool whose process and filesystem state is reset after every branch. */
 export function createContainerSandboxProcessBackend(options: ContainerSandboxOptions = {}): SandboxProcessBackend {
 	return new ContainerSandboxBackend(options);
 }
@@ -120,9 +114,6 @@ class ContainerSandboxBackend implements SandboxProcessBackend {
 	readonly prepare = async ({ signal }: { readonly signal?: AbortSignal }): Promise<void> => {
 		throwIfAborted(signal);
 		await this.runtimeInfo();
-		const slot = await this.acquire(signal ?? new AbortController().signal);
-		slot.busy = false;
-		this.notify();
 		throwIfAborted(signal);
 	};
 
@@ -234,35 +225,49 @@ class ContainerSandboxBackend implements SandboxProcessBackend {
 		await mkdir(base, { recursive: true, mode: 0o700 });
 		const processRoot = await mkdtemp(path.join(base, "pi-speculative-worker-"));
 		const slot: WorkerSlot = { processRoot, busy: false, ready: Promise.resolve() };
-		slot.ready = this.prime(slot);
+		slot.ready = this.resetSlot(slot);
 		return slot;
 	}
 
-	private async prime(slot: WorkerSlot): Promise<void> {
-		const info = await this.runtimeInfo();
+	private async resetSlot(slot: WorkerSlot): Promise<void> {
 		await rm(slot.processRoot, { recursive: true, force: true });
 		await mkdir(path.join(slot.processRoot, "tmp"), { recursive: true, mode: 0o700 });
+	}
+
+	private async startContainer(slot: WorkerSlot, input: SandboxProcessRunnerInput): Promise<ContainerRuntimeInfo> {
+		const info = await this.runtimeInfo();
 		const container = `pi-spec-${randomUUID()}`;
-		const create = await this.lifecycle(info, createArguments(info, slot.processRoot, container));
-		if (create.exitCode !== 0) throw lifecycleError(info.runtime, "create", create);
 		slot.container = container;
 		try {
+			const create = await this.lifecycle(info, createArguments(info, input, container));
+			if (create.exitCode !== 0) throw lifecycleError(info.runtime, "create", create);
 			const start = await this.lifecycle(info, ["start", container]);
 			if (start.exitCode !== 0) throw lifecycleError(info.runtime, "start", start);
 		} catch (error) {
 			await this.destroyContainer(slot).catch(() => undefined);
 			throw error;
 		}
+		return info;
 	}
 
 	private async execute(slot: WorkerSlot, input: SandboxProcessRunnerInput) {
-		const info = await this.runtimeInfo();
-		if (!slot.container) throw new Error("Container worker is not running.");
-		const relativeCwd = path.relative(slot.processRoot, path.resolve(input.cwd));
-		if (relativeCwd.startsWith("..") || path.isAbsolute(relativeCwd)) {
-			throw new Error("Container sandbox cwd escapes its private root.");
+		const processRoot = path.resolve(input.processRoot);
+		const workspaceRoot = path.resolve(input.workspaceRoot);
+		const cwd = path.resolve(input.cwd);
+		if (processRoot !== path.resolve(slot.processRoot))
+			throw new Error("Container session does not own processRoot.");
+		const relativeWorkspace = path.relative(processRoot, workspaceRoot);
+		if (relativeWorkspace.startsWith("..") || path.isAbsolute(relativeWorkspace)) {
+			throw new Error("Container workspaceRoot escapes its private root.");
 		}
-		const guestCwd = guestPath(info, relativeCwd);
+		const relativeCwd = path.relative(workspaceRoot, cwd);
+		if (relativeCwd.startsWith("..") || path.isAbsolute(relativeCwd)) {
+			throw new Error("Container sandbox cwd escapes workspaceRoot.");
+		}
+		const info = await this.startContainer(slot, input);
+		if (!slot.container) throw new Error("Container worker is not running.");
+		const logicalRoot = guestWorkspaceRoot(info, input);
+		const guestCwd = joinGuestPath(info, logicalRoot, relativeCwd);
 		const args = ["exec"];
 		if (input.commandTransport === "stdin") args.push("-i");
 		args.push("--workdir", guestCwd);
@@ -298,7 +303,7 @@ class ContainerSandboxBackend implements SandboxProcessBackend {
 			await this.removeSlot(slot);
 			return;
 		}
-		slot.ready = this.prime(slot);
+		slot.ready = this.resetSlot(slot);
 		void slot.ready.catch(() => this.notify());
 		slot.busy = false;
 		this.notify();
@@ -433,7 +438,11 @@ function runtimePreference(value: string | undefined): ContainerRuntimePreferenc
 	return value === "docker" || value === "podman" ? value : "auto";
 }
 
-function createArguments(info: ContainerRuntimeInfo, processRoot: string, container: string): string[] {
+function createArguments(info: ContainerRuntimeInfo, input: SandboxProcessRunnerInput, container: string): string[] {
+	const processRoot = path.resolve(input.processRoot);
+	const workspaceRoot = path.resolve(input.workspaceRoot);
+	const logicalRoot = guestWorkspaceRoot(info, input);
+	const mountedWorkspace = guestPath(info, path.relative(processRoot, workspaceRoot));
 	const args = [
 		"create",
 		"--name",
@@ -445,6 +454,9 @@ function createArguments(info: ContainerRuntimeInfo, processRoot: string, contai
 		"--mount",
 		`type=bind,src=${path.join(processRoot, "tmp")},dst=${info.guestTmp}`,
 	];
+	if (logicalRoot !== mountedWorkspace) {
+		args.push("--mount", `type=bind,src=${workspaceRoot},dst=${logicalRoot}`);
+	}
 	if (info.os === "linux") {
 		args.push("--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--pids-limit", "256");
 		if (typeof process.getuid === "function" && typeof process.getgid === "function") {
@@ -462,9 +474,19 @@ function keepAliveCommand(osName: ContainerRuntimeInfo["os"]): string[] {
 function guestPath(info: ContainerRuntimeInfo, relative: string): string {
 	if (!relative || relative === ".") return info.guestRoot;
 	const segments = relative.split(/[\\/]+/).filter(Boolean);
-	return info.os === "windows"
-		? path.win32.join(info.guestRoot, ...segments)
-		: path.posix.join(info.guestRoot, ...segments);
+	return joinGuestPath(info, info.guestRoot, ...segments);
+}
+
+function guestWorkspaceRoot(info: ContainerRuntimeInfo, input: SandboxProcessRunnerInput): string {
+	const sourceRoot = input.sourceRoot;
+	if (info.os === "linux" && path.posix.isAbsolute(sourceRoot)) return path.posix.normalize(sourceRoot);
+	if (info.os === "windows" && path.win32.isAbsolute(sourceRoot)) return path.win32.normalize(sourceRoot);
+	return guestPath(info, path.relative(path.resolve(input.processRoot), path.resolve(input.workspaceRoot)));
+}
+
+function joinGuestPath(info: ContainerRuntimeInfo, root: string, ...segments: string[]): string {
+	const clean = segments.flatMap((segment) => segment.split(/[\\/]+/).filter(Boolean));
+	return info.os === "windows" ? path.win32.join(root, ...clean) : path.posix.join(root, ...clean);
 }
 
 function containerEnvironment(

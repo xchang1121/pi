@@ -13,7 +13,7 @@ const binary = binaryArgument
 			"release",
 			process.platform === "win32" ? "pi-sandbox-native.exe" : "pi-sandbox-native",
 		);
-const protocolVersion = 4;
+const protocolVersion = 5;
 const check = await invoke(["--native-sandbox", "check"]);
 if (check.status !== 0 || check.json.version !== protocolVersion || check.json.ready !== true) {
 	throw new Error(`Native sandbox is not ready: ${check.stderr || check.stdout}`);
@@ -43,6 +43,7 @@ try {
 			environment: process.env,
 			cwd: sandboxRoot,
 			sandboxRoot,
+			workspaceRoot: sandboxRoot,
 			sourceRoot,
 			timeoutMs: 15_000,
 			maxOutputBytes: 64 * 1024,

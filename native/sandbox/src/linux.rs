@@ -52,7 +52,8 @@ fn probe_isolation() -> Result<()> {
         command_transport: CommandTransport::Argv,
         environment: env::vars().collect(),
         cwd: sandbox.clone(),
-        sandbox_root: sandbox,
+        sandbox_root: sandbox.clone(),
+        workspace_root: sandbox,
         source_root: source,
         timeout_ms: 5_000,
         max_output_bytes: 16 * 1024,
@@ -158,6 +159,7 @@ fn run_setup_child(request: &ExecuteRequest, rootfs: &Path) -> Result<i32> {
 }
 
 fn run_namespace_init(request: &ExecuteRequest, rootfs: &Path) -> Result<i32> {
+    let logical_cwd = logical_cwd(request)?;
     cvt(
         unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) },
         "set parent-death signal",
@@ -167,7 +169,7 @@ fn run_namespace_init(request: &ExecuteRequest, rootfs: &Path) -> Result<i32> {
         "chroot sandbox rootfs",
     )?;
     cvt(
-        unsafe { libc::chdir(c_path(&request.cwd)?.as_ptr()) },
+        unsafe { libc::chdir(c_path(&logical_cwd)?.as_ptr()) },
         "chdir sandbox cwd",
     )?;
     mount_proc()?;
@@ -204,7 +206,7 @@ fn exec_command(request: &ExecuteRequest) -> Result<()> {
         .unwrap_or_else(Stdio::null);
     let error = Command::new(shell)
         .args(command_arguments(request, &request.command))
-        .current_dir(&request.cwd)
+        .current_dir(logical_cwd(request)?)
         .env_clear()
         .envs(&request.environment)
         .stdin(stdin)
@@ -263,7 +265,19 @@ fn setup_filesystem(request: &ExecuteRequest, rootfs: &Path) -> Result<()> {
     let sandbox_target = rootfs_path(rootfs, &request.sandbox_root)?;
     fs::create_dir_all(&sandbox_target).context("create sandboxRoot target")?;
     bind_mount(&request.sandbox_root, &sandbox_target, true)?;
+
+    let source_target = rootfs_path(rootfs, &request.source_root)?;
+    fs::create_dir_all(&source_target).context("create logical workspace target")?;
+    bind_mount(&request.workspace_root, &source_target, true)?;
     Ok(())
+}
+
+fn logical_cwd(request: &ExecuteRequest) -> Result<PathBuf> {
+    let relative = request
+        .cwd
+        .strip_prefix(&request.workspace_root)
+        .context("cwd is outside workspaceRoot")?;
+    Ok(request.source_root.join(relative))
 }
 
 fn setup_dev(target: &Path) -> Result<()> {

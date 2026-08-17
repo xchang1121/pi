@@ -43,7 +43,7 @@ describe("container sandbox backend", () => {
 		await backend.dispose();
 	});
 
-	it("recycles a warm slot while removing branch state and never mounting the actor source", async () => {
+	it("recycles an isolated slot while removing branch state and never mounting a cross-OS actor source", async () => {
 		const workerRoot = await temporaryRoot("pi-container-worker-test-");
 		const sourceRoot = await temporaryRoot("pi-container-source-test-");
 		const calls: ContainerRuntimeInvocation[] = [];
@@ -78,7 +78,7 @@ describe("container sandbox backend", () => {
 		);
 		expect(execute?.args.some((value) => value.startsWith("PATH="))).toBe(false);
 		expect(execute?.args).toEqual(expect.arrayContaining(["HOME=/tmp", "PI_SPECULATIVE_SANDBOX=container"]));
-		expect(calls.filter((call) => call.args[0] === "create")).toHaveLength(2);
+		expect(calls.filter((call) => call.args[0] === "create")).toHaveLength(1);
 		expect(calls.filter((call) => call.args[0] === "rm")).toHaveLength(1);
 
 		await second.close();
@@ -168,15 +168,42 @@ describe("container sandbox backend", () => {
 		expect(create.args).toEqual(expect.arrayContaining(["--entrypoint", "cmd.exe", "pi-speculative-worker:latest"]));
 		expect(create.args).not.toContain("--read-only");
 		expect(create.args.some((value) => value.endsWith("dst=C:\\pi"))).toBe(true);
+		expect(create.args.some((value) => value.endsWith(`dst=${sourceRoot}`))).toBe(true);
 		expect(execute.args).toEqual(
 			expect.arrayContaining([
 				"--workdir",
-				"C:\\pi\\workspace\\nested",
+				path.win32.join(sourceRoot, "nested"),
 				"C:\\Program Files\\Git\\bin\\bash.exe",
 				"-c",
 				"printf ok",
 			]),
 		);
+
+		await session.close();
+		await backend.dispose();
+	});
+
+	it("mounts a same-OS private workspace at the actor's logical Linux path", async () => {
+		const workerRoot = await temporaryRoot("pi-container-logical-root-test-");
+		const calls: ContainerRuntimeInvocation[] = [];
+		const backend = createContainerSandboxProcessBackend({
+			runtime: "docker",
+			workerRoot,
+			invoker: fakeRuntime(calls),
+		});
+		const session = await backend.open({ parent: workerRoot, signal: new AbortController().signal });
+		const workspaceRoot = path.join(session.processRoot, "workspace");
+		const cwd = path.join(workspaceRoot, "nested");
+		await mkdir(cwd, { recursive: true });
+		await session.execute({
+			...commandInput("/testbed", session.processRoot, cwd),
+			workspaceRoot,
+		});
+
+		const create = calls.find((call) => call.args[0] === "create")!;
+		const execute = calls.find((call) => call.args[0] === "exec")!;
+		expect(create.args).toEqual(expect.arrayContaining(["--mount", `type=bind,src=${workspaceRoot},dst=/testbed`]));
+		expect(execute.args).toEqual(expect.arrayContaining(["--workdir", "/testbed/nested"]));
 
 		await session.close();
 		await backend.dispose();
@@ -357,6 +384,7 @@ function commandInput(sourceRoot: string, processRoot: string, cwd: string) {
 		environment: { PATH: "C:\\Windows", PI_TEST: "visible" },
 		cwd,
 		processRoot,
+		workspaceRoot: path.join(processRoot, "workspace"),
 		sourceRoot,
 		signal: new AbortController().signal,
 	};

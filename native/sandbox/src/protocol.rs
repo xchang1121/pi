@@ -8,7 +8,7 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -29,6 +29,7 @@ pub struct ExecuteRequest {
     pub environment: BTreeMap<String, String>,
     pub cwd: PathBuf,
     pub sandbox_root: PathBuf,
+    pub workspace_root: PathBuf,
     pub source_root: PathBuf,
     pub timeout_ms: u64,
     pub max_output_bytes: u64,
@@ -90,10 +91,15 @@ pub fn canonicalize_request(request: &ExecuteRequest) -> Result<ExecuteRequest> 
     request.cwd = fs::canonicalize(&request.cwd).context("cwd does not exist")?;
     request.sandbox_root =
         fs::canonicalize(&request.sandbox_root).context("sandboxRoot does not exist")?;
+    request.workspace_root =
+        fs::canonicalize(&request.workspace_root).context("workspaceRoot does not exist")?;
     request.source_root =
         fs::canonicalize(&request.source_root).context("sourceRoot does not exist")?;
-    if !request.cwd.starts_with(&request.sandbox_root) {
-        bail!("canonical cwd escapes sandboxRoot");
+    if !request.workspace_root.starts_with(&request.sandbox_root) {
+        bail!("canonical workspaceRoot escapes sandboxRoot");
+    }
+    if !request.cwd.starts_with(&request.workspace_root) {
+        bail!("canonical cwd escapes workspaceRoot");
     }
     if request.sandbox_root.starts_with(&request.source_root)
         || request.source_root.starts_with(&request.sandbox_root)
@@ -168,12 +174,16 @@ fn validate_request(request: &ExecuteRequest) -> Result<()> {
     }
     if !request.cwd.is_absolute()
         || !request.sandbox_root.is_absolute()
+        || !request.workspace_root.is_absolute()
         || !request.source_root.is_absolute()
     {
-        bail!("cwd, sandboxRoot, and sourceRoot must be absolute");
+        bail!("cwd, sandboxRoot, workspaceRoot, and sourceRoot must be absolute");
     }
-    if !lexically_contains(&request.sandbox_root, &request.cwd) {
-        bail!("cwd must be inside sandboxRoot");
+    if !lexically_contains(&request.sandbox_root, &request.workspace_root) {
+        bail!("workspaceRoot must be inside sandboxRoot");
+    }
+    if !lexically_contains(&request.workspace_root, &request.cwd) {
+        bail!("cwd must be inside workspaceRoot");
     }
     if request.sandbox_root == request.source_root {
         bail!("sandboxRoot and sourceRoot must differ");
@@ -283,12 +293,14 @@ mod tests {
             environment: BTreeMap::from([("PATH".into(), "/usr/bin".into())]),
             cwd: PathBuf::from("/tmp/sandbox/work"),
             sandbox_root: PathBuf::from("/tmp/sandbox"),
+            workspace_root: PathBuf::from("/tmp/sandbox/work"),
             source_root: PathBuf::from("/source"),
             timeout_ms: 1_000,
             max_output_bytes: 16_384,
         };
         let value = serde_json::to_value(&request).unwrap();
         assert_eq!(value["sandboxRoot"], "/tmp/sandbox");
+        assert_eq!(value["workspaceRoot"], "/tmp/sandbox/work");
         assert_eq!(value["timeoutMs"], 1_000);
         assert_eq!(value["shell"], "/bin/sh");
         assert_eq!(
@@ -308,11 +320,45 @@ mod tests {
             environment: BTreeMap::new(),
             cwd: PathBuf::from("/tmp/elsewhere"),
             sandbox_root: PathBuf::from("/tmp/sandbox"),
+            workspace_root: PathBuf::from("/tmp/sandbox/work"),
             source_root: PathBuf::from("/source"),
             timeout_ms: 1,
             max_output_bytes: 16_384,
         };
         assert!(validate_request(&request).is_err());
+    }
+
+    #[test]
+    fn rejects_workspace_outside_sandbox_and_cwd_outside_workspace() {
+        let base = ExecuteRequest {
+            version: PROTOCOL_VERSION,
+            command: "true".into(),
+            shell: None,
+            shell_args: vec!["-c".into()],
+            command_transport: CommandTransport::Argv,
+            environment: BTreeMap::new(),
+            cwd: PathBuf::from("/tmp/sandbox/work"),
+            sandbox_root: PathBuf::from("/tmp/sandbox"),
+            workspace_root: PathBuf::from("/tmp/sandbox/work"),
+            source_root: PathBuf::from("/source"),
+            timeout_ms: 1,
+            max_output_bytes: 16_384,
+        };
+        assert!(
+            validate_request(&ExecuteRequest {
+                workspace_root: PathBuf::from("/tmp/outside"),
+                cwd: PathBuf::from("/tmp/outside"),
+                ..base.clone()
+            })
+            .is_err()
+        );
+        assert!(
+            validate_request(&ExecuteRequest {
+                cwd: PathBuf::from("/tmp/sandbox/other"),
+                ..base
+            })
+            .is_err()
+        );
     }
 
     #[test]
@@ -326,6 +372,7 @@ mod tests {
             environment: BTreeMap::new(),
             cwd: PathBuf::from("/tmp/source/sandbox"),
             sandbox_root: PathBuf::from("/tmp/source/sandbox"),
+            workspace_root: PathBuf::from("/tmp/source/sandbox"),
             source_root: PathBuf::from("/tmp/source"),
             timeout_ms: 1,
             max_output_bytes: 16_384,
@@ -363,6 +410,7 @@ mod tests {
             environment: BTreeMap::new(),
             cwd: PathBuf::from("/tmp/sandbox"),
             sandbox_root: PathBuf::from("/tmp/sandbox"),
+            workspace_root: PathBuf::from("/tmp/sandbox"),
             source_root: PathBuf::from("/source"),
             timeout_ms: 1,
             max_output_bytes: 16_384,

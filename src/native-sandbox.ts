@@ -11,7 +11,7 @@ import type {
 	SandboxProcessRunnerInput,
 } from "./workspace-sandbox.ts";
 
-export const NATIVE_SANDBOX_PROTOCOL_VERSION = 4;
+export const NATIVE_SANDBOX_PROTOCOL_VERSION = 5;
 export const NATIVE_SANDBOX_DEFAULT_TIMEOUT_MS = 120_000;
 export const NATIVE_SANDBOX_DEFAULT_MAX_OUTPUT_BYTES = 1024 * 1024;
 
@@ -161,6 +161,7 @@ export async function executeNativeSandbox(
 		environment: input.environment,
 		cwd: path.resolve(input.cwd),
 		sandboxRoot: path.resolve(input.processRoot),
+		workspaceRoot: path.resolve(input.workspaceRoot),
 		sourceRoot: path.resolve(input.sourceRoot),
 		timeoutMs,
 		maxOutputBytes,
@@ -387,6 +388,7 @@ function validateExecuteRequest<
 		command: string;
 		cwd: string;
 		sandboxRoot: string;
+		workspaceRoot: string;
 		sourceRoot: string;
 		timeoutMs: number;
 		maxOutputBytes: number;
@@ -401,12 +403,16 @@ function validateExecuteRequest<
 	for (const [name, value] of [
 		["cwd", request.cwd],
 		["sandboxRoot", request.sandboxRoot],
+		["workspaceRoot", request.workspaceRoot],
 		["sourceRoot", request.sourceRoot],
 	] as const) {
 		if (!path.isAbsolute(value)) throw new Error(`${name} must be absolute.`);
 	}
-	if (request.cwd !== request.sandboxRoot && !contains(request.sandboxRoot, request.cwd)) {
-		throw new Error("cwd must be inside sandboxRoot.");
+	if (request.workspaceRoot !== request.sandboxRoot && !contains(request.sandboxRoot, request.workspaceRoot)) {
+		throw new Error("workspaceRoot must be inside sandboxRoot.");
+	}
+	if (request.cwd !== request.workspaceRoot && !contains(request.workspaceRoot, request.cwd)) {
+		throw new Error("cwd must be inside workspaceRoot.");
 	}
 	if (
 		request.sandboxRoot === request.sourceRoot ||

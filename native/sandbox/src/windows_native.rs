@@ -64,6 +64,7 @@ fn check_ready() -> Result<()> {
         environment: std::env::vars().collect(),
         cwd: sandbox.clone(),
         sandbox_root: sandbox.clone(),
+        workspace_root: sandbox.clone(),
         source_root: source,
         timeout_ms: 10_000,
         max_output_bytes: 16 * 1024,

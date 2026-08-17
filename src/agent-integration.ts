@@ -558,7 +558,7 @@ export function createSpeculativeActionHost(
 			}
 			return result.ok ? result : { ...result, reason: "permission_or_policy_changed" };
 		},
-		executeCandidate: async ({ data, tool: toolName, concrete, action, callID, signal }) => {
+		executeCandidate: async ({ data, tool: toolName, concrete, action, callID, signal, parentWorld }) => {
 			const tool = data.tools.get(toolName);
 			if (!tool) return errorSettlement(`Tool ${toolName} not found`);
 			const args = validateCandidateArguments(tool, toolName, concrete, callID);
@@ -576,6 +576,7 @@ export function createSpeculativeActionHost(
 					invocation: asToolInvocation(action.executionContext),
 					callID,
 					signal,
+					...(parentWorld?.checkpoint ? { parentCheckpoint: parentWorld.checkpoint } : {}),
 				});
 				return branch;
 			}

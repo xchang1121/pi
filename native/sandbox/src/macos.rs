@@ -203,6 +203,7 @@ mod tests {
             environment: std::env::vars().collect(),
             cwd: PathBuf::from("/private/tmp/sandbox"),
             sandbox_root: PathBuf::from("/private/tmp/sandbox"),
+            workspace_root: PathBuf::from("/private/tmp/sandbox"),
             source_root: PathBuf::from("/Users/me/source"),
             timeout_ms: 1,
             max_output_bytes: 16 * 1024,

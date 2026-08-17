@@ -218,8 +218,8 @@ describe("PlanState scheduling", () => {
 		expect(state.promote("plan", "parent")).toEqual({ status: "active" });
 	});
 
-	it("holds every arbitrary bash descendant behind actor adoption", () => {
-		const state = sandboxAwareState();
+	it("uses declared dependency conditions independently of tool execution mode", () => {
+		const state = new PlanState();
 		const parent = bash('npm test && MODE="$TARGET" ./custom-script --flag');
 		const afterSuccess = action("after-success", {
 			dependsOn: [{ actionID: "parent", condition: "succeeded" }],
@@ -232,14 +232,11 @@ describe("PlanState scheduling", () => {
 		expect(state.takeReady(0).map(id)).toEqual(["parent"]);
 		state.markRunning("plan", "parent");
 		state.markSucceeded("plan", "parent");
-		expect(state.takeReady(1)).toEqual([]);
-		expect(state.promote("plan", "after-success")).toEqual({ status: "waiting" });
-		state.markAdopted("plan", "parent", 1);
 		expect(state.takeReady(1).map(id)).toEqual(["after-completion", "after-success"]);
 	});
 
-	it("blocks all sandbox descendants after failure regardless of declared condition", () => {
-		const state = sandboxAwareState();
+	it("releases completed dependencies and blocks succeeded dependencies after failure", () => {
+		const state = new PlanState();
 		const parent = bash("any-command-the-shell-accepts");
 		state.apply(
 			proposal([
@@ -252,8 +249,8 @@ describe("PlanState scheduling", () => {
 
 		state.takeReady(0);
 		state.markFailed("plan", "parent");
-		expect(state.drainBlocked().map(id).sort()).toEqual(["completed", "succeeded"]);
-		expect(state.takeReady(1)).toEqual([]);
+		expect(state.drainBlocked().map(id)).toEqual(["succeeded"]);
+		expect(state.takeReady(1).map(id)).toEqual(["completed"]);
 	});
 
 	it("keeps non-sandbox completion semantics and cascades impossible dependencies", () => {
@@ -329,10 +326,6 @@ function action(
 
 function bash(command: string): PlanAction {
 	return action("parent", { tool: "bash", input: { command } });
-}
-
-function sandboxAwareState(): PlanState {
-	return new PlanState((candidate) => (candidate.tool === "bash" ? "sandbox" : "resource_cached"));
 }
 
 function id(node: { readonly action: PlanAction }): string {

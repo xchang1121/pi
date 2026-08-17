@@ -1,5 +1,4 @@
 import { isDeepStrictEqual } from "node:util";
-import type { SpeculativeExecution } from "./action-semantics.ts";
 import type {
 	MaterializedPlan,
 	PlanAction,
@@ -73,13 +72,6 @@ type MutableNode = {
 /** Materialized proposal and source-neutral scheduler lifecycle stored as one state graph. */
 export class PlanState {
 	private readonly plans = new Map<string, MutablePlan>();
-	private readonly actionExecution: (action: PlanAction) => SpeculativeExecution | undefined;
-
-	constructor(
-		actionExecution: (action: PlanAction) => SpeculativeExecution | undefined = (action) => action.execution,
-	) {
-		this.actionExecution = actionExecution;
-	}
 
 	apply(update: PlanUpdate, anchorActionSeq: number): PlanUpdateResult {
 		return "actions" in update
@@ -370,9 +362,7 @@ export class PlanState {
 	private dependenciesSatisfied(plan: MutablePlan, node: MutableNode): boolean {
 		return (node.action.dependsOn ?? []).every((dependency) => {
 			const parent = plan.nodes.get(dependency.actionID);
-			return parent
-				? conditionSatisfied(parent.state, this.dependencyCondition(parent.action, dependency.condition))
-				: false;
+			return parent ? conditionSatisfied(parent.state, dependency.condition) : false;
 		});
 	}
 
@@ -384,23 +374,13 @@ export class PlanState {
 				if (node.state !== "deferred") continue;
 				const impossible = (node.action.dependsOn ?? []).some((dependency) => {
 					const parent = plan.nodes.get(dependency.actionID);
-					return (
-						!parent ||
-						conditionImpossible(parent.state, this.dependencyCondition(parent.action, dependency.condition))
-					);
+					return !parent || conditionImpossible(parent.state, dependency.condition);
 				});
 				if (!impossible) continue;
 				node.state = "blocked";
 				changed = true;
 			}
 		}
-	}
-
-	private dependencyCondition(
-		parent: PlanAction,
-		declared: PlanActionDependencyCondition | undefined,
-	): PlanActionDependencyCondition | undefined {
-		return this.actionExecution(parent) === "sandbox" ? "adopted" : declared;
 	}
 }
 

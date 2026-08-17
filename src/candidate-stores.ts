@@ -33,7 +33,8 @@ interface IndexedActionStoreLookup<Entry> extends ActionStoreLookup<Entry> {
 }
 
 interface IndexedScope<Entry> {
-	readonly entries: Map<string, Entry>;
+	readonly entries: Set<Entry>;
+	readonly exact: Map<string, Set<Entry>>;
 	readonly partitions: Map<string, Set<Entry>>;
 }
 
@@ -41,17 +42,18 @@ interface IndexedScope<Entry> {
 export class ActionStore<Scope, Entry extends SizedActionStoreEntry> {
 	private readonly scopesByID = new Map<Scope, IndexedScope<Entry>>();
 	private readonly projectors: readonly ActionKeyProjector[];
+	private readonly allowDuplicateExact: boolean;
 
-	constructor(projectors: readonly ActionKeyProjector[] = []) {
+	constructor(projectors: readonly ActionKeyProjector[] = [], allowDuplicateExact = false) {
 		this.projectors = [...projectors];
+		this.allowDuplicateExact = allowDuplicateExact;
 	}
 
 	insert(scope: Scope, entry: Entry): Entry | undefined {
 		const state = this.ensureScope(scope);
-		const existing = state.entries.get(entry.key.key);
-		if (existing) return existing;
-		state.entries.set(entry.key.key, entry);
-		this.addToPartitions(state, entry);
+		const existing = last(state.exact.get(entry.key.key));
+		if (existing && !this.allowDuplicateExact) return existing;
+		this.add(state, entry);
 		return undefined;
 	}
 
@@ -59,24 +61,26 @@ export class ActionStore<Scope, Entry extends SizedActionStoreEntry> {
 		scope: Scope,
 		entry: Entry,
 		canReuseProjected: (existing: Entry, match: ProjectedActionKeyMatch) => boolean = () => false,
+		canReuseExact: (existing: Entry) => boolean = () => true,
 	): ActionStoreInsertResult<Entry> {
 		const state = this.ensureScope(scope);
-		const exact = state.entries.get(entry.key.key);
-		if (exact) return { entry: exact, match: { kind: "exact", distance: 0 }, inserted: false };
-		for (const candidate of this.lookupRecords(state, entry.key)) {
-			if (candidate.match.kind === "exact") {
-				return { entry: candidate.entry, match: candidate.match, inserted: false };
+		const exact = [...(state.exact.get(entry.key.key) ?? [])].reverse();
+		for (const existing of exact) {
+			if (!this.allowDuplicateExact || canReuseExact(existing)) {
+				return { entry: existing, match: { kind: "exact", distance: 0 }, inserted: false };
 			}
+		}
+		for (const candidate of this.lookupRecords(state, entry.key)) {
+			if (candidate.match.kind === "exact") continue;
 			if (!canReuseProjected(candidate.entry, candidate.match)) continue;
 			return { entry: candidate.entry, match: candidate.match, inserted: false };
 		}
-		state.entries.set(entry.key.key, entry);
-		this.addToPartitions(state, entry);
+		this.add(state, entry);
 		return { entry, match: { kind: "exact", distance: 0 }, inserted: true };
 	}
 
 	getExact(scope: Scope, action: ActionKey): Entry | undefined {
-		return this.scopesByID.get(scope)?.entries.get(action.key);
+		return last(this.scopesByID.get(scope)?.exact.get(action.key));
 	}
 
 	lookup(scope: Scope, action: ActionKey): readonly ActionStoreLookup<Entry>[] {
@@ -86,27 +90,32 @@ export class ActionStore<Scope, Entry extends SizedActionStoreEntry> {
 
 	touch(scope: Scope, entry: Entry): boolean {
 		const state = this.scopesByID.get(scope);
-		if (!state || state.entries.get(entry.key.key) !== entry) return false;
-		state.entries.delete(entry.key.key);
-		state.entries.set(entry.key.key, entry);
+		if (!state?.entries.has(entry)) return false;
+		state.entries.delete(entry);
+		state.entries.add(entry);
+		const exact = state.exact.get(entry.key.key)!;
+		exact.delete(entry);
+		exact.add(entry);
 		return true;
 	}
 
 	delete(scope: Scope, entry: Entry): boolean {
 		const state = this.scopesByID.get(scope);
-		if (!state || state.entries.get(entry.key.key) !== entry) return false;
-		state.entries.delete(entry.key.key);
+		if (!state?.entries.delete(entry)) return false;
+		const exact = state.exact.get(entry.key.key);
+		exact?.delete(entry);
+		if (exact?.size === 0) state.exact.delete(entry.key.key);
 		this.removeFromPartitions(state, entry);
 		if (state.entries.size === 0) this.scopesByID.delete(scope);
 		return true;
 	}
 
 	values(scope: Scope): readonly Entry[] {
-		return [...(this.scopesByID.get(scope)?.entries.values() ?? [])];
+		return [...(this.scopesByID.get(scope)?.entries ?? [])];
 	}
 
 	allValues(): readonly Entry[] {
-		return [...this.scopesByID.values()].flatMap((state) => [...state.entries.values()]);
+		return [...this.scopesByID.values()].flatMap((state) => [...state.entries]);
 	}
 
 	scopes(): readonly Scope[] {
@@ -137,14 +146,13 @@ export class ActionStore<Scope, Entry extends SizedActionStoreEntry> {
 
 	private lookupRecords(state: IndexedScope<Entry>, action: ActionKey): readonly IndexedActionStoreLookup<Entry>[] {
 		const candidates = new Set<Entry>();
-		const exact = state.entries.get(action.key);
-		if (exact) candidates.add(exact);
+		for (const exact of state.exact.get(action.key) ?? []) candidates.add(exact);
 		for (const key of actionKeyProjectionPartitions(action, this.projectors)) {
 			for (const entry of state.partitions.get(key) ?? []) candidates.add(entry);
 		}
 		const recency = new Map<Entry, number>();
 		let index = 0;
-		for (const entry of state.entries.values()) recency.set(entry, index++);
+		for (const entry of state.entries) recency.set(entry, index++);
 		const ranked: IndexedActionStoreLookup<Entry>[] = [];
 		for (const entry of candidates) {
 			const match = actionKeyMatch(entry.key, action, this.projectors);
@@ -158,9 +166,17 @@ export class ActionStore<Scope, Entry extends SizedActionStoreEntry> {
 	private ensureScope(scope: Scope): IndexedScope<Entry> {
 		const existing = this.scopesByID.get(scope);
 		if (existing) return existing;
-		const created: IndexedScope<Entry> = { entries: new Map(), partitions: new Map() };
+		const created: IndexedScope<Entry> = { entries: new Set(), exact: new Map(), partitions: new Map() };
 		this.scopesByID.set(scope, created);
 		return created;
+	}
+
+	private add(state: IndexedScope<Entry>, entry: Entry): void {
+		state.entries.add(entry);
+		const exact = state.exact.get(entry.key.key) ?? new Set<Entry>();
+		exact.add(entry);
+		state.exact.set(entry.key.key, exact);
+		this.addToPartitions(state, entry);
 	}
 
 	private addToPartitions(state: IndexedScope<Entry>, entry: Entry): void {
@@ -433,4 +449,10 @@ function expirationLimit(value: number): number {
 
 function entryBytes(entry: SizedActionStoreEntry): number {
 	return Number.isFinite(entry.estimatedBytes) ? Math.max(0, entry.estimatedBytes) : 0;
+}
+
+function last<T>(values: Iterable<T> | undefined): T | undefined {
+	let result: T | undefined;
+	for (const value of values ?? []) result = value;
+	return result;
 }

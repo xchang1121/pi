@@ -32,7 +32,7 @@ describe("M5 native sandbox broker", () => {
 				state: "ready",
 				source: "explicit",
 				detail: "namespaces ready",
-				fingerprint: expect.stringMatching(/^native:4:[a-f0-9]{64}$/),
+				fingerprint: expect.stringMatching(/^native:5:[a-f0-9]{64}$/),
 				path: binaryPath,
 			});
 		});
@@ -154,6 +154,7 @@ describe("M5 native sandbox broker", () => {
 						environment: { PATH: "/usr/bin", PI_TEST: "resolved" },
 						cwd,
 						processRoot,
+						workspaceRoot: cwd,
 						sourceRoot,
 						timeout: 2.5,
 						signal: new AbortController().signal,
@@ -173,6 +174,7 @@ describe("M5 native sandbox broker", () => {
 								environment: { PATH: "/usr/bin", PI_TEST: "resolved" },
 								cwd,
 								sandboxRoot: processRoot,
+								workspaceRoot: cwd,
 								sourceRoot,
 								timeoutMs: 2500,
 								maxOutputBytes: 16 * 1024,
@@ -258,6 +260,33 @@ describe("M5 native sandbox broker", () => {
 		});
 	});
 
+	it("rejects cwd and workspace roots outside the private execution root", async () => {
+		await withPlaceholderBinary(async (binaryPath) => {
+			const root = path.join(os.tmpdir(), "pi-native-containment");
+			const processRoot = path.join(root, "private");
+			const sourceRoot = path.join(root, "source");
+			const outside = path.join(root, "outside");
+			let invoked = false;
+			const options = {
+				binaryPath,
+				invoker: async () => {
+					invoked = true;
+					return invocationResult(executeResponse());
+				},
+			};
+			await expect(
+				executeNativeSandbox(
+					{ ...commandInput(sourceRoot, processRoot), workspaceRoot: outside, cwd: outside },
+					options,
+				),
+			).rejects.toThrow("workspaceRoot must be inside sandboxRoot");
+			await expect(
+				executeNativeSandbox({ ...commandInput(sourceRoot, processRoot), cwd: outside }, options),
+			).rejects.toThrow("cwd must be inside workspaceRoot");
+			expect(invoked).toBe(false);
+		});
+	});
+
 	it("surfaces broker launch failure without attempting a direct command", async () => {
 		await withPlaceholderBinary(async (binaryPath) => {
 			const sourceRoot = path.join(os.tmpdir(), "pi-native-source");
@@ -333,6 +362,7 @@ function commandInput(sourceRoot: string, processRoot: string, cwd = processRoot
 		environment: { PATH: "/usr/bin" },
 		cwd,
 		processRoot,
+		workspaceRoot: cwd,
 		sourceRoot,
 		signal: new AbortController().signal,
 	};

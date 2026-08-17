@@ -13,6 +13,7 @@ import type {
 	WorldAdoptionMetrics,
 	WorldBranch,
 	WorldBranchState,
+	WorldCheckpoint,
 	WorldExecutionMetrics,
 } from "./execution-world.ts";
 import { ResourceVersionManager, type ResourceVersionToken } from "./resource-version.ts";
@@ -52,6 +53,8 @@ export interface SpeculativeSandboxExecuteContext {
 	readonly invocation?: ToolInvocation;
 	readonly callID: string;
 	readonly signal: AbortSignal;
+	/** Optional immutable parent state for source-neutral multi-step execution. */
+	readonly parentCheckpoint?: WorldCheckpoint;
 }
 
 export type SpeculativeAgentSandbox = ExecutionWorld<SpeculativeSandboxExecuteContext, ToolSettlement>;
@@ -60,8 +63,10 @@ export interface SandboxProcessRunnerInput {
 	readonly command: string;
 	readonly shell: string;
 	readonly cwd: string;
-	/** Private parent mounted by native isolation; cwd must remain inside it. */
+	/** Private parent mounted by native isolation. */
 	readonly processRoot: string;
+	/** Private workspace exposed to the command at sourceRoot; cwd must remain inside it. */
+	readonly workspaceRoot: string;
 	readonly sourceRoot: string;
 	readonly timeout?: number;
 	readonly environment: Readonly<Record<string, string>>;
@@ -206,6 +211,37 @@ const SANDBOX_AUTHOR_ENVIRONMENT = {
 	GIT_COMMITTER_EMAIL: "speculative-action@localhost",
 } as const;
 
+class GitWorldCheckpoint implements WorldCheckpoint {
+	readonly backend = "git_worktree" as const;
+	readonly id = randomUUID();
+	readonly lineage: string;
+	readonly depth: number;
+	readonly sourceRoot: string;
+	readonly parent?: GitWorldCheckpoint;
+	readonly changes: readonly SandboxFileChange[];
+
+	constructor(sourceRoot: string, parent: GitWorldCheckpoint | undefined, changes: readonly SandboxFileChange[]) {
+		this.sourceRoot = path.resolve(sourceRoot);
+		this.lineage = parent?.lineage ?? this.id;
+		this.depth = (parent?.depth ?? -1) + 1;
+		this.parent = parent;
+		this.changes = changes;
+	}
+}
+
+function resolveWorkspaceCheckpoint(
+	checkpoint: WorldCheckpoint | undefined,
+	sourceRoot: string,
+): GitWorldCheckpoint | undefined {
+	if (checkpoint === undefined) return undefined;
+	if (!(checkpoint instanceof GitWorldCheckpoint))
+		throw new Error("Execution world checkpoint belongs to another backend.");
+	if (pathKey(checkpoint.sourceRoot) !== pathKey(sourceRoot)) {
+		throw new Error("Execution world checkpoint belongs to another workspace.");
+	}
+	return checkpoint;
+}
+
 /** Create a copy-on-write execution world with transactional multi-file adoption. */
 export function createWorkspaceSandbox(options: WorkspaceSandboxOptions = {}): SpeculativeAgentSandbox {
 	const roots = new Set<string>();
@@ -224,16 +260,18 @@ export function createWorkspaceSandbox(options: WorkspaceSandboxOptions = {}): S
 		},
 		fork: async (context) => {
 			if (!supports(context.mode)) throw new Error(`Execution world does not support mode ${context.mode}`);
-			roots.add(path.resolve(context.cwd));
+			const sourceRoot = path.resolve(context.cwd);
+			roots.add(sourceRoot);
+			const parent = resolveWorkspaceCheckpoint(context.parentCheckpoint, sourceRoot);
 			let snapshot: WorkspaceExecutionSnapshot;
 			if (context.mode === "file_mutation") {
-				snapshot = await executeMutation(context, options.gitBinary);
+				snapshot = await executeMutation(context, parent, options.gitBinary);
 			} else if (context.mode === "workspace_snapshot" && options.processBackend) {
-				snapshot = await executeWorkspaceSnapshot(context, options.processBackend, options.gitBinary);
+				snapshot = await executeWorkspaceSnapshot(context, parent, options.processBackend, options.gitBinary);
 			} else {
 				throw new Error(`Execution world does not support mode ${context.mode}`);
 			}
-			return new GitWorldBranch(snapshot);
+			return new GitWorldBranch(snapshot, sourceRoot, parent);
 		},
 		dispose: async () => {
 			const ownedRoots = [...roots];
@@ -250,6 +288,7 @@ function requireProcessBackend(options: WorkspaceSandboxOptions): SandboxProcess
 
 class GitWorldBranch implements WorldBranch<ToolSettlement> {
 	readonly backend = "git_worktree" as const;
+	readonly checkpoint: GitWorldCheckpoint;
 	readonly output: ToolSettlement;
 	readonly resources: readonly string[];
 	readonly capturedBytes: number;
@@ -259,9 +298,10 @@ class GitWorldBranch implements WorldBranch<ToolSettlement> {
 	private adoptionMetricsValue?: WorldAdoptionMetrics;
 	private adoption?: Promise<ToolSettlement>;
 
-	constructor(snapshot: WorkspaceExecutionSnapshot) {
+	constructor(snapshot: WorkspaceExecutionSnapshot, sourceRoot: string, parent?: GitWorldCheckpoint) {
 		this.output = snapshot.output;
 		this.changes = Object.freeze([...snapshot.changes]);
+		this.checkpoint = new GitWorldCheckpoint(sourceRoot, parent, this.changes);
 		this.resources = Object.freeze([...new Set(this.changes.map((change) => change.resource))]);
 		this.capturedBytes = this.changes.reduce(
 			(total, change) => total + (change.before?.byteLength ?? 0) + (change.after?.byteLength ?? 0),
@@ -410,6 +450,7 @@ export async function prepareSandboxWorkspace(
 
 async function executeMutation(
 	context: SpeculativeSandboxExecuteContext,
+	parent: GitWorldCheckpoint | undefined,
 	gitBinary?: string,
 ): Promise<WorkspaceExecutionSnapshot> {
 	const args = asRecord(context.args);
@@ -424,31 +465,39 @@ async function executeMutation(
 	const requestedPath = args.path;
 	const setupStarted = performance.now();
 
-	return withPrivateGitWorkspace(sourceRoot, gitBinary ?? "git", async (workspace) => {
-		const setupMs = Math.max(0, performance.now() - setupStarted);
-		const sandboxTarget = path.resolve(workspace.sandboxRoot, resource);
-		await assertNoSymlinkPath(workspace.sandboxRoot, sandboxTarget);
-		const redirected = { ...args, path: sandboxTarget };
-		const result = await context.tool.execute(context.callID, redirected as never, context.signal);
-		const collectionStarted = performance.now();
-		const changes = await collectSandboxChanges(workspace);
-		const changeCollectionMs = Math.max(0, performance.now() - collectionStarted);
-		return {
-			output: {
-				result: replacePaths(result, [
-					[sandboxTarget, requestedPath],
-					[workspace.sandboxRoot, sourceRoot],
-				]),
-				isError: false,
-			},
-			changes,
-			executionMetrics: { setupMs, captureMs: changeCollectionMs },
-		};
-	});
+	return withPrivateGitWorkspace(
+		sourceRoot,
+		gitBinary ?? "git",
+		async (workspace) => {
+			const setupMs = Math.max(0, performance.now() - setupStarted);
+			const sandboxTarget = path.resolve(workspace.sandboxRoot, resource);
+			await assertNoSymlinkPath(workspace.sandboxRoot, sandboxTarget);
+			const redirected = { ...args, path: sandboxTarget };
+			const result = await context.tool.execute(context.callID, redirected as never, context.signal);
+			const collectionStarted = performance.now();
+			const changes = await collectSandboxChanges(workspace);
+			const changeCollectionMs = Math.max(0, performance.now() - collectionStarted);
+			return {
+				output: {
+					result: replacePaths(result, [
+						[sandboxTarget, requestedPath],
+						[workspace.sandboxRoot, sourceRoot],
+					]),
+					isError: false,
+				},
+				changes,
+				executionMetrics: { setupMs, captureMs: changeCollectionMs },
+			};
+		},
+		undefined,
+		undefined,
+		parent,
+	);
 }
 
 async function executeWorkspaceSnapshot(
 	context: SpeculativeSandboxExecuteContext,
+	parent: GitWorldCheckpoint | undefined,
 	backend: SandboxProcessBackend,
 	gitBinary?: string,
 ): Promise<WorkspaceExecutionSnapshot> {
@@ -471,6 +520,7 @@ async function executeWorkspaceSnapshot(
 				environment: invocation.environment,
 				cwd: path.join(workspace.sandboxRoot, path.relative(sourceRoot, invocationCwd)),
 				processRoot: workspace.processRoot,
+				workspaceRoot: workspace.sandboxRoot,
 				sourceRoot,
 				...(invocation.timeout !== undefined ? { timeout: invocation.timeout } : {}),
 				signal: context.signal,
@@ -488,6 +538,7 @@ async function executeWorkspaceSnapshot(
 		},
 		backend,
 		context.signal,
+		parent,
 	);
 }
 
@@ -971,13 +1022,41 @@ async function withPrivateGitWorkspace<T>(
 	run: (workspace: PrivateGitWorkspace) => Promise<T>,
 	processBackend?: SandboxProcessBackend,
 	signal?: AbortSignal,
+	checkpoint?: GitWorldCheckpoint,
 ): Promise<T> {
 	const workspace = await createPrivateGitWorkspace(cwd, gitBinary, processBackend, signal);
 	try {
+		if (checkpoint) await materializeCheckpoint(workspace, checkpoint);
 		return await run(workspace);
 	} finally {
 		await cleanupPrivateGitWorkspace(workspace);
 	}
+}
+
+async function materializeCheckpoint(workspace: PrivateGitWorkspace, checkpoint: GitWorldCheckpoint): Promise<void> {
+	const lineage: GitWorldCheckpoint[] = [];
+	for (let current: GitWorldCheckpoint | undefined = checkpoint; current; current = current.parent) {
+		lineage.push(current);
+	}
+	for (const ancestor of lineage.reverse()) {
+		for (const change of ancestor.changes) {
+			const target = path.resolve(workspace.sandboxRoot, change.resource);
+			if (!contains(workspace.sandboxRoot, target) || target === workspace.sandboxRoot) {
+				throw new Error(`execution checkpoint escapes workspace: ${change.resource}`);
+			}
+			await assertNoSymlinkPath(workspace.sandboxRoot, target);
+			if (change.after === undefined) await rm(target, { force: true });
+			else await atomicWrite(target, change.after, change.afterMode, workspace.sandboxRoot);
+		}
+	}
+	if (!lineage.some((ancestor) => ancestor.changes.length > 0)) return;
+	await git(workspace.gitBinary, ["-C", workspace.sandboxRoot, "add", "--all", "--", "."], workspace.sandboxRoot);
+	await git(
+		workspace.gitBinary,
+		["-C", workspace.sandboxRoot, "commit", "--allow-empty", "--no-gpg-sign", "-m", "speculative lineage"],
+		workspace.sandboxRoot,
+		SANDBOX_AUTHOR_ENVIRONMENT,
+	);
 }
 
 async function cleanupPrivateGitWorkspace(workspace: PrivateGitWorkspace): Promise<void> {
