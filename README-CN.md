@@ -84,13 +84,13 @@ spec: on · Windows AppContainer · 3/4 hits · 1.2s saved · 5/512 results
 
 | 配置 | 默认值 | 说明 |
 |---|---:|---|
-| Drafter | 开启 | 与 Actor 并行预测候选动作 |
+| Drafter | 开启 | 默认使用当前 Actor 模型，也可以另外配置模型 |
 | PatternAware | 开启 | 学习并匹配历史动作模板 |
 | PatternAware multi-step | 开启 | 允许未来动作和多步投机展开 |
 | Pattern beam width | 4 | 在每个学习到的前沿只保留预期延迟收益最高的动作 |
 | Pattern prediction depth | 6 | 限制递归多步展开深度，同时允许有界的重复模式 |
 | Adaptive drafter | 开启 | 已有高价值模板时跳过冗余 drafter 请求 |
-| Candidate limit | 8 | 每次最多接收的候选数 |
+| Drafter requests | 8 | 每轮并行发起的独立单动作请求数；结果由 K(a) 去重 |
 | Concurrent actions | 8 | 最大并行投机动作数 |
 | Resource cache | 512 项 / 256 MiB | `read`、`grep`、`find` 结果缓存 |
 | Prediction timeout | 300 秒 | 单轮预测生命周期上限 |
@@ -140,7 +140,7 @@ spec: on · Windows AppContainer · 3/4 hits · 1.2s saved · 5/512 results
 }
 ```
 
-省略 `draftModel` 时使用当前 Actor 模型。设置其他模型时使用 Pi 的 `provider/model` 引用格式，并确保该 provider 已完成认证。
+省略 `draftModel` 时使用当前 Actor 模型。可选的 Pi `provider/model` 引用既可以显式选择相同模型，也可以选择其他已认证模型；无效或不可用的引用会回退到 Actor。
 
 ## 启用 Bash 投机
 
@@ -187,7 +187,7 @@ npm run build:native --workspace @earendil-works/pi-speculative-action
 - macOS：Seatbelt profile、源目录/用户目录/网络限制和进程树监管。
 - Windows：零 capability AppContainer、仅授予暂存工作区的 package-SID 权限、私有 desktop 和 kill-on-close Job 监管。
 
-Windows 的 `auto` 会先尝试 OCI，再回退 AppContainer。AppContainer 会原样执行配置的 shell 与命令，不设 Bash 命令白名单；因此兼容的 Git Bash 命令可以命中，而 MSYS fork 或其他执行失败会由 Scheduler 丢弃，Actor 再按正常路径执行。Bash 后端失败不会影响 `write`、`edit` 和资源缓存类投机。
+Windows 的 `auto` 会先尝试 OCI，再回退 AppContainer。AppContainer 不设命令白名单，可运行兼容的原生 shell，但 Git for Windows 的 MSYS runtime 无法在该边界内完成初始化。需要投机 Git Bash 时应使用 OCI；否则失败候选会由 Scheduler 丢弃，Actor 再按正常路径执行，且不影响 `write`、`edit` 和资源缓存类投机。
 
 `ExecutionWorld` 是 Agent adapter 使用的隔离边界。`ActionSemanticsRegistry` 选择 world mode（`file_mutation` 或 `workspace_snapshot`），world 不再维护第二份硬编码工具列表。完成的 `WorldBranch` 会把工具输出、可提升的文件系统 delta 和不可变 checkpoint 一起封存。与来源无关的 Scheduler 可以在 Actor 采纳前从 checkpoint 派生后续沙箱动作，但真正匹配时仍要求祖先动作按 Actor 顺序完成采纳。进程内 cwd/环境状态以及被阻断的网络副作用不会被提升；并发消费者会合并到同一次经过冲突校验的事务式 adoption，而未被采用的 branch 无法改变 Actor 所在的 world。Linux 原生隔离还会在 mount namespace 内把私有 branch 投影到 Actor 的逻辑工作区路径。
 
@@ -296,7 +296,7 @@ package 只通过 Pi 原生公开 API 接入：生命周期事件提供模型上
 
 - `Enabled: Off`：运行 `/speculative-action on`。
 - `Active sandbox: unavailable`：查看独立的 OCI/native 状态行。OCI 可使用 **Tools & sandbox → Install or repair OCI dependencies**；原生后端可构建或指定 broker，然后运行 `/speculative-action refresh`。
-- 已开启但一直没有候选：确认项目已信任、Drafter 已认证，并检查是否关闭了 Drafter 和 PatternAware。
+- 已开启但一直没有候选：确认项目已信任，并检查是否关闭了 Drafter 和 PatternAware。
 - 有候选但没有命中：预测动作必须与 Actor 的工具名和规范化参数匹配；资源变化也会让候选失效。
 - PatternAware 初期没有效果：它需要先观察重复工作流；冷启动阶段主要依赖 Drafter。
 - Drafter 成本偏高：启用 `adaptiveDrafter`，或指定更快、更便宜的 `draftModel`。
@@ -304,6 +304,6 @@ package 只通过 Pi 原生公开 API 接入：生命周期事件提供模型上
 
 ## 实现概览
 
-Actor 与 Drafter 并行运行，候选依次经过 schema 校验、preflight、资源版本捕获和执行策略选择。完成的候选进入 `ResultCache` 或仅支持精确匹配的 `ActionStore`，隔离副作用由封存的 `WorldBranch` 表示；Actor 调用被包装的原生工具时，package 尝试复用完全匹配或安全可投影的结果，未命中则委托给该原生工具。PatternAware 按 workspace hash 持久化模板和有界 PPM 计数 trie，只保留少量预期收益最高的 beam；DAG 执行、新鲜度和资源调度仍由来源无关的 runtime 统一负责。
+Actor 与 Drafter 并行运行。每轮 Drafter 会并行发起 `candidateLimit` 个独立请求：每个请求看到 Actor 的对话和可投机工具 schema，以 Assistant 身份只调用一个工具，关闭 reasoning，并使用较小的输出预算；第一个请求使用 temperature 0 保证准确性，其余请求使用 0.7 提供多样性。每个响应只接收第一个工具调用，再由现有 K(a) 关系在执行前合并等价工作。候选随后经过 schema 校验、preflight、资源版本捕获和执行策略选择。完成的候选进入 `ResultCache` 或仅支持精确匹配的 `ActionStore`，隔离副作用由封存的 `WorldBranch` 表示；Actor 调用被包装的原生工具时，package 尝试复用完全匹配或安全可投影的结果，未命中则委托给该原生工具。PatternAware 按 workspace hash 持久化模板和有界 PPM 计数 trie，只保留少量预期收益最高的 beam；DAG 执行、新鲜度和资源调度仍由来源无关的 runtime 统一负责。
 
 所有命中、未命中、取消、实际执行、草稿 token、缓存和沙箱阶段耗时均以 typed event 暴露，供实验记录与可视化使用。

@@ -36,6 +36,7 @@
 - Compatible cache insertion is now atomic and directed, so a broader running read can single-flight a narrower request without ever coalescing in the unsafe reverse direction.
 - Native sandbox protocol v3 now forwards the configured shell and requires an explicit process-isolation attestation; Linux recursively enforces read-only host mounts and readiness probes verify mount isolation.
 - K(a) remains a uniform canonical action key; registered projection rules now require both a potential key relation and validated realized-output coverage before reconstructing an actor result.
+- Drafter rounds now issue `candidateLimit` independent one-action requests concurrently, retain one low-temperature accuracy sample and diverse remaining samples, and rely on the existing K(a) relation to deduplicate execution.
 
 ### Fixed
 

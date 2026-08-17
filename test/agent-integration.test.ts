@@ -18,10 +18,10 @@ const readSchema = Type.Object({
 	limit: Type.Optional(Type.Number()),
 });
 
-function model(): Model<"openai-responses"> {
+function model(id = "actor"): Model<"openai-responses"> {
 	return {
-		id: "mock",
-		name: "mock",
+		id,
+		name: id,
 		api: "openai-responses",
 		provider: "openai",
 		baseUrl: "https://example.invalid",
@@ -57,13 +57,13 @@ function drafterCall(input: Record<string, unknown>): AssistantMessage {
 	return assistant([{ type: "toolCall", id: "draft-1", name: "read", arguments: input }], "toolUse");
 }
 
-function settings() {
+function settings(candidateLimit = 1) {
 	return {
 		enabled: true,
 		drafterEnabled: true,
 		adaptiveDrafter: false,
-		candidateLimit: 1,
-		maxConcurrentActions: 1,
+		candidateLimit,
+		maxConcurrentActions: candidateLimit,
 		tools: { resourceCached: ["read"], sandbox: [] },
 		patternAware: { enabled: false },
 	};
@@ -72,7 +72,7 @@ function settings() {
 function startInput(tool: AgentTool) {
 	return {
 		turnID: "turn-1",
-		actorModel: model(),
+		actorModel: model("actor"),
 		context: { systemPrompt: "system", messages: [], tools: [tool] },
 		actorOptions: undefined,
 		tools: [tool],
@@ -108,6 +108,7 @@ describe("speculative action host", () => {
 		const host = createSpeculativeActionHost("session", {
 			cwd,
 			getSettings: settings,
+			draftModel: model("draft"),
 			complete: async () => drafterCall({ path: "notes.txt" }),
 			preflight: () => true,
 			onEvent: (event) => {
@@ -156,6 +157,7 @@ describe("speculative action host", () => {
 		const host = createSpeculativeActionHost("session", {
 			cwd,
 			getSettings: settings,
+			draftModel: model("draft"),
 			complete: async () => drafterCall({ path: "notes.txt", offset: 1, limit: 4 }),
 			preflight: () => true,
 			projectionRules: [PI_READ_RANGE_PROJECTION_RULE],
@@ -201,6 +203,7 @@ describe("speculative action host", () => {
 		const host = createSpeculativeActionHost("session", {
 			cwd,
 			getSettings: settings,
+			draftModel: model("draft"),
 			complete: async () => assistant([{ type: "text", text: "no prediction" }], "stop"),
 			preflight: () => true,
 			sandbox,
@@ -223,12 +226,128 @@ describe("speculative action host", () => {
 		expect(disposed).toBe(1);
 	});
 
+	it("runs independent single-action drafts concurrently and deduplicates them by K(a)", async () => {
+		const cwd = await temporaryWorkspace();
+		await Promise.all([
+			writeFile(path.join(cwd, "other.txt"), "other", "utf8"),
+			writeFile(path.join(cwd, "ignored.txt"), "ignored", "utf8"),
+		]);
+		const executed: string[] = [];
+		const events: SpeculativeActionEvent<string>[] = [];
+		const requests: Array<{ context: Parameters<CreateComplete>[1]; options: Parameters<CreateComplete>[2] }> = [];
+		let releaseSlowRequest: ((message: AssistantMessage) => void) | undefined;
+		const slowRequest = new Promise<AssistantMessage>((resolve) => {
+			releaseSlowRequest = resolve;
+		});
+		let activeRequests = 0;
+		let maxActiveRequests = 0;
+		const complete: CreateComplete = async (_model, context, requestOptions) => {
+			const index = requests.length;
+			requests.push({ context, options: requestOptions });
+			activeRequests++;
+			maxActiveRequests = Math.max(maxActiveRequests, activeRequests);
+			await Promise.resolve();
+			if (index === 6) {
+				activeRequests--;
+				throw new Error("one sample failed");
+			}
+			if (index === 7) {
+				const result = await slowRequest;
+				activeRequests--;
+				return result;
+			}
+			activeRequests--;
+			const selected = index % 2 === 0 ? "notes.txt" : "other.txt";
+			return assistant(
+				[
+					{ type: "toolCall", id: `selected-${index}`, name: "read", arguments: { path: selected } },
+					{ type: "toolCall", id: `ignored-${index}`, name: "read", arguments: { path: "ignored.txt" } },
+				],
+				"toolUse",
+			);
+		};
+		const tool: AgentTool<typeof readSchema> = {
+			name: "read",
+			label: "read",
+			description: "read",
+			parameters: readSchema,
+			execute: async (_id, args) => {
+				executed.push(args.path);
+				return { content: [{ type: "text", text: args.path }], details: {} };
+			},
+		};
+		const host = createSpeculativeActionHost("session", {
+			cwd,
+			getSettings: () => settings(8),
+			draftModel: model("draft"),
+			getDraftOptions: () => ({ temperature: 1, maxTokens: 2_048, reasoning: "high", deferred: true }),
+			complete,
+			preflight: () => true,
+			onEvent: (event) => {
+				events.push(event);
+			},
+		});
+
+		await host.startTurn(startInput(tool));
+		await waitFor(() => events.filter((event) => event.type === "completed").length === 2);
+		expect(host.runtime.inspect("session").pendingPredictions).toBe(1);
+		releaseSlowRequest?.(assistant([{ type: "text", text: "no tool needed" }], "stop"));
+		await waitFor(() => !host.runtime.inspect("session").pendingPredictions);
+
+		expect(requests).toHaveLength(8);
+		expect(maxActiveRequests).toBe(8);
+		expect(new Set(requests.map((request) => request.options?.sessionId)).size).toBe(8);
+		expect(requests.map((request) => request.options?.temperature)).toEqual([0, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7]);
+		for (const request of requests) {
+			expect(request.context.systemPrompt).toContain("Continue the conversation as the assistant");
+			expect(request.context.systemPrompt).not.toMatch(/drafter|predict|speculat|likely next/i);
+			expect(request.context.tools?.map((candidate) => candidate.name)).toEqual(["read"]);
+			expect(request.options).toMatchObject({ maxTokens: 128, reasoning: undefined, deferred: false });
+		}
+		expect(executed.sort()).toEqual(["notes.txt", "other.txt"]);
+		expect(events.filter((event) => event.type === "started")).toHaveLength(2);
+		await host.dispose();
+	});
+
+	it("uses the actor model by default and permits it as the explicit Drafter model", async () => {
+		const cwd = await temporaryWorkspace();
+		const usedModels: string[] = [];
+		const complete: CreateComplete = async (usedModel) => {
+			usedModels.push(`${usedModel.provider}/${usedModel.id}`);
+			return assistant([{ type: "text", text: "no tool needed" }], "stop");
+		};
+		const tool: AgentTool<typeof readSchema> = {
+			name: "read",
+			label: "read",
+			description: "read",
+			parameters: readSchema,
+			execute: async () => ({ content: [{ type: "text", text: "unused" }], details: {} }),
+		};
+
+		for (const draftModel of [undefined, model("actor")]) {
+			const host = createSpeculativeActionHost("session", {
+				cwd,
+				getSettings: settings,
+				...(draftModel ? { draftModel } : {}),
+				complete,
+				preflight: () => true,
+			});
+			await host.startTurn(startInput(tool));
+			await waitFor(() => !host.runtime.inspect("session").pendingPredictions);
+			await host.dispose();
+		}
+
+		expect(usedModels).toEqual(["openai/actor", "openai/actor"]);
+	});
+
 	it("names equal actions under different parent paths independently", () => {
 		const left = patternPlanActionID("shared", patternPlanActionID("left"));
 		const right = patternPlanActionID("shared", patternPlanActionID("right"));
 		expect(left).not.toBe(right);
 	});
 });
+
+type CreateComplete = NonNullable<Parameters<typeof createSpeculativeActionHost>[1]["complete"]>;
 
 async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {
 	const deadline = Date.now() + timeoutMs;

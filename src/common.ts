@@ -23,18 +23,16 @@ export const DEFAULTS = {
 	},
 };
 
-export function buildDrafterToolCallPrompt(candidateLimit = 1): string {
-	const limit = clampCandidateLimit(candidateLimit);
-	return `Dispatch tool calls only.
+export function buildSingleToolCallPrompt(): string {
+	return `Continue the conversation as the assistant by making exactly one tool call now.
 
 Rules:
 - Emit tool calls only. Do not answer with prose, markdown, JSON text, XML-like markup, DSML, or code fences.
-- Call 1 to ${limit} likely next tool call(s), ordered from most likely to least likely.
+- Make exactly one tool call. Do not emit parallel or sequential tool calls.
 - Use the provider tool-call channel only.
 - Use the available tools exactly as provided.
 - Fill arguments according to the real tool schema. Do not invent argument names.
 - Prefer the narrowest concrete action that advances the current user request.
-- Do not include duplicate calls with the same tool and same arguments.
 `;
 }
 

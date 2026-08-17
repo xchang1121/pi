@@ -27,6 +27,7 @@ import type { SpeculativeActionHost } from "../src/agent-integration.ts";
 import {
 	createSpeculativeActionExtension,
 	formatSpeculativeActionStatus,
+	resolveSpeculativeDraftModel,
 	type SpeculativeActionMetrics,
 	type SpeculativeSandboxHealth,
 	type SpeculativeSettingsStore,
@@ -50,6 +51,20 @@ afterEach(async () => {
 });
 
 describe("zero-modification Pi extension", () => {
+	it("uses the actor model by default and accepts either the same or a different configured model", () => {
+		const actor = testModel("actor");
+		const draft = testModel("draft");
+		const registry = {
+			getAll: () => [actor, draft],
+			hasConfiguredAuth: () => true,
+		} as unknown as Parameters<typeof resolveSpeculativeDraftModel>[2];
+
+		expect(resolveSpeculativeDraftModel(undefined, actor, registry)).toBe(actor);
+		expect(resolveSpeculativeDraftModel("openai/actor", actor, registry)).toBe(actor);
+		expect(resolveSpeculativeDraftModel("openai/draft", actor, registry)).toBe(draft);
+		expect(resolveSpeculativeDraftModel("openai/missing", actor, registry)).toBe(actor);
+	});
+
 	it("registers stock-shaped overrides and returns a speculative hit without executing the base tool", async () => {
 		const fixture = await createFixture({
 			consume: async () => ({ result: textResult("cached"), isError: false }),
@@ -479,10 +494,10 @@ function textResult(text: string): AgentToolResult<unknown> {
 	return { content: [{ type: "text", text }], details: {} };
 }
 
-function testModel(): Model<"openai-responses"> {
+function testModel(id = "mock"): Model<"openai-responses"> {
 	return {
-		id: "mock",
-		name: "mock",
+		id,
+		name: id,
 		api: "openai-responses",
 		provider: "openai",
 		baseUrl: "https://example.invalid",

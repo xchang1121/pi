@@ -326,12 +326,16 @@ export interface SpeculativePlanSource<
 	readonly adaptive?: boolean;
 	readonly timeoutMs?: (settings: SpeculativeActionSettings) => number | undefined;
 	readonly multiStepEnabled?: (settings: SpeculativeActionSettings) => boolean;
+	/** Number of independent proposals to request concurrently for this source. */
+	readonly proposalCount?: (settings: SpeculativeActionSettings) => number;
 	readonly propose: (input: {
 		readonly startInput: StartInput;
 		readonly data: StateData;
 		readonly settings: SpeculativeActionSettings;
 		readonly definitions: readonly DrafterToolDefinition[];
 		readonly candidateNames: readonly string[];
+		readonly proposalIndex: number;
+		readonly proposalCount: number;
 		readonly signal: AbortSignal;
 	}) => MaybePromise<PlanProposal | readonly PlanProposal[]>;
 	readonly continue?: (input: {
@@ -2838,43 +2842,66 @@ export function makeSpeculativeActionRuntime<
 				}
 				state.sourceAttempts.add(source.id);
 				const predictionStarted = Date.now();
+				let sourceAccepted = 0;
 				const sourceController = new AbortController();
 				const abortSource = () => sourceController.abort();
 				if (state.predictionController.signal.aborted) sourceController.abort();
 				else state.predictionController.signal.addEventListener("abort", abortSource, { once: true });
 				try {
-					const proposed = Promise.resolve(
-						source.propose({
-							startInput: input,
-							data: state.data,
-							settings: current,
-							definitions,
-							candidateNames,
-							signal: sourceController.signal,
-						}),
+					const proposalCount = clampCandidateLimit(source.proposalCount?.(current) ?? 1);
+					let admissionTail = Promise.resolve();
+					const proposed = Promise.allSettled(
+						Array.from({ length: proposalCount }, (_, proposalIndex) =>
+							Promise.resolve()
+								.then(() =>
+									source.propose({
+										startInput: input,
+										data: state.data,
+										settings: current,
+										definitions,
+										candidateNames,
+										proposalIndex,
+										proposalCount,
+										signal: sourceController.signal,
+									}),
+								)
+								.then((proposal) => {
+									const admit = admissionTail.then(async () => {
+										if (sourceController.signal.aborted || state.finished || state.terminal) return;
+										const proposals = Array.isArray(proposal) ? proposal : [proposal];
+										const admitted = await admitPlanUpdates(
+											state,
+											input,
+											source.id,
+											proposals,
+											Math.max(0, Date.now() - predictionStarted),
+											candidateNames,
+											predictionAnchorActionSeq,
+										);
+										sourceAccepted += admitted;
+										accepted += admitted;
+									});
+									admissionTail = admit.catch(() => undefined);
+									return admit;
+								}),
+						),
 					);
 					const timeout = source.timeoutMs?.(current);
-					const proposals =
+					const settled =
 						timeout === undefined
 							? await proposed
 							: await withTimeout(proposed, Math.max(0, timeout), () => sourceController.abort());
 					if (state.finished || state.terminal) return;
-					const sourceAccepted = await admitPlanUpdates(
-						state,
-						input,
-						source.id,
-						proposals,
-						Math.max(0, Date.now() - predictionStarted),
-						candidateNames,
-						predictionAnchorActionSeq,
-					);
-					accepted += sourceAccepted;
+					const rejected = settled.find((result) => result.status === "rejected");
+					if (rejected?.status === "rejected" && settled.every((result) => result.status === "rejected")) {
+						throw rejected.reason;
+					}
 					if (source.adaptive && adaptiveSourceBackoffEnabled(state) && sourceAccepted === 0) {
 						recordSourceFailure(state, source.id, "source_error");
 					}
 				} catch (error) {
 					if (state.finished || state.terminal) return;
-					if (source.adaptive && adaptiveSourceBackoffEnabled(state)) {
+					if (source.adaptive && sourceAccepted === 0 && adaptiveSourceBackoffEnabled(state)) {
 						recordSourceFailure(state, source.id, "source_error");
 					}
 					await publishMiss(

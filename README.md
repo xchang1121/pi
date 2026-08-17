@@ -84,13 +84,13 @@ The master switch is off by default. After `/speculative-action on`, the followi
 
 | Setting | Default | Description |
 |---|---:|---|
-| Drafter | On | Predict candidates concurrently with the actor |
+| Drafter | On | Uses the active actor model by default, or an optionally configured model |
 | PatternAware | On | Learn and match historical action templates |
 | PatternAware multi-step | On | Admit future actions and expand multi-step speculation |
 | Pattern beam width | 4 | Retain the highest expected-latency-reduction actions at each learned frontier |
 | Pattern prediction depth | 6 | Bound recursive multi-step expansion, including recurring motifs |
 | Adaptive drafter | On | Skip redundant drafter requests when a useful template is already available |
-| Candidate limit | 8 | Maximum accepted candidates per prediction |
+| Drafter requests | 8 | Independent, concurrent one-action requests per Drafter round; K(a) deduplicates their results |
 | Concurrent actions | 8 | Maximum concurrent speculative actions |
 | Resource cache | 512 entries / 256 MiB | Cache for `read`, `grep`, and `find` results |
 | Prediction timeout | 300 seconds | Maximum lifecycle of one prediction round |
@@ -140,7 +140,7 @@ Complete example:
 }
 ```
 
-Omit `draftModel` to use the active actor model. To use another model, specify a Pi `provider/model` reference and make sure that provider is authenticated.
+Omit `draftModel` to use the active actor model. An optional Pi `provider/model` reference may select the same model explicitly or a different authenticated model; invalid or unavailable references fall back to the actor.
 
 ## Enable speculative Bash
 
@@ -187,7 +187,7 @@ To use an explicitly trusted broker built elsewhere, set `PI_SPECULATIVE_SANDBOX
 - macOS: a Seatbelt profile, source/home/network restrictions, and process-tree supervision.
 - Windows: a zero-capability AppContainer, package-SID access only to the staged workspace, a private desktop, and kill-on-close Job supervision.
 
-On Windows, `auto` tries OCI first and then AppContainer. AppContainer runs the configured shell and command as-is; there is no Bash command allowlist. Compatible Git Bash commands can therefore hit, while an MSYS fork or any other execution failure is rejected by the Scheduler and the actor runs the command normally. `write`, `edit`, and resource-cached speculation are unaffected by Bash backend failure.
+On Windows, `auto` tries OCI first and then AppContainer. AppContainer runs compatible native shells without a command allowlist, but Git for Windows' MSYS runtime cannot initialize inside this boundary. Use OCI for speculative Git Bash; otherwise the Scheduler rejects the failed candidate and the actor runs it normally. `write`, `edit`, and resource-cached speculation are unaffected.
 
 `ExecutionWorld` is the isolation boundary used by the Agent adapter. `ActionSemanticsRegistry` selects a world mode (`file_mutation` or `workspace_snapshot`); the world does not maintain a second hard-coded tool list. A completed `WorldBranch` seals the tool output, promotable filesystem delta, and an immutable checkpoint. The source-neutral scheduler can derive a later sandbox action from that checkpoint before actor adoption, while matching still requires ancestors to be adopted in actor order. Process-local cwd/environment state and blocked network effects are never promoted. Concurrent consumers join one conflict-checked, transactional adoption, while an unadopted branch cannot change the actor's world. Linux native isolation also projects the private branch onto the actor's logical workspace path inside its mount namespace.
 
@@ -296,7 +296,7 @@ The engine remains available through `createSpeculativeActionHost()` for non-Pi 
 
 - `Enabled: Off`: run `/speculative-action on`.
 - `Active sandbox: unavailable`: inspect the separate OCI/native rows. Use **Tools & sandbox → Install or repair OCI dependencies** for OCI, or build/provide the native broker, then run `/speculative-action refresh`.
-- Enabled but no candidates: verify project trust and Drafter authentication, and make sure the Drafter and PatternAware are not both disabled.
+- Enabled but no candidates: verify project trust and make sure the Drafter and PatternAware are not both disabled.
 - Candidates but no hits: the predicted tool name and normalized arguments must match the actor call; resource changes also invalidate candidates.
 - No early PatternAware benefit: it needs repeated workflows before it can learn useful templates; cold starts rely mainly on the Drafter.
 - High Drafter cost: keep `adaptiveDrafter` enabled or select a faster, cheaper `draftModel`.
@@ -304,6 +304,6 @@ The engine remains available through `createSpeculativeActionHost()` for non-Pi 
 
 ## Implementation overview
 
-The actor and Drafter run concurrently. Candidates pass schema validation, preflight, resource-version capture, and execution-strategy selection. Completed candidates enter either `ResultCache` or an exact-only `ActionStore`; isolated effects are represented by a sealed `WorldBranch`. When the actor calls a wrapped stock tool, the package tries to reuse an exact match or a conservatively projected result and otherwise delegates to that stock tool. PatternAware persists its templates and bounded PPM count trie by workspace hash, retains a small expected-benefit beam, and leaves DAG execution, freshness, and resource scheduling to the source-neutral runtime.
+The actor and Drafter run concurrently. Each Drafter round launches `candidateLimit` independent requests in parallel. Every request sees the actor conversation and eligible tool schemas, is instructed to act as the assistant with exactly one tool call, disables reasoning, and uses a small output budget; the first request uses temperature 0 for accuracy and the rest use 0.7 for diversity. Only the first tool call from each response is admitted, and the existing K(a) relation deduplicates equivalent work before execution. Candidates then pass schema validation, preflight, resource-version capture, and execution-strategy selection. Completed candidates enter either `ResultCache` or an exact-only `ActionStore`; isolated effects are represented by a sealed `WorldBranch`. When the actor calls a wrapped stock tool, the package tries to reuse an exact match or a conservatively projected result and otherwise delegates to that stock tool. PatternAware persists its templates and bounded PPM count trie by workspace hash, retains a small expected-benefit beam, and leaves DAG execution, freshness, and resource scheduling to the source-neutral runtime.
 
 Hits, misses, cancellation, actual execution, draft tokens, cache state, and sandbox-stage timings are exposed as typed events for experiment collection and visualization.

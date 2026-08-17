@@ -38,7 +38,7 @@ const cargo = spawnSync("cargo", command, {
 if (cargo.error) throw new Error(`Failed to start cargo: ${cargo.error.message}`);
 if (cargo.status !== 0) throw new Error(`Failed to build native sandbox for ${rust.triple}.`);
 
-const compiled = path.join(crate, "target", ...(native ? [] : [rust.triple]), "release", executable);
+const compiled = path.join(path.resolve(process.env.CARGO_TARGET_DIR ?? path.join(crate, "target")), ...(native ? [] : [rust.triple]), "release", executable);
 const assetRoot = path.resolve(requested.assetRoot ?? path.join(crate, "prebuilds"));
 const platformKey = target.os === "linux" ? `${target.os}-${target.arch}-${target.libc}` : `${target.os}-${target.arch}`;
 const outputDirectory = path.join(assetRoot, platformKey);

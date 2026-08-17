@@ -9,8 +9,8 @@ import {
 	actionKeyMismatchReason,
 	actionKeyProjectionPartitions,
 	buildActionKey,
-	buildDrafterToolCallPrompt,
 	buildPiActionKey,
+	buildSingleToolCallPrompt,
 	clampCandidateLimit,
 	DEFAULTS,
 	inferredExecution,
@@ -18,13 +18,14 @@ import {
 import { candidateToolNames } from "../src/runtime.ts";
 
 describe("speculative action common", () => {
-	it("builds a tool-call-only drafter prompt without embedding unrelated schemas", () => {
-		const prompt = buildDrafterToolCallPrompt(4);
+	it("keeps each draft in the actor role while requiring one tool call", () => {
+		const prompt = buildSingleToolCallPrompt();
 
-		expect(prompt).toContain("Dispatch tool calls only");
+		expect(prompt).toContain("Continue the conversation as the assistant");
 		expect(prompt).toContain("provider tool-call channel only");
-		expect(prompt).toContain("Call 1 to 4");
-		expect(prompt).not.toContain('"task"');
+		expect(prompt).toContain("exactly one tool call");
+		expect(prompt).not.toMatch(/drafter|predict|speculat|likely next/i);
+		expect(DEFAULTS.drafterEnabled).toBe(true);
 	});
 
 	it("clamps the per-turn candidate limit to the source range", () => {

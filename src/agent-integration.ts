@@ -5,7 +5,7 @@ import { validateToolArguments } from "@earendil-works/pi-ai";
 import type { ActionProjectionRule } from "./action-key-projection.ts";
 import type { ActionKey, ActionSemanticsRegistry } from "./common.ts";
 import {
-	buildDrafterToolCallPrompt,
+	buildSingleToolCallPrompt,
 	clampCandidateLimit,
 	DEFAULTS,
 	PI_ACTION_SEMANTICS,
@@ -80,8 +80,10 @@ export interface CreateSpeculativeActionHostOptions {
 	readonly cwd: string;
 	/** Runtime settings. The feature remains disabled when omitted. */
 	readonly getSettings?: () => SpeculativeAgentSettingsInput | Promise<SpeculativeAgentSettingsInput>;
-	/** Drafter model. Defaults to the actor model for the current provider turn. */
-	readonly draftModel?: Model<Api> | ((actorModel: Model<Api>) => Model<Api> | Promise<Model<Api>>);
+	/** Drafter model. Defaults to the actor model when omitted or unresolved. */
+	readonly draftModel?:
+		| Model<Api>
+		| ((actorModel: Model<Api>) => Model<Api> | undefined | Promise<Model<Api> | undefined>);
 	/** Resolve drafter request options, including credentials when using a different provider. */
 	readonly getDraftOptions?: (context: DraftOptionsContext) => SimpleStreamOptions | Promise<SimpleStreamOptions>;
 	/** Provider completion used by the drafter. */
@@ -300,11 +302,12 @@ export function createSpeculativeActionHost(
 		enabled: (settings) => settings.drafterEnabled ?? DEFAULTS.drafterEnabled,
 		adaptive: true,
 		timeoutMs: (settings) => settings.predictionTimeoutMs,
-		propose: async ({ startInput: input, settings, candidateNames, signal }): Promise<PlanProposal> => {
-			const draftModel =
-				typeof options.draftModel === "function"
-					? await options.draftModel(input.actorModel)
-					: (options.draftModel ?? input.actorModel);
+		proposalCount: (settings) => clampCandidateLimit(settings.candidateLimit ?? DEFAULTS.candidateLimit),
+		propose: async ({ startInput: input, candidateNames, proposalIndex, signal }): Promise<PlanProposal> => {
+			const proposalID = `drafter:${input.turnID}:${proposalIndex}`;
+			const configuredDraftModel =
+				typeof options.draftModel === "function" ? await options.draftModel(input.actorModel) : options.draftModel;
+			const draftModel = configuredDraftModel ?? input.actorModel;
 			const configuredDraftOptions = options.getDraftOptions
 				? await options.getDraftOptions({
 						actorModel: input.actorModel,
@@ -312,45 +315,49 @@ export function createSpeculativeActionHost(
 						actorOptions: input.actorOptions,
 						signal,
 					})
-				: {
-						...input.actorOptions,
-						signal,
-						temperature: 0,
-						maxTokens: Math.max(128, (settings.candidateLimit ?? DEFAULTS.candidateLimit) * 96),
-						reasoning: undefined,
-						sessionId: `${sessionID}:speculative`,
-					};
+				: input.actorOptions;
+			const draftOptions: SimpleStreamOptions = {
+				...configuredDraftOptions,
+				signal,
+				temperature: proposalIndex === 0 ? 0 : 0.7,
+				maxTokens: 128,
+				reasoning: undefined,
+				deferred: false,
+				sessionId: `${sessionID}:${input.turnID}:${proposalIndex}`,
+			};
 			const enabledTools = new Set(candidateNames);
 			const message = await options.complete(
 				draftModel,
 				{
-					systemPrompt: [
-						input.context.systemPrompt,
-						buildDrafterToolCallPrompt(settings.candidateLimit ?? DEFAULTS.candidateLimit),
-					]
-						.filter(Boolean)
-						.join("\n\n"),
+					systemPrompt: [input.context.systemPrompt, buildSingleToolCallPrompt()].filter(Boolean).join("\n\n"),
 					messages: input.context.messages,
 					tools: (input.context.tools ?? []).filter((tool) => enabledTools.has(tool.name)),
 				},
-				{ ...configuredDraftOptions, signal },
+				draftOptions,
 			);
 			if (message.stopReason === "error" || message.stopReason === "aborted") {
 				throw new Error(message.errorMessage ?? `Drafter stopped with ${message.stopReason}`);
 			}
+			const call = message.content.find((item): item is AgentToolCall => item.type === "toolCall");
 			return {
-				id: `drafter:${input.turnID}`,
+				id: proposalID,
 				source: "drafter",
 				revision: 0,
-				actions: message.content
-					.filter((item): item is AgentToolCall => item.type === "toolCall")
-					.map((call, index) => ({
-						id: `${index}:${call.id}`,
-						type: "tool_call" as const,
-						tool: call.name,
-						input: call.arguments,
-						diagnostic: JSON.stringify({ toolCallID: call.id, tool: call.name, input: call.arguments }, null, 2),
-					})),
+				actions: call
+					? [
+							{
+								id: `${proposalIndex}:${call.id}`,
+								type: "tool_call" as const,
+								tool: call.name,
+								input: call.arguments,
+								diagnostic: JSON.stringify(
+									{ toolCallID: call.id, tool: call.name, input: call.arguments },
+									null,
+									2,
+								),
+							},
+						]
+					: [],
 				draftTokens: usageTokenCount(message.usage),
 			};
 		},

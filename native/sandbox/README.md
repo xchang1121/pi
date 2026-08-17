@@ -36,7 +36,7 @@ cargo test --manifest-path native/sandbox/Cargo.toml --all-targets
 Set `PI_NATIVE_SANDBOX_REQUIRED=1` to make platform integration tests fail
 instead of skip when the host cannot provide its native isolation API.
 
-The Windows backend deliberately passes the configured shell and command
-through without a Git Bash allowlist. Commands that work inside AppContainer
-can be adopted; process-start or MSYS fork failures are ordinary failed
-speculative candidates and are discarded by the Scheduler.
+The Windows backend passes compatible native shells through without a command
+allowlist. Git for Windows' MSYS runtime cannot initialize in AppContainer, so
+speculative Git Bash requires OCI; failed native candidates remain ordinary
+Scheduler rejections and never alter the actor workspace.

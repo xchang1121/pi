@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import type { AgentMessage, AgentTool, AgentToolResult, AgentToolUpdateCallback } from "@earendil-works/pi-agent-core";
-import { type Api, type Model, modelsAreEqual, type SimpleStreamOptions } from "@earendil-works/pi-ai";
+import type { Api, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
 import {
 	convertToLlm,
 	createBashToolDefinition,
@@ -274,7 +274,7 @@ export function formatSpeculativeActionStatus(input: {
 		`Enabled: ${settings.enabled ? "On" : "Off"}`,
 		`Drafter: ${settings.drafterEnabled ? "On" : "Off"}`,
 		`Draft model: ${settings.draftModel ?? "active model"}`,
-		`Candidate limit: ${settings.candidateLimit}`,
+		`Drafter requests: ${settings.candidateLimit}`,
 		`Concurrent actions: ${settings.maxConcurrentActions}`,
 		`Resource cache: ${settings.resourceCacheMaxEntries}`,
 		`Resource cache memory: ${formatBytes(settings.resourceCacheMaxBytes)}`,
@@ -411,15 +411,12 @@ async function installController(
 		complete: (model, llmContext, options) => latestContext.modelRegistry.complete(model, llmContext, options),
 		draftModel: (actorModel) =>
 			resolveSpeculativeDraftModel(settings().draftModel, actorModel, latestContext.modelRegistry),
-		getDraftOptions: async ({ actorModel, draftModel, actorOptions, signal }) =>
+		getDraftOptions: async ({ draftModel, actorOptions, signal }) =>
 			resolveDraftOptions({
-				actorModel,
 				draftModel,
 				actorOptions,
 				signal,
-				settings: settings(),
 				modelRegistry: latestContext.modelRegistry,
-				sessionID: context.sessionManager.getSessionId(),
 			}),
 		preflight: ({ toolName }) =>
 			latestContext.isProjectTrusted() && baseDefinitions.has(toolName) && pi.getActiveTools().includes(toolName),
@@ -955,7 +952,7 @@ async function openSettings(
 			`Enabled: ${applied.enabled ? "On" : "Off"}`,
 			`Configuration scope: ${controller.settingsScope()}`,
 			`Prediction sources › ${sourceSummary(draft)}`,
-			`Scheduling & cache › ${draft.candidateLimit} candidates, ${draft.maxConcurrentActions} concurrent, ${draft.resourceCacheMaxEntries} entries`,
+			`Scheduling & cache › ${draft.candidateLimit} draft requests, ${draft.maxConcurrentActions} concurrent, ${draft.resourceCacheMaxEntries} entries`,
 			`Tools & sandbox › ${enabledToolCount(draft)} tools, ${activeBackendSummary(controller.health())}`,
 			`Apply changes${dirty ? " (pending)" : ""}`,
 			...(dirty ? ["Discard changes"] : []),
@@ -1058,7 +1055,7 @@ async function openPredictionSources(ctx: ExtensionContext, controller: Speculat
 	while (true) {
 		const settings = controller.settings();
 		const choice = await ctx.ui.select("Prediction sources", [
-			`Drafter › ${settings.drafterEnabled ? "On" : "Off"}, ${settings.draftModel ?? "active model"}`,
+			`Drafter › ${settings.drafterEnabled ? "On" : "Off"}, ${settings.draftModel ?? activeModelReference(ctx)}`,
 			`PatternAware › ${settings.patternAware.enabled ? "On" : "Off"}, ${settings.patternAware.multiStepEnabled ? "multi-step" : "single-step"}`,
 			`Avoid redundant drafting: ${settings.adaptiveDrafter ? "On" : "Off"}`,
 			BACK,
@@ -1183,15 +1180,15 @@ async function openSchedulingAndCache(ctx: ExtensionContext, controller: Specula
 	while (true) {
 		const settings = controller.settings();
 		const choice = await ctx.ui.select("Scheduling & cache", [
-			`Candidate limit: ${settings.candidateLimit}`,
+			`Drafter requests: ${settings.candidateLimit}`,
 			`Concurrent actions: ${settings.maxConcurrentActions}`,
 			`Resource cache entries: ${settings.resourceCacheMaxEntries}`,
 			`Resource cache memory: ${formatBytes(settings.resourceCacheMaxBytes)}`,
 			BACK,
 		]);
 		if (!choice || choice === BACK) return;
-		if (choice.startsWith("Candidate limit:")) {
-			await editPositiveInteger(ctx, controller, settings, "candidateLimit", "Candidate limit (1-8)");
+		if (choice.startsWith("Drafter requests:")) {
+			await editPositiveInteger(ctx, controller, settings, "candidateLimit", "Drafter requests per turn (1-8)");
 		}
 		if (choice.startsWith("Concurrent actions:")) {
 			await editPositiveInteger(ctx, controller, settings, "maxConcurrentActions", "Concurrent actions (1-8)");
@@ -1253,7 +1250,7 @@ async function openToolsAndSandbox(
 		}
 		if (choice === "Isolation guarantees") {
 			ctx.ui.notify(
-				"Speculative file edits run in private Git worktrees. Bash additionally runs in the selected process boundary: an OCI worker, or the native OS sandbox (including AppContainer on Windows). Only conflict-checked file changes are adopted. A failed process candidate is discarded by the scheduler and the actor executes normally.",
+				"Speculative file edits run in private Git worktrees. Bash additionally runs in the selected process boundary: an OCI worker, or the native OS sandbox. Git for Windows requires OCI because MSYS cannot initialize in AppContainer. Only conflict-checked file changes are adopted; failed candidates are discarded and the actor executes normally.",
 				"info",
 			);
 		}
@@ -1600,23 +1597,15 @@ function findExactModelReferenceMatch(reference: string, models: readonly Model<
 }
 
 async function resolveDraftOptions(input: {
-	readonly actorModel: Model<Api>;
 	readonly draftModel: Model<Api>;
 	readonly actorOptions: SimpleStreamOptions | undefined;
 	readonly signal: AbortSignal;
-	readonly settings: EffectiveSpeculativeActionSettings;
 	readonly modelRegistry: ModelRegistry;
-	readonly sessionID?: string;
 }): Promise<SimpleStreamOptions> {
 	const base: SimpleStreamOptions = {
 		...input.actorOptions,
 		signal: input.signal,
-		temperature: 0,
-		maxTokens: Math.max(128, input.settings.candidateLimit * 96),
-		reasoning: undefined,
-		sessionId: `${input.sessionID ?? "pi"}:speculative`,
 	};
-	if (modelsAreEqual(input.actorModel, input.draftModel)) return base;
 	const auth = await input.modelRegistry.getApiKeyAndHeaders(input.draftModel);
 	if (!auth.ok) throw new Error(auth.error);
 	return { ...base, apiKey: auth.apiKey, headers: auth.headers, env: auth.env };
