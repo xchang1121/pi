@@ -77,7 +77,13 @@ function authoritativeEvents(): SpeculativeActionEvent<string>[] {
 			...base,
 			type: "source_request",
 			request: {
-				request: { source: "drafter", turnID: "turn", index: 0 },
+				request: {
+					source: "drafter",
+					turnID: "turn",
+					index: 0,
+					kind: "proposal",
+					targetActionSequence: 1,
+				},
 				startedAt: 0,
 				durationMs: 5,
 				settlement: { status: "timeout", cause: { stage: "source", code: "timeout" } },

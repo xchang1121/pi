@@ -100,7 +100,7 @@ describe("PlanRuntime", () => {
 				action("parent"),
 				action("settled", { dependsOn: [{ actionID: "parent", condition: "execution_settled" }] }),
 				action("succeeded", { dependsOn: [{ actionID: "parent", condition: "execution_succeeded" }] }),
-				action("confirmed", { dependsOn: [{ actionID: "parent", condition: "actor_confirmed" }] }),
+				action("confirmed", { dependsOn: [{ actionID: "parent", condition: "actor_adopted" }] }),
 			]),
 			0,
 		);
@@ -108,19 +108,25 @@ describe("PlanRuntime", () => {
 		expect(plan.takeReady(0).map((node) => node.action.id)).toEqual(["parent"]);
 		const execution = new CandidateExecution<string>("shared");
 		plan.attachExecution("plan", "parent", "candidate", execution);
-		execution.fail(cause("execution", "failed"), 1, 0);
-		expect(plan.launchable().map((node) => node.action.id)).toEqual(["settled"]);
-		expect(plan.drainBlocked().map((node) => node.action.id)).toEqual(["succeeded"]);
-		const actor = { id: "actor", sequence: 1, turnID: "turn" } as const;
-		const opportunity = plan.claimMatch("plan", "parent", actor, { kind: "exact", distance: 0 })!;
-
-		plan.confirm(opportunity, actor, { status: "rejected", cause: cause("execution", "failed") });
+		execution.start(0);
+		execution.succeed("output", 1, 1);
 		expect(
 			plan
 				.launchable()
 				.map((node) => node.action.id)
 				.sort(),
-		).toEqual(["confirmed", "settled"]);
+		).toEqual(["settled", "succeeded"]);
+		const actor = { id: "actor", sequence: 1, turnID: "turn" } as const;
+		const opportunity = plan.claimMatch("plan", "parent", actor, { kind: "exact", distance: 0 })!;
+
+		plan.confirm(opportunity, actor, { status: "rejected", cause: cause("execution", "failed") });
+		expect(plan.launchable().map((node) => node.action.id)).toEqual(["settled"]);
+		expect(
+			plan
+				.drainBlocked()
+				.map((node) => node.action.id)
+				.sort(),
+		).toEqual(["confirmed", "succeeded"]);
 	});
 
 	it("derives source-neutral deadlines and critical paths from the dependency graph", () => {
@@ -171,7 +177,7 @@ describe("PlanRuntime", () => {
 			invalid.apply(
 				proposal([
 					{ ...action("hint"), type: "preparation_hint" },
-					action("impossible", { dependsOn: [{ actionID: "hint", condition: "actor_confirmed" }] }),
+					action("impossible", { dependsOn: [{ actionID: "hint", condition: "actor_adopted" }] }),
 				]),
 				0,
 			),

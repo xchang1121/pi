@@ -514,7 +514,7 @@ export class PlanRuntime {
 			if (visiting.has(node.action.id)) return node.anchorActionSeq + horizon(node.action) + 1;
 			visiting.add(node.action.id);
 			const settlement = node.opportunity?.settlement;
-			let value = actorConfirmed(settlement)
+			let value = predictionMatched(settlement)
 				? settlement.actorAction.sequence
 				: node.anchorActionSeq + horizon(node.action) + 1;
 			for (const dependency of node.action.dependsOn ?? []) {
@@ -578,8 +578,8 @@ function newNode(
 function dependencySatisfied(node: MutableNode, condition: PlanActionDependencyCondition | undefined): boolean {
 	const execution = executionProjection(node.execution);
 	switch (canonicalCondition(condition)) {
-		case "actor_confirmed":
-			return actorConfirmed(node.opportunity?.settlement);
+		case "actor_adopted":
+			return predictionAdopted(node.opportunity?.settlement);
 		case "execution_succeeded":
 			return execution.status === "succeeded";
 		case "execution_settled":
@@ -590,24 +590,32 @@ function dependencySatisfied(node: MutableNode, condition: PlanActionDependencyC
 function dependencyImpossible(node: MutableNode, condition: PlanActionDependencyCondition | undefined): boolean {
 	const execution = executionProjection(node.execution);
 	switch (canonicalCondition(condition)) {
-		case "actor_confirmed":
+		case "actor_adopted":
 			return executionSettled(execution) && !node.opportunity
 				? true
-				: node.opportunity?.settlement !== undefined && !actorConfirmed(node.opportunity.settlement);
+				: node.opportunity?.settlement !== undefined && !predictionAdopted(node.opportunity.settlement);
 		case "execution_succeeded":
-			return execution.status === "failed" || execution.status === "cancelled";
+			return (
+				execution.status === "failed" ||
+				execution.status === "cancelled" ||
+				(node.opportunity?.settlement !== undefined && !predictionAdopted(node.opportunity.settlement))
+			);
 		case "execution_settled":
 			return false;
 	}
 }
 
-function actorConfirmed(settlement: PredictionSettlement | undefined): settlement is Extract<
+function predictionMatched(settlement: PredictionSettlement | undefined): settlement is Extract<
 	PredictionSettlement,
 	{ readonly observation: "observed" }
 > & {
 	readonly match: { readonly matched: true };
 } {
 	return settlement?.observation === "observed" && settlement.match.matched;
+}
+
+function predictionAdopted(settlement: PredictionSettlement | undefined): boolean {
+	return predictionMatched(settlement) && settlement.match.adoption.status === "adopted";
 }
 
 function freezeAdoption(adoption: PredictionAdoption): PredictionAdoption {
@@ -622,8 +630,8 @@ function sameActorAction(left: ActorActionIdentity, right: ActorActionIdentity):
 
 function canonicalCondition(
 	condition: PlanActionDependencyCondition | undefined,
-): "execution_settled" | "execution_succeeded" | "actor_confirmed" {
-	if (condition === "actor_confirmed") return "actor_confirmed";
+): "execution_settled" | "execution_succeeded" | "actor_adopted" {
+	if (condition === "actor_adopted") return "actor_adopted";
 	if (condition === "execution_succeeded") return "execution_succeeded";
 	return "execution_settled";
 }
@@ -735,7 +743,7 @@ function dependenciesAreValid(actions: ReadonlyMap<string, PlanAction>): boolean
 			if (
 				dependency.actionID === action.id ||
 				!parent ||
-				(canonicalCondition(dependency.condition) === "actor_confirmed" && parent.type !== "tool_call")
+				(canonicalCondition(dependency.condition) === "actor_adopted" && parent.type !== "tool_call")
 			) {
 				return false;
 			}

@@ -98,10 +98,15 @@ export type SourceRequestSettlement =
 	| { readonly status: "error"; readonly cause: ResolutionCause & { readonly stage: "source" } }
 	| { readonly status: "aborted"; readonly cause: ResolutionCause & { readonly stage: "source" } };
 
+export type SourceRequestKind = "proposal" | "continuation";
+
 export interface SourceRequestIdentity {
 	readonly source: string;
 	readonly turnID: string;
 	readonly index: number;
+	readonly kind: SourceRequestKind;
+	/** Actor action sequence this request is trying to cover. */
+	readonly targetActionSequence: number;
 }
 
 export interface SettledSourceRequest {

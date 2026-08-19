@@ -1,6 +1,6 @@
 import type { SpeculativeExecution } from "./action-semantics.ts";
 
-export type PlanActionDependencyCondition = "execution_settled" | "execution_succeeded" | "actor_confirmed";
+export type PlanActionDependencyCondition = "execution_settled" | "execution_succeeded" | "actor_adopted";
 
 /** A scheduler-visible edge. The producer may add actions in later deltas. */
 export interface PlanActionDependency {

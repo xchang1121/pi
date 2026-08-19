@@ -425,7 +425,9 @@ export function createSpeculativeActionHost(
 			feedback,
 			output,
 			trigger,
+			signal,
 		}) => {
+			if (signal.aborted) return undefined;
 			const context = asPatternPlanFeedback(feedback);
 			if (!context) return undefined;
 			const observation = projectPatternAwareObservation(
@@ -450,7 +452,7 @@ export function createSpeculativeActionHost(
 					learnTarget: false,
 				},
 				data.schemaHashes,
-				trigger === "actor_confirmed",
+				trigger === "actor_adopted",
 				sourcePatternSettings(settings),
 			);
 			if (!next.length) return undefined;

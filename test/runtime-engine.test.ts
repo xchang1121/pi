@@ -767,8 +767,8 @@ describe("structural speculative runtime", () => {
 							type: "tool_call",
 							tool: "read",
 							input: { path: "child.ts" },
-							empiricalProbability: trigger === "actor_confirmed" ? 0.9 : 0.2,
-							feedback: trigger === "actor_confirmed" ? "confirmed-child" : "speculative-child",
+							empiricalProbability: trigger === "actor_adopted" ? 0.9 : 0.2,
+							feedback: trigger === "actor_adopted" ? "confirmed-child" : "speculative-child",
 							dependsOn: [{ actionID, condition: "execution_succeeded" }],
 						},
 					],
@@ -787,7 +787,7 @@ describe("structural speculative runtime", () => {
 		expect(executed).toEqual(["parent.ts"]);
 		expect(await fixture.runtime.consume(call("chain", { path: "parent.ts" }))).toBe("parent.ts:output");
 		await waitFor(() => executed.includes("child.ts"));
-		expect(continuations).toContain("parent.ts:actor_confirmed:none");
+		expect(continuations).toContain("parent.ts:actor_adopted:none");
 		expect(executed).toEqual(["parent.ts", "child.ts"]);
 		expect(
 			await fixture.runtime.consume({
@@ -798,6 +798,128 @@ describe("structural speculative runtime", () => {
 				input: { path: "child.ts" },
 			}),
 		).toBe("child.ts:output");
+	});
+
+	it("keeps a bounded continuation alive across turns without extending turn completion", async () => {
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let continuationStarted = false;
+		let proposals = 0;
+		const executed: string[] = [];
+		const source: Source = {
+			id: "source",
+			enabled: () => true,
+			proposalCount: () => 1,
+			propose: () => {
+				proposals++;
+				return plan("source", "cross-turn", { path: "parent.ts" });
+			},
+			continue: async ({ proposalID, actionID, revision, candidate, trigger }) => {
+				if (String(candidate.input.path) !== "parent.ts" || trigger !== "execution_succeeded") return undefined;
+				continuationStarted = true;
+				await gate;
+				return {
+					proposalID,
+					source: "source",
+					revision,
+					upsert: [
+						{
+							id: "child",
+							type: "tool_call",
+							tool: "read",
+							input: { path: "child.ts" },
+							dependsOn: [{ actionID, condition: "execution_succeeded" }],
+						},
+					],
+				};
+			},
+		};
+		const fixture = harness({
+			source,
+			execute: (_tool, input) => {
+				executed.push(String(input.path));
+				return `${String(input.path)}:output`;
+			},
+		});
+
+		await fixture.runtime.startTurn({ sessionID: "session", turnID: "parent-turn" });
+		await waitFor(() => continuationStarted);
+		expect(await fixture.runtime.consume(call("parent-turn", { path: "parent.ts" }))).toBe("parent.ts:output");
+		const finished = fixture.runtime.finishTurn({ ...call("parent-turn"), terminal: false });
+		expect(
+			await Promise.race([
+				finished.then(() => true),
+				new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 50)),
+			]),
+		).toBe(true);
+		expect(fixture.runtime.inspect()).toMatchObject({ activeTurns: 0, pendingPredictions: 1 });
+
+		await fixture.runtime.startTurn({ sessionID: "session", turnID: "child-turn" });
+		expect(proposals).toBe(1);
+		release();
+		await waitFor(() => executed.includes("child.ts"));
+		expect(await fixture.runtime.consume(call("child-turn", { path: "child.ts" }))).toBe("child.ts:output");
+		await fixture.runtime.finishTurn({ ...call("child-turn"), terminal: true });
+	});
+
+	it("cancels a conditional continuation and rejects its late child when the parent misses", async () => {
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let continuationStarted = false;
+		const executed: string[] = [];
+		const source: Source = {
+			id: "source",
+			enabled: () => true,
+			propose: () => plan("source", "conditional", { path: "parent.ts" }),
+			continue: async ({ proposalID, actionID, revision, trigger }) => {
+				if (trigger !== "execution_succeeded") return undefined;
+				continuationStarted = true;
+				await gate;
+				return {
+					proposalID,
+					source: "source",
+					revision,
+					upsert: [
+						{
+							id: "late-child",
+							type: "tool_call",
+							tool: "read",
+							input: { path: "late.ts" },
+							dependsOn: [{ actionID, condition: "execution_succeeded" }],
+						},
+					],
+				};
+			},
+		};
+		const fixture = harness({
+			source,
+			execute: (_tool, input) => {
+				executed.push(String(input.path));
+				return "output";
+			},
+		});
+
+		await fixture.runtime.startTurn({ sessionID: "session", turnID: "miss" });
+		await waitFor(() => continuationStarted);
+		expect(await fixture.runtime.consume(call("miss", { path: "other.ts" }))).toBeUndefined();
+		await fixture.runtime.actual({ ...call("miss", { path: "other.ts" }), durationMs: 1, output: "actor" });
+		await waitFor(() =>
+			fixture.events.some(
+				(event) =>
+					event.type === "source_request" &&
+					event.request.request.kind === "continuation" &&
+					event.request.settlement.status === "aborted",
+			),
+		);
+		release();
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		expect(executed).toEqual(["parent.ts"]);
+		expect(fixture.runtime.inspect().deferredPlanActions).toBe(0);
+		await fixture.runtime.finishTurn({ ...call("miss"), terminal: true });
 	});
 });
 

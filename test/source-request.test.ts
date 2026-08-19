@@ -2,7 +2,13 @@ import { describe, expect, it } from "vitest";
 import { cause } from "../src/settlement.ts";
 import { runSourceRequest, SourceGeneration } from "../src/source-request.ts";
 
-const request = { source: "source", turnID: "turn", index: 0 } as const;
+const request = {
+	source: "source",
+	turnID: "turn",
+	index: 0,
+	kind: "proposal",
+	targetActionSequence: 1,
+} as const;
 
 describe("source request ownership", () => {
 	it("times only production and never admits a result returned after timeout", async () => {

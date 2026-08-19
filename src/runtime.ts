@@ -119,7 +119,8 @@ export interface SpeculativePlanSource<
 		readonly revision: number;
 		readonly feedback: unknown;
 		readonly output: Output;
-		readonly trigger: "execution_succeeded" | "actor_confirmed";
+		readonly trigger: "execution_succeeded" | "actor_adopted";
+		readonly signal: AbortSignal;
 	}) => MaybePromise<PlanUpdate | readonly PlanUpdate[] | undefined>;
 	readonly observe?: (input: {
 		readonly startInput: StartInput;
