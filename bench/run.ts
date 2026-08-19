@@ -179,6 +179,10 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 	const sandbox = createWorkspaceSandbox();
 	let drafterCost = 0;
 	let drafterTokens = 0;
+	let drafterInputTokens = 0;
+	let drafterOutputTokens = 0;
+	let drafterCacheReadTokens = 0;
+	let drafterCacheWriteTokens = 0;
 	const settings: SpeculativeAgentSettingsInput = {
 		enabled: true,
 		drafterEnabled: true,
@@ -198,6 +202,10 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 			const message = await streamSimple(draftModel, context, streamOptions).result();
 			drafterCost += message.usage.cost.total;
 			drafterTokens += message.usage.totalTokens;
+			drafterInputTokens += message.usage.input;
+			drafterOutputTokens += message.usage.output;
+			drafterCacheReadTokens += message.usage.cacheRead;
+			drafterCacheWriteTokens += message.usage.cacheWrite;
 			return message;
 		},
 		preflight: () => true,
@@ -335,8 +343,12 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 			(current, message) => ({
 				cost: current.cost + message.usage.cost.total,
 				tokens: current.tokens + message.usage.totalTokens,
+				inputTokens: current.inputTokens + message.usage.input,
+				outputTokens: current.outputTokens + message.usage.output,
+				cacheReadTokens: current.cacheReadTokens + message.usage.cacheRead,
+				cacheWriteTokens: current.cacheWriteTokens + message.usage.cacheWrite,
 			}),
-			{ cost: 0, tokens: 0 },
+			{ cost: 0, tokens: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 },
 		);
 	const changedFiles = lines((await command("git", ["-C", task.workspace, "diff", "--name-only"])).stdout);
 	const goldFiles = patchFiles(task.row.patch);
@@ -374,19 +386,40 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 			accelerationRatio: actualEndToEndMs > 0 ? serializedCounterfactualMs / actualEndToEndMs : 1,
 			actorActions: summary.actorActions,
 			speculativeHits: summary.speculativeHits,
+			actorFallbacks: summary.actorFallbacks,
 			hitRate: summary.hitRate,
+			sourceRequests: summary.sourceRequests,
+			sourceOutcomes: summary.sourceOutcomes,
+			predictionsSettled: summary.predictionsSettled,
+			predictionsObserved: summary.predictionsObserved,
+			predictionsMatched: summary.predictionsMatched,
+			predictionsAdopted: summary.predictionsAdopted,
 			predictionPrecision: summary.predictionPrecision,
 			adoptionYield: summary.adoptionYield,
+			predictionUnobserved: summary.predictionUnobserved,
+			predictionRejectedAfterMatch: summary.predictionRejectedAfterMatch,
 			executionAheadMs: summary.executionAheadMs,
 			hitLatencyMs: summary.hitLatencyMs,
+			speculativeExecutionMs: summary.speculativeExecutionMs,
+			actorExecutionMs: summary.actorExecutionMs,
 			candidateStarted: summary.candidateStarted,
 			candidateSucceeded: summary.candidateSucceeded,
 			candidateFailed: summary.candidateFailed,
 			candidateCancelled: summary.candidateCancelled,
+			candidateTerminalCauses: summary.candidateTerminalCauses,
+			actorCandidateRejections: summary.actorCandidateRejections,
 			actorCost: actorUsage.cost,
 			drafterCost,
 			actorTokens: actorUsage.tokens,
 			drafterTokens,
+			actorInputTokens: actorUsage.inputTokens,
+			actorOutputTokens: actorUsage.outputTokens,
+			actorCacheReadTokens: actorUsage.cacheReadTokens,
+			actorCacheWriteTokens: actorUsage.cacheWriteTokens,
+			drafterInputTokens,
+			drafterOutputTokens,
+			drafterCacheReadTokens,
+			drafterCacheWriteTokens,
 			turns: turnSequence,
 			timedOut,
 			agentError: agent.state.errorMessage,
