@@ -326,7 +326,7 @@ describe("speculative action host", () => {
 		expect(getDraftOptions).toHaveBeenCalledTimes(1);
 		expect(new Set(requests.map((request) => request.options?.sessionId))).toEqual(new Set(["session:draft:turn-1"]));
 		expect(requests.every((request) => request.context === requests[0]!.context)).toBe(true);
-		expect(requests.map((request) => request.options?.temperature)).toEqual([0, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]);
+		expect(requests.map((request) => request.options?.temperature)).toEqual([0, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7]);
 		for (const request of requests) {
 			expect(request.context.systemPrompt).toContain("Continue the conversation as the assistant");
 			expect(request.context.systemPrompt).not.toMatch(/drafter|predict|speculat|likely next/i);

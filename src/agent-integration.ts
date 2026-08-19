@@ -438,7 +438,7 @@ export function createSpeculativeActionHost(
 			const prepared = await batch;
 			const draftOptions: SimpleStreamOptions = {
 				...prepared.options,
-				temperature: proposalIndex === 0 ? 0 : Math.min(0.8, (proposalIndex + 1) / 10),
+				temperature: proposalIndex === 0 ? 0 : 0.7,
 				maxTokens: 128,
 				reasoning: undefined,
 				deferred: false,
