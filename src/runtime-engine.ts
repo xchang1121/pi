@@ -742,10 +742,11 @@ export function makeStructuralSpeculativeActionRuntime<
 
 	const startTurn = async (input: StartInput, signal?: AbortSignal): Promise<void> => {
 		const settings = await adapter.settings();
-		if (!settings.enabled || masterEnabled === false || signal?.aborted) {
+		if (!settings.enabled || masterEnabled === false) {
 			await disableSession(input.sessionID, cause("control", "disabled"));
 			return;
 		}
+		if (signal?.aborted) return;
 		const definitions = adapter.definitions(input);
 		const names = candidateNames(settings);
 		if (!definitions.length || !names.length) return;

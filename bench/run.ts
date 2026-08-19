@@ -269,10 +269,11 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 		(base): AgentTool => ({
 			...base,
 			execute: async (callID, args, signal, onUpdate) => {
-				if (!currentTurnID) throw new Error("Actor tool executed outside an active turn");
+				const turnID = currentTurnID;
+				if (!turnID) throw new Error("Actor tool executed outside an active turn");
 				const intentStartedAt = performance.now();
 				const cached = await host.consume(
-					{ turnID: currentTurnID, id: callID, tool: base.name, args, tools },
+					{ turnID, id: callID, tool: base.name, args, tools },
 					signal,
 				);
 				if (cached) {
@@ -283,7 +284,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 				try {
 					const result = await base.execute(callID, args as never, signal, onUpdate as never);
 					await host.actual({
-						turnID: currentTurnID,
+						turnID,
 						id: callID,
 						tool: base.name,
 						args,
@@ -295,7 +296,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 					return result;
 				} catch (error) {
 					await host.actual({
-						turnID: currentTurnID,
+						turnID,
 						id: callID,
 						tool: base.name,
 						args,

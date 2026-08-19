@@ -353,6 +353,30 @@ describe("structural speculative runtime", () => {
 		});
 	});
 
+	it("preserves task timing when an already-aborted next turn is skipped", async () => {
+		const source: Source = {
+			id: "source",
+			enabled: () => false,
+			propose: () => plan("source", "unused", { path: "other.ts" }),
+		};
+		const fixture = harness({ source });
+		await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn-1" });
+		await new Promise((resolve) => setTimeout(resolve, 5));
+		expect(await fixture.runtime.consume(call("turn-1"))).toBeUndefined();
+		await fixture.runtime.actual({ ...call("turn-1"), durationMs: 1, output: "actor" });
+		await fixture.runtime.finishTurn({ ...call("turn-1"), terminal: false });
+
+		const aborted = new AbortController();
+		aborted.abort();
+		await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn-2" }, aborted.signal);
+		await fixture.runtime.finishTurn({ ...call("turn-2"), terminal: true });
+
+		expect(fixture.events.filter((event) => event.type === "task")).toHaveLength(1);
+		expect(fixture.events.find((event) => event.type === "task")).toMatchObject({
+			timing: { authoritativeToolCount: 1, toolExecutionMs: 1 },
+		});
+	});
+
 	it("cancels next-action source requests when the Actor intent arrives", async () => {
 		let entered = 0;
 		const source: Source = {
