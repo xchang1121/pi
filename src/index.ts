@@ -1,21 +1,262 @@
-export * from "./action-key-projection.ts";
-export * from "./agent-integration.ts";
-export * from "./candidate-lifecycle.ts";
-export * from "./candidate-stores.ts";
-export * from "./common.ts";
-export * from "./container-sandbox.ts";
-export * from "./execution-world.ts";
-export * from "./extension.ts";
-export * from "./native-sandbox.ts";
-export * from "./oci-setup.ts";
-export * from "./pattern-aware.ts";
-export * from "./pi-read-projection.ts";
-export * from "./plan-proposal.ts";
-export * from "./plan-state.ts";
-export * from "./resource-version.ts";
-export * from "./runtime.ts";
-export * from "./settings-store.ts";
-export * from "./tool-settlement.ts";
-export * from "./tool-speculation-scheduler.ts";
-export * from "./trace-summary.ts";
-export * from "./workspace-sandbox.ts";
+export {
+	type ActionProjectionCoverage,
+	type ActionProjectionRule,
+	READ_RANGE_ACTION_KEY_PROJECTOR,
+	READ_RANGE_COVERAGE_DETAILS_KEY,
+	type ReadRangeCoverage,
+	readRangesShareInFlight,
+} from "./action-key-projection.ts";
+export {
+	type ActionKey,
+	type ActionKeyMatch,
+	type ActionKeyMismatchReason,
+	type ActionKeyProjector,
+	type ActionReuseKind,
+	type ActionSemanticsDefinition,
+	ActionSemanticsRegistry,
+	actionKeyCovers,
+	actionKeyMatch,
+	actionKeyMatches,
+	actionKeyMismatchReason,
+	actionKeyProjectionPartitions,
+	actionKeyProjects,
+	buildActionKey,
+	buildPiActionKey,
+	type CanonicalAction,
+	type ExactActionKeyMatch,
+	FIND_DEFAULT_LIMIT,
+	GREP_DEFAULT_LIMIT,
+	IDEMPOTENT_ACTION_TOOLS,
+	inferredExecution,
+	isAdoptableSandboxAction,
+	isIdempotentAction,
+	isObservableSandboxAction,
+	KEYABLE_TOOLS,
+	normalizeReadLimit,
+	normalizeReadOffset,
+	normalizeRelativeRoot,
+	PI_ACTION_SEMANTICS,
+	type ProjectedActionKey,
+	type ProjectedActionKeyMatch,
+	READ_DEFAULT_LIMIT,
+	READ_DEFAULT_OFFSET,
+	type ReadActionRange,
+	type ResourceDependencyScope,
+	type ResourceVersionPolicy,
+	readActionRange,
+	SANDBOX_ACTION_TOOLS,
+	type SandboxActionMode,
+	type SpeculativeExecution,
+} from "./action-semantics.ts";
+export {
+	type CreateSpeculativeActionHostOptions,
+	createSpeculativeActionHost,
+	type DraftOptionsContext,
+	patternPlanActionID,
+	type SpeculativeActionHost,
+	type SpeculativeAgentPreflightContext,
+	type SpeculativeAgentSettingsInput,
+} from "./agent-integration.ts";
+export {
+	buildSingleToolCallPrompt,
+	clampCandidateLimit,
+	DEFAULTS,
+	type DrafterToolDefinition,
+	usageTokenCount,
+} from "./common.ts";
+export {
+	type ContainerRuntimeInvocation,
+	type ContainerRuntimeInvocationResult,
+	type ContainerRuntimeInvoker,
+	type ContainerRuntimeName,
+	type ContainerRuntimePreference,
+	type ContainerSandboxOptions,
+	createContainerSandboxProcessBackend,
+	DEFAULT_CONTAINER_SANDBOX_IMAGE,
+	invokeContainerRuntime,
+} from "./container-sandbox.ts";
+export type {
+	CandidateEventDescriptor,
+	CandidateExecutionProjection,
+	SpeculativeActionEvent,
+	SpeculativeCacheSnapshot,
+} from "./events.ts";
+export type {
+	ExecutionWorld,
+	ExecutionWorldMode,
+	ExecutionWorldPreparation,
+	WorldBranch,
+	WorldBranchState,
+	WorldCheckpoint,
+	WorldCommitMetrics,
+	WorldCompatibilityEvidence,
+	WorldExecutionMetrics,
+} from "./execution-world.ts";
+export {
+	createSpeculativeActionExtension,
+	type EffectiveSpeculativeActionSettings,
+	formatSpeculativeActionEvent,
+	formatSpeculativeActionStatus,
+	normalizeSpeculativeActionSettings,
+	resolveSpeculativeDraftModel,
+	type SpeculativeActionExtensionDependencies,
+	type SpeculativeActionMetrics,
+	type SpeculativeSandboxHealth,
+	type SpeculativeSettingsStore,
+} from "./extension.ts";
+export {
+	type CheckNativeSandboxOptions,
+	checkNativeSandboxRuntime,
+	createNativeSandboxProcessBackend,
+	executeNativeSandbox,
+	invokeNativeSandbox,
+	NATIVE_SANDBOX_DEFAULT_MAX_OUTPUT_BYTES,
+	NATIVE_SANDBOX_DEFAULT_TIMEOUT_MS,
+	NATIVE_SANDBOX_PROTOCOL_VERSION,
+	type NativeSandboxBinary,
+	type NativeSandboxBinarySource,
+	type NativeSandboxExecuteResponse,
+	type NativeSandboxInvocation,
+	type NativeSandboxInvocationResult,
+	type NativeSandboxInvoker,
+	type NativeSandboxOptions,
+	type NativeSandboxStatus,
+	resolveNativeSandboxBinary,
+} from "./native-sandbox.ts";
+export {
+	createOciSetupService,
+	type OciRuntime,
+	type OciSetupCommandResult,
+	type OciSetupCommandRunner,
+	type OciSetupOption,
+	type OciSetupService,
+	runOciSetupCommand,
+} from "./oci-setup.ts";
+export {
+	acquirePatternAwareStore,
+	applyBindings,
+	applyBindingsPartial,
+	applyBindingsPartialVariants,
+	applyBindingsVariants,
+	asPatternAwareRuntimeContext,
+	inferBindings,
+	PATTERN_AWARE_DEFAULTS,
+	type PatternAwareActionSemantics,
+	type PatternAwareBinding,
+	type PatternAwareCandidate,
+	type PatternAwareContinuation,
+	type PatternAwareDependency,
+	type PatternAwareDependencySource,
+	type PatternAwareEvent,
+	type PatternAwareEventInput,
+	type PatternAwareEventSignature,
+	type PatternAwareFeedback,
+	type PatternAwareObservation,
+	type PatternAwarePath,
+	type PatternAwarePattern,
+	type PatternAwareRuntimeContext,
+	type PatternAwareSettings,
+	PatternAwareStore,
+	type PatternAwareStoreLease,
+	patternAwareAnalyzerKey,
+	patternAwarePersistenceFile,
+	patternAwareRuntimeContext,
+	patternAwareSettings,
+	projectPatternAwareObservation,
+} from "./pattern-aware.ts";
+export { PI_READ_RANGE_PROJECTION_RULE, withPiReadCoverage } from "./pi-read-projection.ts";
+export type {
+	MaterializedPlan,
+	PlanAction,
+	PlanActionDependency,
+	PlanActionDependencyCondition,
+	PlanDelta,
+	PlanProposal,
+	PlanUpdate,
+} from "./plan-proposal.ts";
+export {
+	captureResourceVersion,
+	closeResourceVersionManagers,
+	isResourceVersionToken,
+	type ResourceChangeSet,
+	type ResourceDependency,
+	type ResourceValidationMetrics,
+	ResourceVersionManager,
+	type ResourceVersionToken,
+	type ResourceVersionValidation,
+	releaseResourceVersion,
+	resourceDependencies,
+	validateResourceVersion,
+	watchResourceVersion,
+} from "./resource-version.ts";
+export {
+	type CandidatePreflight,
+	candidateExecutionMs,
+	candidateToolNames,
+	diagnosticAction,
+	diagnosticJson,
+	makeSpeculativeActionRuntime,
+	redactDiagnostics,
+	type SpeculativeActionRuntime,
+	type SpeculativeActionRuntimeAdapter,
+	type SpeculativeActionSettings,
+	type SpeculativeCandidate,
+	type SpeculativeDraftCandidate,
+	type SpeculativePlanSource,
+	type SpeculativeRuntimeInspection,
+} from "./runtime.ts";
+export {
+	type SpeculativeActionPackageSettings,
+	SpeculativeActionSettingsStore,
+	type SpeculativeSettingsScope,
+} from "./settings-store.ts";
+export {
+	type ActorActionIdentity,
+	type ActorActionProvider,
+	type ActorActionSettlement,
+	type ActorHitTiming,
+	type CandidateRejection,
+	cause,
+	type PlanActionIdentity,
+	type PredictionAdoption,
+	type PredictionIdentity,
+	type PredictionSettlement,
+	type ResolutionCause,
+	type ResolutionStage,
+	type ResourceValidation,
+	type SettledSourceRequest,
+	type SourceRequestIdentity,
+	type SourceRequestSettlement,
+	type ValidationMetrics,
+	zeroValidationMetrics,
+} from "./settlement.ts";
+export type { ToolInvocation, ToolProcessInvocation, ToolSettlement } from "./tool-settlement.ts";
+export {
+	emptySpeculativeTraceSummary,
+	reduceSpeculativeTrace,
+	type SpeculativeTraceSummary,
+	summarizeSpeculativeTrace,
+} from "./trace-summary.ts";
+export {
+	closeWorkspaceSandboxPools,
+	commitSandboxDelta,
+	createSandboxBackendRouter,
+	createWorkspaceSandbox,
+	type PrepareSandboxWorkspaceOptions,
+	prepareSandboxWorkspace,
+	type SandboxBackendRoute,
+	type SandboxBackendRouter,
+	type SandboxBackendRouterStatus,
+	type SandboxExecutionDelta,
+	type SandboxFileChange,
+	type SandboxProcessBackend,
+	type SandboxProcessBackendStatus,
+	type SandboxProcessRunner,
+	type SandboxProcessRunnerInput,
+	type SandboxProcessSession,
+	type SandboxWorkspaceContext,
+	type SpeculativeAgentSandbox,
+	type SpeculativeSandboxExecuteContext,
+	type WorkspaceSandboxOptions,
+	withSandboxWorkspace,
+} from "./workspace-sandbox.ts";

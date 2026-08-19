@@ -2,8 +2,9 @@ import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { type ActionKey, type ActionKeyProjector, actionKeyCovers } from "./common.ts";
+import { type ActionKey, type ActionKeyProjector, actionKeyCovers } from "./action-semantics.ts";
 import { PpmCountTrie, type PpmCountTrieRow, type PpmProbabilityEstimate } from "./ppm-count-trie.ts";
+import type { PredictionSettlement, ResolutionStage } from "./settlement.ts";
 
 export type PatternAwareSettings = {
 	readonly enabled: boolean;
@@ -45,6 +46,8 @@ export type PatternAwareEventInput = {
 };
 
 export type PatternAwareActionSemantics = {
+	/** Stable persistence namespace for the action-key contract. */
+	readonly namespace?: string;
 	readonly actionKey: (
 		tool: string,
 		input: Readonly<Record<string, unknown>>,
@@ -131,20 +134,25 @@ export type PatternAwarePattern = {
 	readonly historicalOpportunities: number;
 	readonly historicalMatches: number;
 	readonly empiricalProbability: number;
-	readonly opportunities: number;
-	readonly consumed: number;
-	readonly unused: number;
-	readonly actorMisses: number;
-	readonly staleInvalidations: number;
-	readonly systemCancellations: number;
-	readonly recentSuccessWeight: number;
-	readonly recentFailureWeight: number;
-	readonly feedbackSequence: number;
+	readonly adoptionProbability: number;
+	readonly feedback: PatternAwareFeedback;
 	readonly averageDurationMs: number;
 	readonly lastSeenSequence: number;
 };
 
-export type PatternAwareResolution = "consumed" | "actor_miss" | "stale" | "system";
+export type PatternAwareFeedback = {
+	readonly issued: number;
+	readonly observed: number;
+	readonly matched: number;
+	readonly adopted: number;
+	readonly rejectedAfterMatch: Readonly<Partial<Record<ResolutionStage, number>>>;
+	readonly unobserved: Readonly<Record<string, number>>;
+	readonly recentMatchedWeight: number;
+	readonly recentMismatchedWeight: number;
+	readonly recentAdoptedWeight: number;
+	readonly recentRejectedWeight: number;
+	readonly sequence: number;
+};
 
 export type PatternAwareCandidate = {
 	readonly type: "tool_call" | "preparation_hint";
@@ -159,6 +167,7 @@ export type PatternAwareCandidate = {
 	readonly horizon: number;
 	readonly empiricalProbability: number;
 	readonly conditionalProbability: number;
+	readonly adoptionProbability: number;
 	readonly expectedDurationMs: number;
 	readonly expectedLatencyBenefitMs: number;
 	readonly dependencies: ReadonlyArray<PatternAwareDependency>;
@@ -196,24 +205,30 @@ type MutablePattern = {
 	replayMatches: number;
 	historicalOpportunities: number;
 	historicalMatches: number;
-	opportunities: number;
-	consumed: number;
-	unused: number;
-	actorMisses: number;
-	staleInvalidations: number;
-	systemCancellations: number;
-	recentSuccessWeight: number;
-	recentFailureWeight: number;
-	feedbackSequence: number;
+	feedback: MutablePatternFeedback;
 	averageDurationMs: number;
 	lastSeenSequence: number;
+};
+
+type MutablePatternFeedback = {
+	issued: number;
+	observed: number;
+	matched: number;
+	adopted: number;
+	rejectedAfterMatch: Partial<Record<ResolutionStage, number>>;
+	unobserved: Record<string, number>;
+	recentMatchedWeight: number;
+	recentMismatchedWeight: number;
+	recentAdoptedWeight: number;
+	recentRejectedWeight: number;
+	sequence: number;
 };
 
 type PersistedState = {
 	readonly version: number;
 	readonly patterns: ReadonlyArray<PatternAwarePattern>;
-	readonly pools?: ReadonlyArray<PatternPool>;
-	readonly sequenceCounts?: ReadonlyArray<PpmCountTrieRow>;
+	readonly pools: ReadonlyArray<PatternPool>;
+	readonly sequenceCounts: ReadonlyArray<PpmCountTrieRow>;
 };
 
 type PatternSample = {
@@ -263,8 +278,7 @@ export const PATTERN_AWARE_DEFAULTS: PatternAwareSettings = {
 const MAX_BINDING_VARIANTS = 32;
 const MAX_PATH_SOURCES = 24;
 const PERSIST_DEBOUNCE_MS = 200;
-const PERSISTENCE_VERSION = 12;
-const MIN_MIGRATABLE_PERSISTENCE_VERSION = 9;
+const PERSISTENCE_VERSION = 13;
 
 class PredictiveContextTrie {
 	private readonly root: TrieNode = { children: new Map(), patterns: new Set() };
@@ -316,9 +330,9 @@ export class PatternAwareStore {
 	private dirty = false;
 	private persistTimer?: ReturnType<typeof setTimeout>;
 	private loaded = false;
-	private settings: PatternAwareSettings;
+	private readonly settings: PatternAwareSettings;
 	private readonly persistenceFile?: string;
-	private actionSemantics?: PatternAwareActionSemantics;
+	private readonly actionSemantics?: PatternAwareActionSemantics;
 
 	constructor(
 		settings: PatternAwareSettings,
@@ -331,24 +345,6 @@ export class PatternAwareStore {
 		this.actionSemantics = actionSemantics;
 	}
 
-	configure(settings: PatternAwareSettings, actionSemantics?: PatternAwareActionSemantics) {
-		const resetInference =
-			settings.minOccurrences !== this.settings.minOccurrences ||
-			settings.maxContextLength !== this.settings.maxContextLength;
-		this.settings = settings;
-		this.sequenceModel.reconfigure(settings.maxContextLength, settings.maxPatterns);
-		if (actionSemantics) this.actionSemantics = actionSemantics;
-		if (resetInference) {
-			for (const pool of this.pools.values()) {
-				pool.nextInferenceAt = pool.observations ?? pool.samples.length;
-				pool.inferenceBackoff = 1;
-			}
-		}
-		this.trimPatterns();
-		this.trimPools();
-		this.trimHistory();
-	}
-
 	async load() {
 		if (this.loaded) return;
 		this.loaded = true;
@@ -359,10 +355,10 @@ export class PatternAwareStore {
 			.catch(() => undefined);
 		if (
 			!parsed ||
-			!Number.isInteger(parsed.version) ||
-			parsed.version < MIN_MIGRATABLE_PERSISTENCE_VERSION ||
-			parsed.version > PERSISTENCE_VERSION ||
-			!Array.isArray(parsed.patterns)
+			parsed.version !== PERSISTENCE_VERSION ||
+			!Array.isArray(parsed.patterns) ||
+			!Array.isArray(parsed.pools) ||
+			!Array.isArray(parsed.sequenceCounts)
 		)
 			return;
 		for (const item of parsed.patterns) {
@@ -371,25 +367,16 @@ export class PatternAwareStore {
 			this.patterns.set(pattern.id, pattern);
 			this.clock = Math.max(this.clock, pattern.lastSeenSequence);
 		}
-		if (Array.isArray(parsed.pools)) {
-			for (const item of parsed.pools) {
-				const pool = mutablePool(item);
-				if (!pool || pool.context.some((event) => event.tool === "$llm")) continue;
-				const key = patternPoolKey(pool.context, pool.targetTool, pool.targetSchemaHash);
-				const normalized = { ...pool, key };
-				const existing = this.pools.get(key);
-				this.pools.set(key, existing ? mergePatternPools(existing, normalized, this.settings) : normalized);
-				for (const sample of pool.samples) {
-					this.clock = Math.max(
-						this.clock,
-						sample.target.sequence,
-						...sample.context.map((event) => event.sequence),
-					);
-				}
+		for (const item of parsed.pools) {
+			const pool = mutablePool(item);
+			if (!pool || pool.context.some((event) => event.tool === "$llm")) continue;
+			const key = patternPoolKey(pool.context, pool.targetTool, pool.targetSchemaHash);
+			this.pools.set(key, { ...pool, key });
+			for (const sample of pool.samples) {
+				this.clock = Math.max(this.clock, sample.target.sequence, ...sample.context.map((event) => event.sequence));
 			}
 		}
-		if (Array.isArray(parsed.sequenceCounts)) this.sequenceModel.restore(parsed.sequenceCounts);
-		else this.seedSequenceModelFromPatterns();
+		this.sequenceModel.restore(parsed.sequenceCounts);
 		this.sequenceModel.trim(this.settings.maxPatterns);
 		this.indexDirty = true;
 		this.trimPools();
@@ -505,14 +492,23 @@ export class PatternAwareStore {
 		return true;
 	}
 
-	predict(sessionID: string, schemaHashes: Readonly<Record<string, string>> = {}) {
-		if (!this.settings.enabled) return [];
+	predict(
+		sessionID: string,
+		schemaHashes: Readonly<Record<string, string>> = {},
+		predictionSettings: PatternAwareSettings = this.settings,
+	) {
+		if (!predictionSettings.enabled) return [];
 		const history = actionHistory(this.history.get(sessionID) ?? []);
-		return this.predictHistory(history, schemaHashes, {
+		return this.predictHistory(
 			history,
-			visitedPatternIDs: [],
-			pathProbability: 1,
-		});
+			schemaHashes,
+			{
+				history,
+				visitedPatternIDs: [],
+				pathProbability: 1,
+			},
+			predictionSettings,
+		);
 	}
 
 	continue(
@@ -520,8 +516,9 @@ export class PatternAwareStore {
 		input: PatternAwareEventInput,
 		schemaHashes: Readonly<Record<string, string>> = {},
 		parentConfirmed = false,
+		predictionSettings: PatternAwareSettings = this.settings,
 	) {
-		if (!this.settings.enabled) return [];
+		if (!predictionSettings.enabled) return [];
 		const event: PatternAwareEvent = {
 			...input,
 			sequence: (continuation.history.at(-1)?.sequence ?? this.clock) + 1,
@@ -529,19 +526,25 @@ export class PatternAwareStore {
 		};
 		const history = actionHistory([...continuation.history, event]);
 		this.trimSessionHistory(history);
-		return this.predictHistory(history, schemaHashes, {
+		return this.predictHistory(
 			history,
-			visitedPatternIDs: continuation.visitedPatternIDs,
-			pathProbability: parentConfirmed ? 1 : continuation.pathProbability,
-		});
+			schemaHashes,
+			{
+				history,
+				visitedPatternIDs: continuation.visitedPatternIDs,
+				pathProbability: parentConfirmed ? 1 : continuation.pathProbability,
+			},
+			predictionSettings,
+		);
 	}
 
 	private predictHistory(
 		history: ReadonlyArray<PatternAwareEvent>,
 		schemaHashes: Readonly<Record<string, string>>,
 		continuation: PatternAwareContinuation,
+		settings: PatternAwareSettings,
 	) {
-		if (continuation.visitedPatternIDs.length >= this.settings.maxPredictionDepth) return [];
+		if (continuation.visitedPatternIDs.length >= settings.maxPredictionDepth) return [];
 		const predictiveHistory = actionHistory(history);
 		const sequenceContext = predictiveHistory.map((event) => signatureToken(signature(event)));
 		const result: PatternAwareCandidate[] = [];
@@ -558,7 +561,7 @@ export class PatternAwareStore {
 		this.ensureIndex();
 		for (const patternID of this.trie.matching(predictiveHistory)) {
 			const pattern = this.patterns.get(patternID);
-			if (!pattern || !structurallyEligible(pattern, this.settings)) continue;
+			if (!pattern || !structurallyEligible(pattern, settings)) continue;
 			if (pattern.targetSchemaHash && schemaHashes[pattern.targetTool] !== pattern.targetSchemaHash) continue;
 			if (!matchesSuffix(predictiveHistory, pattern.context)) continue;
 			const context = predictiveHistory.slice(-pattern.context.length);
@@ -600,23 +603,23 @@ export class PatternAwareStore {
 			const representative = ordered[0]!;
 			const horizon = learnedGroupHorizon(
 				ordered.map((item) => item.pattern),
-				this.settings,
+				settings,
 				this.clock,
 			);
 			const gapCoverage = groupGapCoverage(
 				ordered.map((item) => item.pattern),
 				horizon,
-				this.settings,
+				settings,
 				this.clock,
 			);
 			const patterns = ordered.map((item) => item.pattern);
-			const replayProbability = backoffProbability(patterns, this.clock, this.settings.decayHalfLifeEvents);
+			const replayProbability = backoffProbability(patterns, this.clock, settings.decayHalfLifeEvents);
 			const ppmEstimate = this.sequenceModel.estimate(sequenceContext, representative.pattern.targetTool);
 			const totalWeight = ordered.reduce(
 				(total, item) =>
 					total +
 					Math.max(1, item.pattern.occurrences) *
-						recencyWeight(item.pattern.lastSeenSequence, this.clock, this.settings.decayHalfLifeEvents),
+						recencyWeight(item.pattern.lastSeenSequence, this.clock, settings.decayHalfLifeEvents),
 				0,
 			);
 			const variantProbability =
@@ -625,7 +628,7 @@ export class PatternAwareStore {
 						total +
 						item.variantProbability *
 							Math.max(1, item.pattern.occurrences) *
-							recencyWeight(item.pattern.lastSeenSequence, this.clock, this.settings.decayHalfLifeEvents),
+							recencyWeight(item.pattern.lastSeenSequence, this.clock, settings.decayHalfLifeEvents),
 					0,
 				) / Math.max(1, totalWeight);
 			const expectedDurationMs =
@@ -634,17 +637,18 @@ export class PatternAwareStore {
 						total +
 						Math.max(0, item.pattern.averageDurationMs) *
 							Math.max(1, item.pattern.occurrences) *
-							recencyWeight(item.pattern.lastSeenSequence, this.clock, this.settings.decayHalfLifeEvents),
+							recencyWeight(item.pattern.lastSeenSequence, this.clock, settings.decayHalfLifeEvents),
 					0,
 				) / Math.max(1, totalWeight);
 			const calibration = calibratePatternProbability(
 				replayProbability,
-				patternEvidence(patterns, this.clock, this.settings.decayHalfLifeEvents),
+				patternEvidence(patterns, this.clock, settings.decayHalfLifeEvents),
 				ppmEstimate,
 			);
+			const adoptionProbability = patternAdoptionProbability(patterns, this.clock, settings.decayHalfLifeEvents);
 			const conditionalProbability = clampProbability(calibration.probability * gapCoverage * variantProbability);
 			const empiricalProbability = clampProbability(continuation.pathProbability * conditionalProbability);
-			const beamScore = empiricalProbability * Math.max(1, Math.max(0, expectedDurationMs));
+			const beamScore = empiricalProbability * adoptionProbability * Math.max(1, Math.max(0, expectedDurationMs));
 			return {
 				actionIdentity: hash(identity),
 				ordered,
@@ -656,6 +660,7 @@ export class PatternAwareStore {
 				variantProbability,
 				conditionalProbability,
 				empiricalProbability,
+				adoptionProbability,
 				expectedDurationMs,
 				ppmEstimate,
 				beamScore,
@@ -672,7 +677,7 @@ export class PatternAwareStore {
 					left.representative.pattern.id.localeCompare(right.representative.pattern.id) ||
 					stableStringify(left.representative.input).localeCompare(stableStringify(right.representative.input)),
 			)
-			.slice(0, this.settings.beamWidth);
+			.slice(0, settings.beamWidth);
 		for (const [beamIndex, prediction] of beam.entries()) {
 			const {
 				actionIdentity,
@@ -685,6 +690,7 @@ export class PatternAwareStore {
 				variantProbability,
 				conditionalProbability,
 				empiricalProbability,
+				adoptionProbability,
 				expectedDurationMs,
 				ppmEstimate,
 				beamScore,
@@ -707,6 +713,7 @@ export class PatternAwareStore {
 				horizon,
 				empiricalProbability,
 				conditionalProbability,
+				adoptionProbability,
 				expectedDurationMs,
 				expectedLatencyBenefitMs: beamScore,
 				dependencies: representative.pattern.dependencies,
@@ -723,6 +730,7 @@ export class PatternAwareStore {
 						missing: representative.missing,
 						empiricalProbability,
 						conditionalProbability,
+						adoptionProbability,
 						replayProbability,
 						ppmProbability: ppmEstimate?.probability,
 						ppmWeight: calibration.ppmWeight,
@@ -732,7 +740,7 @@ export class PatternAwareStore {
 						variantProbability,
 						beamScore,
 						beamRank: beamIndex + 1,
-						beamWidth: this.settings.beamWidth,
+						beamWidth: settings.beamWidth,
 						gapCoverage,
 						expectedDurationMs,
 						dependencies: representative.pattern.dependencies,
@@ -746,39 +754,49 @@ export class PatternAwareStore {
 		return result;
 	}
 
-	launched(patternID: string) {
+	issued(patternID: string) {
 		const pattern = this.patterns.get(patternID);
 		if (!pattern) return;
-		pattern.opportunities++;
+		pattern.feedback.issued++;
 		this.persist();
 	}
 
-	resolved(patternID: string, outcome: PatternAwareResolution) {
+	settled(patternID: string, settlement: PredictionSettlement) {
 		const pattern = this.patterns.get(patternID);
 		if (!pattern) return;
 		const recent = feedbackEvidence(pattern, this.clock, this.settings.decayHalfLifeEvents);
-		pattern.recentSuccessWeight = recent.success;
-		pattern.recentFailureWeight = recent.failure;
-		pattern.feedbackSequence = this.clock;
-		if (outcome === "consumed") {
-			pattern.consumed++;
-			pattern.recentSuccessWeight++;
+		pattern.feedback.recentMatchedWeight = recent.matched;
+		pattern.feedback.recentMismatchedWeight = recent.mismatched;
+		pattern.feedback.recentAdoptedWeight = recent.adopted;
+		pattern.feedback.recentRejectedWeight = recent.rejected;
+		pattern.feedback.sequence = this.clock;
+		if (settlement.observation === "unobserved") {
+			const key = `${settlement.cause.stage}:${settlement.cause.code}`;
+			pattern.feedback.unobserved[key] = (pattern.feedback.unobserved[key] ?? 0) + 1;
 		} else {
-			pattern.unused++;
-			if (outcome === "actor_miss") {
-				pattern.actorMisses++;
-				pattern.recentFailureWeight++;
-			} else if (outcome === "stale") {
-				pattern.staleInvalidations++;
+			pattern.feedback.observed++;
+			if (!settlement.match.matched) {
+				pattern.feedback.recentMismatchedWeight++;
 			} else {
-				pattern.systemCancellations++;
+				pattern.feedback.matched++;
+				pattern.feedback.recentMatchedWeight++;
+				if (settlement.match.adoption.status === "adopted") {
+					pattern.feedback.adopted++;
+					pattern.feedback.recentAdoptedWeight++;
+				} else {
+					const stage = settlement.match.adoption.cause.stage;
+					pattern.feedback.rejectedAfterMatch[stage] = (pattern.feedback.rejectedAfterMatch[stage] ?? 0) + 1;
+					pattern.feedback.recentRejectedWeight++;
+				}
 			}
 		}
 		this.persist();
 	}
 
 	snapshot(): ReadonlyArray<PatternAwarePattern> {
-		return [...this.patterns.values()].map(readonlyPattern);
+		return [...this.patterns.values()].map((pattern) =>
+			readonlyPattern(pattern, this.clock, this.settings.decayHalfLifeEvents),
+		);
 	}
 
 	recent(sessionID: string): ReadonlyArray<PatternAwareEvent> {
@@ -963,15 +981,7 @@ export class PatternAwareStore {
 			replayMatches,
 			historicalOpportunities: pool.samples.length,
 			historicalMatches: replayMatches,
-			opportunities: 0,
-			consumed: 0,
-			unused: 0,
-			actorMisses: 0,
-			staleInvalidations: 0,
-			systemCancellations: 0,
-			recentSuccessWeight: 0,
-			recentFailureWeight: 0,
-			feedbackSequence: target.sequence,
+			feedback: emptyPatternFeedback(target.sequence),
 			averageDurationMs: Math.max(0, target.durationMs),
 			lastSeenSequence: target.sequence,
 		});
@@ -1041,10 +1051,6 @@ export class PatternAwareStore {
 		if (matched) pattern.historicalMatches++;
 	}
 
-	private trimHistory() {
-		for (const history of this.history.values()) this.trimSessionHistory(history);
-	}
-
 	private trimSessionHistory(history: PatternAwareEvent[]) {
 		const limit = this.settings.maxContextLength + this.settings.maxFutureGap + 1;
 		const batches = indexedActionBatches(history);
@@ -1076,43 +1082,6 @@ export class PatternAwareStore {
 			.slice(0, this.patterns.size - limit);
 		for (const pattern of evicted) this.patterns.delete(pattern.id);
 		if (evicted.length) this.indexDirty = true;
-	}
-
-	private seedSequenceModelFromPatterns() {
-		const exact = new Map<
-			string,
-			{
-				readonly context: readonly string[];
-				readonly target: string;
-				count: number;
-				lastSeen: number;
-			}
-		>();
-		for (const pattern of this.patterns.values()) {
-			const count = Math.max(0, pattern.gapCounts["0"] ?? 0);
-			if (count <= 0) continue;
-			const context = pattern.context.map(signatureToken);
-			const key = stableStringify({ context, target: pattern.targetTool });
-			const current = exact.get(key);
-			if (!current || count > current.count) {
-				exact.set(key, {
-					context,
-					target: pattern.targetTool,
-					count,
-					lastSeen: pattern.lastSeenSequence,
-				});
-			}
-		}
-		const root = new Map<string, { count: number; lastSeen: number }>();
-		for (const item of exact.values()) {
-			this.sequenceModel.setCount(item.context, item.target, item.count, item.lastSeen);
-			if (item.context.length !== 1) continue;
-			const current = root.get(item.target) ?? { count: 0, lastSeen: 0 };
-			current.count += item.count;
-			current.lastSeen = Math.max(current.lastSeen, item.lastSeen);
-			root.set(item.target, current);
-		}
-		for (const [target, item] of root) this.sequenceModel.setCount([], target, item.count, item.lastSeen);
 	}
 
 	private persist() {
@@ -1188,24 +1157,30 @@ export async function acquirePatternAwareStore(
 	stateDirectory?: string,
 	actionSemantics?: PatternAwareActionSemantics,
 ): Promise<PatternAwareStoreLease> {
-	const file = patternAwarePersistenceFile(workspace, stateDirectory);
-	let pooled = stores.get(file);
+	const analyzerKey = patternAwareAnalyzerKey(settings);
+	const semanticsKey = patternSemanticsKey(actionSemantics);
+	const file = configuredPersistenceFile(
+		patternAwarePersistenceFile(workspace, stateDirectory),
+		analyzerKey,
+		semanticsKey,
+	);
+	const poolKey = `${file}\0${analyzerKey}\0${semanticsKey}`;
+	let pooled = stores.get(poolKey);
 	if (!pooled) {
 		const store = Promise.resolve(new PatternAwareStore(settings, file, actionSemantics)).then(async (value) => {
 			await value.load();
 			return value;
 		});
 		pooled = { store, references: 0 };
-		stores.set(file, pooled);
+		stores.set(poolKey, pooled);
 	}
 	pooled.references++;
 	let store: PatternAwareStore;
 	try {
 		store = await pooled.store;
-		store.configure(settings, actionSemantics);
 	} catch (error) {
 		pooled.references--;
-		if (pooled.references === 0 && stores.get(file) === pooled) stores.delete(file);
+		if (pooled.references === 0 && stores.get(poolKey) === pooled) stores.delete(poolKey);
 		throw error;
 	}
 	let released = false;
@@ -1218,10 +1193,42 @@ export async function acquirePatternAwareStore(
 			try {
 				await store.flush();
 			} finally {
-				if (pooled.references === 0 && stores.get(file) === pooled) stores.delete(file);
+				if (pooled.references === 0 && stores.get(poolKey) === pooled) stores.delete(poolKey);
 			}
 		},
 	};
+}
+
+export function patternAwareAnalyzerKey(settings: PatternAwareSettings): string {
+	return stableStringify({
+		maxContextLength: settings.maxContextLength,
+		maxFutureGap: settings.maxFutureGap,
+		decayHalfLifeEvents: settings.decayHalfLifeEvents,
+		minOccurrences: settings.minOccurrences,
+		minBindingReplayProbability: settings.minBindingReplayProbability,
+		maxPatterns: settings.maxPatterns,
+	});
+}
+
+function patternSemanticsKey(semantics: PatternAwareActionSemantics | undefined): string {
+	if (!semantics) return "default";
+	return (
+		semantics.namespace ??
+		hash(
+			stableStringify({
+				actionKey: semantics.actionKey.toString(),
+				projectors: (semantics.projectors ?? []).map((projector) => projector.id).sort(),
+			}),
+		)
+	);
+}
+
+function configuredPersistenceFile(file: string, analyzerKey: string, semanticsKey: string): string {
+	if (analyzerKey === patternAwareAnalyzerKey(PATTERN_AWARE_DEFAULTS) && semanticsKey === "pi-action-semantics-v1") {
+		return file;
+	}
+	const parsed = path.parse(file);
+	return path.join(parsed.dir, `${parsed.name}.${hash(`${semanticsKey}\0${analyzerKey}`).slice(0, 12)}${parsed.ext}`);
 }
 
 export function patternAwareSettings(value: unknown): PatternAwareSettings {
@@ -2214,8 +2221,11 @@ function backoffProbability(patterns: ReadonlyArray<MutablePattern>, clock: numb
 	for (const pattern of [...byLength.values()].sort((left, right) => left.context.length - right.context.length)) {
 		const weight = recencyWeight(pattern.lastSeenSequence, clock, halfLife);
 		const feedback = feedbackEvidence(pattern, clock, halfLife);
-		const opportunities = Math.max(1, pattern.historicalOpportunities * weight + feedback.success + feedback.failure);
-		const matches = Math.min(opportunities, pattern.historicalMatches * weight + feedback.success);
+		const opportunities = Math.max(
+			1,
+			pattern.historicalOpportunities * weight + feedback.matched + feedback.mismatched,
+		);
+		const matches = Math.min(opportunities, pattern.historicalMatches * weight + feedback.matched);
 		const local = matches / opportunities;
 		const escapeProbability = 1 / (opportunities + 1);
 		estimate = local * (1 - escapeProbability) + estimate * escapeProbability;
@@ -2230,8 +2240,8 @@ function patternEvidence(patterns: ReadonlyArray<MutablePattern>, clock: number,
 			const feedback = feedbackEvidence(pattern, clock, halfLife);
 			return (
 				pattern.historicalOpportunities * recencyWeight(pattern.lastSeenSequence, clock, halfLife) +
-				feedback.success +
-				feedback.failure
+				feedback.matched +
+				feedback.mismatched
 			);
 		}),
 	);
@@ -2257,17 +2267,30 @@ function clampProbability(value: number) {
 function patternRank(pattern: MutablePattern, clock: number, halfLife: number) {
 	const feedback = feedbackEvidence(pattern, clock, halfLife);
 	return (
-		(feedback.success * 4 + pattern.replayMatches * 2 + probability(pattern) - feedback.failure) *
+		(feedback.matched * 4 + pattern.replayMatches * 2 + probability(pattern) - feedback.mismatched) *
 		recencyWeight(pattern.lastSeenSequence, clock, halfLife)
 	);
 }
 
 function feedbackEvidence(pattern: MutablePattern, clock: number, halfLife: number) {
-	const weight = recencyWeight(pattern.feedbackSequence, clock, halfLife);
+	const weight = recencyWeight(pattern.feedback.sequence, clock, halfLife);
 	return {
-		success: pattern.recentSuccessWeight * weight,
-		failure: pattern.recentFailureWeight * weight,
+		matched: pattern.feedback.recentMatchedWeight * weight,
+		mismatched: pattern.feedback.recentMismatchedWeight * weight,
+		adopted: pattern.feedback.recentAdoptedWeight * weight,
+		rejected: pattern.feedback.recentRejectedWeight * weight,
 	};
+}
+
+function patternAdoptionProbability(patterns: ReadonlyArray<MutablePattern>, clock: number, halfLife: number) {
+	let adopted = 0;
+	let rejected = 0;
+	for (const pattern of patterns) {
+		const evidence = feedbackEvidence(pattern, clock, halfLife);
+		adopted += evidence.adopted;
+		rejected += evidence.rejected;
+	}
+	return adopted + rejected === 0 ? 1 : clampProbability(adopted / (adopted + rejected));
 }
 
 function recencyWeight(lastSeen: number, clock: number, halfLife: number) {
@@ -2275,10 +2298,12 @@ function recencyWeight(lastSeen: number, clock: number, halfLife: number) {
 	return 2 ** (-Math.max(0, clock - lastSeen) / halfLife);
 }
 
-function readonlyPattern(pattern: MutablePattern): PatternAwarePattern {
+function readonlyPattern(pattern: MutablePattern, clock: number, halfLife: number): PatternAwarePattern {
 	return {
 		...pattern,
-		empiricalProbability: probability(pattern),
+		empiricalProbability: backoffProbability([pattern], clock, halfLife),
+		adoptionProbability: patternAdoptionProbability([pattern], clock, halfLife),
+		feedback: structuredClone(pattern.feedback),
 		context: pattern.context.map((item) => ({ ...item })),
 		bindings: structuredClone(pattern.bindings),
 		dependencies: structuredClone(pattern.dependencies),
@@ -2290,6 +2315,8 @@ function readonlyPattern(pattern: MutablePattern): PatternAwarePattern {
 function mutablePattern(value: PatternAwarePattern): MutablePattern | undefined {
 	const record = asRecord(value);
 	const bindings = asRecord(record?.bindings);
+	const gapCounts = numericRecord(record?.gapCounts);
+	const feedback = mutablePatternFeedback(record?.feedback);
 	if (
 		!record ||
 		typeof record.id !== "string" ||
@@ -2297,6 +2324,17 @@ function mutablePattern(value: PatternAwarePattern): MutablePattern | undefined 
 		!record.context.every(isEventSignature) ||
 		typeof record.targetTool !== "string" ||
 		!bindings ||
+		!gapCounts ||
+		!feedback ||
+		![
+			record.occurrences,
+			record.replayMatches,
+			record.historicalOpportunities,
+			record.historicalMatches,
+			record.averageDurationMs,
+			record.lastSeenSequence,
+		].every((metric) => isFiniteNumber(metric) && metric >= 0) ||
+		(record.targetSchemaHash !== undefined && typeof record.targetSchemaHash !== "string") ||
 		!Object.entries(bindings).every(
 			([encoded, binding]) => parsePath(encoded) !== undefined && isPatternAwareBinding(binding),
 		)
@@ -2310,40 +2348,79 @@ function mutablePattern(value: PatternAwarePattern): MutablePattern | undefined 
 		bindings: safeBindings,
 		dependencies: bindingDependencies(safeBindings),
 		...(value.targetSchemaHash ? { targetSchemaHash: value.targetSchemaHash } : {}),
-		gapCounts: { ...value.gapCounts },
+		gapCounts,
 		gapLastSeen: Object.fromEntries(
-			Object.keys(value.gapCounts ?? {}).map((gap) => [
+			Object.keys(gapCounts).map((gap) => [
 				gap,
 				isFiniteNumber(value.gapLastSeen?.[gap]) ? value.gapLastSeen[gap]! : finite(value.lastSeenSequence),
 			]),
 		),
 		occurrences: finite(value.occurrences),
 		replayMatches: finite(value.replayMatches),
-		historicalOpportunities: Math.max(
-			1,
-			isFiniteNumber(value.historicalOpportunities) ? value.historicalOpportunities : finite(value.occurrences),
-		),
-		historicalMatches: isFiniteNumber(value.historicalMatches)
-			? Math.max(0, value.historicalMatches)
-			: finite(value.replayMatches),
-		opportunities: finite(value.opportunities),
-		consumed: finite(value.consumed),
-		unused: finite(value.unused),
-		actorMisses: finite(value.actorMisses),
-		staleInvalidations: finite(value.staleInvalidations),
-		systemCancellations: finite(value.systemCancellations),
-		recentSuccessWeight: isFiniteNumber(value.recentSuccessWeight)
-			? Math.max(0, value.recentSuccessWeight)
-			: finite(value.consumed),
-		recentFailureWeight: isFiniteNumber(value.recentFailureWeight)
-			? Math.max(0, value.recentFailureWeight)
-			: finite(value.actorMisses),
-		feedbackSequence: isFiniteNumber(value.feedbackSequence)
-			? Math.max(0, value.feedbackSequence)
-			: finite(value.lastSeenSequence),
+		historicalOpportunities: Math.max(1, value.historicalOpportunities),
+		historicalMatches: value.historicalMatches,
+		feedback,
 		averageDurationMs: finite(value.averageDurationMs),
 		lastSeenSequence: finite(value.lastSeenSequence),
 	};
+}
+
+function emptyPatternFeedback(sequence: number): MutablePatternFeedback {
+	return {
+		issued: 0,
+		observed: 0,
+		matched: 0,
+		adopted: 0,
+		rejectedAfterMatch: {},
+		unobserved: {},
+		recentMatchedWeight: 0,
+		recentMismatchedWeight: 0,
+		recentAdoptedWeight: 0,
+		recentRejectedWeight: 0,
+		sequence: Math.max(0, sequence),
+	};
+}
+
+function mutablePatternFeedback(value: unknown): MutablePatternFeedback | undefined {
+	const feedback = asRecord(value);
+	const rejectedAfterMatch = numericRecord(feedback?.rejectedAfterMatch);
+	const unobserved = numericRecord(feedback?.unobserved);
+	if (
+		!feedback ||
+		!rejectedAfterMatch ||
+		!unobserved ||
+		![
+			feedback.issued,
+			feedback.observed,
+			feedback.matched,
+			feedback.adopted,
+			feedback.recentMatchedWeight,
+			feedback.recentMismatchedWeight,
+			feedback.recentAdoptedWeight,
+			feedback.recentRejectedWeight,
+			feedback.sequence,
+		].every((metric) => isFiniteNumber(metric) && metric >= 0)
+	)
+		return;
+	return {
+		issued: feedback.issued as number,
+		observed: feedback.observed as number,
+		matched: feedback.matched as number,
+		adopted: feedback.adopted as number,
+		rejectedAfterMatch: rejectedAfterMatch as Partial<Record<ResolutionStage, number>>,
+		unobserved,
+		recentMatchedWeight: feedback.recentMatchedWeight as number,
+		recentMismatchedWeight: feedback.recentMismatchedWeight as number,
+		recentAdoptedWeight: feedback.recentAdoptedWeight as number,
+		recentRejectedWeight: feedback.recentRejectedWeight as number,
+		sequence: feedback.sequence as number,
+	};
+}
+
+function numericRecord(value: unknown): Record<string, number> | undefined {
+	const record = asRecord(value);
+	if (!record || Object.values(record).some((count) => !isFiniteNumber(count) || count < 0)) return;
+	return record as Record<string, number>;
 }
 
 function mutablePool(value: unknown): PatternPool | undefined {
@@ -2401,23 +2478,6 @@ function patternPoolKey(
 	targetSchemaHash?: string,
 ) {
 	return hash(stableStringify({ context, targetTool, targetSchemaHash }));
-}
-
-function mergePatternPools(left: PatternPool, right: PatternPool, settings: PatternAwareSettings): PatternPool {
-	const observations = (left.observations ?? left.samples.length) + (right.observations ?? right.samples.length);
-	const samples = [...left.samples, ...right.samples]
-		.sort((a, b) => a.target.sequence - b.target.sequence)
-		.slice(-patternPoolSampleLimit(settings));
-	return {
-		key: left.key,
-		context: left.context,
-		targetTool: left.targetTool,
-		...(left.targetSchemaHash ? { targetSchemaHash: left.targetSchemaHash } : {}),
-		samples,
-		observations,
-		nextInferenceAt: observations,
-		inferenceBackoff: 1,
-	};
 }
 
 function patternPoolSampleLimit(settings: Pick<PatternAwareSettings, "minOccurrences" | "maxContextLength">) {

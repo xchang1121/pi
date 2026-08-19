@@ -1,36 +1,200 @@
 import { describe, expect, test } from "vitest";
-import type { SpeculativeActionEvent } from "../src/runtime.ts";
-import { summarizeSpeculativeTrace } from "../src/trace-summary.ts";
+import type { CandidateEventDescriptor, SpeculativeActionEvent, SpeculativeCacheSnapshot } from "../src/events.ts";
+import {
+	emptySpeculativeTraceSummary,
+	reduceSpeculativeTrace,
+	summarizeSpeculativeTrace,
+} from "../src/trace-summary.ts";
 
-describe("summarizeSpeculativeTrace", () => {
-	test("replays actor outcomes, latency savings, and failure distributions", () => {
-		const events = [
-			{ type: "started", schedulerOutcome: "promoted" },
-			{ type: "completed", executionMs: 40, schedulerOutcome: "promoted" },
-			{ type: "hit", savedMs: 30, waitedMs: 5, consumeOverheadMs: 2, schedulerOutcome: "reused" },
-			{ type: "actual" },
-			{ type: "miss", reason: "key_mismatch" },
-			{ type: "miss", reason: "key_mismatch" },
-			{ type: "cancelled", reason: "resource_stale", schedulerOutcome: "discarded" },
-			{ type: "completed", executionMs: Number.NaN },
-			{ type: "hit", savedMs: -10, waitedMs: Number.POSITIVE_INFINITY, consumeOverheadMs: -1 },
-		] as unknown as SpeculativeActionEvent<string>[];
+describe("speculative trace reduction", () => {
+	test("keeps source, prediction, execution, and Actor outcomes orthogonal in live and replayed metrics", () => {
+		const events = authoritativeEvents();
+		const live = events.reduce(reduceSpeculativeTrace, emptySpeculativeTraceSummary());
+		const replayed = summarizeSpeculativeTrace(events);
 
-		expect(summarizeSpeculativeTrace(events)).toEqual({
-			actorActions: 3,
-			started: 1,
-			completed: 2,
-			hits: 2,
-			misses: 2,
-			cancelled: 1,
-			hitRate: 2 / 3,
-			executionMs: 40,
-			savedMs: 30,
-			waitedMs: 5,
-			consumeOverheadMs: 2,
-			missReasons: { key_mismatch: 2 },
-			cancellationReasons: { resource_stale: 1 },
-			schedulerOutcomes: { promoted: 2, reused: 1, discarded: 1 },
+		expect(live).toEqual(replayed);
+		expect(replayed).toMatchObject({
+			sourceRequests: 1,
+			sourceOutcomes: { timeout: 1 },
+			predictionsSettled: 4,
+			predictionsObserved: 3,
+			predictionsMatched: 2,
+			predictionsAdopted: 1,
+			predictionPrecision: 2 / 3,
+			adoptionYield: 1 / 2,
+			predictionUnobserved: { "source:timeout": 1 },
+			predictionRejectedAfterMatch: { "freshness:resource_changed": 1 },
+			candidateStarted: 2,
+			candidateSucceeded: 1,
+			candidateFailed: 0,
+			candidateCancelled: 1,
+			candidateTerminalCauses: { "control:preempted": 1 },
+			actorActions: 2,
+			speculativeHits: 1,
+			actorFallbacks: 1,
+			hitRate: 1 / 2,
+			actorCandidateRejections: { "compatibility:backend_indeterminate": 1 },
+			speculativeExecutionMs: 40,
+			actorExecutionMs: 12,
+			executionAheadMs: 30,
+			attemptLeadMs: 80,
+			hitLatencyMs: 10,
+			totalDraftTokens: 7,
+			cache: { resultEntries: 2, cacheCold: 1, cacheHot: 1 },
 		});
 	});
 });
+
+function authoritativeEvents(): SpeculativeActionEvent<string>[] {
+	const base = { sessionID: "session", turnID: "turn", timestamp: 1, cache: cache() };
+	const actorAction = { id: "actor", sequence: 1, turnID: "turn" };
+	const prediction = { id: "prediction", source: "pattern_aware", proposalID: "proposal", actionID: "action" };
+	const exact = { kind: "exact" as const, distance: 0 as const };
+	return [
+		{
+			...base,
+			type: "source_request",
+			request: {
+				request: { source: "drafter", turnID: "turn", index: 0 },
+				startedAt: 0,
+				durationMs: 5,
+				settlement: { status: "timeout", cause: { stage: "source", code: "timeout" } },
+			},
+		},
+		{
+			...base,
+			type: "prediction",
+			settlement: { prediction, observation: "unobserved", cause: { stage: "source", code: "timeout" } },
+		},
+		{
+			...base,
+			type: "prediction",
+			settlement: { prediction, observation: "observed", actorAction, match: { matched: false } },
+		},
+		{
+			...base,
+			type: "prediction",
+			settlement: {
+				prediction,
+				observation: "observed",
+				actorAction,
+				match: {
+					matched: true,
+					relation: exact,
+					adoption: {
+						status: "rejected",
+						candidateID: "candidate",
+						cause: { stage: "freshness", code: "resource_changed" },
+					},
+				},
+			},
+		},
+		{
+			...base,
+			type: "prediction",
+			settlement: {
+				prediction,
+				observation: "observed",
+				actorAction,
+				match: {
+					matched: true,
+					relation: exact,
+					adoption: { status: "adopted", candidateID: "candidate" },
+				},
+			},
+		},
+		{ ...base, type: "candidate", candidate: candidate("one"), state: { status: "running", startedAt: 0 } },
+		{
+			...base,
+			type: "candidate",
+			candidate: candidate("one"),
+			state: { status: "succeeded", startedAt: 0, completedAt: 40, executionMs: 40 },
+		},
+		{ ...base, type: "candidate", candidate: candidate("two"), state: { status: "running", startedAt: 0 } },
+		{
+			...base,
+			type: "candidate",
+			candidate: candidate("two"),
+			state: {
+				status: "cancelled",
+				cause: { stage: "control", code: "preempted" },
+				startedAt: 0,
+				completedAt: 1,
+				executionMs: Number.NaN,
+			},
+		},
+		{
+			...base,
+			type: "actor_action",
+			actualAction: "read README.md",
+			settlement: {
+				actorAction,
+				tool: "read",
+				actionKeyHash: "hash",
+				matchedPredictions: [{ id: "prediction", source: "pattern_aware", proposalID: "plan", actionID: "next" }],
+				rejections: [
+					{
+						candidateID: "rejected",
+						match: exact,
+						cause: { stage: "compatibility", code: "backend_indeterminate" },
+					},
+				],
+				provider: {
+					kind: "speculative",
+					candidateID: "candidate",
+					match: exact,
+					timing: { executionAheadMs: 30, attemptLeadMs: 80, hitLatencyMs: 10 },
+				},
+			},
+		},
+		{
+			...base,
+			cache: cache({ resultEntries: 2, cacheCold: 1, cacheHot: 1 }),
+			type: "actor_action",
+			actualAction: "read other.ts",
+			settlement: {
+				actorAction: { ...actorAction, id: "actor-2", sequence: 2 },
+				tool: "read",
+				matchedPredictions: [],
+				rejections: [],
+				provider: { kind: "actor", durationMs: 12, isError: false },
+			},
+		},
+	];
+}
+
+function candidate(id: string): CandidateEventDescriptor {
+	return {
+		id,
+		tool: "read",
+		actionKeyHash: `hash-${id}`,
+		execution: "resource_cached",
+		source: "pattern_aware",
+		predictedAction: "read README.md",
+		predictionLatencyMs: 2,
+		draftTokens: 7,
+		totalDraftTokens: 7,
+		expectedDurationMs: 40,
+		estimatedBytes: 128,
+		validation: { durationMs: 0, bytesRead: 0, filesRead: 0 },
+	};
+}
+
+function cache(overrides: Partial<SpeculativeCacheSnapshot> = {}): SpeculativeCacheSnapshot {
+	return {
+		cacheCapacity: 8,
+		cacheByteCapacity: 1024,
+		cacheCold: 0,
+		cacheHot: 0,
+		inFlightJobs: 0,
+		resultEntries: 0,
+		resultBytes: 0,
+		branchEntries: 0,
+		branchBytes: 0,
+		exclusiveCandidates: 0,
+		sharedCandidates: 0,
+		cacheTools: [],
+		cacheExecutions: [],
+		...overrides,
+	};
+}

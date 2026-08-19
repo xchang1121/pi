@@ -21,7 +21,7 @@ export type ResourceValidationMetrics = {
 	readonly mode: "watcher" | "exact";
 };
 
-export type ResourceValidation = ResourceValidationMetrics & {
+export type ResourceVersionValidation = ResourceValidationMetrics & {
 	readonly expired: boolean;
 	readonly reason?: string;
 };
@@ -163,7 +163,7 @@ export class ResourceVersionManager {
 		}
 	}
 
-	async validate(token: ResourceVersionToken): Promise<ResourceValidation> {
+	async validate(token: ResourceVersionToken): Promise<ResourceVersionValidation> {
 		const started = performance.now();
 		if (token.manager !== this || token.root !== this.root) {
 			return validation(started, true, "resource_version_owner_changed", "exact");
@@ -361,9 +361,6 @@ export function resourceDependencies(
 	actionSemantics: ActionSemanticsRegistry = PI_ACTION_SEMANTICS,
 ): ReadonlyArray<ResourceDependency> {
 	const definition = actionSemantics.definition(action.tool);
-	if (!definition && action.tool === "lsp" && action.input.operation !== "documentSymbol") {
-		return [{ path: root, scope: "tree_content" }];
-	}
 	const scope = definition ? definition.resourceScope : "content";
 	if (scope === undefined) return [];
 	const dependencies = action.resources.map((resource) => ({
@@ -396,7 +393,7 @@ export function captureResourceVersion(
 	return resourceVersionManager(root).capture(resourceDependencies(action, root, actionSemantics));
 }
 
-export function validateResourceVersion(token: unknown): Promise<ResourceValidation> {
+export function validateResourceVersion(token: unknown): Promise<ResourceVersionValidation> {
 	if (!isResourceVersionToken(token)) {
 		return Promise.resolve({
 			expired: true,
@@ -608,7 +605,7 @@ function validation(
 	expired: boolean,
 	reason: string,
 	mode: ResourceValidationMetrics["mode"],
-): ResourceValidation {
+): ResourceVersionValidation {
 	return { expired, reason, ...validationMetrics(started, 0, 0, mode) };
 }
 

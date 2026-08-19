@@ -1,5 +1,11 @@
-import type { ActionKey, ActionKeyMatch, ActionKeyProjector, ProjectedActionKeyMatch } from "./common.ts";
-import { actionKeyMatch, actionKeyProjectionPartitions } from "./common.ts";
+import {
+	type ActionKey,
+	type ActionKeyMatch,
+	type ActionKeyProjector,
+	actionKeyMatch,
+	actionKeyProjectionPartitions,
+	type ProjectedActionKeyMatch,
+} from "./action-semantics.ts";
 
 export interface ActionStoreEntry {
 	readonly key: ActionKey;
@@ -18,16 +24,6 @@ export interface ActionStoreInsertResult<Entry> extends ActionStoreLookup<Entry>
 	readonly inserted: boolean;
 }
 
-export interface ActionStoreLimits {
-	readonly maxEntries: number;
-	readonly maxBytes: number;
-}
-
-export interface ActionStoreSnapshot {
-	readonly entries: number;
-	readonly bytes: number;
-}
-
 interface IndexedActionStoreLookup<Entry> extends ActionStoreLookup<Entry> {
 	readonly recency: number;
 }
@@ -39,7 +35,7 @@ interface IndexedScope<Entry> {
 }
 
 /** Scoped action identity, projection lookup, recency, and bounded storage. */
-export class ActionStore<Scope, Entry extends SizedActionStoreEntry> {
+export class ActionStore<Scope, Entry extends ActionStoreEntry> {
 	private readonly scopesByID = new Map<Scope, IndexedScope<Entry>>();
 	private readonly projectors: readonly ActionKeyProjector[];
 	private readonly allowDuplicateExact: boolean;
@@ -118,32 +114,6 @@ export class ActionStore<Scope, Entry extends SizedActionStoreEntry> {
 		return [...this.scopesByID.values()].flatMap((state) => [...state.entries]);
 	}
 
-	scopes(): readonly Scope[] {
-		return [...this.scopesByID.keys()];
-	}
-
-	snapshot(scope: Scope): ActionStoreSnapshot {
-		const entries = this.values(scope);
-		return { entries: entries.length, bytes: entries.reduce((total, entry) => total + entryBytes(entry), 0) };
-	}
-
-	trim(scope: Scope, limits: ActionStoreLimits, canEvict: (entry: Entry) => boolean = () => true): Entry[] {
-		const maxEntries = finiteLimit(limits.maxEntries);
-		const maxBytes = finiteLimit(limits.maxBytes);
-		let entries = this.values(scope);
-		let bytes = entries.reduce((total, entry) => total + entryBytes(entry), 0);
-		const evicted: Entry[] = [];
-		while (entries.length > maxEntries || bytes > maxBytes) {
-			const victim = entries.find(canEvict);
-			if (!victim) break;
-			bytes -= entryBytes(victim);
-			this.delete(scope, victim);
-			evicted.push(victim);
-			entries = this.values(scope);
-		}
-		return evicted;
-	}
-
 	private lookupRecords(state: IndexedScope<Entry>, action: ActionKey): readonly IndexedActionStoreLookup<Entry>[] {
 		const candidates = new Set<Entry>();
 		for (const exact of state.exact.get(action.key) ?? []) candidates.add(exact);
@@ -197,28 +167,29 @@ export class ActionStore<Scope, Entry extends SizedActionStoreEntry> {
 	}
 }
 
-export type ResultCacheEntryState = "probation" | "protected";
+export type ResultCacheSegment = "cold" | "hot";
 
 export interface ResultCacheLimits {
 	readonly maxEntries: number;
 	readonly maxBytes: number;
-	/** Maximum protected share; older protected entries are demoted before eviction pressure. */
-	readonly protectedFraction?: number;
+	/** Maximum hot share; lower-value hot entries return to cold before eviction pressure. */
+	readonly hotFraction?: number;
 }
 
-export interface ResultCacheProbationPolicy {
+export interface ResultCacheColdPolicy {
 	readonly maxAgeMs: number;
-	readonly maxOpportunities: number;
+	/** A cold entry is evicted after more than this many Actor actions pass without a hit. */
+	readonly maxActorSteps: number;
 }
 
 export interface SpeculativeCacheValueMetrics {
 	readonly executionMs: number;
-	readonly validationMs: number;
-	readonly projectionMs: number;
+	readonly expectedValidationMs: number;
+	readonly expectedProjectionMs: number;
 	readonly bytes: number;
-	readonly hits: number;
-	readonly createdAt: number;
-	readonly lastHitAt?: number;
+	readonly actorHits: number;
+	readonly insertedAt: number;
+	readonly lastActorHitAt?: number;
 }
 
 export const CACHE_HIT_HALF_LIFE_MS = 30 * 60 * 1000;
@@ -228,46 +199,49 @@ export function speculativeCacheValue(
 	now = Date.now(),
 	halfLifeMs = CACHE_HIT_HALF_LIFE_MS,
 ): number {
-	const savedMs = Math.max(
+	const reusableWorkMs = Math.max(
 		0,
-		finiteValue(metrics.executionMs) - finiteValue(metrics.validationMs) - finiteValue(metrics.projectionMs),
+		finiteValue(metrics.executionMs) -
+			finiteValue(metrics.expectedValidationMs) -
+			finiteValue(metrics.expectedProjectionMs),
 	);
-	const referenceAt = metrics.hits > 0 ? (metrics.lastHitAt ?? metrics.createdAt) : metrics.createdAt;
+	const referenceAt = metrics.actorHits > 0 ? (metrics.lastActorHitAt ?? metrics.insertedAt) : metrics.insertedAt;
 	const ageMs = Math.max(0, finiteValue(now - referenceAt));
 	const decay = halfLifeMs > 0 ? 2 ** (-ageMs / halfLifeMs) : 0;
-	const reuseWeight = metrics.hits > 0 ? 1 + finiteValue(metrics.hits) * decay : 0.1 * decay;
-	return (reuseWeight * savedMs) / (finiteValue(metrics.bytes) + 4096);
+	const reuseWeight = metrics.actorHits > 0 ? 1 + finiteValue(metrics.actorHits) * decay : 0.1 * decay;
+	return (reuseWeight * reusableWorkMs) / (finiteValue(metrics.bytes) + 4096);
 }
 
-type CacheMetadata =
-	| { readonly state: "probation"; readonly createdAt: number; readonly opportunities: number }
-	| { readonly state: "protected" };
+export interface ResultCacheEvidence {
+	readonly segment: ResultCacheSegment;
+	readonly insertedAt: number;
+	readonly segmentEnteredAt: number;
+	readonly actorSteps: number;
+	readonly actorHits: number;
+	readonly lastActorHitAt?: number;
+}
 
 export interface ResultCacheLookup<Entry> extends ActionStoreLookup<Entry> {
-	readonly state: ResultCacheEntryState;
-}
-
-export interface ResultCacheInsertResult<Entry> extends ResultCacheLookup<Entry> {
-	readonly inserted: boolean;
+	readonly evidence: ResultCacheEvidence;
 }
 
 export interface ResultCacheSnapshot {
-	readonly probationEntries: number;
-	readonly protectedEntries: number;
-	readonly probationBytes: number;
-	readonly protectedBytes: number;
+	readonly coldEntries: number;
+	readonly hotEntries: number;
+	readonly coldBytes: number;
+	readonly hotBytes: number;
 }
 
-/** Completed shareable results with speculative probation and actor-validated protection. */
+/** Completed shareable results. This aggregate exclusively owns reuse evidence and retention state. */
 export class ResultCache<Scope, Entry extends SizedActionStoreEntry> {
 	private readonly index: ActionStore<Scope, Entry>;
-	private readonly metadata = new Map<Scope, Map<Entry, CacheMetadata>>();
-	private readonly score: (entry: Entry, now: number) => number;
+	private readonly metadata = new Map<Scope, Map<Entry, ResultCacheEvidence>>();
+	private readonly score: (entry: Entry, evidence: ResultCacheEvidence, now: number) => number;
 	private readonly now: () => number;
 
 	constructor(
 		projectors: readonly ActionKeyProjector[] = [],
-		score: (entry: Entry, now: number) => number = () => 0,
+		score: (entry: Entry, evidence: ResultCacheEvidence, now: number) => number = () => 0,
 		now: () => number = Date.now,
 	) {
 		this.index = new ActionStore(projectors);
@@ -277,55 +251,61 @@ export class ResultCache<Scope, Entry extends SizedActionStoreEntry> {
 
 	insert(scope: Scope, entry: Entry): Entry | undefined {
 		const existing = this.index.insert(scope, entry);
-		if (!existing) this.placeOnProbation(scope, entry);
+		if (!existing) this.placeCold(scope, entry);
 		return existing;
-	}
-
-	insertOrGetCompatible(
-		scope: Scope,
-		entry: Entry,
-		canReuseProjected: (existing: Entry, match: ProjectedActionKeyMatch) => boolean = () => false,
-	): ResultCacheInsertResult<Entry> {
-		const result = this.index.insertOrGetCompatible(scope, entry, canReuseProjected);
-		if (result.inserted) this.placeOnProbation(scope, entry);
-		return { ...result, state: this.stateOf(scope, result.entry) ?? "probation" };
 	}
 
 	lookup(scope: Scope, action: ActionKey): readonly ResultCacheLookup<Entry>[] {
 		return this.index.lookup(scope, action).map((item) => ({
 			entry: item.entry,
 			match: item.match,
-			state: this.stateOf(scope, item.entry) ?? "probation",
+			evidence: this.evidenceOf(scope, item.entry)!,
 		}));
 	}
 
 	recordActorHit(scope: Scope, entry: Entry, limits?: ResultCacheLimits): readonly Entry[] {
-		if (this.index.getExact(scope, entry.key) !== entry) return [];
-		this.metadataFor(scope).set(entry, { state: "protected" });
+		const current = this.evidenceOf(scope, entry);
+		if (!current) return [];
+		const now = this.now();
+		this.metadataFor(scope).set(entry, {
+			...current,
+			segment: "hot",
+			segmentEnteredAt: current.segment === "hot" ? current.segmentEnteredAt : now,
+			actorSteps: 0,
+			actorHits: current.actorHits + 1,
+			lastActorHitAt: now,
+		});
 		this.index.touch(scope, entry);
-		return limits ? this.rebalanceProtected(scope, limits) : [];
+		return limits ? this.rebalanceHot(scope, limits) : [];
 	}
 
-	advanceActorOpportunity(scope: Scope, policy: ResultCacheProbationPolicy): readonly Entry[] {
+	advanceActorStep(scope: Scope, policy: ResultCacheColdPolicy): readonly Entry[] {
 		const now = this.now();
 		const maxAgeMs = expirationLimit(policy.maxAgeMs);
-		const maxOpportunities = expirationLimit(policy.maxOpportunities);
+		const maxActorSteps = expirationLimit(policy.maxActorSteps);
 		const expired: Entry[] = [];
 		for (const entry of this.index.values(scope)) {
 			const current = this.metadata.get(scope)?.get(entry);
-			if (!current || current.state !== "probation") continue;
-			if (now - current.createdAt >= maxAgeMs || current.opportunities >= maxOpportunities) {
+			if (!current || current.segment !== "cold") continue;
+			const actorSteps = current.actorSteps + 1;
+			if (now - current.segmentEnteredAt >= maxAgeMs || actorSteps > maxActorSteps) {
 				this.delete(scope, entry);
 				expired.push(entry);
 				continue;
 			}
-			this.metadataFor(scope).set(entry, { ...current, opportunities: current.opportunities + 1 });
+			this.metadataFor(scope).set(entry, { ...current, actorSteps });
 		}
 		return expired;
 	}
 
-	stateOf(scope: Scope, entry: Entry): ResultCacheEntryState | undefined {
-		return this.index.getExact(scope, entry.key) === entry ? this.metadata.get(scope)?.get(entry)?.state : undefined;
+	evidenceOf(scope: Scope, entry: Entry): ResultCacheEvidence | undefined {
+		if (this.index.getExact(scope, entry.key) !== entry) return undefined;
+		const evidence = this.metadata.get(scope)?.get(entry);
+		return evidence ? { ...evidence } : undefined;
+	}
+
+	segmentOf(scope: Scope, entry: Entry): ResultCacheSegment | undefined {
+		return this.evidenceOf(scope, entry)?.segment;
 	}
 
 	delete(scope: Scope, entry: Entry): boolean {
@@ -344,26 +324,22 @@ export class ResultCache<Scope, Entry extends SizedActionStoreEntry> {
 		return this.index.allValues();
 	}
 
-	scopes(): readonly Scope[] {
-		return this.index.scopes();
-	}
-
 	snapshot(scope: Scope): ResultCacheSnapshot {
-		let probationEntries = 0;
-		let protectedEntries = 0;
-		let probationBytes = 0;
-		let protectedBytes = 0;
+		let coldEntries = 0;
+		let hotEntries = 0;
+		let coldBytes = 0;
+		let hotBytes = 0;
 		for (const entry of this.index.values(scope)) {
 			const bytes = entryBytes(entry);
-			if (this.stateOf(scope, entry) === "protected") {
-				protectedEntries++;
-				protectedBytes += bytes;
+			if (this.segmentOf(scope, entry) === "hot") {
+				hotEntries++;
+				hotBytes += bytes;
 			} else {
-				probationEntries++;
-				probationBytes += bytes;
+				coldEntries++;
+				coldBytes += bytes;
 			}
 		}
-		return { probationEntries, protectedEntries, probationBytes, protectedBytes };
+		return { coldEntries, hotEntries, coldBytes, hotBytes };
 	}
 
 	trim(scope: Scope, limits: ResultCacheLimits, canEvict: (entry: Entry) => boolean = () => true): Entry[] {
@@ -375,9 +351,13 @@ export class ResultCache<Scope, Entry extends SizedActionStoreEntry> {
 		while (entries.length > maxEntries || bytes > maxBytes) {
 			const victim =
 				this.lowestValue(
-					entries.filter((entry) => this.stateOf(scope, entry) === "probation" && canEvict(entry)),
+					scope,
+					entries.filter((entry) => this.segmentOf(scope, entry) === "cold" && canEvict(entry)),
 				) ??
-				this.lowestValue(entries.filter((entry) => this.stateOf(scope, entry) === "protected" && canEvict(entry)));
+				this.lowestValue(
+					scope,
+					entries.filter((entry) => this.segmentOf(scope, entry) === "hot" && canEvict(entry)),
+				);
 			if (!victim) break;
 			bytes -= entryBytes(victim);
 			this.delete(scope, victim);
@@ -387,47 +367,63 @@ export class ResultCache<Scope, Entry extends SizedActionStoreEntry> {
 		return evicted;
 	}
 
-	private metadataFor(scope: Scope): Map<Entry, CacheMetadata> {
+	private metadataFor(scope: Scope): Map<Entry, ResultCacheEvidence> {
 		const existing = this.metadata.get(scope);
 		if (existing) return existing;
-		const created = new Map<Entry, CacheMetadata>();
+		const created = new Map<Entry, ResultCacheEvidence>();
 		this.metadata.set(scope, created);
 		return created;
 	}
 
-	private placeOnProbation(scope: Scope, entry: Entry): void {
-		this.metadataFor(scope).set(entry, { state: "probation", createdAt: this.now(), opportunities: 0 });
+	private placeCold(scope: Scope, entry: Entry): void {
+		const now = this.now();
+		this.metadataFor(scope).set(entry, {
+			segment: "cold",
+			insertedAt: now,
+			segmentEnteredAt: now,
+			actorSteps: 0,
+			actorHits: 0,
+		});
 	}
 
-	private rebalanceProtected(scope: Scope, limits: ResultCacheLimits): readonly Entry[] {
-		const fraction = finiteFraction(limits.protectedFraction ?? 0.8);
+	private rebalanceHot(scope: Scope, limits: ResultCacheLimits): readonly Entry[] {
+		const fraction = finiteFraction(limits.hotFraction ?? 0.8);
 		const entryCapacity = finiteLimit(limits.maxEntries);
 		const byteCapacity = finiteLimit(limits.maxBytes);
-		const protectedEntryLimit =
+		const hotEntryLimit =
 			entryCapacity === 0 || fraction === 0 ? 0 : Math.max(1, Math.floor(entryCapacity * fraction));
-		const protectedByteLimit = Math.floor(byteCapacity * fraction);
+		const hotByteLimit = Math.floor(byteCapacity * fraction);
 		const demoted: Entry[] = [];
 		const now = this.now();
 		while (true) {
-			const protectedEntries = this.index
-				.values(scope)
-				.filter((entry) => this.stateOf(scope, entry) === "protected");
-			const protectedBytes = protectedEntries.reduce((total, entry) => total + entryBytes(entry), 0);
-			if (protectedEntries.length <= protectedEntryLimit && protectedBytes <= protectedByteLimit) break;
-			const victim = this.lowestValue(protectedEntries, now);
+			const hotEntries = this.index.values(scope).filter((entry) => this.segmentOf(scope, entry) === "hot");
+			const hotBytes = hotEntries.reduce((total, entry) => total + entryBytes(entry), 0);
+			if (hotEntries.length <= hotEntryLimit && hotBytes <= hotByteLimit) break;
+			const victim = this.lowestValue(scope, hotEntries, now);
 			if (!victim) break;
-			this.metadataFor(scope).set(victim, { state: "probation", createdAt: now, opportunities: 0 });
+			const current = this.evidenceOf(scope, victim)!;
+			this.metadataFor(scope).set(victim, {
+				...current,
+				segment: "cold",
+				segmentEnteredAt: now,
+				actorSteps: 0,
+			});
 			demoted.push(victim);
 		}
 		return demoted;
 	}
 
-	private lowestValue(entries: readonly Entry[], now = this.now()): Entry | undefined {
-		return entries.reduce<Entry | undefined>(
-			(lowest, entry) =>
-				!lowest || finiteValue(this.score(entry, now)) < finiteValue(this.score(lowest, now)) ? entry : lowest,
-			undefined,
-		);
+	private lowestValue(scope: Scope, entries: readonly Entry[], now = this.now()): Entry | undefined {
+		return entries.reduce<Entry | undefined>((lowest, entry) => {
+			if (!lowest) return entry;
+			const evidence = this.evidenceOf(scope, entry);
+			const lowestEvidence = this.evidenceOf(scope, lowest);
+			if (!evidence) return lowest;
+			if (!lowestEvidence) return entry;
+			return finiteValue(this.score(entry, evidence, now)) < finiteValue(this.score(lowest, lowestEvidence, now))
+				? entry
+				: lowest;
+		}, undefined);
 	}
 }
 

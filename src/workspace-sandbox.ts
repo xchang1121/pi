@@ -5,15 +5,15 @@ import { chmod, type FileHandle, lstat, mkdir, mkdtemp, open, readdir, rename, r
 import os from "node:os";
 import path from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
-import type { ActionKey } from "./common.ts";
-import { asRecord, contains, slash } from "./common.ts";
+import { type ActionKey, asRecord, contains, slash } from "./action-semantics.ts";
 import type {
 	ExecutionWorld,
 	ExecutionWorldMode,
-	WorldAdoptionMetrics,
 	WorldBranch,
 	WorldBranchState,
 	WorldCheckpoint,
+	WorldCommitMetrics,
+	WorldCompatibilityEvidence,
 	WorldExecutionMetrics,
 } from "./execution-world.ts";
 import { ResourceVersionManager, type ResourceVersionToken } from "./resource-version.ts";
@@ -103,59 +103,102 @@ export interface SandboxProcessBackend {
 	readonly dispose: () => Promise<void>;
 }
 
+export interface SandboxBackendRoute {
+	readonly id: string;
+	readonly backend: SandboxProcessBackend;
+}
+
+export interface SandboxBackendRouterStatus {
+	readonly configured: string;
+	readonly active: SandboxProcessBackendStatus;
+	readonly candidates: Readonly<Record<string, SandboxProcessBackendStatus>>;
+}
+
+export interface SandboxBackendRouter extends SandboxProcessBackend {
+	readonly configured: string;
+	readonly inspect: (options?: { readonly refresh?: boolean }) => Promise<SandboxBackendRouterStatus>;
+}
+
 export interface WorkspaceSandboxOptions {
 	/** Required process boundary for workspace-snapshot actions such as bash. */
 	readonly processBackend?: SandboxProcessBackend;
 	readonly gitBinary?: string;
 }
 
-/** Select the first ready process backend once, keeping Scheduler and tool semantics backend-agnostic. */
-export function createFallbackSandboxProcessBackend(backends: readonly SandboxProcessBackend[]): SandboxProcessBackend {
-	let selection:
-		| Promise<{ readonly backend: SandboxProcessBackend; readonly status: SandboxProcessBackendStatus }>
-		| undefined;
+/** One route owns health, fingerprint, preparation, and execution backend identity. */
+export function createSandboxBackendRouter(
+	configured: string,
+	routes: readonly SandboxBackendRoute[],
+): SandboxBackendRouter {
+	if (configured !== "auto" && !routes.some((route) => route.id === configured)) {
+		throw new Error(`Unknown speculative process backend: ${configured}`);
+	}
+	if (new Set(routes.map((route) => route.id)).size !== routes.length || routes.some((route) => !route.id.trim())) {
+		throw new Error("Speculative process backend route IDs must be unique and non-empty.");
+	}
+	let selected: SandboxBackendRoute | undefined;
 	let disposed = false;
-	const select = (refresh = false) => {
-		if (refresh) selection = undefined;
-		selection ??= (async () => {
-			const failures: string[] = [];
-			for (const backend of backends) {
-				const status = await backend.check({ refresh });
-				if (status.state === "ready") return { backend, status };
-				failures.push(status.detail);
-			}
-			throw new Error(failures.join("; ") || "No speculative process backend is configured.");
-		})();
-		return selection;
+	const inspect = async ({ refresh = false }: { readonly refresh?: boolean } = {}) => {
+		if (refresh) selected = undefined;
+		const checked = await Promise.all(
+			routes.map(async (route) => [route, await safeBackendCheck(route.backend, refresh)] as const),
+		);
+		const candidates = Object.freeze(
+			Object.fromEntries(checked.map(([route, status]) => [route.id, status])),
+		) as Readonly<Record<string, SandboxProcessBackendStatus>>;
+		if (!selected) {
+			const eligible = configured === "auto" ? checked : checked.filter(([route]) => route.id === configured);
+			selected = eligible.find(([, status]) => status.state === "ready")?.[0];
+		}
+		const active = selected
+			? candidates[selected.id]
+			: unavailableBackendStatus(
+					(configured === "auto" ? checked : checked.filter(([route]) => route.id === configured))
+						.map(([, status]) => status.detail)
+						.join("; ") || "No speculative process backend is configured.",
+				);
+		return Object.freeze({ configured, active, candidates });
+	};
+	const select = async () => {
+		if (disposed) throw new Error("Speculative process backend is disposed.");
+		if (!selected) await inspect();
+		if (!selected) throw new Error((await inspect()).active.detail);
+		return selected.backend;
 	};
 	return {
-		check: async ({ refresh = false } = {}) => {
-			try {
-				return (await select(refresh)).status;
-			} catch (error) {
-				return {
-					backend: "workspace",
-					state: "unavailable",
-					source: "none",
-					detail: error instanceof Error ? error.message : String(error),
-				};
-			}
-		},
-		fingerprint: async () => (await select()).backend.fingerprint(),
+		configured,
+		inspect,
+		check: async (options) => (await inspect(options)).active,
+		fingerprint: async () => (await select()).fingerprint(),
 		prepare: async (input) => {
 			if (disposed) throw new Error("Speculative process backend is disposed.");
-			await (await select()).backend.prepare(input);
+			await (await select()).prepare(input);
 		},
 		open: async (input) => {
 			if (disposed) throw new Error("Speculative process backend is disposed.");
-			return (await select()).backend.open(input);
+			return (await select()).open(input);
 		},
 		dispose: async () => {
 			if (disposed) return;
 			disposed = true;
-			await Promise.all(backends.map((backend) => backend.dispose()));
+			await Promise.all(routes.map((route) => route.backend.dispose()));
 		},
 	};
+}
+
+async function safeBackendCheck(
+	backend: SandboxProcessBackend,
+	refresh: boolean,
+): Promise<SandboxProcessBackendStatus> {
+	try {
+		return await backend.check({ refresh });
+	} catch (error) {
+		return unavailableBackendStatus(error instanceof Error ? error.message : String(error));
+	}
+}
+
+function unavailableBackendStatus(detail: string): SandboxProcessBackendStatus {
+	return { backend: "workspace", state: "unavailable", source: "none", detail };
 }
 
 export interface SandboxWorkspaceContext {
@@ -198,7 +241,7 @@ interface PreparedGitWorkspace {
 }
 
 // The execution world mirrors everything the actor can read below cwd. Git metadata is
-// replaced by the private repository and adoption's own temporary files are internal.
+// replaced by the private repository and commit's own temporary files are internal.
 const SNAPSHOT_EXCLUDES = [".git"] as const;
 const SANDBOX_REPOSITORY_IDLE_MS = 5 * 60 * 1000;
 const GIT_PATHSPEC_BATCH_BYTES = 32 * 1024;
@@ -242,7 +285,7 @@ function resolveWorkspaceCheckpoint(
 	return checkpoint;
 }
 
-/** Create a copy-on-write execution world with transactional multi-file adoption. */
+/** Create a copy-on-write execution world with transactional multi-file commit. */
 export function createWorkspaceSandbox(options: WorkspaceSandboxOptions = {}): SpeculativeAgentSandbox {
 	const roots = new Set<string>();
 	const supports = (mode: ExecutionWorldMode) =>
@@ -271,7 +314,7 @@ export function createWorkspaceSandbox(options: WorkspaceSandboxOptions = {}): S
 			} else {
 				throw new Error(`Execution world does not support mode ${context.mode}`);
 			}
-			return new GitWorldBranch(snapshot, sourceRoot, parent);
+			return new GitWorldBranch(snapshot, sourceRoot, context.action.executionFingerprint, parent);
 		},
 		dispose: async () => {
 			const ownedRoots = [...roots];
@@ -293,12 +336,18 @@ class GitWorldBranch implements WorldBranch<ToolSettlement> {
 	readonly resources: readonly string[];
 	readonly capturedBytes: number;
 	readonly executionMetrics: WorkspaceExecutionSnapshot["executionMetrics"];
+	readonly compatibility: WorldCompatibilityEvidence;
 	private readonly changes: readonly SandboxFileChange[];
-	private stateValue: WorldBranchState = "ready";
-	private adoptionMetricsValue?: WorldAdoptionMetrics;
-	private adoption?: Promise<ToolSettlement>;
+	private stateValue: WorldBranchState = "sealed";
+	private commitMetricsValue?: WorldCommitMetrics;
+	private commitPromise?: Promise<ToolSettlement>;
 
-	constructor(snapshot: WorkspaceExecutionSnapshot, sourceRoot: string, parent?: GitWorldCheckpoint) {
+	constructor(
+		snapshot: WorkspaceExecutionSnapshot,
+		sourceRoot: string,
+		executionFingerprint: string,
+		parent?: GitWorldCheckpoint,
+	) {
 		this.output = snapshot.output;
 		this.changes = Object.freeze([...snapshot.changes]);
 		this.checkpoint = new GitWorldCheckpoint(sourceRoot, parent, this.changes);
@@ -308,23 +357,28 @@ class GitWorldBranch implements WorldBranch<ToolSettlement> {
 			0,
 		);
 		this.executionMetrics = Object.freeze({ ...snapshot.executionMetrics });
+		this.compatibility = Object.freeze({
+			status: "compatible" as const,
+			backend: this.backend,
+			executionFingerprint,
+		});
 	}
 
 	get state(): WorldBranchState {
 		return this.stateValue;
 	}
 
-	get adoptionMetrics(): WorldAdoptionMetrics | undefined {
-		return this.adoptionMetricsValue;
+	get commitMetrics(): WorldCommitMetrics | undefined {
+		return this.commitMetricsValue;
 	}
 
-	readonly adopt = (): Promise<ToolSettlement> => {
-		if (this.adoption) return this.adoption;
-		this.stateValue = "adopting";
-		this.adoption = adoptSandboxExecution({ output: this.output, changes: this.changes }).then(
+	readonly commit = (): Promise<ToolSettlement> => {
+		if (this.commitPromise) return this.commitPromise;
+		this.stateValue = "committing";
+		this.commitPromise = commitSandboxExecution({ output: this.output, changes: this.changes }).then(
 			({ output, metrics }) => {
-				this.adoptionMetricsValue = metrics;
-				this.stateValue = "adopted";
+				this.commitMetricsValue = metrics;
+				this.stateValue = "committed";
 				return output;
 			},
 			(error) => {
@@ -332,18 +386,18 @@ class GitWorldBranch implements WorldBranch<ToolSettlement> {
 				throw error;
 			},
 		);
-		return this.adoption;
+		return this.commitPromise;
 	};
 }
 
-/** Low-level transactional adoption primitive for execution-world implementations. */
+/** Low-level transactional commit primitive for execution-world implementations. */
 export async function commitSandboxDelta(delta: SandboxExecutionDelta): Promise<ToolSettlement> {
-	return (await adoptSandboxExecution(delta)).output;
+	return (await commitSandboxExecution(delta)).output;
 }
 
-async function adoptSandboxExecution(
+async function commitSandboxExecution(
 	execution: SandboxExecutionDelta,
-): Promise<{ readonly output: ToolSettlement; readonly metrics: WorldAdoptionMetrics }> {
+): Promise<{ readonly output: ToolSettlement; readonly metrics: WorldCommitMetrics }> {
 	const started = performance.now();
 	const changes = deduplicateChanges(execution.changes);
 	return withTargetLocks(
@@ -351,14 +405,14 @@ async function adoptSandboxExecution(
 		async () => {
 			const staged = new Map<SandboxFileChange, string>();
 			const baselines = new Map<SandboxFileChange, RegularFileState | undefined>();
-			const adoptionModes = new Map<SandboxFileChange, number | undefined>();
+			const commitModes = new Map<SandboxFileChange, number | undefined>();
 			const applied: SandboxFileChange[] = [];
 			const createdDirectories: string[] = [];
 			let bytesValidated = 0;
 			let validationMs = 0;
-			let resourcesAdopted = 0;
+			let resourcesCommitted = 0;
 			try {
-				for (const change of changes) await assertAdoptionTarget(change);
+				for (const change of changes) await assertCommitTarget(change);
 				for (const change of changes) {
 					if (change.after !== undefined) {
 						staged.set(change, await stageAtomicWrite(change.after, change.afterMode, change.root));
@@ -370,23 +424,23 @@ async function adoptSandboxExecution(
 					baselines.set(change, current);
 					bytesValidated += current?.content.byteLength ?? 0;
 					if (!sameBaselineState(current, change)) {
-						throw new Error(`resource changed before adoption: ${change.resource}`);
+						throw new Error(`resource changed before commit: ${change.resource}`);
 					}
-					adoptionModes.set(change, resolveAdoptionMode(current, change));
+					commitModes.set(change, resolveCommitMode(current, change));
 				}
 				validationMs = Math.max(0, performance.now() - validationStarted);
 				for (const change of changes) {
-					await assertAdoptionTarget(change);
+					await assertCommitTarget(change);
 					applied.push(change);
 					const temporary = staged.get(change);
 					if (temporary) {
 						createdDirectories.push(...(await createParentDirectories(change.root, change.target)));
-						await replaceFile(temporary, change.target, adoptionModes.get(change));
+						await replaceFile(temporary, change.target, commitModes.get(change));
 						staged.delete(change);
 					} else {
 						await rm(change.target, { force: true });
 					}
-					resourcesAdopted++;
+					resourcesCommitted++;
 				}
 			} catch (error) {
 				try {
@@ -395,7 +449,7 @@ async function adoptSandboxExecution(
 				} catch (rollbackError) {
 					throw new AggregateError(
 						[error, rollbackError],
-						"sandbox adoption failed and the original workspace could not be fully restored",
+						"sandbox commit failed and the original workspace could not be fully restored",
 						{ cause: error },
 					);
 				}
@@ -412,7 +466,7 @@ async function adoptSandboxExecution(
 					validationMs,
 					bytesValidated,
 					resourcesValidated: changes.length,
-					resourcesAdopted,
+					resourcesCommitted,
 				},
 			};
 		},
@@ -1200,11 +1254,11 @@ async function assertNoDirectoryLinks(root: string, relative: string): Promise<v
 	}
 }
 
-async function assertAdoptionTarget(change: SandboxFileChange): Promise<void> {
+async function assertCommitTarget(change: SandboxFileChange): Promise<void> {
 	const root = path.resolve(change.root);
 	const target = path.resolve(change.target);
 	if (!contains(root, target) || target === root || target !== path.resolve(root, change.resource)) {
-		throw new Error(`sandbox adoption path escapes workspace: ${change.resource}`);
+		throw new Error(`sandbox commit path escapes workspace: ${change.resource}`);
 	}
 	await assertNoSymlinkPath(root, target);
 }
@@ -1217,7 +1271,7 @@ async function readRegularState(target: string): Promise<RegularFileState | unde
 	} catch (error) {
 		if (isMissing(error)) return undefined;
 		if (error && typeof error === "object" && "code" in error && error.code === "ELOOP") {
-			throw new Error(`symbolic links are not adoptable sandbox resources: ${target}`, { cause: error });
+			throw new Error(`symbolic links are not committable sandbox resources: ${target}`, { cause: error });
 		}
 		throw error;
 	}
@@ -1283,7 +1337,7 @@ async function restoreChanges(
 	const errors: unknown[] = [];
 	for (const change of [...changes].reverse()) {
 		try {
-			await assertAdoptionTarget(change);
+			await assertCommitTarget(change);
 			const baseline = baselines.get(change);
 			if (!baseline) await rm(change.target, { force: true });
 			else await atomicWrite(change.target, baseline.content, baseline.mode, change.root);
@@ -1291,10 +1345,10 @@ async function restoreChanges(
 			errors.push(error);
 		}
 	}
-	if (errors.length > 0) throw new AggregateError(errors, "failed to restore sandbox adoption changes");
+	if (errors.length > 0) throw new AggregateError(errors, "failed to restore sandbox commit changes");
 }
 
-function resolveAdoptionMode(current: RegularFileState | undefined, change: SandboxFileChange): number | undefined {
+function resolveCommitMode(current: RegularFileState | undefined, change: SandboxFileChange): number | undefined {
 	if (process.platform === "win32") return undefined;
 	if (change.afterMode === undefined) return current?.mode ?? 0o644;
 	if (!current || change.beforeMode === undefined) return change.afterMode;
@@ -1348,7 +1402,7 @@ async function createParentDirectories(sourceRoot: string, target: string): Prom
 	const parent = path.dirname(path.resolve(target));
 	const relative = path.relative(root, parent);
 	if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
-		throw new Error(`sandbox adoption path escapes workspace: ${target}`);
+		throw new Error(`sandbox commit path escapes workspace: ${target}`);
 	}
 	const created: string[] = [];
 	let current = root;
@@ -1361,7 +1415,7 @@ async function createParentDirectories(sourceRoot: string, target: string): Prom
 			if (!(error && typeof error === "object" && "code" in error && error.code === "EEXIST")) throw error;
 			const info = await lstat(current);
 			if (info.isSymbolicLink() || !info.isDirectory()) {
-				throw new Error(`sandbox adoption parent is not a real directory: ${current}`, { cause: error });
+				throw new Error(`sandbox commit parent is not a real directory: ${current}`, { cause: error });
 			}
 		}
 	}

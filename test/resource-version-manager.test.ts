@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
-import { ActionSemanticsRegistry, buildActionKey, PI_ACTION_SEMANTICS } from "../src/common.ts";
+import { ActionSemanticsRegistry, buildActionKey, PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import {
 	captureResourceVersion,
 	closeResourceVersionManagers,
@@ -147,21 +147,6 @@ describe("speculative action resource versions", () => {
 		expect(resourceDependencies(writeAction, root, semantics)).toEqual([]);
 	});
 
-	test("tracks LSP workspace operations across files but keeps document symbols file-scoped", async () => {
-		const root = await workspace();
-		await fs.mkdir(path.join(root, "src"), { recursive: true });
-		await fs.writeFile(path.join(root, "src", "one.ts"), "export const one = 1\n");
-		await fs.writeFile(path.join(root, "src", "two.ts"), "export const two = 2\n");
-		const workspaceToken = await captureResourceVersion(lspAction("diagnostics", "src/one.ts"), root);
-		const documentToken = await captureResourceVersion(lspAction("documentSymbol", "src/one.ts"), root);
-
-		await fs.writeFile(path.join(root, "src", "two.ts"), "export const two = 3\n");
-		await settleWatcher();
-
-		expect((await validateResourceVersion(workspaceToken)).expired).toBe(true);
-		expect((await validateResourceVersion(documentToken)).expired).toBe(false);
-	});
-
 	test("ignores adoption staging files in tree-scoped dependencies", async () => {
 		const root = await workspace();
 		await fs.writeFile(path.join(root, "value.ts"), "one\n");
@@ -257,15 +242,6 @@ function action(tool: "read" | "grep" | "find", resources: ReadonlyArray<string>
 		execution: "resource_cached",
 		resources,
 		input: tool === "read" ? { path: resources[0] } : { path: resources[0], pattern: "*" },
-	});
-}
-
-function lspAction(operation: string, filePath: string) {
-	return buildActionKey({
-		tool: "lsp",
-		execution: "resource_cached",
-		resources: [filePath],
-		input: { operation, filePath, line: 0, character: 0 },
 	});
 }
 

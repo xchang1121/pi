@@ -22,14 +22,9 @@ import {
 	type SourceInfo,
 	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
+import { IDEMPOTENT_ACTION_TOOLS, KEYABLE_TOOLS, SANDBOX_ACTION_TOOLS } from "./action-semantics.ts";
 import { createSpeculativeActionHost } from "./agent-integration.ts";
-import {
-	clampCandidateLimit,
-	DEFAULTS,
-	IDEMPOTENT_ACTION_TOOLS,
-	KEYABLE_TOOLS,
-	SANDBOX_ACTION_TOOLS,
-} from "./common.ts";
+import { clampCandidateLimit, DEFAULTS } from "./common.ts";
 import { createContainerSandboxProcessBackend, DEFAULT_CONTAINER_SANDBOX_IMAGE } from "./container-sandbox.ts";
 import { createNativeSandboxProcessBackend } from "./native-sandbox.ts";
 import { createOciSetupService, type OciSetupService } from "./oci-setup.ts";
@@ -42,10 +37,12 @@ import {
 	type SpeculativeSettingsScope,
 } from "./settings-store.ts";
 import type { ToolInvocation, ToolSettlement } from "./tool-settlement.ts";
+import { emptySpeculativeTraceSummary, reduceSpeculativeTrace, type SpeculativeTraceSummary } from "./trace-summary.ts";
 import {
-	createFallbackSandboxProcessBackend,
+	createSandboxBackendRouter,
 	createWorkspaceSandbox,
-	type SandboxProcessBackend,
+	type SandboxBackendRouter,
+	type SandboxBackendRouterStatus,
 	type SandboxProcessBackendStatus,
 	type SpeculativeAgentSandbox,
 } from "./workspace-sandbox.ts";
@@ -75,7 +72,6 @@ export interface EffectiveSpeculativeActionSettings {
 	readonly resourceCacheMaxEntries: number;
 	readonly resourceCacheMaxBytes: number;
 	readonly predictionTimeoutMs: number;
-	readonly adaptiveDrafter: boolean;
 	readonly isolation: {
 		readonly backend: "auto" | "container" | "native";
 		readonly runtime: "auto" | "docker" | "podman";
@@ -89,74 +85,24 @@ export interface EffectiveSpeculativeActionSettings {
 	};
 }
 
-export interface SpeculativeActionMetrics {
-	readonly started: number;
-	readonly hits: number;
-	readonly misses: number;
-	readonly cancelled: number;
-	readonly actualMs: number;
-	readonly savedMs: number;
-	readonly waitedMs: number;
-	readonly totalDraftTokens: number;
-	readonly cacheCapacity: number;
-	readonly cacheByteCapacity: number;
-	readonly cacheProbation: number;
-	readonly cacheProtected: number;
-	readonly inFlightJobs: number;
-	readonly resultEntries: number;
-	readonly resultBytes: number;
-	readonly branchEntries: number;
-	readonly branchBytes: number;
-	readonly observedWallMs: number;
-	readonly lookupRejections?: Readonly<Record<string, number>>;
-}
+export type SpeculativeActionMetrics = SpeculativeTraceSummary;
 
-interface MutableMetrics {
-	started: number;
-	hits: number;
-	misses: number;
-	cancelled: number;
-	actualMs: number;
-	savedMs: number;
-	waitedMs: number;
-	totalDraftTokens: number;
-	cacheCapacity: number;
-	cacheByteCapacity: number;
-	cacheProbation: number;
-	cacheProtected: number;
-	inFlightJobs: number;
-	resultEntries: number;
-	resultBytes: number;
-	branchEntries: number;
-	branchBytes: number;
-	observedWallMs: number;
-	lookupRejections: Record<string, number>;
-}
-
-export interface SpeculativeSandboxHealth {
-	readonly configured: EffectiveSpeculativeActionSettings["isolation"]["backend"];
-	readonly active: SandboxProcessBackendStatus;
-	readonly oci: SandboxProcessBackendStatus;
-	readonly native: SandboxProcessBackendStatus;
-}
-
-interface ProcessBackends {
-	readonly selected: SandboxProcessBackend;
-	readonly oci: SandboxProcessBackend;
-	readonly native: SandboxProcessBackend;
-}
+export type SpeculativeSandboxHealth = SandboxBackendRouterStatus;
 
 export interface SpeculativeSettingsStore {
 	readonly scope: SpeculativeSettingsScope;
 	readonly load: () => Promise<void>;
-	readonly get: () => SpeculativeActionPackageSettings | undefined;
-	readonly set: (settings: SpeculativeActionPackageSettings | undefined) => void;
+	readonly effective: () => SpeculativeActionPackageSettings | undefined;
+	readonly overlay: () => Readonly<Record<string, unknown>> | undefined;
+	readonly setEffective: (settings: SpeculativeActionPackageSettings) => void;
+	readonly clear: () => void;
 	readonly setScope: (scope: SpeculativeSettingsScope) => void;
 	readonly flush: () => Promise<void>;
 }
 
 interface SpeculativeActionController {
 	readonly settings: () => EffectiveSpeculativeActionSettings;
+	readonly sessionIsolation: () => EffectiveSpeculativeActionSettings["isolation"];
 	readonly settingsScope: () => SpeculativeSettingsScope;
 	readonly setSettingsScope: (scope: SpeculativeSettingsScope) => void;
 	readonly health: () => SpeculativeSandboxHealth | undefined;
@@ -183,7 +129,7 @@ interface SpeculativeActionController {
 }
 
 export interface SpeculativeActionExtensionDependencies {
-	readonly createProcessBackends?: (settings: EffectiveSpeculativeActionSettings) => ProcessBackends;
+	readonly createBackendRouter?: (settings: EffectiveSpeculativeActionSettings) => SandboxBackendRouter;
 	readonly createSandbox?: () => SpeculativeAgentSandbox;
 	readonly createHost?: typeof createSpeculativeActionHost;
 	readonly createSettingsStore?: (cwd: string) => SpeculativeSettingsStore;
@@ -204,7 +150,6 @@ export function normalizeSpeculativeActionSettings(
 		resourceCacheMaxEntries: positiveInteger(input?.resourceCacheMaxEntries, DEFAULTS.resourceCacheMaxEntries),
 		resourceCacheMaxBytes: positiveInteger(input?.resourceCacheMaxBytes, DEFAULTS.resourceCacheMaxBytes),
 		predictionTimeoutMs: positiveInteger(input?.predictionTimeoutMs, DEFAULTS.predictionTimeoutMs),
-		adaptiveDrafter: typeof input?.adaptiveDrafter === "boolean" ? input.adaptiveDrafter : DEFAULTS.adaptiveDrafter,
 		isolation: normalizeIsolation(input?.isolation),
 		patternAware: patternAwareSettings(input?.patternAware ?? PATTERN_AWARE_DEFAULTS),
 		tools: {
@@ -218,58 +163,15 @@ export function normalizeSpeculativeActionSettings(
 	};
 }
 
-export function updateSpeculativeActionMetrics(
-	metrics: SpeculativeActionMetrics,
-	event: SpeculativeActionEvent<string>,
-): SpeculativeActionMetrics {
-	const next: MutableMetrics = { ...metrics, lookupRejections: { ...(metrics.lookupRejections ?? {}) } };
-	if (event.type === "started") next.started++;
-	if (event.type === "hit") {
-		next.hits++;
-		next.savedMs += event.savedMs;
-		next.waitedMs += event.waitedMs;
-	}
-	if (event.type === "miss") next.misses++;
-	if (event.type === "cancelled") next.cancelled++;
-	if (event.type === "actual") next.actualMs += event.actualDurationMs;
-	if ((event.type === "hit" || event.type === "miss") && event.lookup) {
-		for (const rejection of event.lookup.rejections) {
-			next.lookupRejections[rejection.reason] = (next.lookupRejections[rejection.reason] ?? 0) + rejection.count;
-		}
-	}
-	if ("totalDraftTokens" in event) next.totalDraftTokens = Math.max(next.totalDraftTokens, event.totalDraftTokens);
-	next.cacheCapacity = event.cacheCapacity;
-	next.cacheByteCapacity = event.cacheByteCapacity ?? next.cacheByteCapacity;
-	next.cacheProbation = event.cacheProbation;
-	next.cacheProtected = event.cacheProtected;
-	next.inFlightJobs = event.inFlightJobs;
-	next.resultEntries = event.resultEntries;
-	next.resultBytes = event.resultBytes;
-	next.branchEntries = event.branchEntries;
-	next.branchBytes = event.branchBytes;
-	next.observedWallMs = event.observedWallMs ?? next.observedWallMs;
-	return next;
-}
-
 export function formatSpeculativeActionStatus(input: {
 	readonly settings: EffectiveSpeculativeActionSettings;
 	readonly metrics: SpeculativeActionMetrics;
 	readonly health?: SpeculativeSandboxHealth;
 }): string {
 	const { settings, metrics, health } = input;
-	const attempts = Math.max(metrics.started, metrics.hits + metrics.misses);
-	const hitRate = attempts > 0 ? Math.round((metrics.hits / attempts) * 100) : 0;
-	const endToEndSpeedup =
-		metrics.savedMs > 0 && metrics.observedWallMs > 0
-			? (metrics.observedWallMs + metrics.savedMs) / metrics.observedWallMs
-			: 1;
+	const hitRate = Math.round(metrics.hitRate * 100);
 	const activeSandbox = health ? statusSummary(health.active) : "not checked";
-	const lookupRejections = Object.entries(metrics.lookupRejections ?? {})
-		.sort(([leftReason, leftCount], [rightReason, rightCount]) =>
-			rightCount === leftCount ? leftReason.localeCompare(rightReason) : rightCount - leftCount,
-		)
-		.map(([reason, count]) => `${reason}=${count}`)
-		.join(", ");
+	const cache = metrics.cache;
 	return [
 		`Enabled: ${settings.enabled ? "On" : "Off"}`,
 		`Drafter: ${settings.drafterEnabled ? "On" : "Off"}`,
@@ -280,19 +182,20 @@ export function formatSpeculativeActionStatus(input: {
 		`Resource cache memory: ${formatBytes(settings.resourceCacheMaxBytes)}`,
 		`Prediction timeout: ${formatDuration(settings.predictionTimeoutMs)}`,
 		`PatternAware: ${settings.patternAware.enabled ? "On" : "Off"}; multi-step: ${settings.patternAware.multiStepEnabled ? "On" : "Off"} (beam ${settings.patternAware.beamWidth}, depth ${settings.patternAware.maxPredictionDepth}, support ${settings.patternAware.minOccurrences}, binding≥${settings.patternAware.minBindingReplayProbability}, gap ${settings.patternAware.maxFutureGap}, coverage ${formatPercent(settings.patternAware.futureGapCoverage)}, half-life ${settings.patternAware.decayHalfLifeEvents})`,
-		`Adaptive drafter: ${settings.adaptiveDrafter ? "On" : "Off"}`,
 		`Resource-cached tools: ${toolsSummary(settings.tools.resourceCached)}`,
 		`Sandbox-staged tools: ${toolsSummary(settings.tools.sandbox)}`,
 		`Configured isolation: ${settings.isolation.backend}; runtime: ${settings.isolation.runtime}; image: ${settings.isolation.image}; shell: ${settings.isolation.guestShell ?? "image default"}`,
-		`Active sandbox: ${activeSandbox}`,
-		`OCI worker: ${health ? statusSummary(health.oci) : "not checked"}`,
-		`Native sandbox: ${health ? statusSummary(health.native) : "not checked"}`,
-		`Hits: ${metrics.hits}/${attempts} (${hitRate}%); misses: ${metrics.misses}; cancelled: ${metrics.cancelled}`,
-		`Lookup rejections: ${lookupRejections || "none"}`,
-		`Saved: ${formatDuration(metrics.savedMs)}; waited: ${formatDuration(metrics.waitedMs)}; actual: ${formatDuration(metrics.actualMs)}`,
-		`End-to-end speedup: ${endToEndSpeedup.toFixed(3)}x`,
+		`Session isolation: ${health?.configured ?? "not started"}; active: ${activeSandbox}`,
+		`OCI worker: ${health ? statusSummary(health.candidates.container) : "not checked"}`,
+		`Native sandbox: ${health ? statusSummary(health.candidates.native) : "not checked"}`,
+		`Actor actions: ${metrics.speculativeHits}/${metrics.actorActions} speculative hits (${hitRate}%); fallbacks: ${metrics.actorFallbacks}`,
+		`Predictions: ${metrics.predictionsMatched}/${metrics.predictionsObserved} matched (${formatPercent(metrics.predictionPrecision)}); ${metrics.predictionsAdopted}/${metrics.predictionsMatched} adopted (${formatPercent(metrics.adoptionYield)}); unobserved: ${metrics.predictionsSettled - metrics.predictionsObserved}`,
+		`Prediction rejections after match: ${countSummary(metrics.predictionRejectedAfterMatch)}`,
+		`Actor candidate rejections: ${countSummary(metrics.actorCandidateRejections)}`,
+		`Candidates: ${metrics.candidateStarted} started; ${metrics.candidateSucceeded} succeeded; ${metrics.candidateFailed} failed; ${metrics.candidateCancelled} cancelled`,
+		`Execution ahead: ${formatDuration(metrics.executionAheadMs)}; hit latency: ${formatDuration(metrics.hitLatencyMs)}; attempt lead: ${formatDuration(metrics.attemptLeadMs)}; Actor execution: ${formatDuration(metrics.actorExecutionMs)}`,
 		`Draft tokens: ${metrics.totalDraftTokens}`,
-		`Results: ${metrics.resultEntries}/${metrics.cacheCapacity}, ${formatBytes(metrics.resultBytes)}/${formatBytes(metrics.cacheByteCapacity)}; probation: ${metrics.cacheProbation}; protected: ${metrics.cacheProtected}; jobs: ${metrics.inFlightJobs}; branches: ${metrics.branchEntries} (${formatBytes(metrics.branchBytes)})`,
+		`Results: ${cache.resultEntries}/${cache.cacheCapacity}, ${formatBytes(cache.resultBytes)}/${formatBytes(cache.cacheByteCapacity ?? 0)}; cold: ${cache.cacheCold}; hot: ${cache.cacheHot}; jobs: ${cache.inFlightJobs}; branches: ${cache.branchEntries} (${formatBytes(cache.branchBytes)})`,
 		...(health?.active.path ? [`Sandbox path: ${health.active.path}`] : []),
 	].join("\n");
 }
@@ -347,8 +250,7 @@ async function installController(
 	dependencies: SpeculativeActionExtensionDependencies,
 	wrapperSources: Map<string, string>,
 ): Promise<SpeculativeActionController> {
-	const metrics: MutableMetrics = emptyMetrics();
-	let currentMetrics: SpeculativeActionMetrics = metrics;
+	let currentMetrics = emptyMetrics();
 	let health: SpeculativeSandboxHealth | undefined;
 	let ui: ExtensionUIContext | undefined;
 	let latestContext = context;
@@ -360,12 +262,15 @@ async function installController(
 	const settingsStore =
 		dependencies.createSettingsStore?.(context.cwd) ?? new SpeculativeActionSettingsStore(context.cwd);
 	await settingsStore.load();
-	const settings = () => normalizeSpeculativeActionSettings(settingsStore.get());
-	const backends = dependencies.createProcessBackends?.(settings()) ?? createConfiguredProcessBackends(settings());
+	let currentSettings = normalizeSpeculativeActionSettings(settingsStore.effective());
+	const settings = () => currentSettings;
+	const sessionSettings = currentSettings;
+	const backendRouter =
+		dependencies.createBackendRouter?.(sessionSettings) ?? createConfiguredBackendRouter(sessionSettings);
 	const sandbox =
 		dependencies.createSandbox?.() ??
 		createWorkspaceSandbox({
-			processBackend: backends.selected,
+			processBackend: backendRouter,
 		});
 	const piToolSettings = await loadPiToolSettings(context.cwd);
 	const availableTools = new Map(pi.getAllTools().map((tool) => [tool.name, tool]));
@@ -392,7 +297,6 @@ async function installController(
 			ui.setStatus(STATUS_KEY, "spec: off");
 			return;
 		}
-		const attempts = Math.max(currentMetrics.started, currentMetrics.hits + currentMetrics.misses);
 		const conflictText =
 			toolConflicts.size > 0 ? ` · ${toolConflicts.size} tool conflict${toolConflicts.size === 1 ? "" : "s"}` : "";
 		const healthText = health
@@ -402,7 +306,7 @@ async function installController(
 			: "unchecked";
 		ui.setStatus(
 			STATUS_KEY,
-			`spec: on · ${healthText}${conflictText} · ${currentMetrics.hits}/${attempts} hits · ${formatDuration(currentMetrics.savedMs)} saved · ${currentMetrics.resultEntries}/${currentMetrics.cacheCapacity} results (${formatBytes(currentMetrics.resultBytes)}) · ${currentMetrics.inFlightJobs} jobs · ${currentMetrics.branchEntries} branches`,
+			`spec: on · ${healthText}${conflictText} · ${currentMetrics.speculativeHits}/${currentMetrics.actorActions} hits · ${formatDuration(currentMetrics.executionAheadMs)} ahead · ${currentMetrics.cache.resultEntries}/${currentMetrics.cache.cacheCapacity} results (${formatBytes(currentMetrics.cache.resultBytes)}) · ${currentMetrics.cache.inFlightJobs} jobs · ${currentMetrics.cache.branchEntries} branches`,
 		);
 	}
 	const host = (dependencies.createHost ?? createSpeculativeActionHost)(context.sessionManager.getSessionId(), {
@@ -425,7 +329,7 @@ async function installController(
 		sandbox,
 		patternStateDirectory: getAgentDir(),
 		onEvent: (event) => {
-			currentMetrics = updateSpeculativeActionMetrics(currentMetrics, event);
+			currentMetrics = reduceSpeculativeTrace(currentMetrics, event);
 			recentEvents.push(formatSpeculativeActionEvent(event));
 			if (recentEvents.length > RECENT_EVENT_LIMIT) recentEvents.splice(0, recentEvents.length - RECENT_EVENT_LIMIT);
 			renderFooter();
@@ -434,6 +338,7 @@ async function installController(
 
 	const controller: SpeculativeActionController = {
 		settings,
+		sessionIsolation: () => sessionSettings.isolation,
 		settingsScope: () => settingsStore.scope,
 		setSettingsScope: (scope) => settingsStore.setScope(scope),
 		health: () => health,
@@ -442,10 +347,10 @@ async function installController(
 		toolConflicts: () => new Map(toolConflicts),
 		recentEvents: () => [...recentEvents],
 		setSettings: (value) => {
-			settingsStore.set(value);
-			void recoverSpeculation(() =>
-				host.runtime.settingsChanged(normalizeSpeculativeActionSettings(settingsStore.get())),
-			);
+			if (value) settingsStore.setEffective(value);
+			else settingsStore.clear();
+			currentSettings = normalizeSpeculativeActionSettings(settingsStore.effective());
+			void recoverSpeculation(() => host.runtime.settingsChanged(currentSettings));
 			renderFooter();
 		},
 		attachUI: (nextUI) => {
@@ -457,16 +362,7 @@ async function installController(
 			ui = undefined;
 		},
 		refreshHealth: async (refresh = false) => {
-			const [oci, native] = await Promise.all([
-				checkBackend(backends.oci, refresh, "OCI worker"),
-				checkBackend(backends.native, refresh, "native sandbox"),
-			]);
-			health = {
-				configured: settings().isolation.backend,
-				oci,
-				native,
-				active: selectActiveStatus(settings().isolation.backend, oci, native),
-			};
+			health = await backendRouter.inspect({ refresh });
 			renderFooter();
 			return health;
 		},
@@ -585,7 +481,7 @@ async function recoverSpeculation<T>(operation: () => Promise<T>): Promise<T | u
 	}
 }
 
-function createConfiguredProcessBackends(settings: EffectiveSpeculativeActionSettings): ProcessBackends {
+function createConfiguredBackendRouter(settings: EffectiveSpeculativeActionSettings): SandboxBackendRouter {
 	const container = createContainerSandboxProcessBackend({
 		runtime: settings.isolation.runtime,
 		image: settings.isolation.image,
@@ -593,13 +489,10 @@ function createConfiguredProcessBackends(settings: EffectiveSpeculativeActionSet
 		...(settings.isolation.guestShell ? { guestShell: settings.isolation.guestShell } : {}),
 	});
 	const native = createNativeSandboxProcessBackend();
-	const selected =
-		settings.isolation.backend === "container"
-			? container
-			: settings.isolation.backend === "native"
-				? native
-				: createFallbackSandboxProcessBackend([container, native]);
-	return { selected, oci: container, native };
+	return createSandboxBackendRouter(settings.isolation.backend, [
+		{ id: "container", backend: container },
+		{ id: "native", backend: native },
+	]);
 }
 
 interface PiToolSettings {
@@ -788,40 +681,6 @@ function expandHome(value: string): string {
 	return home ? path.join(home, value.slice(2)) : value;
 }
 
-async function checkBackend(
-	backend: SandboxProcessBackend,
-	refresh: boolean,
-	label: string,
-): Promise<SandboxProcessBackendStatus> {
-	try {
-		return await backend.check({ refresh });
-	} catch (error) {
-		return {
-			backend: "workspace",
-			state: "unavailable",
-			source: "none",
-			detail: `${label} probe failed: ${error instanceof Error ? error.message : String(error)}`,
-		};
-	}
-}
-
-function selectActiveStatus(
-	configured: EffectiveSpeculativeActionSettings["isolation"]["backend"],
-	oci: SandboxProcessBackendStatus,
-	native: SandboxProcessBackendStatus,
-): SandboxProcessBackendStatus {
-	if (configured === "container") return oci;
-	if (configured === "native") return native;
-	if (oci.state === "ready") return oci;
-	if (native.state === "ready") return native;
-	return {
-		backend: "workspace",
-		state: "unavailable",
-		source: "none",
-		detail: `${oci.detail}; ${native.detail}`,
-	};
-}
-
 function backendDisplayName(status: SandboxProcessBackendStatus): string {
 	if (status.backend === "container") return "OCI worker";
 	if (status.backend === "native") {
@@ -888,9 +747,13 @@ async function prepareSandboxOnEnable(
 	forceOciSetup = false,
 ): Promise<SpeculativeSandboxHealth> {
 	let health = await controller.refreshHealth(true);
-	const settings = controller.settings();
+	const isolation = controller.sessionIsolation();
 	if ((!forceOciSetup && health.active.state === "ready") || ctx.mode !== "tui") return health;
-	const options = await ociSetup.discover(settings.isolation.runtime);
+	if (!forceOciSetup && health.configured === "native") {
+		ctx.ui.notify(`Native sandbox is unavailable: ${health.candidates.native.detail}`, "warning");
+		return health;
+	}
+	const options = await ociSetup.discover(isolation.runtime);
 	if (options.length === 0) {
 		ctx.ui.notify(
 			"No supported automatic OCI installer was found. Install Docker or Podman manually, then refresh.",
@@ -910,15 +773,15 @@ async function prepareSandboxOnEnable(
 	try {
 		await ociSetup.setup({
 			runtime: selected.runtime,
-			image: settings.isolation.image,
+			image: isolation.image,
 			onProgress: (message) => ctx.ui.setStatus(SETUP_STATUS_KEY, `sandbox setup: ${message}`),
 		});
 		health = await controller.refreshHealth(true);
 		ctx.ui.notify(
-			health.oci.state === "ready"
+			health.candidates.container.state === "ready"
 				? `OCI worker is ready. Active backend: ${backendDisplayName(health.active)}.`
-				: `OCI setup completed, but the worker is not ready: ${health.oci.detail}`,
-			health.oci.state === "ready" ? "info" : "warning",
+				: `OCI setup completed, but the worker is not ready: ${health.candidates.container.detail}`,
+			health.candidates.container.state === "ready" ? "info" : "warning",
 		);
 	} catch (error) {
 		ctx.ui.notify(`Sandbox setup failed: ${error instanceof Error ? error.message : String(error)}`, "error");
@@ -1057,15 +920,11 @@ async function openPredictionSources(ctx: ExtensionContext, controller: Speculat
 		const choice = await ctx.ui.select("Prediction sources", [
 			`Drafter › ${settings.drafterEnabled ? "On" : "Off"}, ${settings.draftModel ?? activeModelReference(ctx)}`,
 			`PatternAware › ${settings.patternAware.enabled ? "On" : "Off"}, ${settings.patternAware.multiStepEnabled ? "multi-step" : "single-step"}`,
-			`Avoid redundant drafting: ${settings.adaptiveDrafter ? "On" : "Off"}`,
 			BACK,
 		]);
 		if (!choice || choice === BACK) return;
 		if (choice.startsWith("Drafter")) await openDrafterSettings(ctx, controller);
 		if (choice.startsWith("PatternAware")) await openPatternAwareSettings(ctx, controller);
-		if (choice.startsWith("Avoid redundant drafting:")) {
-			controller.setSettings({ ...settings, adaptiveDrafter: !settings.adaptiveDrafter });
-		}
 	}
 }
 
@@ -1212,8 +1071,8 @@ async function openToolsAndSandbox(
 			`Tool policy › ${enabledToolCount(settings)} enabled`,
 			`Isolation › ${settings.isolation.backend}, ${settings.isolation.runtime}`,
 			`Active backend: ${activeBackendSummary(controller.health())}`,
-			`OCI worker: ${componentHealthSummary(controller.health()?.oci)}`,
-			`Native sandbox: ${componentHealthSummary(controller.health()?.native)}`,
+			`OCI worker: ${componentHealthSummary(controller.health()?.candidates.container)}`,
+			`Native sandbox: ${componentHealthSummary(controller.health()?.candidates.native)}`,
 			"Install or repair OCI dependencies",
 			"Isolation guarantees",
 			BACK,
@@ -1232,8 +1091,8 @@ async function openToolsAndSandbox(
 				[
 					`Configured: ${health.configured}`,
 					`Active: ${statusSummary(health.active)}`,
-					`OCI worker: ${statusSummary(health.oci)}`,
-					`Native sandbox: ${statusSummary(health.native)}`,
+					`OCI worker: ${statusSummary(health.candidates.container)}`,
+					`Native sandbox: ${statusSummary(health.candidates.native)}`,
 				].join("\n"),
 				health.active.state === "ready" ? "info" : "warning",
 			);
@@ -1243,14 +1102,14 @@ async function openToolsAndSandbox(
 				ctx.ui.notify("Apply the pending isolation settings before preparing their dependencies.", "warning");
 				continue;
 			}
-			const before = controller.health()?.oci;
+			const before = controller.health()?.candidates.container;
 			const health = await prepareSandboxOnEnable(ctx, controller, ociSetup, true);
-			if (health.oci.state === "ready" && before?.state === "ready")
-				ctx.ui.notify(`OCI worker ready: ${health.oci.detail}`, "info");
+			if (health.candidates.container.state === "ready" && before?.state === "ready")
+				ctx.ui.notify(`OCI worker ready: ${health.candidates.container.detail}`, "info");
 		}
 		if (choice === "Isolation guarantees") {
 			ctx.ui.notify(
-				"Speculative file edits run in private Git worktrees. Bash additionally runs in the selected process boundary: an OCI worker, or the native OS sandbox. Git for Windows requires OCI because MSYS cannot initialize in AppContainer. Only conflict-checked file changes are adopted; failed candidates are discarded and the actor executes normally.",
+				"Speculative file edits run in private Git worktrees. Bash additionally runs in the selected process boundary: an OCI worker, or the native OS sandbox. Git for Windows requires OCI because MSYS cannot initialize in AppContainer. Only conflict-checked file changes are committed; failed candidates are discarded and the actor executes normally.",
 				"info",
 			);
 		}
@@ -1538,37 +1397,57 @@ function showRecentEvents(ctx: ExtensionContext, controller: SpeculativeActionCo
 
 export function formatSpeculativeActionEvent(event: SpeculativeActionEvent<string>): string {
 	const parts = [`[${event.type}]`];
-	if ("tool" in event && event.tool) parts.push(event.tool);
-	if (event.type === "hit") parts.push(event.sources.join("+"));
-	else if ("source" in event) parts.push(event.source);
 	switch (event.type) {
-		case "started":
-			parts.push(`predicted ${compactEventText(event.predictedAction)}`);
-			break;
-		case "completed":
-			parts.push(`completed in ${formatDuration(event.executionMs)}`);
-			break;
-		case "hit":
-			parts.push(`${formatDuration(event.savedMs)} saved`, `${formatDuration(event.waitedMs)} waited`);
-			break;
-		case "miss":
-			parts.push(event.reason);
-			if (event.detail) parts.push(compactEventText(event.detail));
-			break;
-		case "cancelled":
-			parts.push(event.reason);
-			if (event.detail) parts.push(compactEventText(event.detail));
-			break;
-		case "actual":
-			parts.push(`${formatDuration(event.actualDurationMs)} actual`, compactEventText(event.actualAction));
-			break;
-		case "cache":
+		case "source_request":
 			parts.push(
-				`${event.resultEntries}/${event.cacheCapacity} results (${event.cacheProbation} probation, ${event.cacheProtected} protected), ${event.inFlightJobs} jobs, ${event.branchEntries} branches`,
+				event.request.request.source,
+				event.request.settlement.status,
+				formatDuration(event.request.durationMs),
 			);
 			break;
+		case "prediction": {
+			const settlement = event.settlement;
+			parts.push(settlement.prediction.source, settlement.prediction.actionID);
+			if (settlement.observation === "unobserved") parts.push(`unobserved ${causeSummary(settlement.cause)}`);
+			else if (!settlement.match.matched) parts.push("not matched");
+			else if (settlement.match.adoption.status === "adopted") parts.push("matched and adopted");
+			else parts.push(`matched, rejected ${causeSummary(settlement.match.adoption.cause)}`);
+			break;
+		}
+		case "candidate":
+			parts.push(event.candidate.tool, event.candidate.source, event.state.status);
+			if (event.state.status === "running") {
+				parts.push(`predicted ${compactEventText(event.candidate.predictedAction)}`);
+			} else if (event.state.status === "succeeded") {
+				parts.push(formatDuration(event.state.executionMs));
+			} else {
+				parts.push(causeSummary(event.state.cause), formatDuration(event.state.executionMs));
+			}
+			break;
+		case "actor_action": {
+			const sources = [...new Set(event.settlement.matchedPredictions.map((prediction) => prediction.source))];
+			parts.push(
+				event.settlement.tool,
+				sources.join("+") || (event.settlement.provider.kind === "speculative" ? "cache" : "no prediction"),
+			);
+			if (event.settlement.provider.kind === "speculative") {
+				parts.push(
+					`${formatDuration(event.settlement.provider.timing.executionAheadMs)} ahead`,
+					`${formatDuration(event.settlement.provider.timing.hitLatencyMs)} hit latency`,
+					`${formatDuration(event.settlement.provider.timing.attemptLeadMs)} attempt lead`,
+				);
+			} else {
+				parts.push(`${formatDuration(event.settlement.provider.durationMs)} Actor execution`);
+			}
+			parts.push(compactEventText(event.actualAction));
+			break;
+		}
 	}
 	return parts.join(" · ");
+}
+
+function causeSummary(value: { readonly stage: string; readonly code: string; readonly detail?: string }): string {
+	return `${value.stage}:${value.code}${value.detail ? ` (${compactEventText(value.detail)})` : ""}`;
 }
 
 function compactEventText(value: string): string {
@@ -1611,28 +1490,22 @@ async function resolveDraftOptions(input: {
 	return { ...base, apiKey: auth.apiKey, headers: auth.headers, env: auth.env };
 }
 
-function emptyMetrics(): MutableMetrics {
-	return {
-		started: 0,
-		hits: 0,
-		misses: 0,
-		cancelled: 0,
-		actualMs: 0,
-		savedMs: 0,
-		waitedMs: 0,
-		totalDraftTokens: 0,
+function emptyMetrics(): SpeculativeActionMetrics {
+	return emptySpeculativeTraceSummary({
 		cacheCapacity: DEFAULTS.resourceCacheMaxEntries,
 		cacheByteCapacity: DEFAULTS.resourceCacheMaxBytes,
-		cacheProbation: 0,
-		cacheProtected: 0,
+		cacheCold: 0,
+		cacheHot: 0,
 		inFlightJobs: 0,
 		resultEntries: 0,
 		resultBytes: 0,
 		branchEntries: 0,
 		branchBytes: 0,
-		observedWallMs: 0,
-		lookupRejections: {},
-	};
+		exclusiveCandidates: 0,
+		sharedCandidates: 0,
+		cacheTools: [],
+		cacheExecutions: [],
+	});
 }
 
 function supportedTools(value: unknown, fallback: readonly string[], allowed: readonly string[]): readonly string[] {
@@ -1716,6 +1589,13 @@ function toolCategory(tool: string): number {
 
 function toolsSummary(tools: readonly string[]): string {
 	return tools.length > 0 ? tools.join(" ") : "none";
+}
+
+function countSummary(counts: Readonly<Record<string, number>>): string {
+	const entries = Object.entries(counts).sort(([leftKey, left], [rightKey, right]) =>
+		right === left ? leftKey.localeCompare(rightKey) : right - left,
+	);
+	return entries.length > 0 ? entries.map(([key, count]) => `${key}=${count}`).join(", ") : "none";
 }
 
 function formatDuration(ms: number): string {

@@ -62,10 +62,10 @@ package 只会在受信任项目中预执行候选动作。交互模式下可运
 成功开启后，底部状态栏会出现类似信息：
 
 ```text
-spec: on · Windows AppContainer · 3/4 hits · 1.2s saved · 5/512 results
+spec: on · Windows AppContainer · 3/4 hits · 1.2s ahead · 5/512 results
 ```
 
-首次运行或模板尚未学习时，命中率可能较低。完成若干包含重复 `read`、`grep`、`find` 或 `bash` 工作流的任务后，再观察 `Hits`、`Saved` 和 `End-to-end speedup`。
+首次运行或模板尚未学习时，命中率可能较低。完成若干包含重复 `read`、`grep`、`find` 或 `bash` 工作流的任务后，再观察 `Hits` 和 `Execution ahead`。
 
 ## 命令
 
@@ -121,7 +121,6 @@ spec: on · Windows AppContainer · 3/4 hits · 1.2s saved · 5/512 results
   "resourceCacheMaxEntries": 512,
   "resourceCacheMaxBytes": 268435456,
   "predictionTimeoutMs": 300000,
-  "adaptiveDrafter": true,
   "isolation": {
     "backend": "auto",
     "runtime": "auto",
@@ -171,7 +170,7 @@ OCI worker: unavailable (...)
 Native sandbox: Windows AppContainer ready (...)
 ```
 
-worker 池会预先准备执行 slot，并在 branch 工作区及其 Actor 逻辑路径确定后创建一次性容器。每条命令结束后会删除整个容器再复用 slot，因此未采纳的进程树、根文件系统修改和临时文件不会泄漏到其他 branch。源工作区从不挂载进容器；worker 只能看到 branch 副本，且网络被禁用。在兼容的 OCI guest 中，该副本会挂载到 Actor 的逻辑工作区路径，原命令中的绝对路径无需改写即可保持语义。Linux worker 还使用只读根文件系统、删除全部 capability、`no-new-privileges`、PID 上限，并在可用时使用宿主 UID/GID。
+worker 池会预先准备执行 slot，并在 branch 工作区及其 Actor 逻辑路径确定后创建一次性容器。每条命令结束后会删除整个容器再复用 slot，因此被丢弃的进程树、根文件系统修改和临时文件不会泄漏到其他 branch。源工作区从不挂载进容器；worker 只能看到 branch 副本，且网络被禁用。在兼容的 OCI guest 中，该副本会挂载到 Actor 的逻辑工作区路径，原命令中的绝对路径无需改写即可保持语义。Linux worker 还使用只读根文件系统、删除全部 capability、`no-new-privileges`、PID 上限，并在可用时使用宿主 UID/GID。
 
 内置镜像运行 Linux Bash，可通过 Windows 上的 Docker Desktop，以及 Linux/macOS 上的 Docker/Podman 使用。如果必须精确复现 Git for Windows 行为，可提供 Windows 容器镜像，并把 `guestShell` 设置为 `C:\\Program Files\\Git\\bin\\bash.exe`。配置的镜像 ID、OS、架构、runtime 和 guest shell 都会进入 K(a) 的 execution-world fingerprint，改变任一项都会使旧投机结果失效。
 
@@ -189,7 +188,7 @@ npm run build:native --workspace @earendil-works/pi-speculative-action
 
 Windows 的 `auto` 会先尝试 OCI，再回退 AppContainer。AppContainer 不设命令白名单，可运行兼容的原生 shell，但 Git for Windows 的 MSYS runtime 无法在该边界内完成初始化。需要投机 Git Bash 时应使用 OCI；否则失败候选会由 Scheduler 丢弃，Actor 再按正常路径执行，且不影响 `write`、`edit` 和资源缓存类投机。
 
-`ExecutionWorld` 是 Agent adapter 使用的隔离边界。`ActionSemanticsRegistry` 选择 world mode（`file_mutation` 或 `workspace_snapshot`），world 不再维护第二份硬编码工具列表。完成的 `WorldBranch` 会把工具输出、可提升的文件系统 delta 和不可变 checkpoint 一起封存。与来源无关的 Scheduler 可以在 Actor 采纳前从 checkpoint 派生后续沙箱动作，但真正匹配时仍要求祖先动作按 Actor 顺序完成采纳。进程内 cwd/环境状态以及被阻断的网络副作用不会被提升；并发消费者会合并到同一次经过冲突校验的事务式 adoption，而未被采用的 branch 无法改变 Actor 所在的 world。Linux 原生隔离还会在 mount namespace 内把私有 branch 投影到 Actor 的逻辑工作区路径。
+`ExecutionWorld` 是 Agent adapter 使用的隔离边界。`ActionSemanticsRegistry` 选择 world mode（`file_mutation` 或 `workspace_snapshot`），world 不再维护第二份硬编码工具列表。完成的 `WorldBranch` 会把工具输出、可提交的文件系统 delta 和不可变 checkpoint 一起封存。与来源无关的 Scheduler 可以在 Actor 确认前从 checkpoint 派生后续沙箱动作，而 Actor 匹配仍按顺序遵循已确认的祖先动作意图。进程内 cwd/环境状态以及被阻断的网络副作用不会越过隔离边界。World commit 会检查冲突且至多发生一次；未提交的 branch 无法改变 Actor 所在的 world。Linux 原生隔离还会在 mount namespace 内把私有 branch 投影到 Actor 的逻辑工作区路径。
 
 若所有已配置后端都不可用，Bash 投机会 fail closed，并回退到 Actor 的正常 Bash 执行。
 
@@ -202,10 +201,10 @@ Windows 的 `auto` 会先尝试 OCI，再回退 AppContainer。AppContainer 不�
 | `Started` 的间接计数 | 已实际启动的投机候选；状态中命中分母会综合 started、hit 和 miss |
 | `Hits` | Actor 动作成功复用了投机结果 |
 | `Misses` | 预测未被采用、资源失效或安全检查拒绝 |
-| `Saved` | 因提前执行而估算节省的工具等待时间 |
-| `Waited` | Actor 命中尚未完成的投机动作后实际等待的时间 |
+| `Execution ahead` | 被采纳的工具执行在 Actor 拦截前已经运行的时间，各次命中均以该次实测执行时长为上限 |
+| `Hit latency` | 从 Actor 拦截到采纳结果完成必要的校验、剩余执行、投影、必要的 world commit 和同步命中结算的时间 |
+| `Attempt lead` | 产生该执行所有者候选的请求到 Actor 拦截之间的诊断时间差 |
 | `Actual` | 未命中后 Actor 原生工具执行时间 |
-| `End-to-end speedup` | 根据观测墙钟时间和 saved 时间计算的会话内指标 |
 | `Draft tokens` | Drafter 累计 token 用量 |
 | `Cache` | 当前缓存项、容量、内存占用和运行中任务数 |
 | `Configured isolation` | 用户请求的后端策略及 OCI runtime/image 配置 |
@@ -213,7 +212,7 @@ Windows 的 `auto` 会先尝试 OCI，再回退 AppContainer。AppContainer 不�
 | `OCI worker` | Docker/Podman worker 健康状态，与原生状态独立 |
 | `Native sandbox` | AppContainer/Seatbelt/Linux 原生沙箱状态，与 OCI 状态独立 |
 
-判断真实收益时，应以相同任务、模型和环境下的 baseline/full 配对墙钟时间为准，不应只根据 `Saved` 推断端到端加速。
+`Execution ahead` 是直接观测到的执行重叠量，不是反事实“节省时间”：已完成的缓存动作最多贡献其真实执行时长，仍在运行的动作只贡献 Actor 拦截前已经执行的部分。`Attempt lead` 可能大得多，但只用于诊断。这些指标都不虚构未发生的 Actor 工具路径；判断端到端收益仍应比较相同任务、模型和环境下的 baseline/full 配对墙钟时间。
 
 ## 常用消融配置
 
@@ -299,7 +298,7 @@ package 只通过 Pi 原生公开 API 接入：生命周期事件提供模型上
 - 已开启但一直没有候选：确认项目已信任，并检查是否关闭了 Drafter 和 PatternAware。
 - 有候选但没有命中：预测动作必须与 Actor 的工具名和规范化参数匹配；资源变化也会让候选失效。
 - PatternAware 初期没有效果：它需要先观察重复工作流；冷启动阶段主要依赖 Drafter。
-- Drafter 成本偏高：启用 `adaptiveDrafter`，或指定更快、更便宜的 `draftModel`。
+- Drafter 成本偏高：指定更快、更便宜的 `draftModel`，或降低 `candidateLimit`。
 - 开发模式缺少模型 JSON：在仓库根目录运行 `npm run hydrate:model-data`。
 
 ## 实现概览

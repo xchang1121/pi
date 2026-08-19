@@ -14,11 +14,12 @@ export interface SpeculativeActionPackageSettings extends SpeculativeAgentSettin
 }
 
 export type SpeculativeSettingsScope = "global" | "project";
+type SettingsOverlay = Record<string, unknown>;
 
 /** Extension-owned configuration; Pi's settings schema remains untouched. */
 export class SpeculativeActionSettingsStore {
-	private global: SpeculativeActionPackageSettings | undefined;
-	private project: SpeculativeActionPackageSettings | undefined;
+	private global: SettingsOverlay | undefined;
+	private project: SettingsOverlay | undefined;
 	private scopeValue: SpeculativeSettingsScope = "global";
 	private writeQueue = Promise.resolve();
 
@@ -43,13 +44,28 @@ export class SpeculativeActionSettingsStore {
 		this.scopeValue = scope;
 	}
 
-	get(): SpeculativeActionPackageSettings | undefined {
+	effective(): SpeculativeActionPackageSettings | undefined {
 		return mergeSettings(this.global, this.project);
 	}
 
-	set(value: SpeculativeActionPackageSettings | undefined): void {
-		if (this.scopeValue === "project") this.project = clone(value);
-		else this.global = clone(value);
+	overlay(): Readonly<Record<string, unknown>> | undefined {
+		return clone(this.scopeValue === "project" ? this.project : this.global);
+	}
+
+	setEffective(value: SpeculativeActionPackageSettings): void {
+		if (this.scopeValue === "project") this.project = settingsDiff(this.global, value);
+		else this.global = clone(value) as SettingsOverlay;
+		this.persistSelected();
+	}
+
+	clear(): void {
+		if (this.scopeValue === "project") this.project = undefined;
+		else this.global = undefined;
+		this.persistSelected();
+	}
+
+	private persistSelected(): void {
+		const value = this.scopeValue === "project" ? this.project : this.global;
 		const target = this.scopeValue === "project" ? this.projectPath : this.globalPath;
 		const snapshot = clone(value);
 		this.writeQueue = this.writeQueue.then(() => writeSettings(target, snapshot));
@@ -68,17 +84,17 @@ export class SpeculativeActionSettingsStore {
 	}
 }
 
-async function readSettings(file: string): Promise<SpeculativeActionPackageSettings | undefined> {
+async function readSettings(file: string): Promise<SettingsOverlay | undefined> {
 	try {
 		const parsed: unknown = JSON.parse(await readFile(file, "utf8"));
-		return isRecord(parsed) ? (parsed as SpeculativeActionPackageSettings) : undefined;
+		return isRecord(parsed) && Object.keys(parsed).length > 0 ? parsed : undefined;
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT" || error instanceof SyntaxError) return undefined;
 		throw error;
 	}
 }
 
-async function writeSettings(file: string, value: SpeculativeActionPackageSettings | undefined): Promise<void> {
+async function writeSettings(file: string, value: SettingsOverlay | undefined): Promise<void> {
 	if (!value) {
 		await rm(file, { force: true });
 		return;
@@ -90,18 +106,75 @@ async function writeSettings(file: string, value: SpeculativeActionPackageSettin
 }
 
 function mergeSettings(
-	global: SpeculativeActionPackageSettings | undefined,
-	project: SpeculativeActionPackageSettings | undefined,
+	global: SettingsOverlay | undefined,
+	project: SettingsOverlay | undefined,
 ): SpeculativeActionPackageSettings | undefined {
-	if (!global) return clone(project);
-	if (!project) return clone(global);
-	return {
-		...global,
-		...project,
-		patternAware: { ...global.patternAware, ...project.patternAware },
-		tools: { ...global.tools, ...project.tools },
-		isolation: { ...global.isolation, ...project.isolation },
-	};
+	const merged = applyOverlay(global, project);
+	return merged && Object.keys(merged).length > 0 ? (merged as SpeculativeActionPackageSettings) : undefined;
+}
+
+function settingsDiff(
+	base: SettingsOverlay | undefined,
+	target: SpeculativeActionPackageSettings,
+): SettingsOverlay | undefined {
+	const difference = diffRecord(base ?? {}, target as SettingsOverlay);
+	return Object.keys(difference).length > 0 ? difference : undefined;
+}
+
+function applyOverlay(
+	base: SettingsOverlay | undefined,
+	overlay: SettingsOverlay | undefined,
+): SettingsOverlay | undefined {
+	if (!base && !overlay) return undefined;
+	const result: SettingsOverlay = clone(base) ?? {};
+	for (const [key, value] of Object.entries(overlay ?? {})) {
+		if (value === null) {
+			delete result[key];
+		} else if (isRecord(value)) {
+			const nested = applyOverlay(isRecord(result[key]) ? result[key] : undefined, value);
+			if (nested && Object.keys(nested).length > 0) result[key] = nested;
+			else delete result[key];
+		} else {
+			result[key] = clone(value);
+		}
+	}
+	return result;
+}
+
+function diffRecord(base: SettingsOverlay, target: SettingsOverlay): SettingsOverlay {
+	const result: SettingsOverlay = {};
+	for (const key of new Set([...Object.keys(base), ...Object.keys(target)])) {
+		const baseHas = Object.hasOwn(base, key);
+		const targetHas = Object.hasOwn(target, key);
+		if (!targetHas) {
+			if (baseHas) result[key] = null;
+			continue;
+		}
+		const before = base[key];
+		const after = target[key];
+		if (equalValue(before, after)) continue;
+		if (isRecord(before) && isRecord(after)) {
+			const nested = diffRecord(before, after);
+			if (Object.keys(nested).length > 0) result[key] = nested;
+		} else {
+			result[key] = clone(after);
+		}
+	}
+	return result;
+}
+
+function equalValue(left: unknown, right: unknown): boolean {
+	if (Object.is(left, right)) return true;
+	if (Array.isArray(left) && Array.isArray(right)) {
+		return left.length === right.length && left.every((value, index) => equalValue(value, right[index]));
+	}
+	if (!isRecord(left) || !isRecord(right)) return false;
+	const leftKeys = Object.keys(left);
+	const rightKeys = Object.keys(right);
+	return (
+		leftKeys.length === rightKeys.length &&
+		leftKeys.every((key) => Object.hasOwn(right, key) && equalValue(left[key], right[key]))
+	);
 }
 
 function clone<T>(value: T | undefined): T | undefined {

@@ -1,8 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { READ_RANGE_ACTION_KEY_PROJECTOR } from "../src/action-key-projection.ts";
+import { type ActionKey, actionKeyCovers, buildPiActionKey } from "../src/action-semantics.ts";
 import { ActionStore, ResultCache, speculativeCacheValue } from "../src/candidate-stores.ts";
-import type { ActionKey } from "../src/common.ts";
-import { actionKeyCovers, buildPiActionKey } from "../src/common.ts";
 
 interface Entry {
 	readonly id: string;
@@ -36,24 +35,6 @@ describe("ActionStore", () => {
 		expect(store.lookup("two", requested.key)).toEqual([]);
 	});
 
-	it("deletes by identity and enforces count and byte bounds without evicting a protected target", () => {
-		const store = new ActionStore<string, Entry>();
-		const first = entry("first", "a.ts", 1, 20, 4);
-		const second = entry("second", "b.ts", 1, 20, 8);
-		const newest = entry("newest", "c.ts", 1, 20, 16);
-		store.insert("session", first);
-		store.insert("session", second);
-		store.insert("session", newest);
-
-		expect(store.delete("session", entry("impostor", "a.ts", 1, 20, 4))).toBe(false);
-		expect(store.trim("session", { maxEntries: 2, maxBytes: 20 }, (item) => item !== newest)).toEqual([
-			first,
-			second,
-		]);
-		expect(store.values("session")).toEqual([newest]);
-		expect(store.snapshot("session")).toEqual({ entries: 1, bytes: 16 });
-	});
-
 	it("keeps distinct exact owners when their execution contexts cannot be reused", () => {
 		const store = new ActionStore<string, Entry>([], true);
 		const root = entry("root", "same.ts");
@@ -74,7 +55,7 @@ describe("ActionStore", () => {
 });
 
 describe("ResultCache", () => {
-	it("evicts the least valuable probation entry before actor-validated results", () => {
+	it("owns reuse evidence independently from cold/hot retention", () => {
 		const cache = new ResultCache<string, Entry>([], (item) =>
 			item.id === "valuable" ? 100 : item.id === "shared" ? 1 : Number.NaN,
 		);
@@ -85,22 +66,22 @@ describe("ResultCache", () => {
 		cache.insert("two", shared);
 		cache.insert("one", valuable);
 		cache.recordActorHit("one", shared);
-		expect(cache.recordActorHit("one", valuable, { maxEntries: 2, maxBytes: 16, protectedFraction: 0.5 })).toEqual([
+		expect(cache.recordActorHit("one", valuable, { maxEntries: 2, maxBytes: 16, hotFraction: 0.5 })).toEqual([
 			shared,
 		]);
 		cache.insert("one", worthless);
 
-		expect(cache.stateOf("one", shared)).toBe("probation");
-		expect(cache.stateOf("one", valuable)).toBe("protected");
-		expect(cache.stateOf("two", shared)).toBe("probation");
+		expect(cache.evidenceOf("one", shared)).toMatchObject({ segment: "cold", actorHits: 1, actorSteps: 0 });
+		expect(cache.evidenceOf("one", valuable)).toMatchObject({ segment: "hot", actorHits: 1, actorSteps: 0 });
+		expect(cache.evidenceOf("two", shared)).toMatchObject({ segment: "cold", actorHits: 0, actorSteps: 0 });
 		expect(cache.trim("one", { maxEntries: 2, maxBytes: 16 })).toEqual([worthless]);
 		expect(cache.trim("one", { maxEntries: 1, maxBytes: 8 })).toEqual([shared]);
 		expect(cache.values("one")).toEqual([valuable]);
 		expect(cache.snapshot("one")).toEqual({
-			probationEntries: 0,
-			protectedEntries: 1,
-			probationBytes: 0,
-			protectedBytes: 8,
+			coldEntries: 0,
+			hotEntries: 1,
+			coldBytes: 0,
+			hotBytes: 8,
 		});
 	});
 
@@ -122,7 +103,7 @@ describe("ResultCache", () => {
 		expect(branches.values("session")).toEqual([branch]);
 	});
 
-	it("expires only unvalidated probation after bounded actor opportunities or wall time", () => {
+	it("ages only cold entries by explicit Actor steps or cold-segment wall time", () => {
 		let now = 1_000;
 		const cache = new ResultCache<string, Entry>(
 			[],
@@ -130,38 +111,38 @@ describe("ResultCache", () => {
 			() => now,
 		);
 		const missed = entry("missed", "missed.ts");
-		const protectedEntry = entry("protected", "protected.ts");
+		const hotEntry = entry("hot", "hot.ts");
 		cache.insert("session", missed);
-		cache.insert("session", protectedEntry);
-		cache.recordActorHit("session", protectedEntry);
+		cache.insert("session", hotEntry);
+		cache.recordActorHit("session", hotEntry);
 
-		const policy = { maxAgeMs: 1_000, maxOpportunities: 2 };
-		expect(cache.advanceActorOpportunity("session", policy)).toEqual([]);
-		expect(cache.advanceActorOpportunity("session", policy)).toEqual([]);
-		expect(cache.advanceActorOpportunity("session", policy)).toEqual([missed]);
-		expect(cache.stateOf("session", protectedEntry)).toBe("protected");
+		const policy = { maxAgeMs: 1_000, maxActorSteps: 2 };
+		expect(cache.advanceActorStep("session", policy)).toEqual([]);
+		expect(cache.advanceActorStep("session", policy)).toEqual([]);
+		expect(cache.advanceActorStep("session", policy)).toEqual([missed]);
+		expect(cache.evidenceOf("session", hotEntry)).toMatchObject({ segment: "hot", actorHits: 1, actorSteps: 0 });
 
 		const timedOut = entry("timed-out", "timed.ts");
 		cache.insert("session", timedOut);
 		now += 1_000;
-		expect(cache.advanceActorOpportunity("session", policy)).toEqual([timedOut]);
+		expect(cache.advanceActorStep("session", policy)).toEqual([timedOut]);
 	});
 
 	it("decays proven reuse value while keeping validation and projection costs honest", () => {
 		const base = {
 			executionMs: 100,
-			validationMs: 10,
-			projectionMs: 5,
+			expectedValidationMs: 10,
+			expectedProjectionMs: 5,
 			bytes: 4_096,
-			createdAt: 0,
+			insertedAt: 0,
 		};
-		const freshProtected = speculativeCacheValue({ ...base, hits: 1, lastHitAt: 0 }, 0, 1_000);
-		const agedProtected = speculativeCacheValue({ ...base, hits: 1, lastHitAt: 0 }, 1_000, 1_000);
-		const freshProbation = speculativeCacheValue({ ...base, hits: 0 }, 0, 1_000);
+		const freshHot = speculativeCacheValue({ ...base, actorHits: 1, lastActorHitAt: 0 }, 0, 1_000);
+		const agedHot = speculativeCacheValue({ ...base, actorHits: 1, lastActorHitAt: 0 }, 1_000, 1_000);
+		const freshCold = speculativeCacheValue({ ...base, actorHits: 0 }, 0, 1_000);
 
-		expect(freshProtected).toBeGreaterThan(agedProtected);
-		expect(agedProtected).toBeGreaterThan(freshProbation);
-		expect(speculativeCacheValue({ ...base, hits: 3, validationMs: 100 }, 0, 1_000)).toBe(0);
+		expect(freshHot).toBeGreaterThan(agedHot);
+		expect(agedHot).toBeGreaterThan(freshCold);
+		expect(speculativeCacheValue({ ...base, actorHits: 3, expectedValidationMs: 100 }, 0, 1_000)).toBe(0);
 	});
 });
 

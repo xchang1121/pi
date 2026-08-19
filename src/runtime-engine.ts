@@ -1,0 +1,2131 @@
+import type { ActionProjectionCoverage, ActionProjectionRule } from "./action-key-projection.ts";
+import type {
+	ActionKey,
+	ActionKeyMatch,
+	ActionSemanticsRegistry,
+	ProjectedActionKeyMatch,
+} from "./action-semantics.ts";
+import { actionKeyMatch, PI_ACTION_SEMANTICS } from "./action-semantics.ts";
+import { ActorAction } from "./actor-action.ts";
+import { CandidateExecution, type CandidateReservation, CandidateResources } from "./candidate-execution.ts";
+import { ActionStore, ResultCache, type ResultCacheEvidence, speculativeCacheValue } from "./candidate-stores.ts";
+import { DEFAULTS, type DrafterToolDefinition } from "./common.ts";
+import { diagnosticAction } from "./diagnostics.ts";
+import type { CandidateEventDescriptor, CandidateExecutionProjection } from "./events.ts";
+import type { WorldBranch } from "./execution-world.ts";
+import type { PlanUpdate } from "./plan-proposal.ts";
+import { PlanRuntime, type PlanRuntimeNode, type PredictionOpportunity, type RetiredPlanNode } from "./plan-runtime.ts";
+import { PostSettlementQueue } from "./post-settlement.ts";
+import { resourceProfile } from "./resource-budget.ts";
+import type {
+	CandidatePreflight,
+	SpeculativeActionEvent,
+	SpeculativeActionRuntime,
+	SpeculativeActionRuntimeAdapter,
+	SpeculativeActionSettings,
+	SpeculativeCacheSnapshot,
+	SpeculativeCandidate,
+	SpeculativeDraftCandidate,
+	SpeculativePlanSource,
+	SpeculativeRuntimeInspection,
+} from "./runtime.ts";
+import { type PredictionForecast, SpeculationScheduler } from "./scheduler.ts";
+import type {
+	ActorActionIdentity,
+	PlanActionIdentity,
+	PredictionAdoption,
+	PredictionSettlement,
+	ResolutionCause,
+	ResourceValidation,
+	SettledSourceRequest,
+} from "./settlement.ts";
+import { cause, zeroValidationMetrics } from "./settlement.ts";
+import { runSourceRequest, SourceGeneration, type SourceRequestResult } from "./source-request.ts";
+
+interface TurnInput<SessionID> {
+	readonly sessionID: SessionID;
+	readonly turnID: string;
+	readonly terminal?: boolean;
+}
+
+class CandidateFailure extends Error {
+	readonly failure: ResolutionCause;
+
+	constructor(failure: ResolutionCause) {
+		super(failure.detail ?? failure.code);
+		this.failure = failure;
+	}
+}
+
+function uniqueProjectionRules<Output>(
+	rules: readonly ActionProjectionRule<Output>[],
+	semantics: ActionSemanticsRegistry,
+): readonly ActionProjectionRule<Output>[] {
+	const unique = new Map<string, ActionProjectionRule<Output>>();
+	for (const rule of rules) {
+		if (semantics.supportsProjector(rule.id) && !unique.has(rule.id)) unique.set(rule.id, rule);
+	}
+	return [...unique.values()];
+}
+
+function asUpdates(value: PlanUpdate | readonly PlanUpdate[] | undefined): readonly PlanUpdate[] {
+	return value === undefined ? [] : Array.isArray(value) ? value : [value as PlanUpdate];
+}
+
+function reservationAvailable(reservation: CandidateReservation): boolean {
+	return reservation.kind === "shared" ? reservation.owners.length === 0 : reservation.status === "available";
+}
+
+function updateSource(update: PlanUpdate): string {
+	return "actions" in update ? update.source : update.source;
+}
+
+function immediateOnly(update: PlanUpdate): PlanUpdate {
+	if ("actions" in update) {
+		return {
+			...update,
+			actions: update.actions.filter(
+				(action) =>
+					action.type === "tool_call" &&
+					finiteMetric(action.horizon) === 0 &&
+					(action.dependsOn?.length ?? 0) === 0,
+			),
+		};
+	}
+	return { ...update, upsert: [], remove: update.remove };
+}
+
+function requestCount(value: number | undefined): number {
+	return typeof value === "number" && Number.isFinite(value) ? Math.max(1, Math.min(64, Math.floor(value))) : 1;
+}
+
+function concurrentLimit(settings: SpeculativeActionSettings): number {
+	const value = settings.maxConcurrentActions ?? DEFAULTS.maxConcurrentActions;
+	return Number.isFinite(value) ? Math.max(1, Math.floor(value)) : 1;
+}
+
+function cacheEntryLimit(settings: SpeculativeActionSettings): number {
+	return Number.isFinite(settings.resourceCacheMaxEntries)
+		? Math.max(1, Math.floor(settings.resourceCacheMaxEntries))
+		: 1;
+}
+
+function cacheByteLimit(settings: SpeculativeActionSettings): number {
+	return typeof settings.resourceCacheMaxBytes === "number" && Number.isFinite(settings.resourceCacheMaxBytes)
+		? Math.max(1, Math.floor(settings.resourceCacheMaxBytes))
+		: DEFAULTS.resourceCacheMaxBytes;
+}
+
+function cacheLimits(settings: SpeculativeActionSettings) {
+	return { maxEntries: cacheEntryLimit(settings), maxBytes: cacheByteLimit(settings), hotFraction: 0.8 };
+}
+
+function forecastFor(node: PlanRuntimeNode, semantics: ActionSemanticsRegistry): PredictionForecast {
+	const execution = node.actionKey?.execution ?? semantics.execution(node.action.tool) ?? "resource_cached";
+	return {
+		tool: node.action.tool,
+		execution,
+		sandboxMode: semantics.sandboxMode(node.action.tool) ?? "none",
+		...(node.action.empiricalProbability !== undefined ? { probability: node.action.empiricalProbability } : {}),
+		...(node.action.expectedDurationMs !== undefined ? { expectedDurationMs: node.action.expectedDurationMs } : {}),
+		...(node.action.expectedLatencyBenefitMs !== undefined
+			? { expectedLatencyBenefitMs: node.action.expectedLatencyBenefitMs }
+			: {}),
+		...(node.action.resourceDemand !== undefined ? { resourceDemand: node.action.resourceDemand } : {}),
+	};
+}
+
+function planActionDraft(node: PlanRuntimeNode): SpeculativeDraftCandidate {
+	return {
+		type: node.action.type,
+		tool: node.action.tool,
+		input: node.action.input,
+		...(node.action.missing ? { missing: node.action.missing } : {}),
+		...(node.action.execution ? { execution: node.action.execution } : {}),
+		...(node.action.diagnostic ? { diagnostic: node.action.diagnostic } : {}),
+		source: node.source,
+		proposalID: node.proposalID,
+		actionID: node.action.id,
+		feedback: node.action.feedback,
+		...(node.action.dependsOn ? { dependsOn: node.action.dependsOn } : {}),
+		...(node.action.horizon !== undefined ? { horizon: node.action.horizon } : {}),
+		...(node.action.empiricalProbability !== undefined
+			? { empiricalProbability: node.action.empiricalProbability }
+			: {}),
+		...(node.action.conditionalProbability !== undefined
+			? { conditionalProbability: node.action.conditionalProbability }
+			: {}),
+		...(node.action.expectedDurationMs !== undefined ? { expectedDurationMs: node.action.expectedDurationMs } : {}),
+		...(node.action.expectedLatencyBenefitMs !== undefined
+			? { expectedLatencyBenefitMs: node.action.expectedLatencyBenefitMs }
+			: {}),
+		...(node.action.resourceDemand !== undefined ? { resourceDemand: node.action.resourceDemand } : {}),
+		...(node.action.depth !== undefined ? { depth: node.action.depth } : {}),
+	};
+}
+
+function asConcreteInput(value: unknown): Record<string, unknown> | undefined {
+	if (value === undefined || value === null) return {};
+	return typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
+}
+
+function asWorldBranch<Output>(value: Output | WorldBranch<Output>): WorldBranch<Output> | undefined {
+	if (!value || typeof value !== "object") return undefined;
+	const branch = value as Partial<WorldBranch<Output>>;
+	return typeof branch.commit === "function" && branch.compatibility !== undefined && "output" in branch
+		? (value as WorldBranch<Output>)
+		: undefined;
+}
+
+function publicCandidate<Output, StartInput, StateData>(
+	candidate: CandidateRecord<Output, StartInput, StateData>,
+): SpeculativeCandidate {
+	const execution = candidate.work.execution;
+	return {
+		id: candidate.id,
+		key: candidate.key,
+		tool: candidate.key.tool,
+		input: candidate.key.input,
+		...(candidate.resources.version !== undefined ? { resourceVersion: candidate.resources.version } : {}),
+		...("executionMs" in execution ? { work: { execution: { executionMs: execution.executionMs } } } : {}),
+		...(candidate.owner.draft.source ? { source: candidate.owner.draft.source } : {}),
+	};
+}
+
+function predictionCandidate<Output, StartInput, StateData>(
+	candidate: CandidateRecord<Output, StartInput, StateData>,
+	node: PlanRuntimeNode,
+): SpeculativeCandidate {
+	return {
+		...publicCandidate(candidate),
+		source: node.source,
+		empiricalProbability: node.action.empiricalProbability,
+		conditionalProbability: node.action.conditionalProbability,
+		depth: node.action.depth,
+		planDependencies: node.action.dependsOn,
+	} as unknown as SpeculativeCandidate;
+}
+
+function activeExecution<Output, StartInput, StateData>(
+	candidate: CandidateRecord<Output, StartInput, StateData>,
+): boolean {
+	return candidate.work.execution.status !== "failed" && candidate.work.execution.status !== "cancelled";
+}
+
+function canShareInFlight<Output, StartInput, StateData>(
+	candidate: CandidateRecord<Output, StartInput, StateData>,
+	actor: ActionKey,
+	match: ProjectedActionKeyMatch,
+	rules: readonly ActionProjectionRule<Output>[],
+): boolean {
+	if (!activeExecution(candidate)) return false;
+	const rule = rules.find((item) => item.id === match.projector);
+	return rule?.canShareInFlight?.(candidate.key, actor) === true;
+}
+
+function captureCoverage<Output>(
+	action: ActionKey,
+	output: Output,
+	rules: readonly ActionProjectionRule<Output>[],
+): readonly ActionProjectionCoverage[] {
+	return rules.flatMap((rule) => {
+		try {
+			const value = rule.captureCoverage(action, output);
+			return value === undefined ? [] : [{ rule: rule.id, value }];
+		} catch {
+			return [];
+		}
+	});
+}
+
+async function projectOutput<Output, StartInput, StateData>(
+	candidate: CandidateRecord<Output, StartInput, StateData>,
+	actor: ActionKey,
+	output: Output,
+	match: ActionKeyMatch,
+	rules: readonly ActionProjectionRule<Output>[],
+): Promise<ProjectionResult<Output>> {
+	if (match.kind === "exact") return { ok: true, output, durationMs: 0 };
+	const rule = rules.find((item) => item.id === match.projector);
+	if (!rule) return { ok: false, cause: cause("projection", "rule_missing") };
+	const coverage = candidate.projectionCoverage.find((item) => item.rule === rule.id);
+	if (!coverage) return { ok: false, cause: cause("projection", "coverage_missing") };
+	const startedAt = performance.now();
+	try {
+		const projected = await rule.projectOutput({
+			speculative: candidate.key,
+			actor,
+			output,
+			coverage: coverage.value,
+			keyMatch: match,
+		});
+		const durationMs = Math.max(0, performance.now() - startedAt);
+		return projected === undefined
+			? { ok: false, cause: cause("projection", "view_not_covered") }
+			: { ok: true, output: projected, durationMs };
+	} catch (error) {
+		return { ok: false, cause: cause("projection", "reconstruction_failed", errorDetail(error)) };
+	}
+}
+
+async function waitForCandidate<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T | undefined> {
+	if (!signal) return promise;
+	if (signal.aborted) return undefined;
+	return new Promise((resolve) => {
+		const aborted = () => resolve(undefined);
+		signal.addEventListener("abort", aborted, { once: true });
+		void promise.then((value) => {
+			signal.removeEventListener("abort", aborted);
+			resolve(value);
+		});
+	});
+}
+
+function registerActorAction<SessionID, Output, StartInput, StateData>(
+	session: SessionState<SessionID, Output, StartInput, StateData>,
+	callID: string | undefined,
+	action: ActorAction,
+): void {
+	if (callID) session.actorCalls.set(callKey(action.identity.turnID, callID), action);
+	else session.anonymousActorCalls.push(action);
+}
+
+function takeActorAction<SessionID, Output, StartInput, StateData>(
+	session: SessionState<SessionID, Output, StartInput, StateData>,
+	turnID: string,
+	call: ActualToolCall,
+): ActorAction | undefined {
+	if (call.id) {
+		const key = callKey(turnID, call.id);
+		const action = session.actorCalls.get(key);
+		session.actorCalls.delete(key);
+		return action;
+	}
+	const index = session.anonymousActorCalls.findIndex(
+		(action) =>
+			action.identity.turnID === turnID && action.tool === call.tool && action.state.status === "awaiting_fallback",
+	);
+	return index < 0 ? undefined : session.anonymousActorCalls.splice(index, 1)[0];
+}
+
+function forgetActorAction<SessionID, Output, StartInput, StateData>(
+	session: SessionState<SessionID, Output, StartInput, StateData>,
+	callID: string | undefined,
+	action: ActorAction,
+): void {
+	if (callID) {
+		session.actorCalls.delete(callKey(action.identity.turnID, callID));
+		return;
+	}
+	const index = session.anonymousActorCalls.indexOf(action);
+	if (index >= 0) session.anonymousActorCalls.splice(index, 1);
+}
+
+function clearActorActions<SessionID, Output, StartInput, StateData>(
+	session: SessionState<SessionID, Output, StartInput, StateData>,
+	turnID?: string,
+): void {
+	if (turnID === undefined) {
+		session.actorCalls.clear();
+		session.anonymousActorCalls.length = 0;
+		session.resolvedActions.clear();
+		session.settledThrough = session.sequence;
+		return;
+	}
+	for (const [key, action] of session.actorCalls) {
+		if (action.identity.turnID === turnID) session.actorCalls.delete(key);
+	}
+	for (let index = session.anonymousActorCalls.length - 1; index >= 0; index--) {
+		if (session.anonymousActorCalls[index]?.identity.turnID === turnID) session.anonymousActorCalls.splice(index, 1);
+	}
+	for (const [sequence, observation] of session.resolvedActions) {
+		if (observation.identity.turnID === turnID) session.resolvedActions.delete(sequence);
+	}
+}
+
+function callKey(turnID: string, callID: string): string {
+	return JSON.stringify([turnID, callID]);
+}
+
+function observeActorStep<SessionID, Output, StartInput, StateData>(
+	turn: TurnState<SessionID, Output, StartInput, StateData>,
+	arrivedAt: number,
+): void {
+	const previous = turn.lastActorArrivedAt;
+	turn.lastActorArrivedAt = arrivedAt;
+	if (previous === undefined) return;
+	const interval = Math.max(0, arrivedAt - previous);
+	if (interval >= 25) turn.session.scheduler.observeActorStep(interval);
+}
+
+function enterActorAdmission<SessionID, Output, StartInput, StateData>(
+	session: SessionState<SessionID, Output, StartInput, StateData>,
+): { readonly ready: Promise<void>; readonly release: () => void } {
+	const ready = session.actorAdmissionTail;
+	let unlock!: () => void;
+	session.actorAdmissionTail = new Promise<void>((resolve) => {
+		unlock = resolve;
+	});
+	let released = false;
+	return {
+		ready,
+		release: () => {
+			if (released) return;
+			released = true;
+			unlock();
+		},
+	};
+}
+
+function turnKey<SessionID>(sessionID: SessionID, turnID: string): string {
+	return JSON.stringify([String(sessionID), turnID]);
+}
+
+function outputIsError(value: unknown): boolean {
+	return Boolean(value && typeof value === "object" && (value as { readonly isError?: unknown }).isError === true);
+}
+
+function candidateEventDescriptor<Output, StartInput, StateData>(
+	candidate: CandidateRecord<Output, StartInput, StateData>,
+): CandidateEventDescriptor {
+	return {
+		source: candidate.owner.draft.source ?? "cache",
+		id: candidate.id,
+		tool: candidate.key.tool,
+		actionKeyHash: candidate.key.hash,
+		execution: candidate.key.execution,
+		predictedAction: diagnosticAction(candidate.key.tool, candidate.key.input, candidate.key),
+		predictionLatencyMs: candidate.predictionLatencyMs,
+		draftTokens: candidate.draftTokens,
+		totalDraftTokens: candidate.totalDraftTokens,
+		expectedDurationMs: candidate.expectedDurationMs,
+		estimatedBytes: candidate.estimatedBytes,
+		validation: {
+			durationMs: candidate.validationMs,
+			bytesRead: candidate.validationBytes,
+			filesRead: candidate.validationFiles,
+			...(candidate.validationMode ? { mode: candidate.validationMode } : {}),
+		},
+	};
+}
+
+function candidateExecutionProjection<Output, StartInput, StateData>(
+	candidate: CandidateRecord<Output, StartInput, StateData>,
+): CandidateExecutionProjection | undefined {
+	const state = candidate.work.execution;
+	if (state.status === "queued") return undefined;
+	if (state.status === "running") return { status: "running", startedAt: state.startedAt };
+	if (state.status === "succeeded") {
+		return {
+			status: "succeeded",
+			startedAt: state.startedAt,
+			completedAt: state.completedAt,
+			executionMs: state.executionMs,
+		};
+	}
+	return {
+		status: state.status,
+		cause: state.cause,
+		...(state.startedAt !== undefined ? { startedAt: state.startedAt } : {}),
+		completedAt: state.completedAt,
+		executionMs: state.executionMs,
+	};
+}
+
+function candidateCacheValue<Output, StartInput, StateData>(
+	candidate: CandidateRecord<Output, StartInput, StateData>,
+	evidence: ResultCacheEvidence,
+	now: number,
+): number {
+	const execution = candidate.work.execution;
+	const reuseSamples = Math.max(1, evidence.actorHits);
+	return speculativeCacheValue(
+		{
+			executionMs: "executionMs" in execution ? execution.executionMs : candidate.expectedDurationMs,
+			expectedValidationMs: candidate.validationMs / reuseSamples,
+			expectedProjectionMs: candidate.projectionMs / reuseSamples,
+			bytes: candidate.estimatedBytes,
+			actorHits: evidence.actorHits,
+			insertedAt: evidence.insertedAt,
+			...(evidence.lastActorHitAt ? { lastActorHitAt: evidence.lastActorHitAt } : {}),
+		},
+		now,
+	);
+}
+
+function executionDuration<Output, StartInput, StateData>(
+	candidate: CandidateRecord<Output, StartInput, StateData>,
+): number {
+	const execution = candidate.work.execution;
+	return "executionMs" in execution ? execution.executionMs : 0;
+}
+
+function estimateValueBytes(value: unknown, seen = new WeakSet<object>()): number {
+	if (value === null || value === undefined) return 0;
+	if (typeof value === "string") return value.length * 2;
+	if (typeof value === "number" || typeof value === "boolean" || typeof value === "bigint") return 8;
+	if (typeof value !== "object" || seen.has(value)) return 0;
+	seen.add(value);
+	if (ArrayBuffer.isView(value)) return value.byteLength;
+	if (value instanceof ArrayBuffer) return value.byteLength;
+	if (Array.isArray(value)) return value.reduce((sum, item) => sum + estimateValueBytes(item, seen), 0);
+	return Object.entries(value).reduce((sum, [key, item]) => sum + key.length * 2 + estimateValueBytes(item, seen), 0);
+}
+
+function resourcePathsOverlap(left: string, right: string): boolean {
+	const normalize = (value: string) => value.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+	const a = normalize(left);
+	const b = normalize(right);
+	return a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
+}
+
+function uniqueCandidates<T extends object>(candidates: readonly T[]): T[] {
+	return [...new Set(candidates)];
+}
+
+function maybe<T>(value: T | undefined): T[] {
+	return value === undefined ? [] : [value];
+}
+
+function finiteMetric(value: unknown): number {
+	return typeof value === "number" && Number.isFinite(value) ? Math.max(0, value) : 0;
+}
+
+function finitePositive(value: unknown, fallback: number): number {
+	const metric = finiteMetric(value);
+	return metric > 0 ? metric : Math.max(1, finiteMetric(fallback));
+}
+
+function errorDetail(error: unknown): string {
+	return error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+}
+
+interface ActualToolCall {
+	readonly id?: string;
+	readonly tool: string;
+	readonly input: unknown;
+}
+
+interface PlanActionContext<StartInput, StateData> {
+	readonly identity: PlanActionIdentity;
+	readonly opportunity?: PredictionOpportunity;
+	feedback: unknown;
+	readonly startInput: StartInput;
+	readonly data: StateData;
+	readonly settings: SpeculativeActionSettings;
+	readonly attemptStartedAt: number;
+	readonly predictionLatencyMs: number;
+	readonly draftTokens: number;
+	readonly totalDraftTokens: number;
+	draft: SpeculativeDraftCandidate;
+	readonly admissionSignal: AbortSignal;
+	continuation: "none" | "execution_succeeded" | "actor_confirmed";
+}
+
+interface CandidateRecord<Output, StartInput, StateData> {
+	readonly id: string;
+	readonly key: ActionKey;
+	readonly work: CandidateExecution<Output>;
+	readonly owner: {
+		readonly startInput: StartInput;
+		readonly data: StateData;
+		readonly settings: SpeculativeActionSettings;
+		readonly draft: SpeculativeDraftCandidate;
+		readonly index: number;
+	};
+	readonly createdAt: number;
+	readonly attemptStartedAt: number;
+	readonly predictionLatencyMs: number;
+	readonly draftTokens: number;
+	readonly totalDraftTokens: number;
+	readonly expectedDurationMs: number;
+	estimatedBytes: number;
+	readonly resources: CandidateResources;
+	projectionCoverage: readonly ActionProjectionCoverage[];
+	validationMs: number;
+	validationBytes: number;
+	validationFiles: number;
+	validationMode?: "watcher" | "exact";
+	projectionMs: number;
+	world?: WorldBranch<Output>;
+}
+
+interface SessionState<SessionID, Output, StartInput, StateData> {
+	readonly id: SessionID;
+	readonly plan: PlanRuntime;
+	readonly scheduler: SpeculationScheduler<CandidateRecord<Output, StartInput, StateData>>;
+	readonly effects: PostSettlementQueue;
+	readonly actionContexts: Map<string, PlanActionContext<StartInput, StateData>>;
+	readonly launchTimers: Map<string, ReturnType<typeof setTimeout>>;
+	readonly actorCalls: Map<string, ActorAction>;
+	readonly anonymousActorCalls: ActorAction[];
+	readonly resolvedActions: Map<number, ActorAction>;
+	readonly turns: Set<string>;
+	actorAdmissionTail: Promise<void>;
+	sequence: number;
+	settledThrough: number;
+	tokenTotal: number;
+	candidateSequence: number;
+	disposed: boolean;
+}
+
+interface TurnState<SessionID, Output, StartInput, StateData> {
+	readonly key: string;
+	readonly session: SessionState<SessionID, Output, StartInput, StateData>;
+	readonly sessionID: SessionID;
+	readonly turnID: string;
+	readonly startInput: StartInput;
+	readonly startedAt: number;
+	readonly data: StateData;
+	readonly settings: SpeculativeActionSettings;
+	readonly definitions: readonly DrafterToolDefinition[];
+	readonly candidateNames: readonly string[];
+	readonly generation: SourceGeneration;
+	admissionTail: Promise<void>;
+	pendingProduction: number;
+	pendingAdmission: number;
+	lastActorArrivedAt?: number;
+	lifecycle: "active" | "closing" | "finished";
+}
+
+interface RankedCandidate<Output, StartInput, StateData> {
+	readonly candidate: CandidateRecord<Output, StartInput, StateData>;
+	readonly match: ActionKeyMatch;
+	readonly ready: boolean;
+	readonly remainingMs: number;
+}
+
+interface ClaimedPrediction {
+	readonly node: PlanRuntimeNode;
+	readonly opportunity: PredictionOpportunity;
+}
+
+type ProjectionResult<Output> =
+	| { readonly ok: true; readonly output: Output; readonly durationMs: number }
+	| { readonly ok: false; readonly cause: ResolutionCause };
+
+const CACHE_COLD_MAX_AGE_MS = 5 * 60 * 1000;
+const CACHE_COLD_MAX_ACTOR_STEPS = 8;
+
+/** Structural runtime: plans own predictions, candidates own execution, ActorAction owns adoption. */
+export function makeStructuralSpeculativeActionRuntime<
+	SessionID,
+	Output,
+	StartInput extends TurnInput<SessionID>,
+	ConsumeInput extends TurnInput<SessionID>,
+	FinishInput extends TurnInput<SessionID>,
+	StateData,
+>(
+	adapter: SpeculativeActionRuntimeAdapter<SessionID, Output, StartInput, ConsumeInput, StateData>,
+): SpeculativeActionRuntime<SessionID, Output, StartInput, ConsumeInput, FinishInput> {
+	type Source = SpeculativePlanSource<SessionID, Output, StartInput, ConsumeInput, StateData>;
+	type Candidate = CandidateRecord<Output, StartInput, StateData>;
+	type Session = SessionState<SessionID, Output, StartInput, StateData>;
+	type Turn = TurnState<SessionID, Output, StartInput, StateData>;
+
+	const semantics = adapter.actionSemantics ?? PI_ACTION_SEMANTICS;
+	const sources = adapter.sources ?? [];
+	const sourcesByID = new Map<string, Source>();
+	for (const source of sources) {
+		if (!source.id || source.id.trim() !== source.id) throw new Error(`invalid speculative plan source ${source.id}`);
+		if (sourcesByID.has(source.id)) throw new Error(`duplicate speculative plan source ${source.id}`);
+		sourcesByID.set(source.id, source);
+	}
+	const projectionRules = uniqueProjectionRules(adapter.projectionRules ?? [], semantics);
+	const projectors = projectionRules;
+	const jobs = new ActionStore<SessionID, Candidate>(projectors, true);
+	const results = new ResultCache<SessionID, Candidate>(projectors, candidateCacheValue);
+	const branches = new ActionStore<SessionID, Candidate>([], true);
+	const sessions = new Map<SessionID, Session>();
+	const turns = new Map<string, Turn>();
+	let masterEnabled: boolean | undefined;
+
+	const sessionFor = (sessionID: SessionID): Session => {
+		const current = sessions.get(sessionID);
+		if (current) return current;
+		const created: Session = {
+			id: sessionID,
+			plan: new PlanRuntime(),
+			scheduler: new SpeculationScheduler<Candidate>(),
+			effects: new PostSettlementQueue(),
+			actionContexts: new Map(),
+			launchTimers: new Map(),
+			actorCalls: new Map(),
+			anonymousActorCalls: [],
+			resolvedActions: new Map(),
+			turns: new Set(),
+			actorAdmissionTail: Promise.resolve(),
+			sequence: 0,
+			settledThrough: 0,
+			tokenTotal: 0,
+			candidateSequence: 0,
+			disposed: false,
+		};
+		sessions.set(sessionID, created);
+		return created;
+	};
+
+	const candidateNames = (settings: SpeculativeActionSettings): readonly string[] => {
+		const resource = new Set(settings.tools.resourceCached);
+		const sandbox = new Set(settings.tools.sandbox);
+		return semantics
+			.toolNames()
+			.filter((tool) => (semantics.execution(tool) === "resource_cached" ? resource.has(tool) : sandbox.has(tool)));
+	};
+
+	const startTurn = async (input: StartInput, signal?: AbortSignal): Promise<void> => {
+		const settings = await adapter.settings();
+		if (!settings.enabled || masterEnabled === false || signal?.aborted) {
+			await disableSession(input.sessionID, cause("control", "disabled"));
+			return;
+		}
+		const definitions = adapter.definitions(input);
+		const names = candidateNames(settings);
+		if (!definitions.length || !names.length) return;
+		const key = turnKey(input.sessionID, input.turnID);
+		const previous = turns.get(key);
+		if (previous) await finishState(previous, false);
+		const session = sessionFor(input.sessionID);
+		const generation = new SourceGeneration(signal);
+		const state: Turn = {
+			key,
+			session,
+			sessionID: input.sessionID,
+			turnID: input.turnID,
+			startInput: input,
+			startedAt: performance.now(),
+			data: await adapter.stateData(input),
+			settings,
+			definitions,
+			candidateNames: names,
+			generation,
+			admissionTail: Promise.resolve(),
+			pendingProduction: 0,
+			pendingAdmission: 0,
+			lifecycle: "active",
+		};
+		turns.set(key, state);
+		session.turns.add(key);
+		await reconcileStores(state);
+		try {
+			await adapter.onTurnStarted?.({
+				startInput: input,
+				settings,
+				definitions,
+				candidateNames: names,
+				...(signal ? { signal } : {}),
+			});
+		} catch {
+			// Host analysis does not own runtime state.
+		}
+		dispatchReady(session);
+		launchSourceRequests(state);
+	};
+
+	const launchSourceRequests = (state: Turn): void => {
+		const requests: Promise<void>[] = [];
+		for (const source of sources) {
+			if (!source.enabled(state.settings)) continue;
+			const count = requestCount(source.proposalCount?.(state.settings));
+			for (let index = 0; index < count; index++) {
+				state.pendingProduction++;
+				const pending = runSourceRequest({
+					request: { source: source.id, turnID: state.turnID, index },
+					generation: state.generation,
+					timeoutMs: source.timeoutMs?.(state.settings),
+					produce: (requestSignal) =>
+						source.propose({
+							startInput: state.startInput,
+							data: state.data,
+							settings: state.settings,
+							definitions: state.definitions,
+							candidateNames: state.candidateNames,
+							proposalIndex: index,
+							proposalCount: count,
+							signal: requestSignal,
+						}),
+					count: (value) => asUpdates(value).length,
+				}).then((request) => sourceRequestFinished(state, source, request));
+				requests.push(pending);
+			}
+		}
+		if (!requests.length) return;
+		void Promise.all(requests);
+	};
+
+	const sourceRequestFinished = async (
+		state: Turn,
+		source: Source,
+		request: SourceRequestResult<PlanUpdate | readonly PlanUpdate[]>,
+	): Promise<void> => {
+		state.pendingProduction = Math.max(0, state.pendingProduction - 1);
+		queueSourceRequestEvent(state, request);
+		if (request.settlement.status !== "produced" || request.value === undefined || !state.generation.active) return;
+		state.pendingAdmission++;
+		state.admissionTail = state.admissionTail
+			.then(async () => {
+				if (!state.generation.active || state.lifecycle !== "active") return;
+				for (const update of asUpdates(request.value)) {
+					if (!state.generation.active || state.lifecycle !== "active") break;
+					await admitUpdate(state, source, update, request);
+				}
+			})
+			.catch(() => {
+				// One malformed proposal cannot poison later independent admissions.
+			})
+			.finally(() => {
+				state.pendingAdmission = Math.max(0, state.pendingAdmission - 1);
+			});
+		await state.admissionTail;
+	};
+
+	const admitUpdate = async (
+		state: Turn,
+		source: Source,
+		update: PlanUpdate,
+		request?: SettledSourceRequest,
+	): Promise<void> => {
+		if (updateSource(update) !== source.id) return;
+		const acceptedUpdate = source.multiStepEnabled?.(state.settings) === false ? immediateOnly(update) : update;
+		const applied = state.session.plan.apply(acceptedUpdate, state.session.sequence);
+		if (!applied.accepted) return;
+		for (const retired of applied.retired) retirePlanAction(state.session, retired, cause("plan", "superseded"));
+		const draftTokens = finiteMetric(acceptedUpdate.draftTokens);
+		state.session.tokenTotal += draftTokens;
+		for (const action of applied.upserted) {
+			const node = state.session.plan.get(applied.plan.id, action.id);
+			if (!node || (node.predictionState && node.predictionState.status !== "pending")) continue;
+			const issued = !state.session.actionContexts.has(node.identity.id);
+			if (issued) {
+				state.session.actionContexts.set(node.identity.id, {
+					identity: node.identity,
+					...(node.prediction
+						? { opportunity: state.session.plan.opportunity(node.proposalID, node.action.id) }
+						: {}),
+					feedback: action.feedback,
+					startInput: state.startInput,
+					data: state.data,
+					settings: state.settings,
+					attemptStartedAt: request?.startedAt ?? performance.now(),
+					predictionLatencyMs: request?.durationMs ?? 0,
+					draftTokens,
+					totalDraftTokens: state.session.tokenTotal,
+					draft: planActionDraft(node),
+					admissionSignal: state.generation.signal,
+					continuation: "none",
+				});
+				if (node.prediction && source.onIssued) {
+					state.session.effects.enqueue(() =>
+						source.onIssued!({
+							proposalID: node.identity.proposalID,
+							actionID: node.identity.actionID,
+							feedback: action.feedback,
+						}),
+					);
+				}
+			} else {
+				const context = state.session.actionContexts.get(node.identity.id)!;
+				context.feedback = action.feedback;
+				context.draft = planActionDraft(node);
+			}
+			if (action.type === "preparation_hint") {
+				void runPreparationHint(state.session, node);
+				continue;
+			}
+			await materializeAction(state.session, node);
+		}
+		dispatchReady(state.session);
+	};
+
+	const materializeAction = async (session: Session, node: PlanRuntimeNode): Promise<void> => {
+		if (!node.prediction || node.actionKey || node.execution.status !== "deferred") return;
+		const context = session.actionContexts.get(node.identity.id);
+		if (!context) return;
+		const concrete = asConcreteInput(node.action.input);
+		if (!concrete || !context.settings.enabled || !candidateNames(context.settings).includes(node.action.tool)) {
+			failUnlaunchable(session, node, cause("admission", concrete ? "tool_disabled" : "invalid_input"));
+			return;
+		}
+		let key: ActionKey | undefined;
+		try {
+			key = await adapter.actionKey(node.action.tool, concrete, {
+				type: "start",
+				startInput: context.startInput,
+				data: context.data,
+			});
+		} catch {
+			key = undefined;
+		}
+		if (!key) {
+			failUnlaunchable(session, node, cause("matching", "action_not_keyable"));
+			return;
+		}
+		const callID = `spec_${session.candidateSequence + 1}`;
+		let preflight: CandidatePreflight;
+		try {
+			preflight = await adapter.preflightCandidate({
+				startInput: context.startInput,
+				data: context.data,
+				settings: context.settings,
+				candidate: context.draft,
+				tool: node.action.tool,
+				concrete,
+				action: key,
+				callID,
+				index: session.candidateSequence,
+				signal: context.admissionSignal,
+			});
+		} catch (error) {
+			preflight = { ok: false, reason: "preflight_failed", detail: errorDetail(error) };
+		}
+		if (!preflight.ok) {
+			failUnlaunchable(session, node, cause("admission", preflight.reason, preflight.detail));
+			return;
+		}
+		if (context.admissionSignal.aborted) {
+			failUnlaunchable(session, node, cause("source", "generation_expired"));
+			return;
+		}
+		session.plan.bindActionKey(node.proposalID, node.action.id, key);
+	};
+
+	const runPreparationHint = async (session: Session, node: PlanRuntimeNode): Promise<void> => {
+		if (node.action.type !== "preparation_hint") return;
+		const promoted = session.plan.promote(node.proposalID, node.action.id);
+		if (promoted.status !== "scheduled") return;
+		const context = session.actionContexts.get(node.identity.id);
+		const work = new CandidateExecution<void>("shared");
+		const workID = `hint:${node.identity.id}`;
+		session.plan.attachExecution(node.proposalID, node.action.id, workID, work);
+		const startedAt = performance.now();
+		work.start(startedAt);
+		if (!context || !adapter.prepareCandidate) {
+			work.succeed(undefined, performance.now(), 0);
+			session.actionContexts.delete(node.identity.id);
+			dispatchReady(session);
+			return;
+		}
+		try {
+			await adapter.prepareCandidate({
+				startInput: context.startInput,
+				data: context.data,
+				settings: context.settings,
+				candidate: context.draft,
+				signal: context.admissionSignal,
+			});
+			const completedAt = performance.now();
+			work.succeed(undefined, completedAt, completedAt - startedAt);
+		} catch (error) {
+			const failure = cause("execution", "preparation_failed", errorDetail(error));
+			const completedAt = performance.now();
+			work.fail(failure, completedAt, completedAt - startedAt);
+		} finally {
+			session.actionContexts.delete(node.identity.id);
+			dispatchReady(session);
+		}
+	};
+
+	const failUnlaunchable = (session: Session, node: PlanRuntimeNode, failure: ResolutionCause): void => {
+		const work = new CandidateExecution<never>("shared");
+		work.fail(failure, performance.now(), 0);
+		session.plan.attachExecution(node.proposalID, node.action.id, `rejected:${node.identity.id}`, work);
+		settleUnobserved(session, node, failure);
+	};
+
+	const settleBlockedPlanActions = (session: Session): void => {
+		for (const node of session.plan.drainBlocked()) {
+			const failure = cause("plan", "dependency_impossible");
+			if (node.execution.status === "deferred" || node.execution.status === "scheduled") {
+				const work = new CandidateExecution<never>("shared");
+				work.fail(failure, performance.now(), 0);
+				session.plan.attachExecution(node.proposalID, node.action.id, `blocked:${node.identity.id}`, work);
+			}
+			if (node.prediction) settleUnobserved(session, node, failure);
+			else session.actionContexts.delete(node.identity.id);
+		}
+	};
+
+	const dispatchReady = (session: Session, immediatePredictionID?: string): void => {
+		if (session.disposed) return;
+		settleBlockedPlanActions(session);
+		for (const node of session.plan.launchable()) {
+			if (!node.prediction || !node.actionKey || node.action.type !== "tool_call") continue;
+			const existingTimer = session.launchTimers.get(node.prediction.id);
+			if (existingTimer && node.launchActionSeq > session.sequence && node.prediction.id !== immediatePredictionID)
+				continue;
+			if (existingTimer) clearTimeout(existingTimer);
+			session.launchTimers.delete(node.prediction.id);
+			const forecast = forecastFor(node, semantics);
+			const steps = Math.max(0, node.expectedActionSeq - session.sequence);
+			const delay =
+				node.prediction.id === immediatePredictionID || node.launchActionSeq <= session.sequence
+					? 0
+					: session.scheduler.launchDelay(forecast, steps);
+			if (delay <= 0) {
+				const promoted = session.plan.promote(node.proposalID, node.action.id);
+				if (promoted.status === "scheduled") void launchNode(session, promoted.node);
+				continue;
+			}
+			const timer = setTimeout(() => {
+				session.launchTimers.delete(node.prediction.id);
+				const promoted = session.plan.promote(node.proposalID, node.action.id);
+				if (promoted.status === "scheduled") void launchNode(session, promoted.node);
+			}, delay);
+			session.launchTimers.set(node.prediction.id, timer);
+		}
+	};
+
+	const launchNode = async (session: Session, node: PlanRuntimeNode): Promise<void> => {
+		if (!node.prediction || !node.actionKey || node.predictionState.status === "settled") {
+			session.plan.defer(node.proposalID, node.action.id);
+			return;
+		}
+		const context = session.actionContexts.get(node.identity.id);
+		if (!context) {
+			failUnlaunchable(session, node, cause("plan", "context_missing"));
+			return;
+		}
+		const reusable = await reusableForPrediction(session, node.actionKey);
+		if (reusable) {
+			attachNode(session, node, reusable);
+			return;
+		}
+		const concrete = asConcreteInput(node.action.input);
+		if (!concrete) {
+			failUnlaunchable(session, node, cause("admission", "invalid_input"));
+			return;
+		}
+		const sequence = ++session.candidateSequence;
+		const candidateID = `spec_${sequence}_${node.actionKey.hash.slice(0, 12)}`;
+		const reuse = semantics.reuse(node.action.tool) === "exclusive_branch" ? "exclusive" : "shared";
+		const work = new CandidateExecution<Output>(reuse);
+		const candidate: Candidate = {
+			id: candidateID,
+			key: node.actionKey,
+			work,
+			owner: {
+				startInput: context.startInput,
+				data: context.data,
+				settings: context.settings,
+				draft: context.draft,
+				index: sequence - 1,
+			},
+			createdAt: Date.now(),
+			attemptStartedAt: context.attemptStartedAt,
+			predictionLatencyMs: context.predictionLatencyMs,
+			draftTokens: context.draftTokens,
+			totalDraftTokens: context.totalDraftTokens,
+			expectedDurationMs: finitePositive(node.action.expectedDurationMs, 1),
+			estimatedBytes: 0,
+			resources: new CandidateResources(),
+			projectionCoverage: [],
+			validationMs: 0,
+			validationBytes: 0,
+			validationFiles: 0,
+			projectionMs: 0,
+		};
+		const insertion = jobs.insertOrGetCompatible(
+			session.id,
+			candidate,
+			(existing, match) => canShareInFlight(existing, node.actionKey!, match, projectionRules),
+			(existing) => activeExecution(existing),
+		);
+		if (!insertion.inserted) {
+			attachNode(session, node, insertion.entry);
+			return;
+		}
+		session.plan.attachExecution(node.proposalID, node.action.id, candidate.id, candidate.work);
+		const admission = session.scheduler.admit(
+			candidate,
+			forecastsForCandidate(session, candidate, node),
+			concurrentLimit(context.settings),
+		);
+		if (!admission.admitted) {
+			jobs.delete(session.id, candidate);
+			const rejected = cause("admission", admission.reason);
+			candidate.work.cancel(rejected, performance.now(), 0);
+			queueCandidateEvent(session, candidate);
+			dispatchReady(session);
+			return;
+		}
+		for (const victim of admission.preempted) cancelCandidate(session, victim, cause("admission", "preempted"));
+		const startedAt = performance.now();
+		candidate.work.start(startedAt);
+		queueCandidateEvent(session, candidate);
+		void executeCandidate(session, candidate, startedAt);
+	};
+
+	const attachNode = (session: Session, node: PlanRuntimeNode, candidate: Candidate): void => {
+		if (!session.plan.attachExecution(node.proposalID, node.action.id, candidate.id, candidate.work)) return;
+		const execution = candidate.work.execution;
+		if (execution.status === "succeeded") {
+			queueContinuation(session, node, candidate, execution.output, "execution_succeeded");
+			return;
+		}
+		if (execution.status === "queued" || execution.status === "running") {
+			session.scheduler.refresh(candidate, forecastsForCandidate(session, candidate, node));
+		}
+	};
+
+	const executeCandidate = async (session: Session, candidate: Candidate, startedAt: number): Promise<void> => {
+		try {
+			if (adapter.prepareCandidate) {
+				await adapter.prepareCandidate({
+					startInput: candidate.owner.startInput,
+					data: candidate.owner.data,
+					settings: candidate.owner.settings,
+					candidate: candidate.owner.draft,
+					signal: candidate.work.controller.signal,
+				});
+			}
+			if (semantics.requiresRuntimeResourceVersion(candidate.key.tool) && adapter.captureResourceVersion) {
+				const version = await adapter.captureResourceVersion({
+					startInput: candidate.owner.startInput,
+					data: candidate.owner.data,
+					settings: candidate.owner.settings,
+					candidate: candidate.owner.draft,
+					tool: candidate.key.tool,
+					concrete: candidate.key.input as Record<string, unknown>,
+					action: candidate.key,
+					callID: candidate.id,
+					index: candidate.owner.index,
+				});
+				candidate.resources.setVersion(version, adapter.releaseResourceVersion);
+			}
+			const parentWorld = parentWorldFor(session, candidate);
+			const executed = await adapter.executeCandidate({
+				startInput: candidate.owner.startInput,
+				data: candidate.owner.data,
+				candidate: candidate.owner.draft,
+				tool: candidate.key.tool,
+				concrete: candidate.key.input as Record<string, unknown>,
+				action: candidate.key,
+				callID: candidate.id,
+				index: candidate.owner.index,
+				signal: candidate.work.controller.signal,
+				...(parentWorld ? { parentWorld } : {}),
+			});
+			const branch = asWorldBranch(executed);
+			const output = branch?.output ?? (executed as Output);
+			candidate.world = branch;
+			const rejected = adapter.rejectCandidateOutput?.({
+				output,
+				candidate: publicCandidate(candidate),
+			});
+			if (rejected) throw new CandidateFailure(cause("execution", "output_rejected", rejected));
+			candidate.projectionCoverage = captureCoverage(candidate.key, output, projectionRules);
+			candidate.estimatedBytes = estimateValueBytes(output) + (branch?.capturedBytes ?? 0);
+			const completedAt = performance.now();
+			if (!candidate.work.succeed(output, completedAt, completedAt - startedAt)) return;
+			session.scheduler.observeService(candidate.key.tool, completedAt - startedAt);
+			session.scheduler.complete(candidate);
+			jobs.delete(session.id, candidate);
+			if (candidate.work.reservation.kind === "shared") results.insert(session.id, candidate);
+			else branches.insert(session.id, candidate);
+			installWatcher(session, candidate);
+			for (const node of nodesForCandidate(session, candidate.id)) {
+				const current = session.plan.get(node.proposalID, node.action.id);
+				if (current?.predictionState?.status === "pending")
+					queueContinuation(session, current, candidate, output, "execution_succeeded");
+			}
+			trimResults(session, candidate.owner.settings);
+			queueCandidateEvent(session, candidate);
+			dispatchReady(session);
+		} catch (error) {
+			const failure =
+				error instanceof CandidateFailure
+					? error.failure
+					: candidate.work.controller.signal.aborted
+						? cause("control", "execution_aborted")
+						: cause("execution", "candidate_failed", errorDetail(error));
+			const completedAt = performance.now();
+			const settled = candidate.work.controller.signal.aborted
+				? candidate.work.cancel(failure, completedAt, completedAt - startedAt)
+				: candidate.work.fail(failure, completedAt, completedAt - startedAt);
+			session.scheduler.complete(candidate);
+			removeCandidate(session, candidate);
+			if (settled) queueCandidateEvent(session, candidate);
+			dispatchReady(session);
+		}
+	};
+
+	const consume = async (input: ConsumeInput, signal?: AbortSignal): Promise<Output | undefined> => {
+		const actorArrivedAt = performance.now();
+		const state = turns.get(turnKey(input.sessionID, input.turnID));
+		if (!state || state.lifecycle !== "active" || signal?.aborted || masterEnabled === false) return undefined;
+		observeActorStep(state, actorArrivedAt);
+		advanceColdCache(state.session, state.settings);
+		const candidatesAtArrival = allCandidates(state.sessionID);
+		const sequence = ++state.session.sequence;
+		const actualCall = adapter.actual(input) as ActualToolCall;
+		const identity: ActorActionIdentity = {
+			id: actualCall.id ?? JSON.stringify([input.turnID, sequence]),
+			sequence,
+			turnID: input.turnID,
+		};
+		const admission = enterActorAdmission(state.session);
+		let actualKey: ActionKey | undefined;
+		try {
+			actualKey = await adapter.actionKey(actualCall.tool, actualCall.input, {
+				type: "consume",
+				consumeInput: input,
+			});
+		} catch {
+			actualKey = undefined;
+		}
+		const actorAction = new ActorAction({
+			identity,
+			tool: actualCall.tool,
+			...(actualKey ? { actionKey: actualKey } : {}),
+		});
+		registerActorAction(state.session, actualCall.id, actorAction);
+
+		await admission.ready;
+		try {
+			if (!actualKey) {
+				actorAction.deferToFallback();
+				state.session.resolvedActions.set(sequence, actorAction);
+				advancePredictionFrontier(state.session);
+				preemptForActor(state.session, { class: "global", units: 1 }, state.settings);
+				return undefined;
+			}
+
+			const matchingPredictions: ClaimedPrediction[] = predictionMatches(state.session, actualKey, sequence).flatMap(
+				({ node, relation }) => {
+					const opportunity = state.session.plan.claimMatch(node.proposalID, node.action.id, identity, relation);
+					if (!opportunity) return [];
+					return [{ node, opportunity }];
+				},
+			);
+			await Promise.all(matchingPredictions.map(({ node }) => promoteForActor(state.session, node)));
+			const candidates = uniqueCandidates([...candidatesAtArrival, ...allCandidates(state.sessionID)]);
+			const ranked = rankCandidates(actualKey, candidates);
+			let selected:
+				| {
+						readonly candidate: Candidate;
+						readonly match: ActionKeyMatch;
+						readonly output: Output;
+						readonly timing: { executionAheadMs: number; attemptLeadMs: number; hitLatencyMs: number };
+				  }
+				| undefined;
+			let rejection: ResolutionCause = cause("matching", ranked.length ? "candidate_unavailable" : "no_candidate");
+			let rejectedCandidateID: string | undefined;
+
+			for (const choice of ranked) {
+				const candidate = choice.candidate;
+				const reservationOwner = identity.id;
+				if (!candidate.work.reserve(reservationOwner)) {
+					const failure = cause("matching", "candidate_reserved");
+					actorAction.reject(candidate.id, choice.match, failure);
+					rejection = failure;
+					rejectedCandidateID = candidate.id;
+					continue;
+				}
+				admission.release();
+				const authorization = await authorize(state, input, actualKey, actualCall, candidate, signal);
+				if (authorization) {
+					candidate.work.release(reservationOwner);
+					actorAction.reject(candidate.id, choice.match, authorization);
+					rejection = authorization;
+					rejectedCandidateID = candidate.id;
+					continue;
+				}
+				const before = await validateCandidate(state, input, actualKey, candidate);
+				if (before.status !== "valid") {
+					candidate.work.release(reservationOwner);
+					actorAction.reject(candidate.id, choice.match, before.cause);
+					rejection = before.cause;
+					rejectedCandidateID = candidate.id;
+					if (before.status === "stale") discardCandidate(state.session, candidate, before.cause);
+					continue;
+				}
+				const wasRunning =
+					candidate.work.execution.status === "queued" || candidate.work.execution.status === "running";
+				const execution = await waitForCandidate(candidate.work.completion, signal);
+				if (!execution) {
+					candidate.work.release(reservationOwner);
+					rejection = cause("control", "actor_aborted");
+					break;
+				}
+				if (execution.status !== "succeeded") {
+					candidate.work.release(reservationOwner);
+					actorAction.reject(candidate.id, choice.match, execution.cause);
+					rejection = execution.cause;
+					rejectedCandidateID = candidate.id;
+					continue;
+				}
+				if (wasRunning) {
+					const after = await validateCandidate(state, input, actualKey, candidate);
+					if (after.status !== "valid") {
+						candidate.work.release(reservationOwner);
+						actorAction.reject(candidate.id, choice.match, after.cause);
+						rejection = after.cause;
+						rejectedCandidateID = candidate.id;
+						if (after.status === "stale") discardCandidate(state.session, candidate, after.cause);
+						continue;
+					}
+				}
+				if (candidate.world) {
+					const compatibility = state.session.scheduler.assessCompatibility(
+						candidate.world.compatibility,
+						actualKey.executionFingerprint,
+					);
+					if (!compatibility.compatible) {
+						const failure = cause("compatibility", compatibility.code, compatibility.detail);
+						candidate.work.release(reservationOwner);
+						actorAction.reject(candidate.id, choice.match, failure);
+						rejection = failure;
+						rejectedCandidateID = candidate.id;
+						discardCandidate(state.session, candidate, failure);
+						continue;
+					}
+				}
+
+				// Projection is pure and must succeed before the irreversible world commit.
+				const projection = await projectOutput(
+					candidate,
+					actualKey,
+					execution.output,
+					choice.match,
+					projectionRules,
+				);
+				if (!projection.ok) {
+					candidate.work.release(reservationOwner);
+					actorAction.reject(candidate.id, choice.match, projection.cause);
+					rejection = projection.cause;
+					rejectedCandidateID = candidate.id;
+					continue;
+				}
+				candidate.projectionMs += projection.durationMs;
+				let output = projection.output;
+				if (candidate.world) {
+					try {
+						const committed = await candidate.world.commit();
+						if (choice.match.kind === "exact") output = committed;
+					} catch (error) {
+						const failure = cause("commit", "world_commit_failed", errorDetail(error));
+						candidate.work.release(reservationOwner);
+						actorAction.reject(candidate.id, choice.match, failure);
+						rejection = failure;
+						rejectedCandidateID = candidate.id;
+						discardCandidate(state.session, candidate, failure);
+						continue;
+					}
+				}
+
+				const executionAheadMs = Math.min(execution.executionMs, Math.max(0, actorArrivedAt - execution.startedAt));
+				const timing = {
+					executionAheadMs,
+					attemptLeadMs: Math.max(0, actorArrivedAt - candidate.attemptStartedAt),
+					hitLatencyMs: Math.max(0, performance.now() - actorArrivedAt),
+				};
+				if (candidate.work.reservation.kind === "exclusive") {
+					candidate.work.consume(reservationOwner);
+					removeCandidate(state.session, candidate);
+				} else {
+					candidate.work.release(reservationOwner);
+					results.recordActorHit(state.sessionID, candidate, cacheLimits(state.settings));
+				}
+				selected = { candidate, match: choice.match, output, timing };
+				break;
+			}
+
+			if (selected) {
+				actorAction.adopt(
+					selected.candidate.id,
+					selected.match,
+					selected.timing,
+					matchingPredictions.map(({ opportunity }) => opportunity.identity),
+				);
+				forgetActorAction(state.session, actualCall.id, actorAction);
+				const adoption: PredictionAdoption = {
+					status: "adopted",
+					candidateID: selected.candidate.id,
+				};
+				confirmPredictions(state.session, matchingPredictions, identity, adoption);
+				state.session.resolvedActions.set(sequence, actorAction);
+				advancePredictionFrontier(state.session);
+				invalidateChangedResources(state.session, actualKey, selected.candidate);
+				queueActorSettlement(state, input, actualCall, actorAction, selected.output, selected.candidate);
+				for (const { node } of matchingPredictions) {
+					queueContinuation(state.session, node, selected.candidate, selected.output, "actor_confirmed");
+				}
+				state.session.effects.enqueue(() => dispatchReady(state.session));
+				return selected.output;
+			}
+
+			actorAction.deferToFallback(matchingPredictions.map(({ opportunity }) => opportunity.identity));
+			const adoption: PredictionAdoption = {
+				status: "rejected",
+				...(rejectedCandidateID ? { candidateID: rejectedCandidateID } : {}),
+				cause: rejection,
+			};
+			confirmPredictions(state.session, matchingPredictions, identity, adoption);
+			state.session.resolvedActions.set(sequence, actorAction);
+			advancePredictionFrontier(state.session);
+			preemptForActor(
+				state.session,
+				resourceProfile(actualKey.execution, semantics.sandboxMode(actualKey.tool)),
+				state.settings,
+			);
+			state.session.effects.enqueue(() => dispatchReady(state.session));
+			return undefined;
+		} finally {
+			admission.release();
+		}
+	};
+
+	const actual = async (
+		input: ConsumeInput & { readonly durationMs: number; readonly output?: Output },
+	): Promise<void> => {
+		const state = turns.get(turnKey(input.sessionID, input.turnID));
+		if (!state) return;
+		const actualCall = adapter.actual(input) as ActualToolCall;
+		const actorAction = takeActorAction(state.session, input.turnID, actualCall);
+		if (!actorAction) return;
+		const durationMs = finiteMetric(input.durationMs);
+		if (!actorAction.settleActor(durationMs, outputIsError(input.output))) return;
+		state.session.scheduler.observeService(actorAction.tool, durationMs);
+		const key = actorAction.actionKey;
+		if (key) invalidateChangedResources(state.session, key);
+		queueActorSettlement(state, input, actualCall, actorAction, input.output);
+	};
+
+	const queueActorSettlement = (
+		state: Turn,
+		input: ConsumeInput,
+		actualCall: ActualToolCall,
+		actorAction: ActorAction,
+		output: Output | undefined,
+		candidate?: Candidate,
+	): void => {
+		const settlement = actorAction.settlement;
+		if (!settlement) return;
+		const key = actorAction.actionKey;
+		const settledCandidate =
+			candidate ??
+			(settlement.provider.kind === "speculative"
+				? candidateByID(state.sessionID, settlement.provider.candidateID)
+				: undefined);
+		const event: SpeculativeActionEvent<SessionID> = {
+			type: "actor_action",
+			sessionID: state.sessionID,
+			turnID: state.turnID,
+			timestamp: Date.now(),
+			cache: cacheSnapshot(state.session, state.settings),
+			settlement,
+			actualAction: diagnosticAction(actorAction.tool, actualCall.input, key),
+			...(key ? { execution: key.execution } : {}),
+			...(settledCandidate ? { candidate: candidateEventDescriptor(settledCandidate) } : {}),
+		};
+		state.session.effects.enqueue(async () => {
+			await emit(event);
+			const concrete = asConcreteInput(actualCall.input) ?? {};
+			for (const source of sources) {
+				if (!source.observe || !source.enabled(state.settings)) continue;
+				try {
+					const updates = await source.observe({
+						startInput: state.startInput,
+						data: state.data,
+						settings: state.settings,
+						consumeInput: input,
+						...(key ? { action: key } : {}),
+						tool: actorAction.tool,
+						concrete,
+						...(output !== undefined ? { output } : {}),
+						durationMs:
+							settlement.provider.kind === "actor"
+								? settlement.provider.durationMs
+								: settledCandidate
+									? executionDuration(settledCandidate)
+									: candidateExecutionDuration(state.session, settlement.provider.candidateID),
+						order: settlement.actorAction.sequence,
+					});
+					for (const update of asUpdates(updates)) {
+						if (state.lifecycle === "active") await admitUpdate(state, source, update);
+					}
+				} catch {
+					// Learning and continuation never alter an authoritative Actor result.
+				}
+			}
+		});
+	};
+
+	const confirmPredictions = (
+		session: Session,
+		matches: readonly ClaimedPrediction[],
+		actorAction: ActorActionIdentity,
+		adoption: PredictionAdoption,
+	): void => {
+		for (const { node, opportunity } of matches) {
+			const settlement = session.plan.confirm(opportunity, actorAction, adoption);
+			if (settlement) predictionSettled(session, node, settlement);
+		}
+	};
+
+	const advancePredictionFrontier = (session: Session): void => {
+		while (true) {
+			const sequence = session.settledThrough + 1;
+			const observation = session.resolvedActions.get(sequence);
+			if (!observation) return;
+			for (const node of session.plan.due(sequence)) {
+				if (node.predictionState.status !== "pending") continue;
+				if (!observation.actionKey) {
+					settleUnobserved(session, node, cause("matching", "actor_action_not_keyable"));
+					continue;
+				}
+				const settlement = session.plan.miss(node.proposalID, node.action.id, observation.identity);
+				if (settlement) predictionSettled(session, node, settlement);
+			}
+			session.resolvedActions.delete(sequence);
+			session.settledThrough = sequence;
+			dispatchReady(session);
+		}
+	};
+
+	const predictionSettled = (session: Session, node: PlanRuntimeNode, settlement: PredictionSettlement): void => {
+		if (!node.prediction) return;
+		const context = session.actionContexts.get(node.identity.id);
+		if (!context) return;
+		const source = sourcesByID.get(context.identity.source);
+		const event: SpeculativeActionEvent<SessionID> = {
+			type: "prediction",
+			sessionID: session.id,
+			turnID: context.startInput.turnID,
+			timestamp: Date.now(),
+			cache: cacheSnapshot(session, context.settings),
+			settlement,
+		};
+		const queued = session.effects.enqueue(async () => {
+			await emit(event);
+			try {
+				if (source?.onSettled) {
+					await source.onSettled({
+						proposalID: context.identity.proposalID,
+						actionID: context.identity.actionID,
+						feedback: context.feedback,
+						settlement,
+					});
+				}
+			} catch {
+				// Source feedback is a projection of settlement, never its owner.
+			} finally {
+				session.actionContexts.delete(node.identity.id);
+			}
+		});
+		if (!queued) session.actionContexts.delete(node.identity.id);
+		if ("candidateID" in node.execution && node.execution.candidateID) {
+			const candidate = candidateByID(session.id, node.execution.candidateID);
+			if (
+				candidate?.work.reservation.kind === "exclusive" &&
+				!nodesForCandidate(session, candidate.id).some(
+					(item) => item.predictionState && item.predictionState.status !== "settled",
+				)
+			) {
+				discardCandidate(session, candidate, cause("retention", "prediction_horizon_settled"));
+			}
+		}
+	};
+
+	const settleUnobserved = (session: Session, node: PlanRuntimeNode, failure: ResolutionCause): void => {
+		const settlement = session.plan.unobserve(node.proposalID, node.action.id, failure);
+		if (settlement) predictionSettled(session, node, settlement);
+	};
+
+	const queueContinuation = (
+		session: Session,
+		node: PlanRuntimeNode,
+		candidate: Candidate,
+		output: Output,
+		trigger: "execution_succeeded" | "actor_confirmed",
+	): void => {
+		if (!node.prediction) return;
+		if (session.plan.get(node.proposalID, node.action.id)?.identity.id !== node.identity.id) return;
+		const context = session.actionContexts.get(node.identity.id);
+		const source = context ? sourcesByID.get(context.identity.source) : undefined;
+		if (!context || !source?.continue) return;
+		if (source.multiStepEnabled?.(context.settings) === false) return;
+		if (
+			trigger === "actor_confirmed" ? context.continuation === "actor_confirmed" : context.continuation !== "none"
+		) {
+			return;
+		}
+		context.continuation = trigger;
+		session.effects.enqueue(async () => {
+			const revision = session.plan.reserveRevision(node.proposalID);
+			if (revision === undefined || session.disposed) return;
+			try {
+				const updates = await source.continue!({
+					startInput: context.startInput,
+					data: context.data,
+					settings: context.settings,
+					candidate: predictionCandidate(candidate, node),
+					proposalID: node.proposalID,
+					actionID: node.action.id,
+					revision,
+					feedback: context.feedback,
+					output,
+					trigger,
+				});
+				const activeTurn = newestTurn(session);
+				if (!activeTurn) return;
+				for (const update of asUpdates(updates)) await admitUpdate(activeTurn, source, update);
+			} catch {
+				// Continuation failure cannot revoke completed work or Actor adoption.
+			}
+		});
+	};
+
+	const retirePlanAction = (session: Session, retired: RetiredPlanNode, failure: ResolutionCause): void => {
+		const timer = session.launchTimers.get(retired.node.identity.id);
+		if (timer) clearTimeout(timer);
+		session.launchTimers.delete(retired.node.identity.id);
+		if (retired.opportunity?.state.status === "matching") return;
+		const finalized = retired.opportunity?.unobserve(failure);
+		if (finalized) predictionSettled(session, retired.node, finalized);
+		else session.actionContexts.delete(retired.node.identity.id);
+	};
+
+	const reusableForPrediction = async (session: Session, key: ActionKey): Promise<Candidate | undefined> => {
+		for (const lookup of [
+			...jobs.lookup(session.id, key),
+			...results.lookup(session.id, key),
+			...branches.lookup(session.id, key),
+		]) {
+			const candidate = lookup.entry;
+			if (!activeExecution(candidate)) continue;
+			if (lookup.match.kind === "projected" && candidate.work.execution.status !== "succeeded") {
+				if (!canShareInFlight(candidate, key, lookup.match, projectionRules)) continue;
+			}
+			if (candidate.work.execution.status === "succeeded") {
+				const validation = await validateCandidateWithoutTurn(key, candidate);
+				if (validation.status === "stale") {
+					discardCandidate(session, candidate, validation.cause);
+					continue;
+				}
+				if (validation.status === "indeterminate") continue;
+			}
+			return candidate;
+		}
+		return undefined;
+	};
+
+	const nodesForCandidate = (session: Session, candidateID: string): readonly PlanRuntimeNode[] =>
+		session.plan
+			.values()
+			.filter((node) => "candidateID" in node.execution && node.execution.candidateID === candidateID);
+
+	const forecastsForCandidate = (
+		session: Session,
+		candidate: Candidate,
+		additional?: PlanRuntimeNode,
+	): readonly PredictionForecast[] => {
+		const nodes = nodesForCandidate(session, candidate.id);
+		const unique =
+			additional?.prediction && !nodes.some((node) => node.prediction?.id === additional.prediction.id)
+				? [...nodes, additional]
+				: nodes;
+		return unique.map((node) => forecastFor(node, semantics));
+	};
+
+	const parentWorldFor = (session: Session, candidate: Candidate): WorldBranch<Output> | undefined => {
+		const nodes = nodesForCandidate(session, candidate.id);
+		for (const node of nodes) {
+			for (const dependency of node.action.dependsOn ?? []) {
+				const parent = session.plan.get(node.proposalID, dependency.actionID);
+				if (!parent || !("candidateID" in parent.execution) || !parent.execution.candidateID) continue;
+				const parentCandidate = candidateByID(session.id, parent.execution.candidateID);
+				if (parentCandidate?.world) {
+					return parentCandidate.world;
+				}
+			}
+		}
+		return undefined;
+	};
+
+	const installWatcher = (session: Session, candidate: Candidate): void => {
+		if (!adapter.watchResourceVersion || !semantics.watchesResourceVersion(candidate.key.tool)) return;
+		void Promise.resolve(
+			adapter.watchResourceVersion({
+				stateData: candidate.owner.data,
+				action: candidate.key,
+				candidate: publicCandidate(candidate),
+				onInvalidated: (changedPath) => {
+					discardCandidate(session, candidate, cause("freshness", "resource_changed", changedPath));
+				},
+			}),
+		).then(
+			(stop) => candidate.resources.setWatcher(stop),
+			() => undefined,
+		);
+	};
+
+	const validateCandidate = async (
+		state: Turn,
+		input: ConsumeInput,
+		action: ActionKey,
+		candidate: Candidate,
+	): Promise<ResourceValidation> => {
+		if (!adapter.validateResourceVersion || !semantics.requiresRuntimeResourceVersion(candidate.key.tool)) {
+			return { status: "valid", metrics: zeroValidationMetrics() };
+		}
+		try {
+			const validation = await adapter.validateResourceVersion({
+				stateData: state.data,
+				consumeInput: input,
+				action,
+				candidate: publicCandidate(candidate),
+			});
+			recordValidation(candidate, validation);
+			return validation;
+		} catch (error) {
+			return {
+				status: "indeterminate",
+				cause: cause("freshness", "validation_failed", errorDetail(error)),
+				metrics: zeroValidationMetrics(),
+			};
+		}
+	};
+
+	const validateCandidateWithoutTurn = async (
+		action: ActionKey,
+		candidate: Candidate,
+	): Promise<ResourceValidation> => {
+		if (!adapter.validateResourceVersion || !semantics.requiresRuntimeResourceVersion(candidate.key.tool)) {
+			return { status: "valid", metrics: zeroValidationMetrics() };
+		}
+		try {
+			const validation = await adapter.validateResourceVersion({
+				stateData: candidate.owner.data,
+				action,
+				candidate: publicCandidate(candidate),
+			});
+			recordValidation(candidate, validation);
+			return validation;
+		} catch (error) {
+			return {
+				status: "indeterminate",
+				cause: cause("freshness", "validation_failed", errorDetail(error)),
+				metrics: zeroValidationMetrics(),
+			};
+		}
+	};
+
+	const authorize = async (
+		state: Turn,
+		input: ConsumeInput,
+		action: ActionKey,
+		actualCall: ActualToolCall,
+		candidate: Candidate,
+		signal?: AbortSignal,
+	): Promise<ResolutionCause | undefined> => {
+		if (!adapter.authorizeCandidate) return undefined;
+		const concrete = asConcreteInput(actualCall.input);
+		if (!concrete) return cause("authorization", "invalid_input");
+		try {
+			const result = await adapter.authorizeCandidate({
+				stateData: state.data,
+				consumeInput: input,
+				settings: state.settings,
+				action,
+				candidate: publicCandidate(candidate),
+				tool: actualCall.tool,
+				concrete,
+				...(signal ? { signal } : {}),
+			});
+			return result.ok ? undefined : cause("authorization", result.reason, result.detail);
+		} catch (error) {
+			return cause("authorization", "authorization_failed", errorDetail(error));
+		}
+	};
+
+	const rankCandidates = (
+		action: ActionKey,
+		candidates: readonly Candidate[],
+	): readonly RankedCandidate<Output, StartInput, StateData>[] => {
+		const now = performance.now();
+		return candidates
+			.flatMap((candidate) => {
+				const match = actionKeyMatch(candidate.key, action, projectors);
+				if (!match || !activeExecution(candidate)) return [];
+				const execution = candidate.work.execution;
+				const remainingMs =
+					execution.status === "running"
+						? Math.max(0, candidate.expectedDurationMs - (now - execution.startedAt))
+						: execution.status === "queued"
+							? candidate.expectedDurationMs
+							: 0;
+				return [{ candidate, match, ready: execution.status === "succeeded", remainingMs }];
+			})
+			.sort(
+				(left, right) =>
+					Number(right.ready) - Number(left.ready) ||
+					left.remainingMs - right.remainingMs ||
+					left.match.distance - right.match.distance ||
+					right.candidate.createdAt - left.candidate.createdAt,
+			);
+	};
+
+	const predictionMatches = (
+		session: Session,
+		action: ActionKey,
+		sequence: number,
+	): readonly { readonly node: PlanRuntimeNode; readonly relation: ActionKeyMatch }[] => {
+		const groups = new Map<string, Array<{ readonly node: PlanRuntimeNode; readonly relation: ActionKeyMatch }>>();
+		for (const node of session.plan.pending()) {
+			if (!node.actionKey || node.action.type !== "tool_call") continue;
+			const relation = actionKeyMatch(node.actionKey, action, projectors);
+			if (!relation) continue;
+			const group = groups.get(node.proposalID) ?? [];
+			group.push({ node, relation });
+			groups.set(node.proposalID, group);
+		}
+		return [...groups.values()].flatMap((group) => {
+			const due = group.filter(({ node }) => node.expectedActionSeq <= sequence);
+			const ranked = (due.length ? due : group).sort((left, right) =>
+				due.length
+					? right.node.expectedActionSeq - left.node.expectedActionSeq
+					: left.node.expectedActionSeq - right.node.expectedActionSeq,
+			);
+			return ranked[0] ? [ranked[0]] : [];
+		});
+	};
+
+	const promoteForActor = async (session: Session, node: PlanRuntimeNode): Promise<void> => {
+		if (!node.prediction) return;
+		const timer = session.launchTimers.get(node.prediction.id);
+		if (timer) clearTimeout(timer);
+		session.launchTimers.delete(node.prediction.id);
+		const promoted = session.plan.promote(node.proposalID, node.action.id);
+		if (promoted.status === "scheduled") await launchNode(session, promoted.node);
+	};
+
+	const preemptForActor = (
+		session: Session,
+		resource: ReturnType<typeof resourceProfile>,
+		settings: SpeculativeActionSettings,
+	): void => {
+		for (const candidate of session.scheduler.preemptForAuthoritative(
+			resource,
+			concurrentLimit(settings),
+			(candidate) => reservationAvailable(candidate.work.reservation),
+		)) {
+			cancelCandidate(session, candidate, cause("admission", "preempted_by_actor"));
+		}
+	};
+
+	const cancelCandidate = (session: Session, candidate: Candidate, failure: ResolutionCause): void => {
+		const state = candidate.work.execution;
+		const startedAt = state.status === "running" ? state.startedAt : performance.now();
+		const completedAt = performance.now();
+		const settled = candidate.work.cancel(failure, completedAt, Math.max(0, completedAt - startedAt));
+		session.scheduler.discard(candidate);
+		removeCandidate(session, candidate);
+		if (settled) queueCandidateEvent(session, candidate);
+		dispatchReady(session);
+	};
+
+	const discardCandidate = (session: Session, candidate: Candidate, failure: ResolutionCause): void => {
+		if (candidate.work.execution.status === "queued" || candidate.work.execution.status === "running") {
+			cancelCandidate(session, candidate, failure);
+			return;
+		}
+		removeCandidate(session, candidate);
+	};
+
+	const removeCandidate = (session: Session, candidate: Candidate): void => {
+		jobs.delete(session.id, candidate);
+		results.delete(session.id, candidate);
+		branches.delete(session.id, candidate);
+		candidate.resources.dispose();
+	};
+
+	const reconcileStores = async (state: Turn): Promise<void> => {
+		const enabled = new Set(candidateNames(state.settings));
+		for (const candidate of allCandidates(state.sessionID)) {
+			if (!enabled.has(candidate.key.tool))
+				discardCandidate(state.session, candidate, cause("control", "tool_disabled"));
+		}
+		trimResults(state.session, state.settings);
+	};
+
+	const trimResults = (session: Session, settings: SpeculativeActionSettings): void => {
+		for (const candidate of results.trim(session.id, cacheLimits(settings))) {
+			removeCandidate(session, candidate);
+		}
+	};
+
+	const advanceColdCache = (session: Session, settings: SpeculativeActionSettings): void => {
+		for (const candidate of results.advanceActorStep(session.id, {
+			maxAgeMs: CACHE_COLD_MAX_AGE_MS,
+			maxActorSteps: CACHE_COLD_MAX_ACTOR_STEPS,
+		})) {
+			removeCandidate(session, candidate);
+		}
+		trimResults(session, settings);
+	};
+
+	const invalidateChangedResources = (session: Session, action: ActionKey, adopted?: Candidate): void => {
+		const invalidateWorkspace = adopted && semantics.resourceVersionPolicy(adopted.key.tool) === "workspace";
+		const changed =
+			adopted && !invalidateWorkspace ? (adopted.world?.resources ?? action.resources) : action.resources;
+		if ((!changed.length && !invalidateWorkspace) || (adopted && adopted.work.reservation.kind === "shared")) return;
+		for (const candidate of allCandidates(session.id)) {
+			if (candidate === adopted) continue;
+			// Once an Actor reserves a candidate, its freshness and compatibility checks
+			// are authoritative. Cache invalidation may only retire unclaimed work.
+			if (!reservationAvailable(candidate.work.reservation)) continue;
+			if (
+				invalidateWorkspace ||
+				candidate.key.resources.some((resource) => changed.some((path) => resourcePathsOverlap(resource, path)))
+			) {
+				discardCandidate(session, candidate, cause("freshness", "authoritative_resource_changed"));
+			}
+		}
+	};
+
+	const pruneActionContexts = (session: Session): void => {
+		for (const [id, context] of session.actionContexts) {
+			if (context.opportunity?.state.status !== "matching") session.actionContexts.delete(id);
+		}
+	};
+
+	const finishState = async (state: Turn, terminal: boolean): Promise<void> => {
+		if (state.lifecycle !== "active") return;
+		state.lifecycle = "closing";
+		await state.session.effects.flush();
+		state.generation.expire(cause("control", terminal ? "terminal_turn" : "turn_finished"));
+		await state.admissionTail;
+		state.lifecycle = "finished";
+		try {
+			await adapter.onTurnFinished?.({
+				startInput: state.startInput,
+				settings: state.settings,
+				terminal,
+				durationMs: Math.max(0, performance.now() - state.startedAt),
+			});
+		} catch {
+			// Host lifecycle is outside authoritative settlement.
+		}
+		turns.delete(state.key);
+		state.session.turns.delete(state.key);
+		clearActorActions(state.session, state.turnID);
+		if (!terminal) return;
+		for (const node of state.session.plan.unsettled()) {
+			settleUnobserved(state.session, node, cause("control", "session_terminal"));
+		}
+		for (const timer of state.session.launchTimers.values()) clearTimeout(timer);
+		state.session.launchTimers.clear();
+		for (const candidate of allCandidates(state.sessionID)) {
+			if (candidate.work.reservation.kind === "exclusive")
+				discardCandidate(state.session, candidate, cause("control", "session_terminal"));
+		}
+		await state.session.effects.flush();
+		for (const source of sources) {
+			try {
+				await source.flush?.();
+			} catch {
+				// Persistence failure is isolated per source.
+			}
+		}
+		state.session.plan.clear();
+		pruneActionContexts(state.session);
+		clearActorActions(state.session);
+	};
+
+	const finishTurn = async (input: FinishInput): Promise<void> => {
+		const state = turns.get(turnKey(input.sessionID, input.turnID));
+		if (state) await finishState(state, input.terminal === true);
+		else if (input.terminal === true) {
+			const session = sessions.get(input.sessionID);
+			if (!session) return;
+			for (const node of session.plan.unsettled())
+				settleUnobserved(session, node, cause("control", "session_terminal"));
+			for (const candidate of allCandidates(input.sessionID)) {
+				if (candidate.work.reservation.kind === "exclusive")
+					discardCandidate(session, candidate, cause("control", "session_terminal"));
+			}
+			await session.effects.flush();
+			session.plan.clear();
+			pruneActionContexts(session);
+			clearActorActions(session);
+		}
+	};
+
+	const settingsChanged = async (settings: SpeculativeActionSettings): Promise<void> => {
+		masterEnabled = settings.enabled;
+		if (settings.enabled) return;
+		await Promise.all(
+			[...sessions.keys()].map((sessionID) => disableSession(sessionID, cause("control", "disabled"))),
+		);
+	};
+
+	const disableSession = async (sessionID: SessionID, failure: ResolutionCause): Promise<void> => {
+		const session = sessions.get(sessionID);
+		if (!session) return;
+		for (const key of [...session.turns]) {
+			const state = turns.get(key);
+			if (!state) continue;
+			state.lifecycle = "finished";
+			state.generation.expire(failure);
+			turns.delete(key);
+		}
+		session.turns.clear();
+		for (const node of session.plan.unsettled()) settleUnobserved(session, node, failure);
+		for (const timer of session.launchTimers.values()) clearTimeout(timer);
+		session.launchTimers.clear();
+		for (const candidate of allCandidates(sessionID)) discardCandidate(session, candidate, failure);
+		session.plan.clear();
+		clearActorActions(session);
+		await session.effects.flush();
+		pruneActionContexts(session);
+	};
+
+	const disposeSession = async (sessionID: SessionID): Promise<void> => {
+		const session = sessions.get(sessionID);
+		if (!session) return;
+		session.disposed = true;
+		await disableSession(sessionID, cause("control", "session_disposed"));
+		await session.effects.close();
+		sessions.delete(sessionID);
+		for (const source of sources) {
+			try {
+				await source.flush?.();
+			} catch {
+				// Persistence failure is isolated per source.
+			}
+		}
+	};
+
+	const releaseSession = async (sessionID: SessionID): Promise<void> => {
+		await disposeSession(sessionID);
+	};
+
+	const dispose = async (): Promise<void> => {
+		for (const sessionID of [...sessions.keys()]) await disposeSession(sessionID);
+	};
+
+	const inspect = (sessionID?: SessionID): SpeculativeRuntimeInspection => {
+		const selectedSessions = sessionID === undefined ? [...sessions.values()] : maybe(sessions.get(sessionID));
+		const selectedTurns = [...turns.values()].filter(
+			(turn) => sessionID === undefined || turn.sessionID === sessionID,
+		);
+		const candidates =
+			sessionID === undefined
+				? uniqueCandidates([...jobs.allValues(), ...results.allValues(), ...branches.allValues()])
+				: allCandidates(sessionID);
+		const planNodes = selectedSessions.flatMap((session) => session.plan.values());
+		return {
+			activeTurns: selectedTurns.length,
+			exclusiveCandidates: candidates.filter((candidate) => candidate.work.reservation.kind === "exclusive").length,
+			sharedCandidates: candidates.filter((candidate) => candidate.work.reservation.kind === "shared").length,
+			pendingPredictions: selectedTurns.reduce(
+				(total, turn) => total + turn.pendingProduction + turn.pendingAdmission,
+				0,
+			),
+			deferredPlanActions: planNodes.filter((node) => node.execution.status === "deferred").length,
+			activePlanActions: planNodes.filter(
+				(node) => node.execution.status === "scheduled" || node.execution.status === "running",
+			).length,
+			blockedPlanActions: planNodes.filter((node) => node.readiness === "blocked").length,
+		};
+	};
+
+	const cacheSnapshot = (session: Session, settings: SpeculativeActionSettings): SpeculativeCacheSnapshot => {
+		const inFlight = jobs.values(session.id);
+		const cached = results.values(session.id);
+		const staged = branches.values(session.id);
+		const segments = results.snapshot(session.id);
+		return {
+			cacheCapacity: settings.resourceCacheMaxEntries,
+			cacheByteCapacity: cacheByteLimit(settings),
+			cacheCold: segments.coldEntries,
+			cacheHot: segments.hotEntries,
+			inFlightJobs: inFlight.length,
+			resultEntries: cached.length,
+			resultBytes: cached.reduce((sum, candidate) => sum + candidate.estimatedBytes, 0),
+			branchEntries: staged.length,
+			branchBytes: staged.reduce((sum, candidate) => sum + candidate.estimatedBytes, 0),
+			exclusiveCandidates: [...inFlight, ...staged].filter(
+				(candidate) => candidate.work.reservation.kind === "exclusive",
+			).length,
+			sharedCandidates: [...inFlight, ...cached].filter((candidate) => candidate.work.reservation.kind === "shared")
+				.length,
+			cacheTools: [...new Set([...inFlight, ...cached, ...staged].map((candidate) => candidate.key.tool))].sort(),
+			cacheExecutions: [
+				...new Set([...inFlight, ...cached, ...staged].map((candidate) => candidate.key.execution)),
+			].sort(),
+		};
+	};
+
+	const queueSourceRequestEvent = (state: Turn, result: SettledSourceRequest): void => {
+		const request: SettledSourceRequest = {
+			request: result.request,
+			startedAt: result.startedAt,
+			durationMs: result.durationMs,
+			settlement: result.settlement,
+		};
+		const event: SpeculativeActionEvent<SessionID> = {
+			type: "source_request",
+			sessionID: state.sessionID,
+			turnID: state.turnID,
+			timestamp: Date.now(),
+			cache: cacheSnapshot(state.session, state.settings),
+			request,
+		};
+		state.session.effects.enqueue(() => emit(event));
+	};
+
+	const queueCandidateEvent = (session: Session, candidate: Candidate): void => {
+		const state = candidateExecutionProjection(candidate);
+		if (!state) return;
+		const descriptor = candidateEventDescriptor(candidate);
+		const event: SpeculativeActionEvent<SessionID> = {
+			type: "candidate",
+			sessionID: session.id,
+			turnID: candidate.owner.startInput.turnID,
+			timestamp: Date.now(),
+			cache: cacheSnapshot(session, candidate.owner.settings),
+			candidate: descriptor,
+			state,
+		};
+		session.effects.enqueue(() => emit(event));
+	};
+
+	const emit = async (event: SpeculativeActionEvent<SessionID>): Promise<void> => {
+		try {
+			await adapter.onEvent?.(event);
+		} catch {
+			// Events are projections and cannot mutate settlement.
+		}
+	};
+
+	return { startTurn, consume, actual, finishTurn, settingsChanged, releaseSession, disposeSession, dispose, inspect };
+
+	function allCandidates(sessionID: SessionID): Candidate[] {
+		return uniqueCandidates([...jobs.values(sessionID), ...results.values(sessionID), ...branches.values(sessionID)]);
+	}
+
+	function candidateByID(sessionID: SessionID, candidateID: string): Candidate | undefined {
+		return allCandidates(sessionID).find((candidate) => candidate.id === candidateID);
+	}
+
+	function newestTurn(session: Session): Turn | undefined {
+		return [...session.turns]
+			.map((key) => turns.get(key))
+			.filter((value): value is Turn => value !== undefined)
+			.at(-1);
+	}
+
+	function candidateExecutionDuration(session: Session, candidateID: string): number {
+		const execution = candidateByID(session.id, candidateID)?.work.execution;
+		return execution && "executionMs" in execution ? execution.executionMs : 0;
+	}
+
+	function recordValidation(candidate: Candidate, validation: ResourceValidation): void {
+		candidate.validationMs += finiteMetric(validation.metrics.durationMs);
+		candidate.validationBytes += finiteMetric(validation.metrics.bytesRead);
+		candidate.validationFiles += finiteMetric(validation.metrics.filesRead);
+		candidate.validationMode = validation.metrics.mode;
+	}
+}

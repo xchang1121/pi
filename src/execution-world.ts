@@ -3,7 +3,7 @@ import type { SandboxActionMode } from "./action-semantics.ts";
 /** Sandbox modes that require an isolated execution world. */
 export type ExecutionWorldMode = Exclude<SandboxActionMode, "none">;
 
-export type WorldBranchState = "ready" | "adopting" | "adopted" | "failed";
+export type WorldBranchState = "sealed" | "committing" | "committed" | "failed";
 
 export interface WorldExecutionMetrics {
 	/** Time spent materializing an isolated world before the tool could start. */
@@ -12,13 +12,27 @@ export interface WorldExecutionMetrics {
 	readonly captureMs?: number;
 }
 
-export interface WorldAdoptionMetrics {
+export interface WorldCommitMetrics {
 	readonly durationMs: number;
 	readonly validationMs: number;
 	readonly bytesValidated: number;
 	readonly resourcesValidated: number;
-	readonly resourcesAdopted: number;
+	readonly resourcesCommitted: number;
 }
+
+/** Backend-issued evidence; policy decides whether it matches the Actor world. */
+export type WorldCompatibilityEvidence =
+	| {
+			readonly status: "compatible";
+			readonly backend: string;
+			readonly executionFingerprint: string;
+	  }
+	| {
+			readonly status: "incompatible" | "indeterminate";
+			readonly backend: string;
+			readonly code: string;
+			readonly detail?: string;
+	  };
 
 /** Immutable execution state from which a later speculative action may derive. */
 export interface WorldCheckpoint {
@@ -32,8 +46,8 @@ export interface WorldCheckpoint {
  * A sealed speculative execution.
  *
  * The tool output and promotable persistent effects are captured together. Ephemeral process,
- * environment, and network state never crosses the branch boundary. Adoption is lossless,
- * conflict-checked, and at most once; callers may safely join the same in-progress adoption.
+ * environment, and network state never crosses the branch boundary. Commit is lossless,
+ * conflict-checked, and at most once; callers may safely join the same in-progress commit.
  */
 export interface WorldBranch<Output> {
 	readonly output: Output;
@@ -43,9 +57,10 @@ export interface WorldBranch<Output> {
 	/** Captured persistent-effect bytes, excluding the serialized tool output. */
 	readonly capturedBytes: number;
 	readonly executionMetrics: WorldExecutionMetrics;
+	readonly compatibility: WorldCompatibilityEvidence;
 	readonly state: WorldBranchState;
-	readonly adoptionMetrics?: WorldAdoptionMetrics;
-	readonly adopt: () => Promise<Output>;
+	readonly commitMetrics?: WorldCommitMetrics;
+	readonly commit: () => Promise<Output>;
 }
 
 export interface ExecutionWorldPreparation {
@@ -54,7 +69,7 @@ export interface ExecutionWorldPreparation {
 	readonly signal?: AbortSignal;
 }
 
-/** Source-independent lifecycle for isolating, sealing, and adopting speculative effects. */
+/** Source-independent lifecycle for isolating, sealing, and committing speculative effects. */
 export interface ExecutionWorld<Context extends { readonly mode: ExecutionWorldMode }, Output> {
 	readonly supports: (mode: ExecutionWorldMode) => boolean;
 	/** Stable identity of the concrete isolation backend used by K(a). */

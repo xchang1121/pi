@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { READ_RANGE_COVERAGE_DETAILS_KEY, type ReadRangeCoverage } from "../src/action-key-projection.ts";
-import { actionKeyMatch, buildPiActionKey } from "../src/common.ts";
+import { actionKeyMatch, buildPiActionKey } from "../src/action-semantics.ts";
 import { PI_READ_RANGE_PROJECTION_RULE } from "../src/pi-read-projection.ts";
 import type { ToolSettlement } from "../src/tool-settlement.ts";
 

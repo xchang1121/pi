@@ -4,7 +4,7 @@ import path from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it } from "vitest";
-import { buildPiActionKey } from "../src/common.ts";
+import { buildPiActionKey } from "../src/action-semantics.ts";
 import {
 	type ContainerRuntimeInvocation,
 	type ContainerRuntimeInvocationResult,
@@ -249,7 +249,7 @@ describe("container sandbox backend", () => {
 		await expect(aborted).rejects.toThrow("Windows invocation cancelled");
 	});
 
-	it("composes the OCI backend with workspace capture, adoption, and discard", async () => {
+	it("composes the OCI backend with workspace capture, commit, and discard", async () => {
 		const root = await temporaryRoot("pi-container-workspace-source-test-");
 		const workerRoot = await temporaryRoot("pi-container-workspace-worker-test-");
 		await writeFile(path.join(root, "input.txt"), "source\n");
@@ -265,7 +265,7 @@ describe("container sandbox backend", () => {
 		expect(await readFile(path.join(root, "input.txt"), "utf8")).toBe("source\n");
 		await expect(stat(path.join(root, "adopted.txt"))).rejects.toThrow();
 		expect(adopted.resources).toEqual(["adopted.txt", "input.txt"]);
-		await adopted.adopt();
+		await adopted.commit();
 		expect(await readFile(path.join(root, "input.txt"), "utf8")).toBe("container\n");
 		expect(await readFile(path.join(root, "adopted.txt"), "utf8")).toBe("adopted\n");
 

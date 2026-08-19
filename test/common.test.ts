@@ -10,11 +10,9 @@ import {
 	actionKeyProjectionPartitions,
 	buildActionKey,
 	buildPiActionKey,
-	buildSingleToolCallPrompt,
-	clampCandidateLimit,
-	DEFAULTS,
 	inferredExecution,
-} from "../src/common.ts";
+} from "../src/action-semantics.ts";
+import { buildSingleToolCallPrompt, clampCandidateLimit, DEFAULTS } from "../src/common.ts";
 import { candidateToolNames } from "../src/runtime.ts";
 
 describe("speculative action common", () => {

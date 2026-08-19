@@ -11,20 +11,24 @@ afterEach(async () => {
 });
 
 describe("extension-owned speculative settings", () => {
-	it("persists global and project layers without writing Pi settings.json", async () => {
+	it("persists only the project overlay while preserving global inheritance", async () => {
 		const { root, agent, cwd } = await fixture();
 		const store = new SpeculativeActionSettingsStore(cwd, agent);
 		await store.load();
-		store.set({ enabled: true, candidateLimit: 4, patternAware: { enabled: true, beamWidth: 2 } });
+		store.setEffective({ enabled: true, candidateLimit: 4, patternAware: { enabled: true, beamWidth: 2 } });
 		await store.flush();
 		store.setScope("project");
-		store.set({ candidateLimit: 2, patternAware: { beamWidth: 5 } });
+		store.setEffective({ enabled: true, candidateLimit: 2, patternAware: { enabled: true, beamWidth: 5 } });
 		await store.flush();
+		expect(JSON.parse(await readFile(path.join(cwd, ".pi", "speculative-action.json"), "utf8"))).toEqual({
+			candidateLimit: 2,
+			patternAware: { beamWidth: 5 },
+		});
 
 		const reloaded = new SpeculativeActionSettingsStore(cwd, agent);
 		await reloaded.load();
 		expect(reloaded.scope).toBe("project");
-		expect(reloaded.get()).toMatchObject({
+		expect(reloaded.effective()).toMatchObject({
 			enabled: true,
 			candidateLimit: 2,
 			patternAware: { enabled: true, beamWidth: 5 },
@@ -32,19 +36,20 @@ describe("extension-owned speculative settings", () => {
 		await expect(readFile(path.join(root, ".pi", "settings.json"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
 	});
 
-	it("removes only the selected layer and falls back to global settings", async () => {
+	it("uses explicit tombstones for project removal and clears only the selected layer", async () => {
 		const { agent, cwd } = await fixture();
 		const store = new SpeculativeActionSettingsStore(cwd, agent);
 		await store.load();
-		store.set({ enabled: true, candidateLimit: 6 });
+		store.setEffective({ enabled: true, candidateLimit: 6, draftModel: "openai/draft" });
 		await store.flush();
 		store.setScope("project");
-		store.set({ enabled: false });
+		store.setEffective({ enabled: false, candidateLimit: 6 });
 		await store.flush();
-		expect(store.get()?.enabled).toBe(false);
-		store.set(undefined);
+		expect(store.overlay()).toEqual({ enabled: false, draftModel: null });
+		expect(store.effective()).toEqual({ enabled: false, candidateLimit: 6 });
+		store.clear();
 		await store.flush();
-		expect(store.get()).toMatchObject({ enabled: true, candidateLimit: 6 });
+		expect(store.effective()).toMatchObject({ enabled: true, candidateLimit: 6, draftModel: "openai/draft" });
 	});
 
 	it("treats malformed optional layers as absent", async () => {
@@ -52,7 +57,7 @@ describe("extension-owned speculative settings", () => {
 		await writeFile(path.join(agent, "speculative-action.json"), "{broken", "utf8");
 		const store = new SpeculativeActionSettingsStore(cwd, agent);
 		await expect(store.load()).resolves.toBeUndefined();
-		expect(store.get()).toBeUndefined();
+		expect(store.effective()).toBeUndefined();
 	});
 });
 

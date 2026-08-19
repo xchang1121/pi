@@ -1,7 +1,5 @@
 import { IDEMPOTENT_ACTION_TOOLS, SANDBOX_ACTION_TOOLS } from "./action-semantics.ts";
 
-export * from "./action-semantics.ts";
-
 export interface DrafterToolDefinition {
 	readonly name: string;
 	readonly description?: string;
@@ -16,7 +14,6 @@ export const DEFAULTS = {
 	resourceCacheMaxEntries: 512,
 	resourceCacheMaxBytes: 256 * 1024 * 1024,
 	predictionTimeoutMs: 300_000,
-	adaptiveDrafter: true,
 	tools: {
 		resourceCached: IDEMPOTENT_ACTION_TOOLS,
 		sandbox: SANDBOX_ACTION_TOOLS,

@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
 import { READ_RANGE_ACTION_KEY_PROJECTOR } from "../src/action-key-projection.ts";
-import { buildPiActionKey } from "../src/common.ts";
+import { buildPiActionKey } from "../src/action-semantics.ts";
 import {
 	acquirePatternAwareStore,
 	applyBindings,
@@ -13,6 +13,7 @@ import {
 	patternAwareSettings,
 	projectPatternAwareObservation,
 } from "../src/pattern-aware.ts";
+import type { PredictionSettlement, ResolutionStage } from "../src/settlement.ts";
 
 const temporary: string[] = [];
 
@@ -227,12 +228,15 @@ describe("PatternAware", () => {
 					{ "0": 2 },
 					{
 						id: "balanced-runtime",
-						opportunities: 2,
-						consumed: 1,
-						unused: 1,
-						actorMisses: 1,
-						recentSuccessWeight: 1,
-						recentFailureWeight: 1,
+						feedback: patternFeedback({
+							issued: 2,
+							observed: 2,
+							matched: 1,
+							adopted: 1,
+							recentMatchedWeight: 1,
+							recentMismatchedWeight: 1,
+							recentAdoptedWeight: 1,
+						}),
 					},
 				),
 			),
@@ -243,42 +247,42 @@ describe("PatternAware", () => {
 		expect(store.predict("probe").some((item) => item.tool === "read")).toBe(true);
 	});
 
-	test("attributes only actor choices as negative predictor feedback", () => {
+	test("derives orthogonal feedback only from authoritative prediction settlements", () => {
 		const store = new PatternAwareStore(settings({ minOccurrences: 2 }));
 		expect(store.registerValidatedPattern(validatedGapPattern({ "0": 10 }, { id: "attributed" }))).toBe(true);
 		store.observe(input({ sessionID: "probe", tool: "grep", input: { pattern: "TODO" } }));
+		const beforeUnobserved = store.predict("probe").find((item) => item.patternID === "attributed");
+		for (let index = 0; index < 4; index++) store.issued("attributed");
+		store.settled("attributed", unobservedSettlement("source", "timeout"));
+		const afterUnobserved = store.predict("probe").find((item) => item.patternID === "attributed");
+		expect(afterUnobserved?.empiricalProbability).toBe(beforeUnobserved?.empiricalProbability);
+		store.settled("attributed", unmatchedSettlement());
+		store.settled("attributed", rejectedSettlement("freshness", "resource_changed"));
+		store.settled("attributed", adoptedSettlement());
 
-		for (const outcome of ["system", "stale", "system", "stale"] as const) {
-			store.launched("attributed");
-			store.resolved("attributed", outcome);
-		}
-		const beforeActorMiss = store.predict("probe").find((item) => item.patternID === "attributed");
-		expect(beforeActorMiss).toBeDefined();
-
-		for (let index = 0; index < 2; index++) {
-			store.launched("attributed");
-			store.resolved("attributed", "actor_miss");
-		}
 		const pattern = store.snapshot().find((item) => item.id === "attributed");
 		expect(pattern).toMatchObject({
-			opportunities: 6,
-			unused: 6,
-			actorMisses: 2,
-			staleInvalidations: 2,
-			systemCancellations: 2,
+			adoptionProbability: 0.5,
+			feedback: {
+				issued: 4,
+				observed: 3,
+				matched: 2,
+				adopted: 1,
+				rejectedAfterMatch: { freshness: 1 },
+				unobserved: { "source:timeout": 1 },
+			},
 		});
-		const afterActorMiss = store.predict("probe").find((item) => item.patternID === "attributed");
-		expect(afterActorMiss).toBeDefined();
-		expect(afterActorMiss!.empiricalProbability).toBeLessThan(beforeActorMiss!.empiricalProbability);
+		const afterObservedMiss = store.predict("probe").find((item) => item.patternID === "attributed");
+		expect(afterObservedMiss!.empiricalProbability).toBeLessThan(beforeUnobserved!.empiricalProbability);
 	});
 
-	test("discounts stale runtime failures so fresh successes recover after drift", () => {
+	test("discounts old mismatch evidence so fresh matches recover after drift", () => {
 		const store = new PatternAwareStore(settings({ minOccurrences: 2, decayHalfLifeEvents: 2 }));
 		expect(store.registerValidatedPattern(validatedGapPattern({ "0": 10 }, { id: "drift" }))).toBe(true);
 		store.observe(input({ sessionID: "probe", tool: "grep", input: { pattern: "TODO" } }));
 		for (let index = 0; index < 2; index++) {
-			store.launched("drift");
-			store.resolved("drift", "actor_miss");
+			store.issued("drift");
+			store.settled("drift", unmatchedSettlement());
 		}
 		const afterFailures = store.predict("probe").find((item) => item.patternID === "drift");
 		expect(afterFailures).toBeDefined();
@@ -291,14 +295,16 @@ describe("PatternAware", () => {
 			});
 		}
 		for (let index = 0; index < 2; index++) {
-			store.launched("drift");
-			store.resolved("drift", "consumed");
+			store.issued("drift");
+			store.settled("drift", adoptedSettlement());
 		}
 
 		const afterRecovery = store.predict("probe").find((item) => item.patternID === "drift");
 		expect(afterRecovery).toBeDefined();
 		const recoveredPattern = store.snapshot().find((item) => item.id === "drift");
-		expect(recoveredPattern!.recentSuccessWeight).toBeGreaterThan(recoveredPattern!.recentFailureWeight);
+		expect(recoveredPattern!.feedback.recentMatchedWeight).toBeGreaterThan(
+			recoveredPattern!.feedback.recentMismatchedWeight,
+		);
 	});
 
 	test("lets recent gap behavior replace stale high-volume history", () => {
@@ -380,7 +386,7 @@ describe("PatternAware", () => {
 
 		const raw = await fs.readFile(file, "utf8");
 		expect(raw).not.toContain('"history"');
-		expect(JSON.parse(raw).version).toBe(12);
+		expect(JSON.parse(raw).version).toBe(13);
 		const second = new PatternAwareStore(settings(), file);
 		await second.load();
 		second.observe(input({ sessionID: "three", tool: "grep", input: {}, outputPaths: ["src/c.ts"] }));
@@ -396,7 +402,7 @@ describe("PatternAware", () => {
 		await fs.writeFile(
 			file,
 			JSON.stringify({
-				version: 11,
+				version: 13,
 				patterns: [
 					valid,
 					{ ...valid, id: "bad-context", context: [{ tool: 7, outcome: "success" }] },
@@ -410,6 +416,7 @@ describe("PatternAware", () => {
 					},
 				],
 				pools: [],
+				sequenceCounts: [],
 			}),
 		);
 
@@ -419,130 +426,47 @@ describe("PatternAware", () => {
 		expect(store.snapshot().map((pattern) => pattern.id)).toEqual(["valid-persisted-pattern"]);
 	});
 
-	test("shares a workspace store only while runtime leases remain active", async () => {
+	test("shares analyzer state across predictor-only settings and isolates analyzer configurations", async () => {
 		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "pi-pattern-lease-"));
 		temporary.push(workspace);
 		const first = await acquirePatternAwareStore(workspace, settings());
 		const second = await acquirePatternAwareStore(workspace, settings());
+		const predictorOnly = await acquirePatternAwareStore(
+			workspace,
+			settings({ beamWidth: PATTERN_AWARE_DEFAULTS.beamWidth + 1, maxPredictionDepth: 1 }),
+		);
+		const differentAnalyzer = await acquirePatternAwareStore(
+			workspace,
+			settings({ maxContextLength: PATTERN_AWARE_DEFAULTS.maxContextLength + 1 }),
+		);
 
 		expect(second.store).toBe(first.store);
+		expect(predictorOnly.store).toBe(first.store);
+		expect(differentAnalyzer.store).not.toBe(first.store);
 		await first.release();
 		const third = await acquirePatternAwareStore(workspace, settings());
 		expect(third.store).toBe(second.store);
 
 		await second.release();
+		await predictorOnly.release();
+		await differentAnalyzer.release();
 		await third.release();
 		const next = await acquirePatternAwareStore(workspace, settings());
 		expect(next.store).not.toBe(first.store);
 		await next.release();
 	});
 
-	test("merges v10 gap-partitioned pools before collecting new evidence", async () => {
-		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "pi-pattern-gap-migration-"));
-		temporary.push(directory);
-		const file = path.join(directory, "patterns.json");
-		const legacySample = (sessionID: string, filePath: string, gap: number, sequence: number) => ({
-			context: [
-				{
-					...input({ sessionID, tool: "grep", input: {}, outputPaths: [filePath] }),
-					sequence,
-				},
-			],
-			target: {
-				...input({ sessionID, tool: "read", input: { filePath } }),
-				sequence: sequence + 1,
-			},
-			gap,
-		});
-		await fs.writeFile(
-			file,
-			JSON.stringify({
-				version: 10,
-				patterns: [],
-				pools: [
-					{
-						key: "legacy-gap-0",
-						context: [{ tool: "grep", outcome: "success" }],
-						targetTool: "read",
-						samples: [legacySample("legacy-immediate", "src/a.ts", 0, 1)],
-						observations: 1,
-					},
-					{
-						key: "legacy-gap-1",
-						context: [{ tool: "grep", outcome: "success" }],
-						targetTool: "read",
-						samples: [legacySample("legacy-delayed", "src/b.ts", 1, 3)],
-						observations: 1,
-					},
-				],
-			}),
-		);
-
-		const store = new PatternAwareStore(settings({ maxContextLength: 1, maxFutureGap: 1, minOccurrences: 3 }), file);
-		await store.load();
-		store.observe(input({ sessionID: "fresh", tool: "grep", input: {}, outputPaths: ["src/c.ts"] }));
-		store.observe(input({ sessionID: "fresh", tool: "read", input: { filePath: "src/c.ts" } }));
-
-		const pattern = store
-			.snapshot()
-			.find((item) => item.targetTool === "read" && item.context.length === 1 && item.context[0]?.tool === "grep");
-		expect(pattern).toMatchObject({
-			occurrences: 3,
-			replayMatches: 3,
-			gapCounts: { "0": 2, "1": 1 },
-		});
-	});
-
-	test("migrates v9 patterns without treating ambiguous unused work as actor misses", async () => {
-		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "pi-pattern-aware-migration-"));
-		temporary.push(directory);
-		const file = path.join(directory, "patterns.json");
-		const {
-			actorMisses: _actorMisses,
-			staleInvalidations: _staleInvalidations,
-			systemCancellations: _systemCancellations,
-			recentSuccessWeight: _recentSuccessWeight,
-			recentFailureWeight: _recentFailureWeight,
-			feedbackSequence: _feedbackSequence,
-			...legacy
-		} = validatedGapPattern(
-			{ "0": 10 },
-			{
-				id: "migrated",
-				opportunities: 9,
-				consumed: 2,
-				unused: 7,
-			},
-		);
-		await fs.writeFile(file, JSON.stringify({ version: 9, patterns: [legacy], pools: [] }));
-
-		const store = new PatternAwareStore(settings(), file);
-		await store.load();
-		const migrated = store.snapshot().find((item) => item.id === "migrated");
-
-		expect(migrated).toMatchObject({
-			consumed: 2,
-			unused: 7,
-			actorMisses: 0,
-			staleInvalidations: 0,
-			systemCancellations: 0,
-			recentSuccessWeight: 2,
-			recentFailureWeight: 0,
-		});
-		store.observe(input({ sessionID: "probe", tool: "grep", input: { pattern: "TODO" } }));
-		expect(store.predict("probe").some((item) => item.patternID === "migrated")).toBe(true);
-	});
-
-	test("discards persisted patterns from an incompatible analyzer version", async () => {
+	test("discards persisted patterns from a different schema version", async () => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "pi-pattern-aware-version-"));
 		temporary.push(directory);
 		const file = path.join(directory, "patterns.json");
 		await fs.writeFile(
 			file,
 			JSON.stringify({
-				version: 8,
+				version: 12,
 				patterns: [validatedGapPattern({ "0": 10 })],
 				pools: [],
+				sequenceCounts: [],
 			}),
 		);
 
@@ -591,7 +515,7 @@ describe("PatternAware", () => {
 		await first.flush();
 
 		const persisted = JSON.parse(await fs.readFile(file, "utf8"));
-		expect(persisted.version).toBe(12);
+		expect(persisted.version).toBe(13);
 		expect(persisted.sequenceCounts.length).toBeGreaterThan(0);
 		const restored = new PatternAwareStore(configured, file);
 		await restored.load();
@@ -715,8 +639,8 @@ describe("PatternAware", () => {
 		const store = new PatternAwareStore(settings());
 		expect(store.registerValidatedPattern(validatedGapPattern({ "0": 10 }))).toBe(true);
 		for (let index = 0; index < 3; index++) {
-			store.launched("gap-pattern");
-			store.resolved("gap-pattern", "actor_miss");
+			store.issued("gap-pattern");
+			store.settled("gap-pattern", unmatchedSettlement());
 		}
 
 		store.observe(input({ sessionID: "probe", tool: "grep", input: {} }));
@@ -1365,8 +1289,8 @@ describe("PatternAware", () => {
 		const before = store.predict("probe").find((item) => item.tool === "read");
 		expect(before).toBeDefined();
 		for (let index = 0; index < 3; index++) {
-			store.launched(before!.patternID);
-			store.resolved(before!.patternID, "actor_miss");
+			store.issued(before!.patternID);
+			store.settled(before!.patternID, unmatchedSettlement());
 		}
 
 		const after = store.predict("probe").find((item) => item.tool === "read");
@@ -1526,7 +1450,7 @@ describe("PatternAware", () => {
 		).toBe(false);
 	});
 
-	test("projects native and legacy tool outputs without parsing display text", () => {
+	test("projects supported structured tool outputs without parsing display text", () => {
 		expect(
 			projectPatternAwareObservation({
 				output: {
@@ -1761,19 +1685,84 @@ function validatedGapPattern(
 		historicalOpportunities: 10,
 		historicalMatches: 10,
 		empiricalProbability: 1,
-		opportunities: 0,
-		consumed: 0,
-		unused: 0,
-		actorMisses: 0,
-		staleInvalidations: 0,
-		systemCancellations: 0,
-		recentSuccessWeight: 0,
-		recentFailureWeight: 0,
-		feedbackSequence: 1,
+		adoptionProbability: 1,
+		feedback: patternFeedback(),
 		averageDurationMs: 100,
 		lastSeenSequence: 1,
 		...overrides,
 	};
+}
+
+function patternFeedback(
+	overrides: Partial<Parameters<PatternAwareStore["registerValidatedPattern"]>[0]["feedback"]> = {},
+): Parameters<PatternAwareStore["registerValidatedPattern"]>[0]["feedback"] {
+	return {
+		issued: 0,
+		observed: 0,
+		matched: 0,
+		adopted: 0,
+		rejectedAfterMatch: {},
+		unobserved: {},
+		recentMatchedWeight: 0,
+		recentMismatchedWeight: 0,
+		recentAdoptedWeight: 0,
+		recentRejectedWeight: 0,
+		sequence: 1,
+		...overrides,
+	};
+}
+
+type PredictionSettlementBody<Settlement> = Settlement extends unknown ? Omit<Settlement, "prediction"> : never;
+
+function predictionSettlement(settlement: PredictionSettlementBody<PredictionSettlement>): PredictionSettlement {
+	return {
+		prediction: {
+			id: "prediction",
+			source: "pattern_aware",
+			proposalID: "proposal",
+			actionID: "action",
+		},
+		...settlement,
+	} as PredictionSettlement;
+}
+
+function unobservedSettlement(stage: ResolutionStage, code: string): PredictionSettlement {
+	return predictionSettlement({ observation: "unobserved", cause: { stage, code } });
+}
+
+function unmatchedSettlement(): PredictionSettlement {
+	return predictionSettlement({
+		observation: "observed",
+		actorAction: { id: "actor", sequence: 1, turnID: "turn" },
+		match: { matched: false },
+	});
+}
+
+function rejectedSettlement(stage: ResolutionStage, code: string): PredictionSettlement {
+	return predictionSettlement({
+		observation: "observed",
+		actorAction: { id: "actor", sequence: 1, turnID: "turn" },
+		match: {
+			matched: true,
+			relation: { kind: "exact", distance: 0 },
+			adoption: { status: "rejected", candidateID: "candidate", cause: { stage, code } },
+		},
+	});
+}
+
+function adoptedSettlement(): PredictionSettlement {
+	return predictionSettlement({
+		observation: "observed",
+		actorAction: { id: "actor", sequence: 1, turnID: "turn" },
+		match: {
+			matched: true,
+			relation: { kind: "exact", distance: 0 },
+			adoption: {
+				status: "adopted",
+				candidateID: "candidate",
+			},
+		},
+	});
 }
 
 function input(

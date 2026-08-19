@@ -2,7 +2,7 @@ import path from "node:path";
 
 export type SpeculativeExecution = "resource_cached" | "sandbox";
 export type ActionReuseKind = "shared_result" | "exclusive_branch";
-export type ResourceVersionPolicy = "resources" | "workspace" | "adoption";
+export type ResourceVersionPolicy = "resources" | "workspace" | "actor_time";
 export type ResourceDependencyScope = "content" | "tree_entries" | "tree_query" | "tree_content";
 export type SandboxActionMode = "none" | "workspace_snapshot" | "file_mutation";
 
@@ -268,7 +268,7 @@ export const PI_ACTION_SEMANTICS = new ActionSemanticsRegistry([
 		epoch: "pi.write.v1",
 		execution: "sandbox",
 		reuse: "exclusive_branch",
-		resourceVersion: "adoption",
+		resourceVersion: "actor_time",
 		sandboxMode: "file_mutation",
 		canonicalize: canonicalWrite,
 	},
@@ -277,7 +277,7 @@ export const PI_ACTION_SEMANTICS = new ActionSemanticsRegistry([
 		epoch: "pi.edit.v1",
 		execution: "sandbox",
 		reuse: "exclusive_branch",
-		resourceVersion: "adoption",
+		resourceVersion: "actor_time",
 		sandboxMode: "file_mutation",
 		canonicalize: canonicalEdit,
 	},
@@ -300,26 +300,34 @@ export function buildActionKey(input: {
 	const schemaHash = input.schemaHash ?? "";
 	const semanticsEpoch = input.semanticsEpoch ?? "";
 	const executionFingerprint = input.executionFingerprint ?? "";
+	const canonicalInput = freezeCanonicalValue(structuredClone(input.input));
 	const key = stableStringify({
 		tool: input.tool,
 		execution: input.execution,
 		semanticsEpoch,
 		schemaHash,
 		executionFingerprint,
-		input: input.input,
+		input: canonicalInput,
 	});
-	return {
+	return Object.freeze({
 		key,
 		hash: fastHash(key),
 		tool: input.tool,
-		input: structuredClone(input.input),
-		resources: [...input.resources],
+		input: canonicalInput,
+		resources: Object.freeze([...input.resources]),
 		execution: input.execution,
 		semanticsEpoch,
 		schemaHash,
 		executionFingerprint,
 		...(input.executionContext !== undefined ? { executionContext: input.executionContext } : {}),
-	};
+	});
+}
+
+function freezeCanonicalValue<Value>(value: Value, seen = new WeakSet<object>()): Value {
+	if (!value || typeof value !== "object" || Object.isFrozen(value) || seen.has(value)) return value;
+	seen.add(value);
+	for (const child of Object.values(value)) freezeCanonicalValue(child, seen);
+	return Object.freeze(value);
 }
 
 /** Build K(a) from the default Pi action semantics registry. */
@@ -611,7 +619,7 @@ function assertDefinitionCoherence(definition: ActionSemanticsDefinition): void 
 	if (
 		(definition.resourceVersion === "workspace" &&
 			(definition.resourceScope !== "tree_content" || definition.sandboxMode !== "workspace_snapshot")) ||
-		(definition.resourceVersion === "adoption" &&
+		(definition.resourceVersion === "actor_time" &&
 			(definition.resourceScope !== undefined || definition.sandboxMode !== "file_mutation")) ||
 		definition.resourceVersion === "resources"
 	) {

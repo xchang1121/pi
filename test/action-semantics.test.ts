@@ -40,7 +40,7 @@ describe("ActionSemanticsRegistry", () => {
 		expect(PI_ACTION_SEMANTICS.definition("write")).toMatchObject({
 			execution: "sandbox",
 			reuse: "exclusive_branch",
-			resourceVersion: "adoption",
+			resourceVersion: "actor_time",
 			sandboxMode: "file_mutation",
 		});
 		expect(PI_ACTION_SEMANTICS.resourceScope("write")).toBeUndefined();
@@ -67,6 +67,9 @@ describe("ActionSemanticsRegistry", () => {
 			resources: ["src/a.ts"],
 		});
 		expect(implicit?.key).toContain('"semanticsEpoch":"pi.read.v1"');
+		expect(Object.isFrozen(implicit)).toBe(true);
+		expect(Object.isFrozen(implicit?.input)).toBe(true);
+		expect(Object.isFrozen(implicit?.resources)).toBe(true);
 	});
 
 	it("never equates identical inputs across different tool-semantics epochs", () => {
@@ -243,7 +246,7 @@ describe("ActionSemanticsRegistry", () => {
 		).toThrow();
 	});
 
-	it("distinguishes runtime-watched resources, workspace snapshots, and adoption-time validation", () => {
+	it("distinguishes runtime-watched resources, workspace snapshots, and Actor-time validation", () => {
 		expect(PI_ACTION_SEMANTICS.requiresRuntimeResourceVersion("read")).toBe(true);
 		expect(PI_ACTION_SEMANTICS.watchesResourceVersion("read")).toBe(true);
 		expect(PI_ACTION_SEMANTICS.requiresRuntimeResourceVersion("bash")).toBe(true);

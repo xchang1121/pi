@@ -2,11 +2,12 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, test } from "vitest";
+import * as packageApi from "../src/index.ts";
 import {
 	acquirePatternAwareStore,
 	captureResourceVersion,
 	createContainerSandboxProcessBackend,
-	createFallbackSandboxProcessBackend,
+	createSandboxBackendRouter,
 	createSpeculativeActionExtension,
 	createSpeculativeActionHost,
 	createWorkspaceSandbox,
@@ -28,23 +29,45 @@ describe("speculative action package boundary", () => {
 			captureResourceVersion,
 			releaseResourceVersion,
 			createContainerSandboxProcessBackend,
-			createFallbackSandboxProcessBackend,
+			createSandboxBackendRouter,
 			createWorkspaceSandbox,
 			prepareSandboxWorkspace,
 		]) {
 			expect(exported).toBeTypeOf("function");
 		}
+		for (const internal of [
+			"ActorAction",
+			"CandidateExecution",
+			"PlanRuntime",
+			"PostSettlementQueue",
+			"ResultCache",
+			"SourceGeneration",
+			"SpeculationScheduler",
+		]) {
+			expect(packageApi).not.toHaveProperty(internal);
+		}
+	});
+
+	test("keeps source implementations and Pi dependencies outside the host-neutral runtime", async () => {
+		const core = await Promise.all(
+			["runtime.ts", "runtime-engine.ts", "settlement.ts"].map((file) =>
+				fs.readFile(path.join(packageRoot, "src", file), "utf8"),
+			),
+		);
+		expect(core.join("\n")).not.toMatch(/pattern-aware|@earendil-works\/pi-/);
 	});
 
 	test("publishes an installable Pi extension without coupling Pi core back to speculation", async () => {
 		const manifest = JSON.parse(await fs.readFile(path.join(packageRoot, "package.json"), "utf8")) as {
 			exports: Record<string, unknown>;
 			files: string[];
+			scripts?: Record<string, string>;
 			pi?: { extensions?: string[] };
 			peerDependencies?: Record<string, string>;
 		};
 		expect(Object.keys(manifest.exports).sort()).toEqual([".", "./extension", "./package.json"]);
 		expect(manifest.files).toEqual(expect.arrayContaining(["dist", "native/sandbox", "native/worker"]));
+		expect(manifest.scripts?.build).toMatch(/^shx rm -rf dist && /);
 		expect(manifest.pi?.extensions).toEqual(["./dist/extension.js"]);
 		expect(manifest.peerDependencies).toMatchObject({
 			"@earendil-works/pi-agent-core": "*",

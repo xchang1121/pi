@@ -4,7 +4,7 @@ import { chmod, mkdir, mkdtemp, readFile, rename, rm, stat, writeFile } from "no
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { contains } from "./common.ts";
+import { contains } from "./action-semantics.ts";
 import type {
 	SandboxProcessBackend,
 	SandboxProcessBackendStatus,

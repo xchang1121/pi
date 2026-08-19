@@ -5,13 +5,12 @@ import path from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it } from "vitest";
-import { buildPiActionKey } from "../src/common.ts";
+import { buildPiActionKey } from "../src/action-semantics.ts";
 import { createNativeSandboxProcessBackend } from "../src/native-sandbox.ts";
 import type { ToolSettlement } from "../src/tool-settlement.ts";
 import {
 	closeWorkspaceSandboxPools,
 	commitSandboxDelta,
-	createFallbackSandboxProcessBackend,
 	createWorkspaceSandbox,
 	prepareSandboxWorkspace,
 	type SandboxProcessBackend,
@@ -76,49 +75,7 @@ const bashTool: AgentTool<typeof bashParameters> = {
 };
 
 describe("workspace ExecutionWorld", () => {
-	it("selects one ready process backend and delegates its complete lifecycle", async () => {
-		const calls: string[] = [];
-		const unavailable: SandboxProcessBackend = {
-			...testProcessBackend(async () => settlement("unused")),
-			check: async () => ({ backend: "first", state: "unavailable", source: "test", detail: "first failed" }),
-			dispose: async () => {
-				calls.push("dispose:first");
-			},
-		};
-		const ready: SandboxProcessBackend = {
-			...testProcessBackend(
-				async () => settlement("unused"),
-				async () => {
-					calls.push("prepare:second");
-				},
-			),
-			check: async () => ({
-				backend: "second",
-				state: "ready",
-				source: "test",
-				detail: "second ready",
-				fingerprint: "second:v1",
-			}),
-			fingerprint: async () => {
-				calls.push("fingerprint:second");
-				return "second:v1";
-			},
-			dispose: async () => {
-				calls.push("dispose:second");
-			},
-		};
-		const backend = createFallbackSandboxProcessBackend([unavailable, ready]);
-
-		expect(await backend.check()).toMatchObject({ backend: "second", state: "ready" });
-		expect(await backend.fingerprint()).toBe("second:v1");
-		await backend.prepare({});
-		await backend.dispose();
-		await backend.dispose();
-
-		expect(calls).toEqual(["fingerprint:second", "prepare:second", "dispose:first", "dispose:second"]);
-	});
-
-	it("stages write output without touching the workspace and adopts after base validation", async () => {
+	it("stages write output without touching the workspace and commits after base validation", async () => {
 		const root = await mkdtemp(path.join(os.tmpdir(), "pi-spec-write-test-"));
 		try {
 			const args = { path: "nested/created.txt", content: "from sandbox\n" };
@@ -139,26 +96,31 @@ describe("workspace ExecutionWorld", () => {
 			expect(execution.output.result.content).toEqual([
 				{ type: "text", text: "Successfully wrote nested/created.txt" },
 			]);
-			expect(execution.state).toBe("ready");
+			expect(execution.state).toBe("sealed");
 			expect(execution.resources).toEqual(["nested/created.txt"]);
 			expect(execution.capturedBytes).toBe(Buffer.byteLength("from sandbox\n"));
 			expect(execution.executionMetrics.setupMs).toBeGreaterThanOrEqual(0);
 			expect(execution.executionMetrics.captureMs).toBeGreaterThanOrEqual(0);
-			await execution.adopt();
-			expect(execution.state).toBe("adopted");
+			expect(execution.compatibility).toEqual({
+				status: "compatible",
+				backend: "git_worktree",
+				executionFingerprint: action.executionFingerprint,
+			});
+			await execution.commit();
+			expect(execution.state).toBe("committed");
 			expect(await readFile(path.join(root, args.path), "utf8")).toBe("from sandbox\n");
-			expect(execution.adoptionMetrics).toEqual(
-				expect.objectContaining({ resourcesValidated: 1, resourcesAdopted: 1, bytesValidated: 0 }),
+			expect(execution.commitMetrics).toEqual(
+				expect.objectContaining({ resourcesValidated: 1, resourcesCommitted: 1, bytesValidated: 0 }),
 			);
 		} finally {
 			await rm(root, { recursive: true, force: true });
 		}
 	});
 
-	it("joins concurrent adoption calls and applies a world branch exactly once", async () => {
+	it("joins concurrent commit calls and applies a world branch exactly once", async () => {
 		const root = await mkdtemp(path.join(os.tmpdir(), "pi-spec-world-adopt-once-"));
 		try {
-			const args = { path: "once.txt", content: "one adoption\n" };
+			const args = { path: "once.txt", content: "one commit\n" };
 			const world = createWorkspaceSandbox();
 			const branch = await world.fork({
 				mode: "file_mutation",
@@ -171,20 +133,20 @@ describe("workspace ExecutionWorld", () => {
 				signal: new AbortController().signal,
 			});
 
-			const first = branch.adopt();
-			const second = branch.adopt();
+			const first = branch.commit();
+			const second = branch.commit();
 			expect(second).toBe(first);
-			expect(branch.state).toBe("adopting");
+			expect(branch.state).toBe("committing");
 			await expect(Promise.all([first, second])).resolves.toEqual([branch.output, branch.output]);
-			expect(await branch.adopt()).toBe(branch.output);
-			expect(branch.state).toBe("adopted");
-			expect(await readFile(path.join(root, "once.txt"), "utf8")).toBe("one adoption\n");
+			expect(await branch.commit()).toBe(branch.output);
+			expect(branch.state).toBe("committed");
+			expect(await readFile(path.join(root, "once.txt"), "utf8")).toBe("one commit\n");
 		} finally {
 			await rm(root, { recursive: true, force: true });
 		}
 	});
 
-	it("derives a child checkpoint before actor adoption and commits only the child delta", async () => {
+	it("derives a child checkpoint before actor commit and commits only the child delta", async () => {
 		const root = await mkdtemp(path.join(os.tmpdir(), "pi-spec-world-lineage-"));
 		try {
 			const target = path.join(root, "lineage.txt");
@@ -220,9 +182,9 @@ describe("workspace ExecutionWorld", () => {
 			expect(child.checkpoint?.lineage).toBe(parent.checkpoint?.lineage);
 			expect(child.checkpoint?.depth).toBe(1);
 			expect(await readFile(target, "utf8")).toBe("base\n");
-			await parent.adopt();
+			await parent.commit();
 			expect(await readFile(target, "utf8")).toBe("parent\n");
-			await child.adopt();
+			await child.commit();
 			expect(await readFile(target, "utf8")).toBe("child\n");
 		} finally {
 			await rm(root, { recursive: true, force: true });
@@ -230,7 +192,7 @@ describe("workspace ExecutionWorld", () => {
 	});
 
 	itWithNativeBroker(
-		"runs a real multi-step process world before ordered adoption",
+		"runs a real multi-step process world before ordered commit",
 		async () => {
 			const root = await mkdtemp(path.join(os.tmpdir(), "pi-spec-native-lineage-"));
 			const shell =
@@ -295,11 +257,11 @@ describe("workspace ExecutionWorld", () => {
 				expect(grandchild.checkpoint?.depth).toBe(2);
 				expect(await readFile(path.join(root, "state.txt"), "utf8")).toBe("base\n");
 
-				await parent.adopt();
+				await parent.commit();
 				expect(await readFile(path.join(root, "state.txt"), "utf8")).toBe(expectedLine("parent"));
-				await child.adopt();
+				await child.commit();
 				expect(await readFile(path.join(root, "state.txt"), "utf8")).toBe(expectedLine("child"));
-				await grandchild.adopt();
+				await grandchild.commit();
 				expect(await readFile(path.join(root, "state.txt"), "utf8")).toBe(expectedLine("grandchild"));
 			} finally {
 				await world.dispose?.();
@@ -309,7 +271,7 @@ describe("workspace ExecutionWorld", () => {
 		60_000,
 	);
 
-	it("stages edit output but rejects adoption after a concurrent real-file change", async () => {
+	it("stages edit output but rejects commit after a concurrent real-file change", async () => {
 		const root = await mkdtemp(path.join(os.tmpdir(), "pi-spec-edit-test-"));
 		try {
 			const target = path.join(root, "file.txt");
@@ -331,10 +293,10 @@ describe("workspace ExecutionWorld", () => {
 			expect(await readFile(target, "utf8")).toBe("hello\n");
 			expect(execution.output.result.details).toEqual({ path: "file.txt" });
 			await writeFile(target, "actor changed\n", "utf8");
-			const adoption = execution.adopt();
-			await expect(adoption).rejects.toThrow("resource changed before adoption");
+			const commit = execution.commit();
+			await expect(commit).rejects.toThrow("resource changed before commit");
 			expect(execution.state).toBe("failed");
-			expect(execution.adopt()).toBe(adoption);
+			expect(execution.commit()).toBe(commit);
 			expect(await readFile(target, "utf8")).toBe("actor changed\n");
 		} finally {
 			await rm(root, { recursive: true, force: true });
@@ -387,7 +349,7 @@ describe("workspace ExecutionWorld", () => {
 			});
 
 			await expect(stat(path.join(root, args.path))).rejects.toThrow();
-			await branch.adopt();
+			await branch.commit();
 			expect(await readFile(path.join(root, args.path), "utf8")).toBe("custom mode\n");
 		} finally {
 			await rm(root, { recursive: true, force: true });
@@ -455,7 +417,7 @@ describe("workspace ExecutionWorld", () => {
 			expect(await readFile(path.join(root, "input.txt"), "utf8")).toBe("hello");
 			expect(await readFile(path.join(root, "delete.txt"), "utf8")).toBe("remove me");
 			expect(execution.resources).toEqual(["delete.txt", "input.txt", "sandbox-created.txt"]);
-			expect(await execution.adopt()).toBe(execution.output);
+			expect(await execution.commit()).toBe(execution.output);
 			expect(await readFile(path.join(root, "sandbox-created.txt"), "utf8")).toBe("hello");
 			expect(await readFile(path.join(root, "input.txt"), "utf8")).toBe("changed");
 			await expect(stat(path.join(root, "delete.txt"))).rejects.toThrow();
@@ -465,7 +427,7 @@ describe("workspace ExecutionWorld", () => {
 		}
 	}, 10_000);
 
-	it("mirrors and adopts ignored files that are part of the agent-visible environment", async () => {
+	it("mirrors and commits ignored files that are part of the agent-visible environment", async () => {
 		const root = await mkdtemp(path.join(os.tmpdir(), "pi-spec-ignored-world-test-"));
 		try {
 			await mkdir(path.join(root, "node_modules", "pkg"), { recursive: true });
@@ -505,7 +467,7 @@ describe("workspace ExecutionWorld", () => {
 			await expect(stat(path.join(root, ".pi", "result.json"))).rejects.toThrow();
 			expect(await readFile(path.join(root, "build.log"), "utf8")).toBe("source log\n");
 
-			await execution.adopt();
+			await execution.commit();
 			expect(await readFile(path.join(root, "node_modules", "pkg", "index.js"), "utf8")).toBe(
 				"sandbox dependency\n",
 			);
@@ -542,7 +504,7 @@ describe("workspace ExecutionWorld", () => {
 			});
 			await writeFile(path.join(root, "b.txt"), "actor", "utf8");
 
-			await expect(execution.adopt()).rejects.toThrow("resource changed before adoption: b.txt");
+			await expect(execution.commit()).rejects.toThrow("resource changed before commit: b.txt");
 			expect(await readFile(path.join(root, "a.txt"), "utf8")).toBe("a0");
 			expect(await readFile(path.join(root, "b.txt"), "utf8")).toBe("actor");
 		} finally {
@@ -565,12 +527,12 @@ describe("workspace ExecutionWorld", () => {
 						target: stale,
 						resource: "z-stale.txt",
 						before: Buffer.from("original"),
-						after: Buffer.from("adopted"),
+						after: Buffer.from("committed"),
 					},
 				],
 			};
 
-			await expect(commitSandboxDelta(execution)).rejects.toThrow("resource changed before adoption");
+			await expect(commitSandboxDelta(execution)).rejects.toThrow("resource changed before commit");
 			await expect(stat(path.dirname(nested))).rejects.toThrow();
 			expect(await readFile(stale, "utf8")).toBe("changed");
 		} finally {
@@ -606,7 +568,7 @@ describe("workspace ExecutionWorld", () => {
 		}
 	});
 
-	it("rolls back already applied paths when a later adoption write fails", async () => {
+	it("rolls back already applied paths when a later commit write fails", async () => {
 		const root = await mkdtemp(path.join(os.tmpdir(), "pi-spec-rollback-test-"));
 		try {
 			const first = path.join(root, "a.txt");
@@ -660,7 +622,7 @@ describe("workspace ExecutionWorld", () => {
 					signal: new AbortController().signal,
 				});
 
-				await execution.adopt();
+				await execution.commit();
 				expect((await stat(target)).mode & 0o777).toBe(0o640);
 			} finally {
 				await rm(root, { recursive: true, force: true });
@@ -907,7 +869,7 @@ describe("workspace ExecutionWorld", () => {
 		}
 	});
 
-	it("excludes atomic-adoption staging files from workspace snapshots", async () => {
+	it("excludes atomic-commit staging files from workspace snapshots", async () => {
 		const root = await mkdtemp(path.join(os.tmpdir(), "pi-spec-staging-exclusion-test-"));
 		try {
 			await writeFile(path.join(root, "value.txt"), "real\n");

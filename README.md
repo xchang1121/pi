@@ -7,8 +7,8 @@ Speculative tool-action execution for Pi. While the actor model is thinking, it 
 This is tool-action speculation, not token-level LLM speculative decoding. It currently supports:
 
 - `read`, `grep`, and `find`: result caching and reuse with resource-version validation.
-- `write` and `edit`: pre-execution in a private Git workspace, followed by transactional adoption on a hit.
-- `bash`: pre-execution in a private Git workspace and isolated process backend, followed by output reuse and change adoption on a hit.
+- `write` and `edit`: pre-execution in a private Git workspace, followed by a transactional world commit on a hit.
+- `bash`: pre-execution in a private Git workspace and isolated process backend, followed by output reuse and a transactional world commit on a hit.
 - PatternAware: learns historical tool sequences and predicts immediate or multi-step future actions.
 - Drafter: runs alongside the actor to propose candidates for the current turn.
 
@@ -62,10 +62,10 @@ Inside Pi, run:
 Once enabled, the footer shows information similar to:
 
 ```text
-spec: on · Windows AppContainer · 3/4 hits · 1.2s saved · 5/512 results
+spec: on · Windows AppContainer · 3/4 hits · 1.2s ahead · 5/512 results
 ```
 
-Hit rate may be low on the first run or before PatternAware has learned a workflow. Complete several tasks with repeated `read`, `grep`, `find`, or `bash` sequences, then inspect `Hits`, `Saved`, and `End-to-end speedup` again.
+Hit rate may be low on the first run or before PatternAware has learned a workflow. Complete several tasks with repeated `read`, `grep`, `find`, or `bash` sequences, then inspect `Hits` and `Execution ahead` again.
 
 ## Commands
 
@@ -121,7 +121,6 @@ Complete example:
   "resourceCacheMaxEntries": 512,
   "resourceCacheMaxBytes": 268435456,
   "predictionTimeoutMs": 300000,
-  "adaptiveDrafter": true,
   "isolation": {
     "backend": "auto",
     "runtime": "auto",
@@ -171,7 +170,7 @@ OCI worker: unavailable (...)
 Native sandbox: Windows AppContainer ready (...)
 ```
 
-The worker pool keeps execution slots prepared, then creates a disposable container once the branch workspace and its logical actor path are known. After each command, the complete container is removed before the slot is reused. This prevents an unadopted process tree, root-filesystem change, or temporary file from leaking into another branch. The source workspace is never mounted; only the branch copy is visible, with networking disabled. On compatible OCI guests, the copy is mounted at the actor's logical workspace path, so absolute paths in the original command keep their meaning without command rewriting. Linux workers additionally use a read-only root filesystem, dropped capabilities, `no-new-privileges`, a PID limit, and the host UID/GID when available.
+The worker pool keeps execution slots prepared, then creates a disposable container once the branch workspace and its logical actor path are known. After each command, the complete container is removed before the slot is reused. This prevents a discarded process tree, root-filesystem change, or temporary file from leaking into another branch. The source workspace is never mounted; only the branch copy is visible, with networking disabled. On compatible OCI guests, the copy is mounted at the actor's logical workspace path, so absolute paths in the original command keep their meaning without command rewriting. Linux workers additionally use a read-only root filesystem, dropped capabilities, `no-new-privileges`, a PID limit, and the host UID/GID when available.
 
 The bundled image uses Linux Bash and works through Docker Desktop on Windows as well as native Docker/Podman on Linux and macOS. If exact Git-for-Windows behavior is required, supply a Windows container image and set `guestShell` to `C:\\Program Files\\Git\\bin\\bash.exe`. The configured image ID, OS, architecture, runtime, and guest shell are part of K(a)'s execution-world fingerprint, so changing them invalidates prior speculative results.
 
@@ -189,7 +188,7 @@ To use an explicitly trusted broker built elsewhere, set `PI_SPECULATIVE_SANDBOX
 
 On Windows, `auto` tries OCI first and then AppContainer. AppContainer runs compatible native shells without a command allowlist, but Git for Windows' MSYS runtime cannot initialize inside this boundary. Use OCI for speculative Git Bash; otherwise the Scheduler rejects the failed candidate and the actor runs it normally. `write`, `edit`, and resource-cached speculation are unaffected.
 
-`ExecutionWorld` is the isolation boundary used by the Agent adapter. `ActionSemanticsRegistry` selects a world mode (`file_mutation` or `workspace_snapshot`); the world does not maintain a second hard-coded tool list. A completed `WorldBranch` seals the tool output, promotable filesystem delta, and an immutable checkpoint. The source-neutral scheduler can derive a later sandbox action from that checkpoint before actor adoption, while matching still requires ancestors to be adopted in actor order. Process-local cwd/environment state and blocked network effects are never promoted. Concurrent consumers join one conflict-checked, transactional adoption, while an unadopted branch cannot change the actor's world. Linux native isolation also projects the private branch onto the actor's logical workspace path inside its mount namespace.
+`ExecutionWorld` is the isolation boundary used by the Agent adapter. `ActionSemanticsRegistry` selects a world mode (`file_mutation` or `workspace_snapshot`); the world does not maintain a second hard-coded tool list. A completed `WorldBranch` seals the tool output, committable filesystem delta, and an immutable checkpoint. The source-neutral scheduler can derive a later sandbox action from that checkpoint before Actor confirmation, while Actor matching still follows confirmed ancestor intent in order. Process-local cwd/environment state and blocked network effects never cross the boundary. World commit is conflict-checked and at most once; an uncommitted branch cannot change the Actor's world. Linux native isolation also projects the private branch onto the Actor's logical workspace path inside its mount namespace.
 
 If no configured backend is ready, Bash speculation fails closed and the actor falls back to normal Bash execution.
 
@@ -202,10 +201,10 @@ Run `/speculative-action status` and inspect these fields:
 | Attempts | Derived from started candidates, hits, and misses; shown as the denominator in the hit summary |
 | `Hits` | Actor actions that reused speculative results |
 | `Misses` | Predictions that were not adopted, became stale, or failed a safety check |
-| `Saved` | Estimated tool wait time avoided through early execution |
-| `Waited` | Time spent waiting when the actor hit an in-flight candidate |
+| `Execution ahead` | Adopted tool-execution time that elapsed before Actor interception, capped at each execution's measured duration |
+| `Hit latency` | Time from Actor interception until the adopted result finishes validation, remaining execution, projection, world commit if needed, and synchronous hit settlement |
+| `Attempt lead` | Diagnostic interval from the request that produced the execution-owning candidate to Actor interception |
 | `Actual` | Native actor tool time after speculation did not settle the action |
-| `End-to-end speedup` | Session metric computed from observed wall time and saved time |
 | `Draft tokens` | Total drafter token usage |
 | `Cache` | Current entries, capacity, memory, and in-flight jobs |
 | `Configured isolation` | Requested backend policy and OCI runtime/image settings |
@@ -213,7 +212,7 @@ Run `/speculative-action status` and inspect these fields:
 | `OCI worker` | Docker/Podman worker health, independent of native health |
 | `Native sandbox` | AppContainer/Seatbelt/Linux-native health, independent of OCI health |
 
-To establish real performance impact, compare paired baseline/full wall-clock measurements under the same tasks, model, and environment. Do not infer end-to-end acceleration from `Saved` alone.
+`Execution ahead` is directly observed overlap, not counterfactual saved time. A completed cached action contributes at most its measured execution duration; an in-flight action contributes only the execution elapsed before Actor interception. `Attempt lead` may be much larger and is diagnostic only. None of these metrics invents the unexecuted Actor tool path, so use paired baseline/full wall-clock measurements under the same tasks, model, and environment to establish end-to-end benefit.
 
 ## Common ablations
 
@@ -299,7 +298,7 @@ The engine remains available through `createSpeculativeActionHost()` for non-Pi 
 - Enabled but no candidates: verify project trust and make sure the Drafter and PatternAware are not both disabled.
 - Candidates but no hits: the predicted tool name and normalized arguments must match the actor call; resource changes also invalidate candidates.
 - No early PatternAware benefit: it needs repeated workflows before it can learn useful templates; cold starts rely mainly on the Drafter.
-- High Drafter cost: keep `adaptiveDrafter` enabled or select a faster, cheaper `draftModel`.
+- High Drafter cost: select a faster, cheaper `draftModel` or reduce `candidateLimit`.
 - Missing model JSON in development: run `npm run hydrate:model-data` from the repository root.
 
 ## Implementation overview

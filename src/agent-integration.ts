@@ -3,14 +3,8 @@ import type { AgentTool, AgentToolCall, AgentToolResult } from "@earendil-works/
 import type { Api, AssistantMessage, Context, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
 import { validateToolArguments } from "@earendil-works/pi-ai";
 import type { ActionProjectionRule } from "./action-key-projection.ts";
-import type { ActionKey, ActionSemanticsRegistry } from "./common.ts";
-import {
-	buildSingleToolCallPrompt,
-	clampCandidateLimit,
-	DEFAULTS,
-	PI_ACTION_SEMANTICS,
-	usageTokenCount,
-} from "./common.ts";
+import { type ActionKey, type ActionSemanticsRegistry, PI_ACTION_SEMANTICS } from "./action-semantics.ts";
+import { buildSingleToolCallPrompt, clampCandidateLimit, DEFAULTS, usageTokenCount } from "./common.ts";
 import type { ExecutionWorldMode } from "./execution-world.ts";
 import {
 	acquirePatternAwareStore,
@@ -22,6 +16,7 @@ import {
 	type PatternAwareSettings,
 	type PatternAwareStore,
 	type PatternAwareStoreLease,
+	patternAwareAnalyzerKey,
 	patternAwareRuntimeContext,
 	patternAwareSettings,
 	projectPatternAwareObservation,
@@ -29,6 +24,7 @@ import {
 import type { PlanAction, PlanProposal } from "./plan-proposal.ts";
 import {
 	captureResourceVersion,
+	type ResourceVersionValidation,
 	releaseResourceVersion,
 	validateResourceVersion,
 	watchResourceVersion,
@@ -41,6 +37,7 @@ import type {
 	SpeculativePlanSource,
 } from "./runtime.ts";
 import { candidateExecutionMs, candidateToolNames, makeSpeculativeActionRuntime } from "./runtime.ts";
+import { cause, type ResourceValidation } from "./settlement.ts";
 import type { ToolInvocation, ToolSettlement } from "./tool-settlement.ts";
 import type { SpeculativeAgentSandbox } from "./workspace-sandbox.ts";
 
@@ -52,7 +49,6 @@ export interface SpeculativeAgentSettingsInput {
 	readonly resourceCacheMaxEntries?: number;
 	readonly resourceCacheMaxBytes?: number;
 	readonly predictionTimeoutMs?: number;
-	readonly adaptiveDrafter?: boolean;
 	readonly patternAware?: Partial<PatternAwareSettings>;
 	readonly tools?: {
 		readonly resourceCached?: readonly string[];
@@ -176,11 +172,13 @@ export function createSpeculativeActionHost(
 		return mode === "file_mutation" || mode === "workspace_snapshot" ? mode : undefined;
 	};
 	const patternActionSemantics = {
+		namespace: "pi-action-semantics-v1",
 		actionKey: (tool: string, input: Readonly<Record<string, unknown>>, schemaHash?: string) =>
 			actionSemantics.buildKey(tool, input, options.cwd, schemaHash),
 		projectors: projectionRules,
 	};
 	let openedPatternStore: Promise<PatternAwareStoreLease> | undefined;
+	let openedPatternStoreKey: string | undefined;
 	const authoritativeBatches = new Map<string, Map<number, PatternAwareEventInput>>();
 	const authoritativeBatchKey = (batchSessionID: string, turnID: string) => JSON.stringify([batchSessionID, turnID]);
 	const clearAuthoritativeSession = (batchSessionID: string) => {
@@ -205,30 +203,35 @@ export function createSpeculativeActionHost(
 				DEFAULTS.resourceCacheMaxBytes,
 			),
 			predictionTimeoutMs: normalizeTimeout(settings.predictionTimeoutMs),
-			adaptiveDrafter:
-				typeof settings.adaptiveDrafter === "boolean" ? settings.adaptiveDrafter : DEFAULTS.adaptiveDrafter,
-			patternAware: patternAwareSettings(settings.patternAware ?? PATTERN_AWARE_DEFAULTS),
+			sourceConfig: { patternAware: patternAwareSettings(settings.patternAware ?? PATTERN_AWARE_DEFAULTS) },
 			tools: {
 				resourceCached: normalizeStringArray(settings.tools?.resourceCached, DEFAULTS.tools.resourceCached),
 				sandbox: normalizeStringArray(settings.tools?.sandbox, DEFAULTS.tools.sandbox),
 			},
 		};
 	};
+	const sourcePatternSettings = (settings: SpeculativeActionSettings): PatternAwareSettings =>
+		patternAwareSettings(settings.sourceConfig?.patternAware);
 	const resolvePatternStore = async (settings: SpeculativeActionSettings): Promise<PatternAwareStore> => {
 		if (options.patternStore) {
-			const store = await options.patternStore;
-			store.configure(settings.patternAware ?? PATTERN_AWARE_DEFAULTS, patternActionSemantics);
-			return store;
+			return options.patternStore;
 		}
+		const patternSettings = sourcePatternSettings(settings);
+		const configurationKey = patternAwareAnalyzerKey(patternSettings);
+		if (openedPatternStore && openedPatternStoreKey !== configurationKey) {
+			const previous = await openedPatternStore;
+			previous.store.finishSession(sessionID);
+			await previous.release();
+			openedPatternStore = undefined;
+		}
+		openedPatternStoreKey = configurationKey;
 		openedPatternStore ??= acquirePatternAwareStore(
 			options.cwd,
-			settings.patternAware ?? PATTERN_AWARE_DEFAULTS,
+			patternSettings,
 			options.patternStateDirectory,
 			patternActionSemantics,
 		);
-		const store = (await openedPatternStore).store;
-		store.configure(settings.patternAware ?? PATTERN_AWARE_DEFAULTS, patternActionSemantics);
-		return store;
+		return (await openedPatternStore).store;
 	};
 	const finishPatternSession = async (): Promise<void> => {
 		clearAuthoritativeSession(sessionID);
@@ -300,7 +303,6 @@ export function createSpeculativeActionHost(
 	const drafterSource: AgentPlanSource = {
 		id: "drafter",
 		enabled: (settings) => settings.drafterEnabled ?? DEFAULTS.drafterEnabled,
-		adaptive: true,
 		timeoutMs: (settings) => settings.predictionTimeoutMs,
 		proposalCount: (settings) => clampCandidateLimit(settings.candidateLimit ?? DEFAULTS.candidateLimit),
 		propose: async ({ startInput: input, candidateNames, proposalIndex, signal }): Promise<PlanProposal> => {
@@ -364,15 +366,16 @@ export function createSpeculativeActionHost(
 	};
 	const patternSource: AgentPlanSource = {
 		id: "pattern_aware",
-		enabled: (settings) => settings.patternAware?.enabled ?? false,
-		multiStepEnabled: (settings) => settings.patternAware?.multiStepEnabled ?? true,
+		enabled: (settings) => sourcePatternSettings(settings).enabled,
+		multiStepEnabled: (settings) => sourcePatternSettings(settings).multiStepEnabled,
 		propose: async ({ startInput, settings, definitions }) => {
-			if (!settings.patternAware?.enabled) {
+			const patternSettings = sourcePatternSettings(settings);
+			if (!patternSettings.enabled) {
 				return { id: `pattern:${startInput.turnID}`, source: "pattern_aware", revision: 0, actions: [] };
 			}
 			const store = await resolvePatternStore(settings);
 			const proposalID = `pattern:${startInput.turnID}`;
-			const candidates = store.predict(startInput.sessionID, definitionSchemaHashes(definitions));
+			const candidates = store.predict(startInput.sessionID, definitionSchemaHashes(definitions), patternSettings);
 			return {
 				id: proposalID,
 				source: "pattern_aware",
@@ -385,13 +388,14 @@ export function createSpeculativeActionHost(
 		continue: async ({
 			startInput,
 			data,
+			settings,
 			candidate,
 			proposalID,
 			actionID,
 			revision,
 			feedback,
 			output,
-			parentConfirmed,
+			trigger,
 		}) => {
 			const context = asPatternPlanFeedback(feedback);
 			if (!context) return undefined;
@@ -417,7 +421,8 @@ export function createSpeculativeActionHost(
 					learnTarget: false,
 				},
 				data.schemaHashes,
-				parentConfirmed,
+				trigger === "actor_confirmed",
+				sourcePatternSettings(settings),
 			);
 			if (!next.length) return undefined;
 			return {
@@ -426,13 +431,13 @@ export function createSpeculativeActionHost(
 				revision,
 				upsert: next.map((item) =>
 					patternPlanAction(item, context.store, patternPlanActionID(item.actionIdentity, actionID), [
-						{ actionID, condition: "succeeded" },
+						{ actionID, condition: "execution_succeeded" },
 					]),
 				),
 			};
 		},
 		observe: async ({ startInput, settings, consumeInput, action, tool, concrete, output, durationMs, order }) => {
-			if (!settings.patternAware?.enabled) return undefined;
+			if (!sourcePatternSettings(settings).enabled) return undefined;
 			const definition = startInput.tools.find((item) => item.name === tool);
 			const observation = projectPatternAwareObservation(
 				output?.result,
@@ -456,13 +461,13 @@ export function createSpeculativeActionHost(
 			authoritativeBatches.set(key, batch);
 			return undefined;
 		},
-		onLaunched: ({ feedback }) => {
+		onIssued: ({ feedback }) => {
 			const context = asPatternPlanFeedback(feedback);
-			for (const patternID of context?.patternIDs ?? []) context?.store.launched(patternID);
+			for (const patternID of context?.patternIDs ?? []) context?.store.issued(patternID);
 		},
-		onResolved: ({ feedback, outcome }) => {
+		onSettled: ({ feedback, settlement }) => {
 			const context = asPatternPlanFeedback(feedback);
-			for (const patternID of context?.patternIDs ?? []) context?.store.resolved(patternID, outcome);
+			for (const patternID of context?.patternIDs ?? []) context?.store.settled(patternID, settlement);
 		},
 		flush: async () => {
 			if (openedPatternStore) await (await openedPatternStore).store.flush();
@@ -596,7 +601,8 @@ export function createSpeculativeActionHost(
 		rejectCandidateOutput: ({ output }) => (output.isError ? "tool_error_result" : undefined),
 		captureResourceVersion: ({ action }) => captureResourceVersion(action, options.cwd, actionSemantics),
 		releaseResourceVersion,
-		isResourceExpired: ({ candidate }) => validateResourceVersion(candidate.resourceVersion),
+		validateResourceVersion: async ({ candidate }) =>
+			toRuntimeResourceValidation(await validateResourceVersion(candidate.resourceVersion)),
 		watchResourceVersion: ({ candidate, onInvalidated }) =>
 			watchResourceVersion(candidate.resourceVersion, onInvalidated),
 		projectionRules,
@@ -611,7 +617,7 @@ export function createSpeculativeActionHost(
 			void prepareSandbox(settings.tools.sandbox, signal).catch(() => {
 				// Turn warm-up is best-effort; concrete candidate preparation retries it.
 			});
-			if (!settings.patternAware?.enabled) return;
+			if (!sourcePatternSettings(settings).enabled) return;
 			const store = await resolvePatternStore(settings);
 			store.observeTurn({
 				sessionID: startInput.sessionID,
@@ -624,7 +630,7 @@ export function createSpeculativeActionHost(
 			const key = authoritativeBatchKey(startInput.sessionID, startInput.turnID);
 			const batch = authoritativeBatches.get(key);
 			authoritativeBatches.delete(key);
-			if (!settings.patternAware?.enabled) return;
+			if (!sourcePatternSettings(settings).enabled) return;
 			const store = await resolvePatternStore(settings);
 			if (batch?.size) {
 				store.observeBatch(
@@ -712,6 +718,22 @@ function errorSettlement(message: string): ToolSettlement {
 		details: {},
 	};
 	return { result, isError: true };
+}
+
+function toRuntimeResourceValidation(validation: ResourceVersionValidation): ResourceValidation {
+	const metrics = {
+		durationMs: validation.durationMs,
+		bytesRead: validation.bytesRead,
+		filesRead: validation.filesRead,
+		mode: validation.mode,
+	};
+	return validation.expired
+		? {
+				status: "stale",
+				cause: cause("freshness", validation.reason ?? "resource_changed"),
+				metrics,
+			}
+		: { status: "valid", metrics };
 }
 
 function definitionSchemaHashes(

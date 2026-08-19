@@ -34,7 +34,12 @@ import {
 } from "../src/extension.ts";
 import type { OciSetupService } from "../src/oci-setup.ts";
 import type { SpeculativeActionPackageSettings } from "../src/settings-store.ts";
-import type { SandboxProcessBackend, SandboxProcessBackendStatus } from "../src/workspace-sandbox.ts";
+import { emptySpeculativeTraceSummary } from "../src/trace-summary.ts";
+import {
+	createSandboxBackendRouter,
+	type SandboxProcessBackend,
+	type SandboxProcessBackendStatus,
+} from "../src/workspace-sandbox.ts";
 
 const roots: string[] = [];
 
@@ -141,7 +146,7 @@ describe("zero-modification Pi extension", () => {
 			const speculativeExtension = createSpeculativeActionExtension({
 				createHost: () => host,
 				createSettingsStore: () => memorySettingsStore(),
-				createProcessBackends: () => ({ selected: native, oci: native, native }),
+				createBackendRouter: () => backendRouter(native, native),
 				createSandbox: () => ({ supports: () => false, fork: vi.fn(), dispose: vi.fn() }),
 			});
 			const extensionFactories =
@@ -240,9 +245,12 @@ describe("zero-modification Pi extension", () => {
 					: "Linux native sandbox";
 
 		expect(status).toContain("Configured isolation: auto");
-		expect(status).toContain(`Active sandbox: ${nativeLabel} ready`);
+		expect(status).toContain(`Session isolation: auto; active: ${nativeLabel} ready`);
 		expect(status).toContain("OCI worker: unavailable (none): docker missing");
 		expect(status).toContain(`Native sandbox: ${nativeLabel} ready`);
+		expect(status).toContain("Execution ahead: 0ms; hit latency: 0ms; attempt lead: 0ms; Actor execution: 0ms");
+		expect(status).not.toContain("Saved:");
+		expect(status).not.toContain("End-to-end speedup");
 	});
 
 	it("does not offer OCI installation while the native fallback is ready", async () => {
@@ -258,6 +266,22 @@ describe("zero-modification Pi extension", () => {
 
 		expect(discover).not.toHaveBeenCalled();
 		expect(fixture.ui.notify).toHaveBeenLastCalledWith("Speculative action enabled.", "info");
+	});
+
+	it("does not offer OCI installation for an unavailable explicitly configured native session", async () => {
+		const discover = vi.fn(async () => []);
+		const fixture = await createFixture({
+			oci: { ...readyNative(), backend: "container", detail: "container ready" },
+			native: unavailable("native broker missing"),
+			ociSetup: { discover, setup: vi.fn() },
+		});
+		fixture.store.setEffective({ enabled: false, isolation: { backend: "native" } });
+		await fixture.emit("session_start", {}, fixture.context);
+
+		await fixture.commands.get("speculative-action")?.handler("on", fixture.context as ExtensionCommandContext);
+
+		expect(discover).not.toHaveBeenCalled();
+		expect(fixture.ui.notify).toHaveBeenCalledWith("Native sandbox is unavailable: native broker missing", "warning");
 	});
 
 	it("keeps the TUI hierarchical and offers OCI repair even when native fallback is ready", async () => {
@@ -398,11 +422,7 @@ async function createFixture(options: FixtureOptions = {}) {
 	const factory = createSpeculativeActionExtension({
 		createHost: () => host,
 		createSettingsStore: () => store,
-		createProcessBackends: () => ({
-			selected: native,
-			oci,
-			native,
-		}),
+		createBackendRouter: (settings) => backendRouter(oci, native, settings.isolation.backend),
 		createSandbox: () => ({ supports: () => false, fork: vi.fn(), dispose: vi.fn() }),
 		ociSetup: options.ociSetup,
 	});
@@ -424,8 +444,8 @@ function mockHost(consume: SpeculativeActionHost["consume"] = async () => undefi
 			settingsChanged: vi.fn(),
 			inspect: () => ({
 				activeTurns: 0,
-				turnCandidates: 0,
-				resourceCandidates: 0,
+				exclusiveCandidates: 0,
+				sharedCandidates: 0,
 				pendingPredictions: 0,
 				deferredPlanActions: 0,
 				activePlanActions: 0,
@@ -448,9 +468,13 @@ function memorySettingsStore(): SpeculativeSettingsStore {
 			return scope;
 		},
 		load: async () => undefined,
-		get: () => value,
-		set: (next) => {
+		effective: () => value,
+		overlay: () => value as unknown as Readonly<Record<string, unknown>> | undefined,
+		setEffective: (next) => {
 			value = next;
+		},
+		clear: () => {
+			value = undefined;
 		},
 		setScope: (next) => {
 			scope = next;
@@ -487,7 +511,18 @@ function sandboxHealth(
 	oci: SandboxProcessBackendStatus,
 	native: SandboxProcessBackendStatus,
 ): SpeculativeSandboxHealth {
-	return { configured: "auto", active: native, oci, native };
+	return { configured: "auto", active: native, candidates: { container: oci, native } };
+}
+
+function backendRouter(
+	oci: SandboxProcessBackend,
+	native: SandboxProcessBackend,
+	configured: "auto" | "container" | "native" = "auto",
+) {
+	return createSandboxBackendRouter(configured, [
+		{ id: "container", backend: oci },
+		{ id: "native", backend: native },
+	]);
 }
 
 function textResult(text: string): AgentToolResult<unknown> {
@@ -518,7 +553,6 @@ function effectiveSettings() {
 		resourceCacheMaxEntries: 8,
 		resourceCacheMaxBytes: 1024,
 		predictionTimeoutMs: 1000,
-		adaptiveDrafter: true,
 		isolation: { backend: "auto" as const, runtime: "auto" as const, image: "worker" },
 		patternAware: {
 			enabled: false,
@@ -538,24 +572,19 @@ function effectiveSettings() {
 }
 
 function emptyMetrics(): SpeculativeActionMetrics {
-	return {
-		started: 0,
-		hits: 0,
-		misses: 0,
-		cancelled: 0,
-		actualMs: 0,
-		savedMs: 0,
-		waitedMs: 0,
-		totalDraftTokens: 0,
+	return emptySpeculativeTraceSummary({
 		cacheCapacity: 8,
 		cacheByteCapacity: 1024,
-		cacheProbation: 0,
-		cacheProtected: 0,
+		cacheCold: 0,
+		cacheHot: 0,
 		inFlightJobs: 0,
 		resultEntries: 0,
 		resultBytes: 0,
 		branchEntries: 0,
 		branchBytes: 0,
-		observedWallMs: 0,
-	};
+		exclusiveCandidates: 0,
+		sharedCandidates: 0,
+		cacheTools: [],
+		cacheExecutions: [],
+	});
 }

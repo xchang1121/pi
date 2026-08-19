@@ -13,7 +13,7 @@ import {
 	READ_RANGE_COVERAGE_DETAILS_KEY,
 	type ReadRangeCoverage,
 } from "./action-key-projection.ts";
-import { READ_DEFAULT_LIMIT, readActionRange } from "./common.ts";
+import { READ_DEFAULT_LIMIT, readActionRange } from "./action-semantics.ts";
 import type { ToolSettlement } from "./tool-settlement.ts";
 
 /** Production Pi read projection. Other tools remain exact-only. */

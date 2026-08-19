@@ -61,7 +61,6 @@ function settings(candidateLimit = 1) {
 	return {
 		enabled: true,
 		drafterEnabled: true,
-		adaptiveDrafter: false,
 		candidateLimit,
 		maxConcurrentActions: candidateLimit,
 		tools: { resourceCached: ["read"], sandbox: [] },
@@ -117,7 +116,7 @@ describe("speculative action host", () => {
 		});
 
 		await host.startTurn(startInput(tool));
-		await waitFor(() => events.some((event) => event.type === "completed"));
+		await waitFor(() => events.some((event) => event.type === "candidate" && event.state.status === "succeeded"));
 		const hit = await host.consume({
 			turnID: "turn-1",
 			id: "actor-1",
@@ -128,7 +127,9 @@ describe("speculative action host", () => {
 
 		expect(hit?.result.content).toEqual([{ type: "text", text: "one\ntwo\nthree\nfour" }]);
 		expect(executions).toBe(1);
-		expect(events.some((event) => event.type === "hit")).toBe(true);
+		await waitFor(() =>
+			events.some((event) => event.type === "actor_action" && event.settlement.provider.kind === "speculative"),
+		);
 		await host.dispose();
 	});
 
@@ -164,7 +165,7 @@ describe("speculative action host", () => {
 		});
 
 		await host.startTurn(startInput(tool));
-		await waitFor(() => host.runtime.inspect("session").resourceCandidates === 1);
+		await waitFor(() => host.runtime.inspect("session").sharedCandidates === 1);
 		const hit = await host.consume({
 			turnID: "turn-1",
 			tool: "read",
@@ -212,8 +213,18 @@ describe("speculative action host", () => {
 			},
 		});
 		await host.startTurn(startInput(tool));
+		expect(
+			await host.consume({
+				turnID: "turn-1",
+				id: "actor",
+				tool: "read",
+				args: { path: "notes.txt" },
+				tools: [tool],
+			}),
+		).toBeUndefined();
 		await host.actual({
 			turnID: "turn-1",
+			id: "actor",
 			tool: "read",
 			args: { path: "notes.txt" },
 			tools: [tool],
@@ -221,7 +232,14 @@ describe("speculative action host", () => {
 			output: { result: await tool.execute("actor", { path: "notes.txt" }), isError: false },
 		});
 
-		expect(actualEvents.some((event) => event.type === "actual" && event.actualDurationMs === 12)).toBe(true);
+		await waitFor(() =>
+			actualEvents.some(
+				(event) =>
+					event.type === "actor_action" &&
+					event.settlement.provider.kind === "actor" &&
+					event.settlement.provider.durationMs === 12,
+			),
+		);
 		await expect(host.dispose()).resolves.toBeUndefined();
 		expect(disposed).toBe(1);
 	});
@@ -289,7 +307,9 @@ describe("speculative action host", () => {
 		});
 
 		await host.startTurn(startInput(tool));
-		await waitFor(() => events.filter((event) => event.type === "completed").length === 2);
+		await waitFor(
+			() => events.filter((event) => event.type === "candidate" && event.state.status === "succeeded").length === 2,
+		);
 		expect(host.runtime.inspect("session").pendingPredictions).toBe(1);
 		releaseSlowRequest?.(assistant([{ type: "text", text: "no tool needed" }], "stop"));
 		await waitFor(() => !host.runtime.inspect("session").pendingPredictions);
@@ -305,7 +325,9 @@ describe("speculative action host", () => {
 			expect(request.options).toMatchObject({ maxTokens: 128, reasoning: undefined, deferred: false });
 		}
 		expect(executed.sort()).toEqual(["notes.txt", "other.txt"]);
-		expect(events.filter((event) => event.type === "started")).toHaveLength(2);
+		await waitFor(
+			() => events.filter((event) => event.type === "candidate" && event.state.status === "running").length === 2,
+		);
 		await host.dispose();
 	});
 
