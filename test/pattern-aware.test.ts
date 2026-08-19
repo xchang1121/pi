@@ -637,6 +637,20 @@ describe("PatternAware", () => {
 		).toBe(false);
 	});
 
+	test("keeps the highest-replay mapper instead of requiring perfect history", () => {
+		const store = new PatternAwareStore(settings({ minBindingReplayProbability: 0.75 }));
+		trainGrepRead(store, "one", "src/a.ts");
+		trainGrepRead(store, "two", "src/b.ts");
+		trainGrepRead(store, "three", "src/c.ts");
+		store.observe(input({ sessionID: "noise", tool: "grep", input: {}, outputPaths: ["src/noise.ts"] }));
+		store.observe(input({ sessionID: "noise", tool: "read", input: { filePath: "manual.ts" } }));
+
+		const pattern = store.snapshot().find((item) => item.targetTool === "read");
+		expect(pattern).toMatchObject({ targetOccurrences: 4, occurrences: 4, replayMatches: 3 });
+		store.observe(input({ sessionID: "probe", tool: "grep", input: {}, outputPaths: ["src/d.ts"] }));
+		expect(store.predict("probe").find((item) => item.tool === "read")?.input).toEqual({ filePath: "src/d.ts" });
+	});
+
 	test("keeps low-feedback candidates available for scheduler utility ranking", () => {
 		const store = new PatternAwareStore(settings());
 		expect(store.registerValidatedPattern(validatedGapPattern({ "0": 10 }))).toBe(true);

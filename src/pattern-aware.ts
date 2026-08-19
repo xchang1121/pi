@@ -1346,40 +1346,51 @@ function inferBindingsFromSamples(
 	constantSupport = 4,
 	allowProjectedOmissions = false,
 ): Record<string, PatternAwareBinding> | undefined {
-	const first = samples[0];
-	if (!first) return;
+	if (!samples.length) return;
 	const bindings: Record<string, PatternAwareBinding> = {};
-	for (const [targetPath, firstTarget] of leaves(first.target.input)) {
+	const targetPaths = new Map(
+		samples.flatMap((sample) =>
+			leaves(sample.target.input).map(([targetPath]) => [encodePath(targetPath), targetPath] as const),
+		),
+	);
+	for (const [encodedPath, targetPath] of [...targetPaths].sort(([left], [right]) => left.localeCompare(right))) {
 		const targets = samples.map((sample) => getPath(sample.target.input, targetPath));
-		if (targets.some((value) => value === MISSING)) return;
+		if (targets.some((value) => value === MISSING)) {
+			if (allowProjectedOmissions) continue;
+			return;
+		}
+		const firstTarget = targets[0];
 		const constant = targets.every((value) => sameValue(value, firstTarget));
 		if (constant && !requiresProvenance(targetPath, firstTarget)) {
-			bindings[encodePath(targetPath)] = { type: "constant", value: firstTarget };
+			bindings[encodedPath] = { type: "constant", value: firstTarget };
 			continue;
 		}
 		const targetIsPath = isPathField(String(targetPath.at(-1) ?? ""));
-		const direct = candidateBindings(first.context, firstTarget, false, targetIsPath);
-		let selected = direct.find((candidate) =>
-			samples.every((sample, index) => bindingMatches(candidate, sample.context, targets[index])),
+		const direct = samples.flatMap((sample, index) =>
+			candidateBindings(sample.context, targets[index], false, targetIsPath),
 		);
-		if (!selected && typeof firstTarget === "string") {
-			selected = candidateBindings(first.context, firstTarget, true, targetIsPath).find((candidate) =>
-				samples.every((sample, index) => bindingMatches(candidate, sample.context, targets[index])),
+		const candidates = uniqueBindings([
+			...direct,
+			...samples.flatMap((sample, index) =>
+				typeof targets[index] === "string"
+					? candidateBindings(sample.context, targets[index], true, targetIsPath)
+					: [],
+			),
+		]);
+		const fallbackSources = uniqueBindings(
+			direct.filter((binding) => binding.type === "event" || binding.type === "transform"),
+		);
+		if (fallbackSources.length > 1) candidates.push({ type: "coalesce", sources: fallbackSources });
+		let selected: PatternAwareBinding | undefined;
+		let selectedReplay = -1;
+		for (const candidate of candidates) {
+			const replay = samples.reduce(
+				(matches, sample, index) => matches + Number(bindingMatches(candidate, sample.context, targets[index])),
+				0,
 			);
-		}
-		if (!selected) {
-			const fallbackSources = uniqueBindings(
-				samples.flatMap((sample, index) =>
-					candidateBindings(sample.context, targets[index], false, targetIsPath).filter(
-						(binding) => binding.type === "event" || binding.type === "transform",
-					),
-				),
-			);
-			if (fallbackSources.length > 1) {
-				const fallback: PatternAwareBinding = { type: "coalesce", sources: fallbackSources };
-				if (samples.every((sample, index) => bindingMatches(fallback, sample.context, targets[index])))
-					selected = fallback;
-			}
+			if (replay <= selectedReplay) continue;
+			selected = candidate;
+			selectedReplay = replay;
 		}
 		if (selected) selected = withObservedVariantCounts(selected, samples, targets);
 		if (!selected && constant && stablePayloadConstant(samples, constantSupport)) {
@@ -1389,7 +1400,7 @@ function inferBindingsFromSamples(
 			if (allowProjectedOmissions) continue;
 			return;
 		}
-		bindings[encodePath(targetPath)] = selected;
+		bindings[encodedPath] = selected;
 	}
 	return bindings;
 }
