@@ -100,7 +100,7 @@ const { values } = parseArgs({
 		"candidate-limit": { type: "string", default: "8" },
 		"drafter-max-depth": { type: "string", default: "0" },
 		"max-concurrent-actions": { type: "string", default: "8" },
-		"max-turns": { type: "string", default: "64" },
+		"max-turns": { type: "string", default: "128" },
 		"timeout-ms": { type: "string", default: "900000" },
 		latency: { type: "string", default: "remote" },
 		"repo-cache": { type: "string" },

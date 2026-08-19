@@ -21,9 +21,10 @@ DEEPSEEK_API_KEY=... npm run bench:ablation -- \
   --drafter-max-depth 2
 ```
 
-The default 64-turn budget is deliberate: shorter 16-turn runs repeatedly ended
-before the Agent produced a patch. A result with `turnLimitReached=true` is an
-incomplete trajectory and cannot support an algorithm-retention decision.
+The default 128-turn budget is deliberate: both 16- and 64-turn runs repeatedly
+ended before the Agent completed otherwise plausible patches. A result with
+`turnLimitReached=true` is incomplete and cannot support an algorithm-retention
+decision.
 
 PowerShell:
 
