@@ -41,6 +41,12 @@ draw conclusions about Bash hit rate.
 Set `--drafter-max-depth 0` for the one-step Drafter ablation. Positive values
 bound output-informed continuation steps after the first action.
 
+Use `--drafter-disabled --pattern-aware --pattern-state <directory>` to isolate
+PatternAware. The explicit state directory also selects a stable logical
+repository identity, so training and evaluation runs in fresh temporary
+checkouts share learned patterns without sharing workspace files. Without
+`--pattern-state`, PatternAware state is intentionally isolated to one run.
+
 `actualEndToEndMs` is the single speculative Agent invocation. Its serialized
 counterfactual is reconstructed from that same run as:
 

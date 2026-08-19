@@ -119,6 +119,8 @@ export interface CreateSpeculativeActionHostOptions {
 	readonly sandbox?: SpeculativeAgentSandbox;
 	/** Optional persistence root for workspace-hashed PatternAware state. */
 	readonly patternStateDirectory?: string;
+	/** Stable logical workspace identity when physical checkout paths are ephemeral. */
+	readonly patternWorkspaceIdentity?: string;
 	/** Optional injected store, primarily for embedding and deterministic tests. */
 	readonly patternStore?: PatternAwareStore | Promise<PatternAwareStore>;
 	readonly onEvent?: (event: SpeculativeActionEvent<string>) => void | Promise<void>;
@@ -254,7 +256,7 @@ export function createSpeculativeActionHost(
 		}
 		openedPatternStoreKey = configurationKey;
 		openedPatternStore ??= acquirePatternAwareStore(
-			options.cwd,
+			options.patternWorkspaceIdentity ?? options.cwd,
 			patternSettings,
 			options.patternStateDirectory,
 			patternActionSemantics,

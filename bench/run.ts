@@ -77,6 +77,8 @@ interface BenchmarkOptions {
 	readonly repoCache: string;
 	readonly runRoot: string;
 	readonly output?: string;
+	readonly patternState?: string;
+	readonly drafterEnabled: boolean;
 	readonly patternAware: boolean;
 	readonly prepareOnly: boolean;
 }
@@ -101,6 +103,8 @@ const { values } = parseArgs({
 		"repo-cache": { type: "string" },
 		"run-root": { type: "string" },
 		output: { type: "string" },
+		"pattern-state": { type: "string" },
+		"drafter-disabled": { type: "boolean", default: false },
 		"pattern-aware": { type: "boolean", default: false },
 		"prepare-only": { type: "boolean", default: false },
 	},
@@ -125,6 +129,8 @@ const options: BenchmarkOptions = {
 	repoCache,
 	runRoot,
 	...(values.output ? { output: path.resolve(values.output) } : {}),
+	...(values["pattern-state"] ? { patternState: path.resolve(values["pattern-state"]) } : {}),
+	drafterEnabled: !(values["drafter-disabled"] ?? false),
 	patternAware: values["pattern-aware"] ?? false,
 	prepareOnly: values["prepare-only"] ?? false,
 };
@@ -216,7 +222,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 	let drafterCacheWriteTokens = 0;
 	const settings: SpeculativeAgentSettingsInput = {
 		enabled: true,
-		drafterEnabled: true,
+		drafterEnabled: input.drafterEnabled,
 		drafterMaxDepth: input.drafterMaxDepth,
 		candidateLimit: input.candidateLimit,
 		maxConcurrentActions: input.maxConcurrentActions,
@@ -244,7 +250,10 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 		resolveInvocation,
 		projectionRules: [PI_READ_RANGE_PROJECTION_RULE],
 		sandbox,
-		patternStateDirectory: path.join(task.runDirectory, "patterns"),
+		patternStateDirectory: input.patternState ?? path.join(task.runDirectory, "patterns"),
+		...(input.patternState
+			? { patternWorkspaceIdentity: path.join(input.repoCache, "pattern-workspaces", safeName(task.row.repo)) }
+			: {}),
 		onEvent: (event) => {
 			events.push(event);
 		},
@@ -418,10 +427,12 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 			drafter: `${input.drafter.provider}/${input.drafter.id}`,
 			candidateLimit: input.candidateLimit,
 			drafterMaxDepth: input.drafterMaxDepth,
+			drafterEnabled: input.drafterEnabled,
 			maxConcurrentActions: input.maxConcurrentActions,
 			latencyProfile: input.latency,
 			latencyMs: profile,
 			patternAware: input.patternAware,
+			patternState: input.patternState ?? "isolated-per-run",
 			sandbox: { health: sandboxHealth, bash: bashIsolation },
 			workspace: task.workspace,
 		},
