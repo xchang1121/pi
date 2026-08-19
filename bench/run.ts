@@ -400,6 +400,22 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 		}
 		return counts;
 	}, {});
+	const actorActionsByTool: Record<string, number> = {};
+	const speculativeHitsByTool: Record<string, number> = {};
+	const actorFallbacksByTool: Record<string, number> = {};
+	const speculativeHitsByRelation: Record<string, number> = {};
+	for (const event of events) {
+		if (event.type !== "actor_action") continue;
+		const { provider, tool } = event.settlement;
+		actorActionsByTool[tool] = (actorActionsByTool[tool] ?? 0) + 1;
+		if (provider.kind === "actor") {
+			actorFallbacksByTool[tool] = (actorFallbacksByTool[tool] ?? 0) + 1;
+			continue;
+		}
+		speculativeHitsByTool[tool] = (speculativeHitsByTool[tool] ?? 0) + 1;
+		const relation = provider.match.kind === "exact" ? "exact" : `projected:${provider.match.projector}`;
+		speculativeHitsByRelation[relation] = (speculativeHitsByRelation[relation] ?? 0) + 1;
+	}
 	const agentPromptMs = Math.max(0, (taskCompletedAt ?? performance.now()) - taskStartedAt);
 	const actualEndToEndMs = Math.max(agentPromptMs, summary.endToEndMs);
 	const hiddenLatencyMs = summary.hiddenLatencyMs;
@@ -461,9 +477,13 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 			hiddenLatencyMs,
 			accelerationRatio: actualEndToEndMs > 0 ? serializedCounterfactualMs / actualEndToEndMs : 1,
 			actorActions: summary.actorActions,
+			actorActionsByTool,
 			speculativeHits: summary.speculativeHits,
 			speculativeHitsByDepth,
+			speculativeHitsByTool,
+			speculativeHitsByRelation,
 			actorFallbacks: summary.actorFallbacks,
+			actorFallbacksByTool,
 			hitRate: summary.hitRate,
 			sourceRequests: summary.sourceRequests,
 			sourceRequestKinds,
