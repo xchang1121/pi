@@ -36,8 +36,6 @@ describe("speculative action common", () => {
 	});
 
 	it("canonicalizes Pi defaults and rejects paths outside the workspace", () => {
-		const implicitRead = buildPiActionKey("read", { path: "README.md" }, "/workspace");
-		const explicitRead = buildPiActionKey("read", { path: "README.md", offset: 1, limit: 2000 }, "/workspace");
 		const implicitGrep = buildPiActionKey("grep", { pattern: "TODO" }, "/workspace");
 		const explicitGrep = buildPiActionKey(
 			"grep",
@@ -47,7 +45,6 @@ describe("speculative action common", () => {
 		const implicitFind = buildPiActionKey("find", { pattern: "**/*.ts" }, "/workspace");
 		const explicitFind = buildPiActionKey("find", { pattern: "**/*.ts", path: ".", limit: 1000 }, "/workspace");
 
-		expect(implicitRead?.key).toBe(explicitRead?.key);
 		expect(implicitGrep?.key).toBe(explicitGrep?.key);
 		expect(implicitFind?.key).toBe(explicitFind?.key);
 		expect(buildPiActionKey("read", { path: "../secret" }, "/workspace")).toBeUndefined();

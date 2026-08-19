@@ -49,7 +49,7 @@ describe("ActionSemanticsRegistry", () => {
 		expect(isAdoptableSandboxAction("edit")).toBe(true);
 	});
 
-	it("builds canonical K(a) with an explicit semantics epoch as well as the schema hash", () => {
+	it("keeps read's omitted-limit view distinct inside its versioned K(a)", () => {
 		const implicit = buildPiActionKey("read", { path: "src/a.ts" }, "/workspace", "schema-v1");
 		const explicit = buildPiActionKey(
 			"read",
@@ -58,18 +58,32 @@ describe("ActionSemanticsRegistry", () => {
 			"schema-v1",
 		);
 
-		expect(implicit).toEqual(explicit);
+		expect(implicit?.key).not.toBe(explicit?.key);
+		expect(
+			implicit && explicit ? actionKeyMatch(implicit, explicit, [READ_RANGE_ACTION_KEY_PROJECTOR]) : undefined,
+		).toMatchObject({ kind: "projected", projector: "read.range" });
 		expect(implicit).toMatchObject({
 			tool: "read",
 			execution: "resource_cached",
-			semanticsEpoch: "pi.read.v1",
+			semanticsEpoch: "pi.read.v2",
 			schemaHash: "schema-v1",
 			resources: ["src/a.ts"],
 		});
-		expect(implicit?.key).toContain('"semanticsEpoch":"pi.read.v1"');
+		expect(implicit?.input).not.toHaveProperty("limit");
+		expect(explicit?.input).toHaveProperty("limit", 2000);
+		expect(implicit?.key).toContain('"semanticsEpoch":"pi.read.v2"');
 		expect(Object.isFrozen(implicit)).toBe(true);
 		expect(Object.isFrozen(implicit?.input)).toBe(true);
 		expect(Object.isFrozen(implicit?.resources)).toBe(true);
+	});
+
+	it("fails closed instead of folding unsupported numeric query views into valid keys", () => {
+		expect(buildPiActionKey("read", { path: "a.ts", offset: 1.5 }, "/workspace")).toBeUndefined();
+		expect(buildPiActionKey("read", { path: "a.ts", limit: -1 }, "/workspace")).toBeUndefined();
+		expect(buildPiActionKey("grep", { pattern: "x", context: 0.5 }, "/workspace")).toBeUndefined();
+		expect(buildPiActionKey("grep", { pattern: "x", limit: 0 }, "/workspace")).toBeUndefined();
+		expect(buildPiActionKey("find", { pattern: "*", limit: 0 }, "/workspace")).toBeUndefined();
+		expect(buildPiActionKey("find", { pattern: "*", limit: 1.5 }, "/workspace")).toBeUndefined();
 	});
 
 	it("never equates identical inputs across different tool-semantics epochs", () => {

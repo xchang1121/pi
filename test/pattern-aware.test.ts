@@ -1238,7 +1238,14 @@ describe("PatternAware", () => {
 		for (const [id, bindings] of [
 			["default-implicit", { '["path"]': { type: "constant" as const, value: "src/index.ts" } }],
 			[
-				"default-explicit",
+				"default-offset-explicit",
+				{
+					'["path"]': { type: "constant" as const, value: "src/index.ts" },
+					'["offset"]': { type: "constant" as const, value: 1 },
+				},
+			],
+			[
+				"bounded-explicit",
 				{
 					'["path"]': { type: "constant" as const, value: "src/index.ts" },
 					'["offset"]': { type: "constant" as const, value: 1 },
@@ -1270,15 +1277,19 @@ describe("PatternAware", () => {
 		store.observe(input({ sessionID: "dedupe", tool: "grep", input: { pattern: "symbol" } }));
 		const reads = store.predict("dedupe").filter((candidate) => candidate.tool === "read");
 
-		expect(reads).toHaveLength(2);
+		expect(reads).toHaveLength(3);
 		expect(reads.map((candidate) => candidate.input)).toEqual(
-			expect.arrayContaining([{ path: "src/index.ts" }, { path: "src/index.ts", offset: 2200, limit: 10 }]),
+			expect.arrayContaining([
+				{ path: "src/index.ts" },
+				{ path: "src/index.ts", offset: 1, limit: 2000 },
+				{ path: "src/index.ts", offset: 2200, limit: 10 },
+			]),
 		);
 		expect(
 			JSON.parse(reads.find((candidate) => candidate.input.offset === undefined)!.diagnostic).supportingPatterns,
-		).toEqual(expect.arrayContaining(["default-implicit", "default-explicit"]));
+		).toEqual(expect.arrayContaining(["default-implicit", "default-offset-explicit"]));
 		expect(reads.find((candidate) => candidate.input.offset === undefined)?.supportingPatternIDs).toEqual(
-			expect.arrayContaining(["default-implicit", "default-explicit"]),
+			expect.arrayContaining(["default-implicit", "default-offset-explicit"]),
 		);
 	});
 

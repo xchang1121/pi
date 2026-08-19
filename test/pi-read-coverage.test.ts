@@ -43,9 +43,15 @@ describe("read coverage on unmodified Pi output", () => {
 	it("recovers line-truncated coverage from the stock notice", async () => {
 		const source = Array.from({ length: 2002 }, (_, index) => `line-${index + 1}`).join("\n");
 		const result = await execute(source, { path: "long.txt" });
+		const explicitlyLimited = await execute(source, { path: "long.txt", limit: 2000 });
 		expect(coverage(result)).toEqual(
 			expect.objectContaining({ startLine: 1, endLineExclusive: 2001, totalLines: 2002 }),
 		);
+		expect(result.content[0]).toMatchObject({ type: "text", text: expect.stringContaining("[Showing lines 1-2000") });
+		expect(explicitlyLimited.content[0]).toMatchObject({
+			type: "text",
+			text: expect.stringContaining("[2 more lines in file"),
+		});
 	});
 
 	it("does not claim coverage when Pi cannot return the first complete line", async () => {

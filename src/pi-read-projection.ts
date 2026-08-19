@@ -40,14 +40,14 @@ export const PI_READ_RANGE_PROJECTION_RULE: ActionProjectionRule<ToolSettlement>
 	projectOutput: ({ actor, output, coverage }) => {
 		if (output.isError) return undefined;
 		const actorRange = readActionRange(actor);
+		const actorUsesDefaultLimit = actor.input.limit === undefined;
 		const snapshot = parseReadCoverage(coverage);
 		const sourceLines = snapshot ? readCoverageLines(output, snapshot) : undefined;
 		if (!actorRange || !snapshot || !sourceLines || actorRange.offset > snapshot.totalLines) return undefined;
 
-		const selectionEndExclusive =
-			actorRange.limit === READ_DEFAULT_LIMIT
-				? snapshot.totalLines + 1
-				: Math.min(actorRange.offset + actorRange.limit, snapshot.totalLines + 1);
+		const selectionEndExclusive = actorUsesDefaultLimit
+			? snapshot.totalLines + 1
+			: Math.min(actorRange.offset + actorRange.limit, snapshot.totalLines + 1);
 		if (actorRange.offset < snapshot.startLine || selectionEndExclusive > snapshot.endLineExclusive) {
 			return undefined;
 		}
@@ -75,10 +75,7 @@ export const PI_READ_RANGE_PROJECTION_RULE: ActionProjectionRule<ToolSettlement>
 			} else {
 				outputText += `\n\n[Showing lines ${startLine}-${endLine} of ${snapshot.totalLines} (${formatSize(snapshot.maxBytes)} limit). Use offset=${nextOffset} to continue.]`;
 			}
-		} else if (
-			actorRange.limit !== READ_DEFAULT_LIMIT &&
-			startLineIndex + selectedLines.length < snapshot.totalLines
-		) {
+		} else if (!actorUsesDefaultLimit && startLineIndex + selectedLines.length < snapshot.totalLines) {
 			const remaining = snapshot.totalLines - (startLineIndex + selectedLines.length);
 			const nextOffset = startLine + selectedLines.length;
 			outputText = `${truncation.content}\n\n[${remaining} more lines in file. Use offset=${nextOffset} to continue.]`;

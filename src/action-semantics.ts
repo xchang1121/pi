@@ -224,7 +224,7 @@ export const READ_RANGE_ACTION_KEY_PROJECTOR: ActionKeyProjector = {
 export const PI_ACTION_SEMANTICS = new ActionSemanticsRegistry([
 	{
 		tool: "read",
-		epoch: "pi.read.v1",
+		epoch: "pi.read.v2",
 		execution: "resource_cached",
 		reuse: "shared_result",
 		resourceVersion: "resources",
@@ -235,7 +235,7 @@ export const PI_ACTION_SEMANTICS = new ActionSemanticsRegistry([
 	},
 	{
 		tool: "grep",
-		epoch: "pi.grep.v1",
+		epoch: "pi.grep.v2",
 		execution: "resource_cached",
 		reuse: "shared_result",
 		resourceVersion: "resources",
@@ -245,7 +245,7 @@ export const PI_ACTION_SEMANTICS = new ActionSemanticsRegistry([
 	},
 	{
 		tool: "find",
-		epoch: "pi.find.v1",
+		epoch: "pi.find.v2",
 		execution: "resource_cached",
 		reuse: "shared_result",
 		resourceVersion: "resources",
@@ -445,6 +445,7 @@ export function readRangesShareInFlight(speculative: ActionKey, actor: ActionKey
 	return (
 		!!speculativeRange &&
 		!!actorRange &&
+		!(actor.input.limit === undefined && speculative.input.limit !== undefined) &&
 		readProjectionPartition(speculative) === readProjectionPartition(actor) &&
 		speculativeRange.offset <= actorRange.offset &&
 		speculativeRange.end >= actorRange.end
@@ -502,6 +503,9 @@ export function contains(root: string, target: string): boolean {
 function canonicalRead(input: unknown, cwd: string): CanonicalAction | undefined {
 	const record = asRecord(input);
 	if (!record || typeof record.path !== "string") return undefined;
+	if (!validOptionalInteger(record.offset, 1) || !validOptionalInteger(record.limit, 0)) {
+		return undefined;
+	}
 	const resource = normalizeWorkspacePath(record.path, cwd);
 	if (resource === undefined) return undefined;
 	return {
@@ -509,7 +513,7 @@ function canonicalRead(input: unknown, cwd: string): CanonicalAction | undefined
 		input: {
 			path: resource,
 			offset: normalizeReadOffset(record.offset),
-			limit: normalizeReadLimit(record.limit),
+			...(record.limit !== undefined ? { limit: normalizeReadLimit(record.limit) } : {}),
 		},
 	};
 }
@@ -517,6 +521,7 @@ function canonicalRead(input: unknown, cwd: string): CanonicalAction | undefined
 function canonicalGrep(input: unknown, cwd: string): CanonicalAction | undefined {
 	const record = asRecord(input);
 	if (!record || typeof record.pattern !== "string") return undefined;
+	if (!validOptionalInteger(record.context, 0) || !validOptionalInteger(record.limit, 1)) return undefined;
 	const root = normalizeRelativeRoot(record.path, cwd);
 	if (root === undefined) return undefined;
 	return {
@@ -536,6 +541,7 @@ function canonicalGrep(input: unknown, cwd: string): CanonicalAction | undefined
 function canonicalFind(input: unknown, cwd: string): CanonicalAction | undefined {
 	const record = asRecord(input);
 	if (!record || typeof record.pattern !== "string") return undefined;
+	if (!validOptionalInteger(record.limit, 1)) return undefined;
 	const root = normalizeRelativeRoot(record.path, cwd);
 	if (root === undefined) return undefined;
 	return {
@@ -642,6 +648,10 @@ function normalizePositiveInteger(value: unknown, fallback: number): number {
 function normalizeNonNegativeInteger(value: unknown, fallback: number): number {
 	const number = finiteOrUndefined(value);
 	return number !== undefined && number >= 0 ? Math.floor(number) : fallback;
+}
+
+function validOptionalInteger(value: unknown, minimum: number): boolean {
+	return value === undefined || (typeof value === "number" && Number.isSafeInteger(value) && value >= minimum);
 }
 
 function stableStringify(value: unknown): string {

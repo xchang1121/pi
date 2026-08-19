@@ -116,6 +116,19 @@ describe("Pi read range projection", () => {
 		expect(outputText(projected)).toBe("three\nfour\nfive");
 	});
 
+	it("does not treat an explicit bounded read as an in-flight default view", async () => {
+		const implicit = readKey("notes.txt", 1);
+		const explicit = readKey("notes.txt", 1, 2);
+		const firstTwo = coveredSettlement(["one", "two"], { totalLines: 5, maxLines: 2 });
+
+		expect(actionKeyCovers(implicit, explicit, [PI_READ_RANGE_PROJECTION_RULE])).toBe(true);
+		expect(actionKeyCovers(explicit, implicit, [PI_READ_RANGE_PROJECTION_RULE])).toBe(false);
+		expect(outputText(await project(implicit, explicit, firstTwo))).toBe(
+			"one\ntwo\n\n[3 more lines in file. Use offset=3 to continue.]",
+		);
+		expect(await project(explicit, implicit, firstTwo)).toBeUndefined();
+	});
+
 	it("reconstructs the intentionally empty zero-limit view", async () => {
 		const projected = await project(
 			readKey("notes.txt", 1, 5),
