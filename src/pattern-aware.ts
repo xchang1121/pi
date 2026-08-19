@@ -245,6 +245,7 @@ type PatternPool = {
 	readonly context: ReadonlyArray<PatternAwareEventSignature>;
 	readonly targetTool: string;
 	readonly targetSchemaHash?: string;
+	readonly gap: number;
 	readonly samples: PatternSample[];
 	patternID?: string;
 	inferred?: Record<string, PatternAwareBinding>;
@@ -282,7 +283,8 @@ export const PATTERN_AWARE_DEFAULTS: PatternAwareSettings = {
 const MAX_BINDING_VARIANTS = 32;
 const MAX_PATH_SOURCES = 24;
 const PERSIST_DEBOUNCE_MS = 200;
-const PERSISTENCE_VERSION = 14;
+const PERSISTENCE_VERSION = 15;
+const MIGRATABLE_PERSISTENCE_VERSION = 14;
 
 class PredictiveContextTrie {
 	private readonly root: TrieNode = { children: new Map(), patterns: new Set() };
@@ -359,23 +361,38 @@ export class PatternAwareStore {
 			.catch(() => undefined);
 		if (
 			!parsed ||
-			parsed.version !== PERSISTENCE_VERSION ||
+			(parsed.version !== PERSISTENCE_VERSION && parsed.version !== MIGRATABLE_PERSISTENCE_VERSION) ||
 			!Array.isArray(parsed.patterns) ||
 			!Array.isArray(parsed.pools) ||
 			!Array.isArray(parsed.sequenceCounts)
 		)
 			return;
-		for (const item of parsed.patterns) {
-			const pattern = mutablePattern(item);
-			if (!pattern || pattern.context.some((event) => event.tool === "$llm")) continue;
-			this.patterns.set(pattern.id, pattern);
-			this.clock = Math.max(this.clock, pattern.lastSeenSequence);
+		if (parsed.version === PERSISTENCE_VERSION) {
+			for (const item of parsed.patterns) {
+				const pattern = mutablePattern(item);
+				if (!pattern || pattern.context.some((event) => event.tool === "$llm")) continue;
+				this.patterns.set(pattern.id, pattern);
+				this.clock = Math.max(this.clock, pattern.lastSeenSequence);
+			}
 		}
 		for (const item of parsed.pools) {
 			const pool = mutablePool(item);
 			if (!pool || pool.context.some((event) => event.tool === "$llm")) continue;
-			const key = patternPoolKey(pool.context, pool.targetTool, pool.targetSchemaHash);
-			this.pools.set(key, { ...pool, key });
+			const { patternID: persistedPatternID, ...persistedPool } = pool;
+			for (const [gap, samples] of samplesByGap(pool.samples)) {
+				const key = patternPoolKey(pool.context, pool.targetTool, pool.targetSchemaHash, gap);
+				this.pools.set(key, {
+					...persistedPool,
+					key,
+					gap,
+					samples,
+					observations:
+						parsed.version === PERSISTENCE_VERSION ? (pool.observations ?? samples.length) : samples.length,
+					...(parsed.version === PERSISTENCE_VERSION && pool.gap === gap && persistedPatternID
+						? { patternID: persistedPatternID }
+						: {}),
+				});
+			}
 			for (const sample of pool.samples) {
 				this.clock = Math.max(this.clock, sample.target.sequence, ...sample.context.map((event) => event.sequence));
 			}
@@ -907,12 +924,13 @@ export class PatternAwareStore {
 
 	private learnOccurrence(context: ReadonlyArray<PatternAwareEvent>, target: PatternAwareEvent, gap: number) {
 		const signatures = context.map(signature);
-		const poolKey = patternPoolKey(signatures, target.tool, target.schemaHash);
+		const poolKey = patternPoolKey(signatures, target.tool, target.schemaHash, gap);
 		const pool = this.pools.get(poolKey) ?? {
 			key: poolKey,
 			context: signatures,
 			targetTool: target.tool,
 			...(target.schemaHash ? { targetSchemaHash: target.schemaHash } : {}),
+			gap,
 			samples: [],
 		};
 		pool.samples.push({ context: [...context], target, gap });
@@ -963,6 +981,7 @@ export class PatternAwareStore {
 				targetTool: target.tool,
 				bindings: bindingMapStructure(inferred),
 				targetSchemaHash: target.schemaHash,
+				gap,
 			}),
 		);
 		if (pool.patternID && pool.patternID !== id) this.retirePoolPattern(pool);
@@ -2501,6 +2520,7 @@ function mutablePool(value: unknown): PatternPool | undefined {
 		context: structuredClone(record.context) as PatternAwareEventSignature[],
 		targetTool: record.targetTool,
 		...(typeof record.targetSchemaHash === "string" ? { targetSchemaHash: record.targetSchemaHash } : {}),
+		gap: isFiniteNumber(record.gap) ? Math.max(0, Math.floor(record.gap)) : samples[0]!.gap,
 		samples,
 		...(typeof record.patternID === "string" ? { patternID: record.patternID } : {}),
 		observations,
@@ -2516,9 +2536,20 @@ function mutablePool(value: unknown): PatternPool | undefined {
 function patternPoolKey(
 	context: ReadonlyArray<PatternAwareEventSignature>,
 	targetTool: string,
-	targetSchemaHash?: string,
+	targetSchemaHash: string | undefined,
+	gap: number,
 ) {
-	return hash(stableStringify({ context, targetTool, targetSchemaHash }));
+	return hash(stableStringify({ context, targetTool, targetSchemaHash, gap }));
+}
+
+function samplesByGap(samples: ReadonlyArray<PatternSample>) {
+	const groups = new Map<number, PatternSample[]>();
+	for (const sample of samples) {
+		const group = groups.get(sample.gap) ?? [];
+		group.push(sample);
+		groups.set(sample.gap, group);
+	}
+	return groups;
 }
 
 function patternPoolSampleLimit(settings: Pick<PatternAwareSettings, "minOccurrences" | "maxContextLength">) {

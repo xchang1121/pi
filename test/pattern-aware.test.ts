@@ -188,22 +188,32 @@ describe("PatternAware", () => {
 		expect(candidate?.horizon).toBeGreaterThanOrEqual(1);
 	});
 
-	test("combines support for one pattern across different observed gaps", () => {
+	test("learns mappers per gap and merges equivalent actions only at prediction", () => {
 		const store = new PatternAwareStore(
 			settings({ maxContextLength: 1, maxFutureGap: 1, minOccurrences: 2, futureGapCoverage: 0.9 }),
 		);
-		store.observe(input({ sessionID: "immediate", tool: "grep", input: {}, outputPaths: ["src/a.ts"] }));
-		store.observe(input({ sessionID: "immediate", tool: "read", input: { filePath: "src/a.ts" } }));
-		store.finishSession("immediate");
+		for (const [sessionID, filePath] of [
+			["immediate-a", "src/a.ts"],
+			["immediate-b", "src/b.ts"],
+		] as const) {
+			store.observe(input({ sessionID, tool: "grep", input: {}, outputPaths: [filePath] }));
+			store.observe(input({ sessionID, tool: "read", input: { filePath } }));
+			store.finishSession(sessionID);
+		}
+		for (const [sessionID, filePath] of [
+			["delayed-a", "src/c.ts"],
+			["delayed-b", "src/d.ts"],
+		] as const) {
+			store.observe(input({ sessionID, tool: "grep", input: {}, outputPaths: [filePath] }));
+			store.observe(input({ sessionID, tool: "bash", input: { command: "pwd" } }));
+			store.observe(input({ sessionID, tool: "read", input: { filePath } }));
+			store.finishSession(sessionID);
+		}
 
-		store.observe(input({ sessionID: "delayed", tool: "grep", input: {}, outputPaths: ["src/b.ts"] }));
-		store.observe(input({ sessionID: "delayed", tool: "bash", input: { command: "pwd" } }));
-		store.observe(input({ sessionID: "delayed", tool: "read", input: { filePath: "src/b.ts" } }));
-
-		const pattern = store
+		const patterns = store
 			.snapshot()
-			.find((item) => item.targetTool === "read" && item.context.length === 1 && item.context[0]?.tool === "grep");
-		expect(pattern).toMatchObject({ occurrences: 2, replayMatches: 2, gapCounts: { "0": 1, "1": 1 } });
+			.filter((item) => item.targetTool === "read" && item.context.length === 1 && item.context[0]?.tool === "grep");
+		expect(patterns.map((pattern) => pattern.gapCounts)).toEqual([{ "0": 2 }, { "1": 2 }]);
 
 		store.observe(input({ sessionID: "probe", tool: "grep", input: {}, outputPaths: ["src/c.ts"] }));
 		const candidate = store.predict("probe").find((item) => item.tool === "read");
@@ -388,7 +398,7 @@ describe("PatternAware", () => {
 
 		const raw = await fs.readFile(file, "utf8");
 		expect(raw).not.toContain('"history"');
-		expect(JSON.parse(raw).version).toBe(14);
+		expect(JSON.parse(raw).version).toBe(15);
 		const second = new PatternAwareStore(settings(), file);
 		await second.load();
 		second.observe(input({ sessionID: "three", tool: "grep", input: {}, outputPaths: ["src/c.ts"] }));
@@ -404,7 +414,7 @@ describe("PatternAware", () => {
 		await fs.writeFile(
 			file,
 			JSON.stringify({
-				version: 14,
+				version: 15,
 				patterns: [
 					valid,
 					{ ...valid, id: "bad-context", context: [{ tool: 7, outcome: "success" }] },
@@ -478,6 +488,42 @@ describe("PatternAware", () => {
 		expect(store.snapshot()).toEqual([]);
 	});
 
+	test("migrates v14 evidence by gap without loading its mixed mapper patterns", async () => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "pi-pattern-gap-migration-"));
+		temporary.push(directory);
+		const file = path.join(directory, "patterns.json");
+		const sample = (sessionID: string, filePath: string, gap: number) => ({
+			context: [event({ sessionID, tool: "grep", input: {}, outputPaths: [filePath] })],
+			target: event({ sessionID, tool: "read", input: { filePath } }),
+			gap,
+		});
+		await fs.writeFile(
+			file,
+			JSON.stringify({
+				version: 14,
+				patterns: [validatedGapPattern({ "0": 10 }, { id: "stale-v14" })],
+				pools: [
+					{
+						key: "legacy-mixed-gap",
+						context: [{ tool: "grep", outcome: "success" }],
+						targetTool: "read",
+						samples: [sample("immediate", "src/a.ts", 0), sample("delayed", "src/b.ts", 1)],
+					},
+				],
+				sequenceCounts: [],
+			}),
+		);
+
+		const store = new PatternAwareStore(settings(), file);
+		await store.load();
+		expect(store.snapshot()).toEqual([]);
+		trainGrepRead(store, "fresh", "src/c.ts");
+
+		expect(store.snapshot()).toEqual([
+			expect.objectContaining({ targetTool: "read", targetOccurrences: 2, gapCounts: { "0": 2 } }),
+		]);
+	});
+
 	test("persists bounded analyzer pools so patterns can form across processes", async () => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "pi-pattern-pool-"));
 		temporary.push(directory);
@@ -517,7 +563,7 @@ describe("PatternAware", () => {
 		await first.flush();
 
 		const persisted = JSON.parse(await fs.readFile(file, "utf8"));
-		expect(persisted.version).toBe(14);
+		expect(persisted.version).toBe(15);
 		expect(persisted.sequenceCounts.length).toBeGreaterThan(0);
 		const restored = new PatternAwareStore(configured, file);
 		await restored.load();
