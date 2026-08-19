@@ -386,7 +386,7 @@ describe("PatternAware", () => {
 		);
 	});
 
-	test("persists compact learned patterns without persisting raw event history", async () => {
+	test("persists a deduplicated learning table without session history", async () => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "pi-pattern-aware-"));
 		temporary.push(directory);
 		const file = path.join(directory, "patterns.json");
@@ -398,12 +398,39 @@ describe("PatternAware", () => {
 
 		const raw = await fs.readFile(file, "utf8");
 		expect(raw).not.toContain('"history"');
-		expect(JSON.parse(raw).version).toBe(15);
+		const persisted = JSON.parse(raw);
+		expect(persisted.version).toBe(16);
+		expect(persisted.events.length).toBeGreaterThan(0);
+		expect(
+			persisted.pools.every((pool: { samples: Array<{ context: number[]; target: number }> }) =>
+				pool.samples.every(
+					(sample) => sample.context.every((event) => Number.isInteger(event)) && Number.isInteger(sample.target),
+				),
+			),
+		).toBe(true);
 		const second = new PatternAwareStore(settings(), file);
 		await second.load();
 		second.observe(input({ sessionID: "three", tool: "grep", input: {}, outputPaths: ["src/c.ts"] }));
 
 		expect(second.predict("three").some((item) => item.tool === "read")).toBe(true);
+	});
+
+	test("stores a large event once when many inference pools reference it", async () => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "pi-pattern-event-table-"));
+		temporary.push(directory);
+		const file = path.join(directory, "patterns.json");
+		const marker = `unique-payload-${"x".repeat(100_000)}`;
+		const store = new PatternAwareStore(settings({ minOccurrences: 8 }), file);
+		await store.load();
+		store.observe(input({ sessionID: "one", tool: "inspect", input: {}, output: { text: marker } }));
+		store.observe(input({ sessionID: "one", tool: "read", input: { filePath: "src/a.ts" } }));
+		store.observe(input({ sessionID: "one", tool: "grep", input: { pattern: "TODO" } }));
+		store.observe(input({ sessionID: "one", tool: "find", input: { pattern: "*.ts" } }));
+		await store.flush();
+
+		const raw = await fs.readFile(file, "utf8");
+		expect(raw.split("unique-payload-")).toHaveLength(2);
+		expect(Buffer.byteLength(raw)).toBeLessThan(200_000);
 	});
 
 	test("skips malformed persisted contexts, binding paths, and binding nodes", async () => {
@@ -436,6 +463,33 @@ describe("PatternAware", () => {
 		await expect(store.load()).resolves.toBeUndefined();
 
 		expect(store.snapshot().map((pattern) => pattern.id)).toEqual(["valid-persisted-pattern"]);
+	});
+
+	test("rejects indexed pools that reference a missing or malformed event", async () => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "pi-pattern-corrupt-index-"));
+		temporary.push(directory);
+		const file = path.join(directory, "patterns.json");
+		await fs.writeFile(
+			file,
+			JSON.stringify({
+				version: 16,
+				patterns: [],
+				events: [event({ sessionID: "one", tool: "grep", input: {} }), { sequence: 2 }],
+				pools: [
+					{
+						key: "bad-reference",
+						context: [{ tool: "grep", outcome: "success" }],
+						targetTool: "read",
+						samples: [{ context: [0], target: 1, gap: 0 }],
+					},
+				],
+				sequenceCounts: [],
+			}),
+		);
+
+		const store = new PatternAwareStore(settings({ minOccurrences: 1 }), file);
+		await expect(store.load()).resolves.toBeUndefined();
+		expect(store.snapshot()).toEqual([]);
 	});
 
 	test("shares analyzer state across predictor-only settings and isolates analyzer configurations", async () => {
@@ -566,7 +620,7 @@ describe("PatternAware", () => {
 		await first.flush();
 
 		const persisted = JSON.parse(await fs.readFile(file, "utf8"));
-		expect(persisted.version).toBe(15);
+		expect(persisted.version).toBe(16);
 		expect(persisted.sequenceCounts.length).toBeGreaterThan(0);
 		const restored = new PatternAwareStore(configured, file);
 		await restored.load();

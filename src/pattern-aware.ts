@@ -224,10 +224,21 @@ type MutablePatternFeedback = {
 	sequence: number;
 };
 
+type PersistedPatternSample = {
+	readonly context: ReadonlyArray<number>;
+	readonly target: number;
+	readonly gap: number;
+};
+
+type PersistedPatternPool = Omit<PatternPool, "samples" | "inferred"> & {
+	readonly samples: ReadonlyArray<PersistedPatternSample>;
+};
+
 type PersistedState = {
 	readonly version: number;
 	readonly patterns: ReadonlyArray<PatternAwarePattern>;
-	readonly pools: ReadonlyArray<PatternPool>;
+	readonly events?: ReadonlyArray<PatternAwareEvent>;
+	readonly pools: ReadonlyArray<unknown>;
 	readonly sequenceCounts: ReadonlyArray<PpmCountTrieRow>;
 };
 
@@ -280,8 +291,10 @@ export const PATTERN_AWARE_DEFAULTS: PatternAwareSettings = {
 const MAX_BINDING_VARIANTS = 32;
 const MAX_PATH_SOURCES = 24;
 const PERSIST_DEBOUNCE_MS = 200;
-const PERSISTENCE_VERSION = 15;
+const PERSISTENCE_VERSION = 16;
 const MIN_MIGRATABLE_PERSISTENCE_VERSION = 13;
+const INDEXED_POOL_PERSISTENCE_VERSION = 16;
+const COMPATIBLE_PATTERN_VERSION = 15;
 
 class PredictiveContextTrie {
 	private readonly root: TrieNode = { children: new Map(), patterns: new Set() };
@@ -366,7 +379,7 @@ export class PatternAwareStore {
 			!Array.isArray(parsed.sequenceCounts)
 		)
 			return;
-		if (parsed.version === PERSISTENCE_VERSION) {
+		if (parsed.version >= COMPATIBLE_PATTERN_VERSION) {
 			for (const item of parsed.patterns) {
 				const pattern = mutablePattern(item);
 				if (!pattern || pattern.context.some((event) => event.tool === "$llm")) continue;
@@ -374,12 +387,15 @@ export class PatternAwareStore {
 				this.clock = Math.max(this.clock, pattern.lastSeenSequence);
 			}
 		}
-		for (const item of parsed.pools) {
-			const pool = mutablePool(item);
+		const restoredPools =
+			parsed.version >= INDEXED_POOL_PERSISTENCE_VERSION
+				? mutableIndexedPools(parsed.events, parsed.pools)
+				: parsed.pools.flatMap((item) => mutablePool(item) ?? []);
+		for (const pool of restoredPools) {
 			if (!pool || pool.context.some((event) => event.tool === "$llm")) continue;
 			for (const [gap, samples] of samplesByGap(pool.samples)) {
 				const key = patternPoolKey(pool.context, pool.targetTool, pool.targetSchemaHash, gap);
-				const compatible = parsed.version === PERSISTENCE_VERSION && pool.gap === gap;
+				const compatible = parsed.version >= COMPATIBLE_PATTERN_VERSION && pool.gap === gap;
 				this.pools.set(key, {
 					key,
 					context: pool.context,
@@ -1144,10 +1160,12 @@ export class PatternAwareStore {
 	private enqueuePersist() {
 		if (!this.persistenceFile || !this.loaded || !this.dirty) return;
 		this.dirty = false;
+		const learning = this.persistedLearningState();
 		const state: PersistedState = {
 			version: PERSISTENCE_VERSION,
 			patterns: this.snapshot(),
-			pools: this.persistedPools(),
+			events: learning.events,
+			pools: learning.pools,
 			sequenceCounts: this.sequenceModel.snapshot(this.settings.maxPatterns),
 		};
 		const target = this.persistenceFile;
@@ -1169,19 +1187,40 @@ export class PatternAwareStore {
 			});
 	}
 
-	private persistedPools(): ReadonlyArray<PatternPool> {
+	private persistedLearningState(): {
+		readonly events: ReadonlyArray<PatternAwareEvent>;
+		readonly pools: ReadonlyArray<PersistedPatternPool>;
+	} {
 		const sampleLimit = patternPoolSampleLimit(this.settings);
-		return [...this.pools.values()]
+		const events: PatternAwareEvent[] = [];
+		const eventIDs = new Map<string, number>();
+		const reference = (event: PatternAwareEvent) => {
+			const key = persistedEventIdentity(event);
+			const existing = eventIDs.get(key);
+			if (existing !== undefined) return existing;
+			const id = events.length;
+			events.push(event);
+			eventIDs.set(key, id);
+			return id;
+		};
+		const pools = [...this.pools.values()]
 			.sort(
 				(left, right) =>
 					(right.samples.at(-1)?.target.sequence ?? 0) - (left.samples.at(-1)?.target.sequence ?? 0) ||
 					right.samples.length - left.samples.length,
 			)
 			.slice(0, this.settings.maxPatterns)
-			.map(({ inferred: _, ...pool }) => ({
-				...pool,
-				samples: pool.samples.slice(-sampleLimit),
-			}));
+			.map(
+				({ inferred: _, ...pool }): PersistedPatternPool => ({
+					...pool,
+					samples: pool.samples.slice(-sampleLimit).map((sample) => ({
+						context: sample.context.map(reference),
+						target: reference(sample.target),
+						gap: sample.gap,
+					})),
+				}),
+			);
+		return { events, pools };
 	}
 }
 
@@ -2181,6 +2220,17 @@ function canonicalBatchActionKey(input: PatternAwareEventInput) {
 	});
 }
 
+function persistedEventIdentity(event: PatternAwareEvent) {
+	return stableStringify({
+		sessionID: event.sessionID,
+		turnID: event.turnID,
+		sequence: event.sequence,
+		tool: event.tool,
+		...(event.batchID ? { batchID: event.batchID } : {}),
+		...(event.batchIndex !== undefined ? { batchIndex: event.batchIndex } : {}),
+	});
+}
+
 function actionHistory(history: ReadonlyArray<PatternAwareEvent>) {
 	return history.filter(isActionEvent);
 }
@@ -2482,15 +2532,7 @@ function numericRecord(value: unknown): Record<string, number> | undefined {
 
 function mutablePool(value: unknown): PatternPool | undefined {
 	const record = asRecord(value);
-	if (
-		!record ||
-		typeof record.key !== "string" ||
-		typeof record.targetTool !== "string" ||
-		!Array.isArray(record.context) ||
-		!record.context.every(isEventSignature) ||
-		!Array.isArray(record.samples)
-	)
-		return;
+	if (!record || !Array.isArray(record.samples)) return;
 	const samples = record.samples.flatMap((item) => {
 		const sample = asRecord(item);
 		if (
@@ -2509,7 +2551,45 @@ function mutablePool(value: unknown): PatternPool | undefined {
 			},
 		];
 	});
-	if (!samples.length) return;
+	return mutablePoolRecord(record, samples);
+}
+
+function mutableIndexedPools(eventsValue: unknown, pools: ReadonlyArray<unknown>): PatternPool[] {
+	if (!Array.isArray(eventsValue)) return [];
+	const events = eventsValue.map((item) =>
+		isPersistedEvent(item) ? (structuredClone(item) as PatternAwareEvent) : undefined,
+	);
+	return pools.flatMap((value) => {
+		const record = asRecord(value);
+		if (!record || !Array.isArray(record.samples)) return [];
+		const samples = record.samples.flatMap((item) => {
+			const sample = asRecord(item);
+			if (
+				!sample ||
+				!Array.isArray(sample.context) ||
+				!sample.context.every(isEventReference) ||
+				!isEventReference(sample.target) ||
+				!isFiniteNumber(sample.gap)
+			)
+				return [];
+			const context = sample.context.map((id) => events[id as number]);
+			const target = events[sample.target as number];
+			if (!target || context.some((event) => !event)) return [];
+			return [{ context: context as PatternAwareEvent[], target, gap: Math.max(0, Math.floor(sample.gap)) }];
+		});
+		return mutablePoolRecord(record, samples) ?? [];
+	});
+}
+
+function mutablePoolRecord(record: Record<string, unknown>, samples: PatternSample[]): PatternPool | undefined {
+	if (
+		typeof record.key !== "string" ||
+		typeof record.targetTool !== "string" ||
+		!Array.isArray(record.context) ||
+		!record.context.every(isEventSignature) ||
+		!samples.length
+	)
+		return;
 	const observations = isFiniteNumber(record.observations)
 		? Math.max(samples.length, Math.floor(record.observations))
 		: samples.length;
@@ -2529,6 +2609,10 @@ function mutablePool(value: unknown): PatternPool | undefined {
 			? { inferenceBackoff: Math.min(8, Math.max(1, Math.floor(record.inferenceBackoff))) }
 			: {}),
 	};
+}
+
+function isEventReference(value: unknown): value is number {
+	return Number.isSafeInteger(value) && (value as number) >= 0;
 }
 
 function patternPoolKey(

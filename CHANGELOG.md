@@ -37,6 +37,7 @@
 - Resource candidates now use probation/protected, value-aware eviction, and sandbox failures fall back without mutating the real workspace.
 - Renamed read-only execution telemetry and settings to `resource_cached`/`resourceCached`.
 - Pattern-aware and drafter predictions now deduplicate onto shared jobs, learned actions can be admitted immediately after authoritative results, and in-flight work is preempted by explicit utility and per-session cache budgets.
+- PatternAware persistence now stores shared events once and references them from inference pools, preserving cross-process mapper evidence without repeatedly serializing tool payloads.
 - Actor lookup cascades across authorization, freshness, execution, compatibility, projection, and world-commit failures before falling back to real execution.
 - Compatible cache insertion is now atomic and directed, so a broader running read can single-flight a narrower request without ever coalescing in the unsafe reverse direction.
 - Native sandbox protocol v3 now forwards the configured shell and requires an explicit process-isolation attestation; Linux recursively enforces read-only host mounts and readiness probes verify mount isolation.
