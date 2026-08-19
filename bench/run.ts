@@ -223,6 +223,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 	let drafterOutputTokens = 0;
 	let drafterCacheReadTokens = 0;
 	let drafterCacheWriteTokens = 0;
+	const drafterStopReasons: Record<string, number> = {};
 	const settings: SpeculativeAgentSettingsInput = {
 		enabled: true,
 		drafterEnabled: input.drafterEnabled,
@@ -241,6 +242,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 		getDraftOptions: ({ signal }) => ({ signal }),
 		complete: async (draftModel, context, streamOptions) => {
 			const message = await streamSimple(draftModel, context, streamOptions).result();
+			drafterStopReasons[message.stopReason] = (drafterStopReasons[message.stopReason] ?? 0) + 1;
 			drafterCost += message.usage.cost.total;
 			drafterTokens += message.usage.totalTokens;
 			drafterInputTokens += message.usage.input;
@@ -488,6 +490,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 			drafterOutputTokens,
 			drafterCacheReadTokens,
 			drafterCacheWriteTokens,
+			drafterStopReasons,
 			turns: turnSequence,
 			turnLimitReached,
 			timedOut,
