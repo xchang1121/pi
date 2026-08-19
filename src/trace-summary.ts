@@ -22,6 +22,14 @@ export interface SpeculativeTraceSummary {
 	readonly actorFallbacks: number;
 	readonly hitRate: number;
 	readonly actorCandidateRejections: Readonly<Record<string, number>>;
+	readonly tasks: number;
+	readonly endToEndMs: number;
+	readonly nonToolMs: number;
+	readonly actorPhaseMs: number;
+	readonly orchestrationMs: number;
+	readonly toolExecutionMs: number;
+	readonly serializedMs: number;
+	readonly hiddenLatencyMs: number;
 	readonly speculativeExecutionMs: number;
 	readonly actorExecutionMs: number;
 	readonly executionAheadMs: number;
@@ -69,6 +77,14 @@ export function emptySpeculativeTraceSummary(cache: SpeculativeCacheSnapshot = E
 		actorFallbacks: 0,
 		hitRate: 0,
 		actorCandidateRejections: {},
+		tasks: 0,
+		endToEndMs: 0,
+		nonToolMs: 0,
+		actorPhaseMs: 0,
+		orchestrationMs: 0,
+		toolExecutionMs: 0,
+		serializedMs: 0,
+		hiddenLatencyMs: 0,
 		speculativeExecutionMs: 0,
 		actorExecutionMs: 0,
 		executionAheadMs: 0,
@@ -87,6 +103,16 @@ export function reduceSpeculativeTrace<SessionID>(
 	const next = mutableSummary(current);
 	next.cache = cloneCache(event.cache);
 	switch (event.type) {
+		case "task":
+			next.tasks++;
+			next.endToEndMs += metric(event.timing.endToEndMs);
+			next.nonToolMs += metric(event.timing.nonToolMs);
+			next.actorPhaseMs += metric(event.timing.actorPhaseMs);
+			next.orchestrationMs += metric(event.timing.orchestrationMs);
+			next.toolExecutionMs += metric(event.timing.toolExecutionMs);
+			next.serializedMs += metric(event.timing.serializedMs);
+			next.hiddenLatencyMs += metric(event.timing.hiddenLatencyMs);
+			break;
 		case "source_request":
 			next.sourceRequests++;
 			increment(next.sourceOutcomes, event.request.settlement.status);

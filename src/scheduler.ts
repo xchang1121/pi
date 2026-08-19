@@ -11,25 +11,26 @@ export interface PredictionForecast {
 	readonly tool: string;
 	readonly execution: SpeculativeExecution;
 	readonly sandboxMode: "none" | "workspace_snapshot" | "file_mutation";
-	readonly probability?: number;
 	readonly expectedDurationMs?: number;
-	readonly expectedLatencyBenefitMs?: number;
 	readonly resourceDemand?: number;
+	readonly stepsUntilCall?: number;
+	readonly sourceLatencyMs?: number;
+	readonly criticalPathMs?: number;
 }
 
 export interface ScheduledWork {
 	readonly expectedDurationMs: number;
-	readonly expectedBenefitMs: number;
 	readonly resource: SpeculativeResourceProfile;
-	readonly utility: number;
+	readonly stepsUntilCall: number;
+	readonly criticalPathMs: number;
 }
 
-export type SchedulerAdmission<Job> =
-	| { readonly admitted: true; readonly work: ScheduledWork; readonly preempted: readonly Job[] }
+export type SchedulerAdmission =
+	| { readonly admitted: true; readonly work: ScheduledWork }
 	| {
 			readonly admitted: false;
 			readonly work: ScheduledWork;
-			readonly reason: "insufficient_expected_benefit" | "budget_exhausted";
+			readonly reason: "budget_exhausted";
 	  };
 
 export type WorldCompatibilityDecision =
@@ -49,33 +50,22 @@ interface SchedulerEntry<Job> {
 /** Owns forecast aggregation, timing observations, capacity, and preemption. */
 export class SpeculationScheduler<Job extends object> {
 	private readonly entries = new Map<Job, SchedulerEntry<Job>>();
-	private readonly serviceTimes = new Map<string, Average>();
-	private actorStep = emptyAverage();
+	private readonly serviceTimes = new Map<string, SampleWindow>();
+	private readonly actorSteps = new SampleWindow();
 	private sequence = 0;
 
 	admit(
 		job: Job,
 		forecasts: readonly PredictionForecast[],
 		capacity: number | SpeculativeResourceBudget,
-	): SchedulerAdmission<Job> {
+	): SchedulerAdmission {
 		const work = this.evaluate(forecasts);
-		if (work.utility <= 0) return { admitted: false, work, reason: "insufficient_expected_benefit" };
 		const budget = normalizeBudget(capacity);
-		const remaining = [...this.entries.values()];
-		const victims: SchedulerEntry<Job>[] = [];
-		if (!fits(remaining, work.resource, budget)) {
-			for (const entry of [...remaining].sort(compareEntry)) {
-				if (entry.work.utility >= work.utility) break;
-				victims.push(entry);
-				const retained = remaining.filter((candidate) => !victims.includes(candidate));
-				if (fits(retained, work.resource, budget)) break;
-			}
+		if (!fits([...this.entries.values()], work.resource, budget)) {
+			return { admitted: false, work, reason: "budget_exhausted" };
 		}
-		const retained = remaining.filter((entry) => !victims.includes(entry));
-		if (!fits(retained, work.resource, budget)) return { admitted: false, work, reason: "budget_exhausted" };
-		for (const victim of victims) this.entries.delete(victim.job);
 		this.entries.set(job, { job, work, sequence: this.sequence++ });
-		return { admitted: true, work, preempted: victims.map((entry) => entry.job) };
+		return { admitted: true, work };
 	}
 
 	refresh(job: Job, forecasts: readonly PredictionForecast[]): ScheduledWork | undefined {
@@ -110,7 +100,7 @@ export class SpeculationScheduler<Job extends object> {
 		) {
 			const victim = remaining
 				.filter((entry) => !victims.includes(entry) && canPreempt(entry.job))
-				.sort(compareEntry)[0];
+				.sort(compareVictim)[0];
 			if (!victim) break;
 			victims.push(victim);
 		}
@@ -121,14 +111,27 @@ export class SpeculationScheduler<Job extends object> {
 	evaluate(forecasts: readonly PredictionForecast[]): ScheduledWork {
 		if (forecasts.length === 0) return emptyWork();
 		const evaluated = forecasts.map((forecast) => this.evaluateOne(forecast));
-		return evaluated.reduce((best, current) => (current.utility > best.utility ? current : best));
+		const resource = evaluated.reduce(
+			(current, item) => mergeResource(current, item.resource),
+			evaluated[0]!.resource,
+		);
+		return {
+			expectedDurationMs: Math.max(...evaluated.map((item) => item.expectedDurationMs)),
+			resource,
+			stepsUntilCall: Math.min(...evaluated.map((item) => item.stepsUntilCall)),
+			criticalPathMs: Math.max(...evaluated.map((item) => item.criticalPathMs)),
+		};
 	}
 
-	launchDelay(forecast: PredictionForecast, stepsUntilCall: number, safetyMarginMs = 10): number {
-		const duration = this.duration(forecast);
+	launchDelay(forecast: PredictionForecast, safetyMarginMs = 10): number {
+		const stepsUntilCall = sequence(forecast.stepsUntilCall);
 		if (stepsUntilCall <= 1) return 0;
-		const averageStepMs = this.actorStep.count > 0 ? this.actorStep.average : Math.max(50, duration * 2);
-		return Math.max(0, finite(stepsUntilCall) * averageStepMs - duration - finite(safetyMarginMs));
+		const duration = this.duration(forecast, 0.9);
+		const actorStepMs = this.actorSteps.quantile(0.25, Math.max(50, duration * 2));
+		return Math.max(
+			0,
+			stepsUntilCall * actorStepMs - duration - finite(forecast.sourceLatencyMs) - finite(safetyMarginMs),
+		);
 	}
 
 	assessCompatibility(
@@ -148,11 +151,13 @@ export class SpeculationScheduler<Job extends object> {
 	}
 
 	observeActorStep(durationMs: number): void {
-		this.actorStep = observe(this.actorStep, durationMs);
+		this.actorSteps.observe(durationMs);
 	}
 
 	observeService(tool: string, durationMs: number): void {
-		this.serviceTimes.set(tool, observe(this.serviceTimes.get(tool) ?? emptyAverage(), durationMs));
+		const samples = this.serviceTimes.get(tool) ?? new SampleWindow();
+		samples.observe(durationMs);
+		this.serviceTimes.set(tool, samples);
 	}
 
 	snapshot(): readonly { readonly job: Job; readonly work: ScheduledWork }[] {
@@ -163,13 +168,6 @@ export class SpeculationScheduler<Job extends object> {
 
 	private evaluateOne(forecast: PredictionForecast): ScheduledWork {
 		const expectedDurationMs = this.duration(forecast);
-		const probability = finiteProbability(forecast.probability, 1);
-		const expectedBenefitMs = Math.min(
-			expectedDurationMs,
-			forecast.expectedLatencyBenefitMs === undefined
-				? probability * expectedDurationMs
-				: finite(forecast.expectedLatencyBenefitMs),
-		);
 		const baseResource = resourceProfile(forecast.execution, forecast.sandboxMode);
 		const resource = {
 			class: baseResource.class,
@@ -177,47 +175,66 @@ export class SpeculationScheduler<Job extends object> {
 		};
 		return {
 			expectedDurationMs,
-			expectedBenefitMs,
 			resource,
-			utility: expectedBenefitMs,
+			stepsUntilCall: sequence(forecast.stepsUntilCall),
+			criticalPathMs: Math.max(expectedDurationMs, finite(forecast.criticalPathMs)),
 		};
 	}
 
-	private duration(forecast: PredictionForecast): number {
-		return positive(forecast.expectedDurationMs, this.serviceTimes.get(forecast.tool)?.average ?? 1);
+	private duration(forecast: PredictionForecast, quantile = 0.5): number {
+		return (
+			this.serviceTimes.get(forecast.tool)?.quantile(quantile, positive(forecast.expectedDurationMs, 1)) ??
+			positive(forecast.expectedDurationMs, 1)
+		);
 	}
 }
 
-interface Average {
-	readonly count: number;
-	readonly average: number;
-}
+class SampleWindow {
+	private readonly values: number[] = [];
 
-function emptyAverage(): Average {
-	return { count: 0, average: 0 };
-}
+	observe(value: number): void {
+		const normalized = finite(value);
+		if (normalized <= 0) return;
+		this.values.push(normalized);
+		if (this.values.length > 64) this.values.shift();
+	}
 
-function observe(current: Average, value: number): Average {
-	const next = finite(value);
-	const count = current.count + 1;
-	return { count, average: current.average + (next - current.average) / count };
+	quantile(value: number, fallback: number): number {
+		if (!this.values.length) return positive(fallback, 1);
+		const sorted = [...this.values].sort((left, right) => left - right);
+		return sorted[Math.floor((sorted.length - 1) * Math.max(0, Math.min(1, value)))]!;
+	}
 }
 
 function emptyWork(): ScheduledWork {
 	return {
 		expectedDurationMs: 0,
-		expectedBenefitMs: 0,
 		resource: { class: "filesystem", units: 1 },
-		utility: 0,
+		stepsUntilCall: 0,
+		criticalPathMs: 0,
 	};
 }
 
-function compareEntry<Job>(left: SchedulerEntry<Job>, right: SchedulerEntry<Job>): number {
-	return left.work.utility - right.work.utility || left.sequence - right.sequence;
+function compareVictim<Job>(left: SchedulerEntry<Job>, right: SchedulerEntry<Job>): number {
+	return (
+		right.work.stepsUntilCall - left.work.stepsUntilCall ||
+		left.work.criticalPathMs - right.work.criticalPathMs ||
+		right.sequence - left.sequence
+	);
 }
 
 function normalizeBudget(capacity: number | SpeculativeResourceBudget): SpeculativeResourceBudget {
 	return typeof capacity === "number" ? speculativeResourceBudget(capacity) : capacity;
+}
+
+function mergeResource(
+	left: SpeculativeResourceProfile,
+	right: SpeculativeResourceProfile,
+): SpeculativeResourceProfile {
+	return {
+		class: left.class === right.class ? left.class : "global",
+		units: Math.max(left.units, right.units),
+	};
 }
 
 function fits<Job>(
@@ -265,6 +282,6 @@ function positive(value: number | undefined, fallback: number): number {
 	return normalized > 0 ? normalized : Math.max(1, finite(fallback));
 }
 
-function finiteProbability(value: number | undefined, fallback: number): number {
-	return typeof value === "number" && Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : fallback;
+function sequence(value: number | undefined): number {
+	return typeof value === "number" && Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0;
 }

@@ -40,7 +40,11 @@ function plan(source: string, proposalID: string, input: Record<string, unknown>
 function harness(input: {
 	readonly source: Source;
 	readonly settings?: () => SpeculativeActionSettings;
-	readonly execute?: (tool: string, input: Readonly<Record<string, unknown>>) => unknown | Promise<unknown>;
+	readonly execute?: (
+		tool: string,
+		input: Readonly<Record<string, unknown>>,
+		signal: AbortSignal,
+	) => unknown | Promise<unknown>;
 	readonly expired?: () => boolean | Promise<boolean>;
 	readonly projection?: boolean;
 	readonly onEvent?: (event: SpeculativeActionEvent<string>) => void | Promise<void>;
@@ -56,9 +60,9 @@ function harness(input: {
 		actionKey: input.actionKey ?? ((tool, args) => buildPiActionKey(tool, args, "/workspace")),
 		actual: (call) => ({ id: call.id, tool: call.tool, input: call.input }),
 		preflightCandidate: () => ({ ok: true }),
-		executeCandidate: async ({ tool, concrete }) => {
+		executeCandidate: async ({ tool, concrete, signal }) => {
 			executions++;
-			return ((await input.execute?.(tool, concrete)) as string) ?? "speculative";
+			return ((await input.execute?.(tool, concrete, signal)) as string) ?? "speculative";
 		},
 		captureResourceVersion: () => ({ version: 1 }),
 		validateResourceVersion: async () =>
@@ -289,6 +293,124 @@ describe("structural speculative runtime", () => {
 		);
 	});
 
+	it("cancels next-action source requests when the Actor intent arrives", async () => {
+		let entered = 0;
+		const source: Source = {
+			id: "source",
+			enabled: () => true,
+			requestLifetime: "actor_action",
+			proposalCount: () => 8,
+			propose: ({ proposalIndex, signal }) => {
+				entered++;
+				if (proposalIndex === 0) return plan("source", "empty", { path: "other.ts" });
+				return new Promise((_, reject) => {
+					signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+				});
+			},
+		};
+		const fixture = harness({ source });
+		await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn" });
+		await waitFor(() => entered === 8 && fixture.runtime.inspect().sharedCandidates === 1);
+
+		expect(await fixture.runtime.consume(call("turn"))).toBeUndefined();
+		await waitFor(() => fixture.runtime.inspect().pendingPredictions === 0);
+		await waitFor(() => fixture.events.filter((event) => event.type === "source_request").length === 8);
+		expect(
+			fixture.events.filter(
+				(event) => event.type === "source_request" && event.request.settlement.status === "aborted",
+			),
+		).toHaveLength(7);
+	});
+
+	it("queues unique candidates at capacity and starts each without admission loss", async () => {
+		let releaseFirst!: () => void;
+		const firstGate = new Promise<void>((resolve) => {
+			releaseFirst = resolve;
+		});
+		const executed: string[] = [];
+		const source: Source = {
+			id: "source",
+			enabled: () => true,
+			propose: () => ({
+				id: "queue",
+				source: "source",
+				revision: 0,
+				actions: [
+					{ id: "first", type: "tool_call", tool: "read", input: { path: "first.ts" } },
+					{ id: "second", type: "tool_call", tool: "read", input: { path: "second.ts" } },
+				],
+			}),
+		};
+		const fixture = harness({
+			source,
+			settings: () => ({ ...settings, maxConcurrentActions: 1 }),
+			execute: async (_tool, input) => {
+				const path = String(input.path);
+				executed.push(path);
+				if (path === "first.ts") await firstGate;
+				return path;
+			},
+		});
+		await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn" });
+		await waitFor(() => fixture.runtime.inspect().sharedCandidates === 2 && executed.length === 1);
+		expect(executed).toEqual(["first.ts"]);
+
+		releaseFirst();
+		await waitFor(() => executed.length === 2);
+		expect(executed).toEqual(["first.ts", "second.ts"]);
+		expect(
+			fixture.events.filter((event) => event.type === "candidate" && event.state.status === "cancelled"),
+		).toEqual([]);
+	});
+
+	it("promotes an Actor-matched queued candidate and preempts unrelated work", async () => {
+		const executed: string[] = [];
+		const source: Source = {
+			id: "source",
+			enabled: () => true,
+			propose: () => ({
+				id: "promotion",
+				source: "source",
+				revision: 0,
+				actions: [
+					{ id: "busy", type: "tool_call", tool: "read", input: { path: "busy.ts" } },
+					{
+						id: "target",
+						type: "tool_call",
+						tool: "read",
+						input: { path: "target.ts" },
+						resourceDemand: 2,
+					},
+				],
+			}),
+		};
+		const fixture = harness({
+			source,
+			settings: () => ({ ...settings, maxConcurrentActions: 1 }),
+			execute: async (_tool, input, signal) => {
+				const path = String(input.path);
+				executed.push(path);
+				if (path !== "busy.ts") return "target";
+				return new Promise((_, reject) => {
+					signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+				});
+			},
+		});
+		await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn" });
+		await waitFor(() => fixture.runtime.inspect().sharedCandidates === 2 && executed.length === 1);
+
+		expect(await fixture.runtime.consume(call("turn", { path: "target.ts" }))).toBe("target");
+		expect(executed).toEqual(["busy.ts", "target.ts"]);
+		expect(
+			fixture.events.find(
+				(event) =>
+					event.type === "candidate" &&
+					event.state.status === "cancelled" &&
+					event.state.cause.code === "preempted_by_actor",
+			),
+		).toBeDefined();
+	});
+
 	it("cannot commit a speculative world when output projection fails", async () => {
 		const commit = vi.fn(async () => "committed");
 		const source: Source = {
@@ -478,6 +600,61 @@ describe("structural speculative runtime", () => {
 				},
 			}),
 		);
+	});
+
+	it("recalculates a distant prediction deadline across Actor turns", async () => {
+		let executions = 0;
+		const source: Source = {
+			id: "source",
+			enabled: () => true,
+			propose: ({ startInput }) =>
+				startInput.turnID === "turn-2"
+					? {
+							...plan("source", "distant", { path: "future.ts" }),
+							actions: [
+								{
+									id: "next",
+									type: "tool_call",
+									tool: "read",
+									input: { path: "future.ts" },
+									horizon: 2,
+									expectedDurationMs: 10,
+								},
+							],
+						}
+					: { id: "empty", source: "source", revision: 0, actions: [] },
+		};
+		const fixture = harness({
+			source,
+			execute: () => {
+				executions++;
+				return "future";
+			},
+		});
+		await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn-1" });
+		await waitFor(() => fixture.runtime.inspect().pendingPredictions === 0);
+		const first: Call = {
+			sessionID: "session",
+			turnID: "turn-1",
+			id: "first",
+			tool: "find",
+			input: { pattern: "*" },
+		};
+		expect(await fixture.runtime.consume(first)).toBeUndefined();
+		await fixture.runtime.actual({ ...first, durationMs: 1, output: "files" });
+		await fixture.runtime.finishTurn({ ...first, terminal: false });
+		await new Promise((resolve) => setTimeout(resolve, 120));
+
+		await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn-2" });
+		await waitFor(() => fixture.runtime.inspect().pendingPredictions === 0);
+		const second = { ...first, turnID: "turn-2", id: "second" };
+		expect(await fixture.runtime.consume(second)).toBeUndefined();
+		await fixture.runtime.actual({ ...second, durationMs: 1, output: "files" });
+		await new Promise((resolve) => setTimeout(resolve, 150));
+		expect(executions).toBe(0);
+
+		await waitFor(() => executions === 1);
+		await fixture.runtime.finishTurn({ ...call("turn-2"), terminal: true });
 	});
 
 	it("serializes one exclusive result across parallel Actor calls", async () => {

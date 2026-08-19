@@ -1,4 +1,5 @@
 import type { ActionKeyMatch } from "./action-semantics.ts";
+import type { TimelineInterval } from "./task-timing.ts";
 
 export type ResolutionStage =
 	| "source"
@@ -131,8 +132,14 @@ export type ActorActionProvider =
 			readonly candidateID: string;
 			readonly match: ActionKeyMatch;
 			readonly timing: ActorHitTiming;
+			readonly toolExecution: TimelineInterval;
 	  }
-	| { readonly kind: "actor"; readonly durationMs: number; readonly isError: boolean };
+	| {
+			readonly kind: "actor";
+			readonly durationMs: number;
+			readonly isError: boolean;
+			readonly toolExecution: TimelineInterval;
+	  };
 
 export interface ActorActionSettlement {
 	readonly actorAction: ActorActionIdentity;

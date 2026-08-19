@@ -123,6 +123,26 @@ describe("PlanRuntime", () => {
 		).toEqual(["confirmed", "settled"]);
 	});
 
+	it("derives source-neutral deadlines and critical paths from the dependency graph", () => {
+		const plan = new PlanRuntime();
+		plan.apply(
+			proposal([
+				action("short", { expectedDurationMs: 10 }),
+				action("critical", { expectedDurationMs: 20 }),
+				action("child", {
+					expectedDurationMs: 80,
+					dependsOn: [{ actionID: "critical", condition: "execution_succeeded" }],
+				}),
+			]),
+			4,
+		);
+
+		expect(plan.get("plan", "short")).toMatchObject({ expectedActionSeq: 5, criticalPathMs: 10 });
+		expect(plan.get("plan", "critical")).toMatchObject({ expectedActionSeq: 5, criticalPathMs: 100 });
+		expect(plan.get("plan", "child")).toMatchObject({ expectedActionSeq: 6, criticalPathMs: 80 });
+		expect(plan.takeReady(4).map((node) => node.action.id)).toEqual(["critical", "short"]);
+	});
+
 	it("keeps preparation work outside Actor prediction settlement", () => {
 		const plan = new PlanRuntime();
 		plan.apply(
@@ -240,6 +260,7 @@ function action(
 		readonly input?: unknown;
 		readonly horizon?: number;
 		readonly dependsOn?: PlanAction["dependsOn"];
+		readonly expectedDurationMs?: number;
 	} = {},
 ): PlanAction {
 	return {
@@ -249,5 +270,6 @@ function action(
 		input: options.input ?? { path: `${id}.ts` },
 		...(options.horizon !== undefined ? { horizon: options.horizon } : {}),
 		...(options.dependsOn ? { dependsOn: options.dependsOn } : {}),
+		...(options.expectedDurationMs !== undefined ? { expectedDurationMs: options.expectedDurationMs } : {}),
 	};
 }

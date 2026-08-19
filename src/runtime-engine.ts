@@ -41,6 +41,7 @@ import type {
 } from "./settlement.ts";
 import { cause, zeroValidationMetrics } from "./settlement.ts";
 import { runSourceRequest, SourceGeneration, type SourceRequestResult } from "./source-request.ts";
+import { measureSpeculativeTask, type TimelineInterval } from "./task-timing.ts";
 
 interface TurnInput<SessionID> {
 	readonly sessionID: SessionID;
@@ -120,18 +121,22 @@ function cacheLimits(settings: SpeculativeActionSettings) {
 	return { maxEntries: cacheEntryLimit(settings), maxBytes: cacheByteLimit(settings), hotFraction: 0.8 };
 }
 
-function forecastFor(node: PlanRuntimeNode, semantics: ActionSemanticsRegistry): PredictionForecast {
+function forecastFor(
+	node: PlanRuntimeNode,
+	semantics: ActionSemanticsRegistry,
+	sequence: number,
+	sourceLatencyMs = 0,
+): PredictionForecast {
 	const execution = node.actionKey?.execution ?? semantics.execution(node.action.tool) ?? "resource_cached";
 	return {
 		tool: node.action.tool,
 		execution,
 		sandboxMode: semantics.sandboxMode(node.action.tool) ?? "none",
-		...(node.action.empiricalProbability !== undefined ? { probability: node.action.empiricalProbability } : {}),
 		...(node.action.expectedDurationMs !== undefined ? { expectedDurationMs: node.action.expectedDurationMs } : {}),
-		...(node.action.expectedLatencyBenefitMs !== undefined
-			? { expectedLatencyBenefitMs: node.action.expectedLatencyBenefitMs }
-			: {}),
 		...(node.action.resourceDemand !== undefined ? { resourceDemand: node.action.resourceDemand } : {}),
+		stepsUntilCall: Math.max(0, node.expectedActionSeq - sequence),
+		sourceLatencyMs,
+		criticalPathMs: node.criticalPathMs,
 	};
 }
 
@@ -348,14 +353,23 @@ function callKey(turnID: string, callID: string): string {
 }
 
 function observeActorStep<SessionID, Output, StartInput, StateData>(
-	turn: TurnState<SessionID, Output, StartInput, StateData>,
+	session: SessionState<SessionID, Output, StartInput, StateData>,
 	arrivedAt: number,
 ): void {
-	const previous = turn.lastActorArrivedAt;
-	turn.lastActorArrivedAt = arrivedAt;
+	const previous = session.lastActorArrivedAt;
+	session.lastActorArrivedAt = arrivedAt;
 	if (previous === undefined) return;
 	const interval = Math.max(0, arrivedAt - previous);
-	if (interval >= 25) turn.session.scheduler.observeActorStep(interval);
+	if (interval >= 25) session.scheduler.observeActorStep(interval);
+}
+
+function closeActorPhase<SessionID, Output, StartInput, StateData>(
+	turn: TurnState<SessionID, Output, StartInput, StateData>,
+	completedAt: number,
+): void {
+	if (turn.actorPhaseCompletedAt !== undefined) return;
+	turn.actorPhaseCompletedAt = Math.max(turn.startedAt, completedAt);
+	turn.session.actorPhaseIntervals.push({ startedAt: turn.startedAt, completedAt: turn.actorPhaseCompletedAt });
 }
 
 function enterActorAdmission<SessionID, Output, StartInput, StateData>(
@@ -491,11 +505,6 @@ function finiteMetric(value: unknown): number {
 	return typeof value === "number" && Number.isFinite(value) ? Math.max(0, value) : 0;
 }
 
-function finitePositive(value: unknown, fallback: number): number {
-	const metric = finiteMetric(value);
-	return metric > 0 ? metric : Math.max(1, finiteMetric(fallback));
-}
-
 function errorDetail(error: unknown): string {
 	return error instanceof Error ? `${error.name}: ${error.message}` : String(error);
 }
@@ -538,7 +547,9 @@ interface CandidateRecord<Output, StartInput, StateData> {
 	readonly predictionLatencyMs: number;
 	readonly draftTokens: number;
 	readonly totalDraftTokens: number;
-	readonly expectedDurationMs: number;
+	expectedDurationMs: number;
+	expectedActionSeq: number;
+	criticalPathMs: number;
 	estimatedBytes: number;
 	readonly resources: CandidateResources;
 	projectionCoverage: readonly ActionProjectionCoverage[];
@@ -561,7 +572,12 @@ interface SessionState<SessionID, Output, StartInput, StateData> {
 	readonly anonymousActorCalls: ActorAction[];
 	readonly resolvedActions: Map<number, ActorAction>;
 	readonly turns: Set<string>;
+	readonly actorPhaseIntervals: TimelineInterval[];
+	readonly authoritativeToolIntervals: TimelineInterval[];
 	actorAdmissionTail: Promise<void>;
+	settings: SpeculativeActionSettings;
+	taskStartedAt?: number;
+	lastActorArrivedAt?: number;
 	sequence: number;
 	settledThrough: number;
 	tokenTotal: number;
@@ -581,10 +597,11 @@ interface TurnState<SessionID, Output, StartInput, StateData> {
 	readonly definitions: readonly DrafterToolDefinition[];
 	readonly candidateNames: readonly string[];
 	readonly generation: SourceGeneration;
+	readonly actorScopedGenerations: Set<SourceGeneration>;
 	admissionTail: Promise<void>;
 	pendingProduction: number;
 	pendingAdmission: number;
-	lastActorArrivedAt?: number;
+	actorPhaseCompletedAt?: number;
 	lifecycle: "active" | "closing" | "finished";
 }
 
@@ -640,9 +657,12 @@ export function makeStructuralSpeculativeActionRuntime<
 	const turns = new Map<string, Turn>();
 	let masterEnabled: boolean | undefined;
 
-	const sessionFor = (sessionID: SessionID): Session => {
+	const sessionFor = (sessionID: SessionID, settings: SpeculativeActionSettings): Session => {
 		const current = sessions.get(sessionID);
-		if (current) return current;
+		if (current) {
+			current.settings = settings;
+			return current;
+		}
 		const created: Session = {
 			id: sessionID,
 			plan: new PlanRuntime(),
@@ -654,7 +674,10 @@ export function makeStructuralSpeculativeActionRuntime<
 			anonymousActorCalls: [],
 			resolvedActions: new Map(),
 			turns: new Set(),
+			actorPhaseIntervals: [],
+			authoritativeToolIntervals: [],
 			actorAdmissionTail: Promise.resolve(),
+			settings,
 			sequence: 0,
 			settledThrough: 0,
 			tokenTotal: 0,
@@ -663,6 +686,11 @@ export function makeStructuralSpeculativeActionRuntime<
 		};
 		sessions.set(sessionID, created);
 		return created;
+	};
+
+	const clearLaunchTimers = (session: Session): void => {
+		for (const timer of session.launchTimers.values()) clearTimeout(timer);
+		session.launchTimers.clear();
 	};
 
 	const candidateNames = (settings: SpeculativeActionSettings): readonly string[] => {
@@ -685,20 +713,27 @@ export function makeStructuralSpeculativeActionRuntime<
 		const key = turnKey(input.sessionID, input.turnID);
 		const previous = turns.get(key);
 		if (previous) await finishState(previous, false);
-		const session = sessionFor(input.sessionID);
+		const session = sessionFor(input.sessionID, settings);
 		const generation = new SourceGeneration(signal);
+		const startedAt = performance.now();
+		if (session.taskStartedAt === undefined) {
+			session.taskStartedAt = startedAt;
+			session.actorPhaseIntervals.length = 0;
+			session.authoritativeToolIntervals.length = 0;
+		}
 		const state: Turn = {
 			key,
 			session,
 			sessionID: input.sessionID,
 			turnID: input.turnID,
 			startInput: input,
-			startedAt: performance.now(),
+			startedAt,
 			data: await adapter.stateData(input),
 			settings,
 			definitions,
 			candidateNames: names,
 			generation,
+			actorScopedGenerations: new Set(),
 			admissionTail: Promise.resolve(),
 			pendingProduction: 0,
 			pendingAdmission: 0,
@@ -729,9 +764,14 @@ export function makeStructuralSpeculativeActionRuntime<
 			const count = requestCount(source.proposalCount?.(state.settings));
 			for (let index = 0; index < count; index++) {
 				state.pendingProduction++;
+				const generation =
+					source.requestLifetime === "actor_action"
+						? new SourceGeneration(state.generation.signal)
+						: state.generation;
+				if (generation !== state.generation) state.actorScopedGenerations.add(generation);
 				const pending = runSourceRequest({
 					request: { source: source.id, turnID: state.turnID, index },
-					generation: state.generation,
+					generation,
 					timeoutMs: source.timeoutMs?.(state.settings),
 					produce: (requestSignal) =>
 						source.propose({
@@ -951,16 +991,18 @@ export function makeStructuralSpeculativeActionRuntime<
 		for (const node of session.plan.launchable()) {
 			if (!node.prediction || !node.actionKey || node.action.type !== "tool_call") continue;
 			const existingTimer = session.launchTimers.get(node.prediction.id);
-			if (existingTimer && node.launchActionSeq > session.sequence && node.prediction.id !== immediatePredictionID)
+			if (
+				existingTimer &&
+				node.expectedActionSeq > session.sequence + 1 &&
+				node.prediction.id !== immediatePredictionID
+			) {
 				continue;
+			}
 			if (existingTimer) clearTimeout(existingTimer);
 			session.launchTimers.delete(node.prediction.id);
-			const forecast = forecastFor(node, semantics);
-			const steps = Math.max(0, node.expectedActionSeq - session.sequence);
-			const delay =
-				node.prediction.id === immediatePredictionID || node.launchActionSeq <= session.sequence
-					? 0
-					: session.scheduler.launchDelay(forecast, steps);
+			const context = session.actionContexts.get(node.identity.id);
+			const forecast = forecastFor(node, semantics, session.sequence, context?.predictionLatencyMs);
+			const delay = node.prediction.id === immediatePredictionID ? 0 : session.scheduler.launchDelay(forecast);
 			if (delay <= 0) {
 				const promoted = session.plan.promote(node.proposalID, node.action.id);
 				if (promoted.status === "scheduled") void launchNode(session, promoted.node);
@@ -973,6 +1015,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			}, delay);
 			session.launchTimers.set(node.prediction.id, timer);
 		}
+		startQueuedCandidates(session);
 	};
 
 	const launchNode = async (session: Session, node: PlanRuntimeNode): Promise<void> => {
@@ -999,6 +1042,9 @@ export function makeStructuralSpeculativeActionRuntime<
 		const candidateID = `spec_${sequence}_${node.actionKey.hash.slice(0, 12)}`;
 		const reuse = semantics.reuse(node.action.tool) === "exclusive_branch" ? "exclusive" : "shared";
 		const work = new CandidateExecution<Output>(reuse);
+		const scheduled = session.scheduler.evaluate([
+			forecastFor(node, semantics, session.sequence, context.predictionLatencyMs),
+		]);
 		const candidate: Candidate = {
 			id: candidateID,
 			key: node.actionKey,
@@ -1015,7 +1061,9 @@ export function makeStructuralSpeculativeActionRuntime<
 			predictionLatencyMs: context.predictionLatencyMs,
 			draftTokens: context.draftTokens,
 			totalDraftTokens: context.totalDraftTokens,
-			expectedDurationMs: finitePositive(node.action.expectedDurationMs, 1),
+			expectedDurationMs: scheduled.expectedDurationMs,
+			expectedActionSeq: node.expectedActionSeq,
+			criticalPathMs: node.criticalPathMs,
 			estimatedBytes: 0,
 			resources: new CandidateResources(),
 			projectionCoverage: [],
@@ -1035,28 +1083,15 @@ export function makeStructuralSpeculativeActionRuntime<
 			return;
 		}
 		session.plan.attachExecution(node.proposalID, node.action.id, candidate.id, candidate.work);
-		const admission = session.scheduler.admit(
-			candidate,
-			forecastsForCandidate(session, candidate, node),
-			concurrentLimit(context.settings),
-		);
-		if (!admission.admitted) {
-			jobs.delete(session.id, candidate);
-			const rejected = cause("admission", admission.reason);
-			candidate.work.cancel(rejected, performance.now(), 0);
-			queueCandidateEvent(session, candidate);
-			dispatchReady(session);
-			return;
-		}
-		for (const victim of admission.preempted) cancelCandidate(session, victim, cause("admission", "preempted"));
-		const startedAt = performance.now();
-		candidate.work.start(startedAt);
-		queueCandidateEvent(session, candidate);
-		void executeCandidate(session, candidate, startedAt);
+		startQueuedCandidates(session);
 	};
 
 	const attachNode = (session: Session, node: PlanRuntimeNode, candidate: Candidate): void => {
 		if (!session.plan.attachExecution(node.proposalID, node.action.id, candidate.id, candidate.work)) return;
+		const scheduled = session.scheduler.evaluate(forecastsForCandidate(session, candidate, node));
+		candidate.expectedDurationMs = Math.max(candidate.expectedDurationMs, scheduled.expectedDurationMs);
+		candidate.expectedActionSeq = Math.min(candidate.expectedActionSeq, node.expectedActionSeq);
+		candidate.criticalPathMs = Math.max(candidate.criticalPathMs, node.criticalPathMs);
 		const execution = candidate.work.execution;
 		if (execution.status === "succeeded") {
 			queueContinuation(session, node, candidate, execution.output, "execution_succeeded");
@@ -1064,6 +1099,35 @@ export function makeStructuralSpeculativeActionRuntime<
 		}
 		if (execution.status === "queued" || execution.status === "running") {
 			session.scheduler.refresh(candidate, forecastsForCandidate(session, candidate, node));
+		}
+		if (execution.status === "queued") startQueuedCandidates(session);
+	};
+
+	const startQueuedCandidates = (session: Session, preferred?: Candidate, authoritative = false): void => {
+		const queued = jobs
+			.values(session.id)
+			.filter((candidate) => candidate.work.execution.status === "queued")
+			.sort(
+				(left, right) =>
+					Number(right === preferred) - Number(left === preferred) ||
+					Number(!reservationAvailable(right.work.reservation)) -
+						Number(!reservationAvailable(left.work.reservation)) ||
+					left.expectedActionSeq - right.expectedActionSeq ||
+					right.criticalPathMs - left.criticalPathMs ||
+					right.expectedDurationMs - left.expectedDurationMs ||
+					left.createdAt - right.createdAt,
+			);
+		for (const candidate of queued) {
+			const admission = session.scheduler.admit(
+				candidate,
+				forecastsForCandidate(session, candidate),
+				concurrentLimit(session.settings),
+			);
+			if (!admission.admitted && !(authoritative && candidate === preferred)) continue;
+			const startedAt = performance.now();
+			if (!candidate.work.start(startedAt)) continue;
+			queueCandidateEvent(session, candidate);
+			void executeCandidate(session, candidate, startedAt);
 		}
 	};
 
@@ -1075,6 +1139,7 @@ export function makeStructuralSpeculativeActionRuntime<
 					data: candidate.owner.data,
 					settings: candidate.owner.settings,
 					candidate: candidate.owner.draft,
+					action: candidate.key,
 					signal: candidate.work.controller.signal,
 				});
 			}
@@ -1153,10 +1218,16 @@ export function makeStructuralSpeculativeActionRuntime<
 		const actorArrivedAt = performance.now();
 		const state = turns.get(turnKey(input.sessionID, input.turnID));
 		if (!state || state.lifecycle !== "active" || signal?.aborted || masterEnabled === false) return undefined;
-		observeActorStep(state, actorArrivedAt);
+		for (const generation of state.actorScopedGenerations) {
+			generation.expire(cause("control", "actor_action_arrived"));
+		}
+		state.actorScopedGenerations.clear();
+		closeActorPhase(state, actorArrivedAt);
+		observeActorStep(state.session, actorArrivedAt);
 		advanceColdCache(state.session, state.settings);
 		const candidatesAtArrival = allCandidates(state.sessionID);
 		const sequence = ++state.session.sequence;
+		clearLaunchTimers(state.session);
 		const actualCall = adapter.actual(input) as ActualToolCall;
 		const identity: ActorActionIdentity = {
 			id: actualCall.id ?? JSON.stringify([input.turnID, sequence]),
@@ -1206,6 +1277,7 @@ export function makeStructuralSpeculativeActionRuntime<
 						readonly match: ActionKeyMatch;
 						readonly output: Output;
 						readonly timing: { executionAheadMs: number; attemptLeadMs: number; hitLatencyMs: number };
+						readonly toolExecution: TimelineInterval;
 				  }
 				| undefined;
 			let rejection: ResolutionCause = cause("matching", ranked.length ? "candidate_unavailable" : "no_candidate");
@@ -1220,6 +1292,15 @@ export function makeStructuralSpeculativeActionRuntime<
 					rejection = failure;
 					rejectedCandidateID = candidate.id;
 					continue;
+				}
+				if (candidate.work.execution.status === "queued") {
+					preemptForActor(
+						state.session,
+						resourceProfile(candidate.key.execution, semantics.sandboxMode(candidate.key.tool)),
+						state.settings,
+						candidate,
+					);
+					startQueuedCandidates(state.session, candidate, true);
 				}
 				admission.release();
 				const authorization = await authorize(state, input, actualKey, actualCall, candidate, signal);
@@ -1326,7 +1407,13 @@ export function makeStructuralSpeculativeActionRuntime<
 					candidate.work.release(reservationOwner);
 					results.recordActorHit(state.sessionID, candidate, cacheLimits(state.settings));
 				}
-				selected = { candidate, match: choice.match, output, timing };
+				selected = {
+					candidate,
+					match: choice.match,
+					output,
+					timing,
+					toolExecution: { startedAt: execution.startedAt, completedAt: execution.completedAt },
+				};
 				break;
 			}
 
@@ -1335,6 +1422,7 @@ export function makeStructuralSpeculativeActionRuntime<
 					selected.candidate.id,
 					selected.match,
 					selected.timing,
+					selected.toolExecution,
 					matchingPredictions.map(({ opportunity }) => opportunity.identity),
 				);
 				forgetActorAction(state.session, actualCall.id, actorAction);
@@ -1384,7 +1472,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		const actorAction = takeActorAction(state.session, input.turnID, actualCall);
 		if (!actorAction) return;
 		const durationMs = finiteMetric(input.durationMs);
-		if (!actorAction.settleActor(durationMs, outputIsError(input.output))) return;
+		if (!actorAction.settleActor(durationMs, outputIsError(input.output), performance.now())) return;
 		state.session.scheduler.observeService(actorAction.tool, durationMs);
 		const key = actorAction.actionKey;
 		if (key) invalidateChangedResources(state.session, key);
@@ -1401,6 +1489,7 @@ export function makeStructuralSpeculativeActionRuntime<
 	): void => {
 		const settlement = actorAction.settlement;
 		if (!settlement) return;
+		state.session.authoritativeToolIntervals.push(settlement.provider.toolExecution);
 		const key = actorAction.actionKey;
 		const settledCandidate =
 			candidate ??
@@ -1625,7 +1714,14 @@ export function makeStructuralSpeculativeActionRuntime<
 			additional?.prediction && !nodes.some((node) => node.prediction?.id === additional.prediction.id)
 				? [...nodes, additional]
 				: nodes;
-		return unique.map((node) => forecastFor(node, semantics));
+		return unique.map((node) =>
+			forecastFor(
+				node,
+				semantics,
+				session.sequence,
+				session.actionContexts.get(node.identity.id)?.predictionLatencyMs,
+			),
+		);
 	};
 
 	const parentWorldFor = (session: Session, candidate: Candidate): WorldBranch<Output> | undefined => {
@@ -1804,11 +1900,12 @@ export function makeStructuralSpeculativeActionRuntime<
 		session: Session,
 		resource: ReturnType<typeof resourceProfile>,
 		settings: SpeculativeActionSettings,
+		protectedCandidate?: Candidate,
 	): void => {
 		for (const candidate of session.scheduler.preemptForAuthoritative(
 			resource,
 			concurrentLimit(settings),
-			(candidate) => reservationAvailable(candidate.work.reservation),
+			(candidate) => candidate !== protectedCandidate && reservationAvailable(candidate.work.reservation),
 		)) {
 			cancelCandidate(session, candidate, cause("admission", "preempted_by_actor"));
 		}
@@ -1892,9 +1989,12 @@ export function makeStructuralSpeculativeActionRuntime<
 
 	const finishState = async (state: Turn, terminal: boolean): Promise<void> => {
 		if (state.lifecycle !== "active") return;
+		const completedAt = performance.now();
+		closeActorPhase(state, completedAt);
 		state.lifecycle = "closing";
 		await state.session.effects.flush();
 		state.generation.expire(cause("control", terminal ? "terminal_turn" : "turn_finished"));
+		state.actorScopedGenerations.clear();
 		await state.admissionTail;
 		state.lifecycle = "finished";
 		try {
@@ -1902,7 +2002,7 @@ export function makeStructuralSpeculativeActionRuntime<
 				startInput: state.startInput,
 				settings: state.settings,
 				terminal,
-				durationMs: Math.max(0, performance.now() - state.startedAt),
+				durationMs: Math.max(0, completedAt - state.startedAt),
 			});
 		} catch {
 			// Host lifecycle is outside authoritative settlement.
@@ -1914,12 +2014,12 @@ export function makeStructuralSpeculativeActionRuntime<
 		for (const node of state.session.plan.unsettled()) {
 			settleUnobserved(state.session, node, cause("control", "session_terminal"));
 		}
-		for (const timer of state.session.launchTimers.values()) clearTimeout(timer);
-		state.session.launchTimers.clear();
+		clearLaunchTimers(state.session);
 		for (const candidate of allCandidates(state.sessionID)) {
 			if (candidate.work.reservation.kind === "exclusive")
 				discardCandidate(state.session, candidate, cause("control", "session_terminal"));
 		}
+		queueTaskEvent(state.session, state.turnID, completedAt);
 		await state.session.effects.flush();
 		for (const source of sources) {
 			try {
@@ -1939,12 +2039,15 @@ export function makeStructuralSpeculativeActionRuntime<
 		else if (input.terminal === true) {
 			const session = sessions.get(input.sessionID);
 			if (!session) return;
+			const completedAt = performance.now();
 			for (const node of session.plan.unsettled())
 				settleUnobserved(session, node, cause("control", "session_terminal"));
 			for (const candidate of allCandidates(input.sessionID)) {
 				if (candidate.work.reservation.kind === "exclusive")
 					discardCandidate(session, candidate, cause("control", "session_terminal"));
 			}
+			clearLaunchTimers(session);
+			queueTaskEvent(session, input.turnID, completedAt);
 			await session.effects.flush();
 			session.plan.clear();
 			pruneActionContexts(session);
@@ -1968,15 +2071,19 @@ export function makeStructuralSpeculativeActionRuntime<
 			if (!state) continue;
 			state.lifecycle = "finished";
 			state.generation.expire(failure);
+			state.actorScopedGenerations.clear();
 			turns.delete(key);
 		}
 		session.turns.clear();
 		for (const node of session.plan.unsettled()) settleUnobserved(session, node, failure);
-		for (const timer of session.launchTimers.values()) clearTimeout(timer);
-		session.launchTimers.clear();
+		clearLaunchTimers(session);
 		for (const candidate of allCandidates(sessionID)) discardCandidate(session, candidate, failure);
 		session.plan.clear();
 		clearActorActions(session);
+		session.taskStartedAt = undefined;
+		session.lastActorArrivedAt = undefined;
+		session.actorPhaseIntervals.length = 0;
+		session.authoritativeToolIntervals.length = 0;
 		await session.effects.flush();
 		pruneActionContexts(session);
 	};
@@ -2056,6 +2163,30 @@ export function makeStructuralSpeculativeActionRuntime<
 				...new Set([...inFlight, ...cached, ...staged].map((candidate) => candidate.key.execution)),
 			].sort(),
 		};
+	};
+
+	const queueTaskEvent = (session: Session, turnID: string, completedAt: number): void => {
+		const startedAt = session.taskStartedAt;
+		if (startedAt === undefined) return;
+		const timing = measureSpeculativeTask({
+			startedAt,
+			completedAt,
+			actorPhases: session.actorPhaseIntervals,
+			authoritativeTools: session.authoritativeToolIntervals,
+		});
+		session.taskStartedAt = undefined;
+		session.lastActorArrivedAt = undefined;
+		session.actorPhaseIntervals.length = 0;
+		session.authoritativeToolIntervals.length = 0;
+		const event: SpeculativeActionEvent<SessionID> = {
+			type: "task",
+			sessionID: session.id,
+			turnID,
+			timestamp: Date.now(),
+			cache: cacheSnapshot(session, session.settings),
+			timing,
+		};
+		session.effects.enqueue(() => emit(event));
 	};
 
 	const queueSourceRequestEvent = (state: Turn, result: SettledSourceRequest): void => {

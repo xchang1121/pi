@@ -5,6 +5,7 @@ import type {
 	ResolutionCause,
 	SettledSourceRequest,
 } from "./settlement.ts";
+import type { SpeculativeTaskTiming } from "./task-timing.ts";
 
 export interface SpeculativeCacheSnapshot {
 	readonly cacheCapacity: number;
@@ -67,6 +68,10 @@ interface EventEnvelope<SessionID> {
 
 /** Immutable observability projections. Policy and learning never consume this stream. */
 export type SpeculativeActionEvent<SessionID> =
+	| (EventEnvelope<SessionID> & {
+			readonly type: "task";
+			readonly timing: SpeculativeTaskTiming;
+	  })
 	| (EventEnvelope<SessionID> & {
 			readonly type: "source_request";
 			readonly request: SettledSourceRequest;

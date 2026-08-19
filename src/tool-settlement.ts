@@ -21,4 +21,6 @@ export interface ToolProcessInvocation {
 export interface ToolInvocation {
 	readonly executor: string;
 	readonly process?: ToolProcessInvocation;
+	/** Concrete isolation route selected while constructing K(a). */
+	readonly isolationFingerprint?: string;
 }

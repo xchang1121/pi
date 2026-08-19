@@ -95,6 +95,8 @@ export interface SpeculativePlanSource<
 	readonly id: string;
 	readonly enabled: (settings: SpeculativeActionSettings) => boolean;
 	readonly timeoutMs?: (settings: SpeculativeActionSettings) => number | undefined;
+	/** Stop requests that can only predict the next Actor action once that intent arrives. */
+	readonly requestLifetime?: "actor_action" | "turn";
 	readonly multiStepEnabled?: (settings: SpeculativeActionSettings) => boolean;
 	readonly proposalCount?: (settings: SpeculativeActionSettings) => number;
 	readonly propose: (input: {
@@ -204,6 +206,7 @@ export interface SpeculativeActionRuntimeAdapter<
 		readonly data: StateData;
 		readonly settings: SpeculativeActionSettings;
 		readonly candidate: SpeculativeDraftCandidate;
+		readonly action?: ActionKey;
 		readonly signal: AbortSignal;
 	}) => MaybePromise<void>;
 	readonly captureResourceVersion?: (input: {

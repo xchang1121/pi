@@ -29,6 +29,7 @@ describe("ActorAction", () => {
 				attemptLeadMs: 55,
 				hitLatencyMs: 3,
 			},
+			{ startedAt: 10, completedAt: 50 },
 			[{ id: "prediction", source: "pattern", proposalID: "plan", actionID: "next" }],
 		);
 
@@ -42,7 +43,12 @@ describe("ActorAction", () => {
 		expect(Object.isFrozen(settled?.matchedPredictions)).toBe(true);
 		expect(Object.isFrozen(settled?.rejections[0]?.cause)).toBe(true);
 		expect(
-			action.adopt("another", exact, { executionAheadMs: 1, attemptLeadMs: 1, hitLatencyMs: 1 }),
+			action.adopt(
+				"another",
+				exact,
+				{ executionAheadMs: 1, attemptLeadMs: 1, hitLatencyMs: 1 },
+				{ startedAt: 1, completedAt: 2 },
+			),
 		).toBeUndefined();
 		expect(action.settleActor(100, false)).toBeUndefined();
 	});

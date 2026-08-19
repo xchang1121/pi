@@ -4,7 +4,7 @@ import path from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, Model } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { READ_RANGE_COVERAGE_DETAILS_KEY } from "../src/action-key-projection.ts";
 import { createSpeculativeActionHost, patternPlanActionID } from "../src/agent-integration.ts";
 import { PI_READ_RANGE_PROJECTION_RULE } from "../src/pi-read-projection.ts";
@@ -259,6 +259,12 @@ describe("speculative action host", () => {
 		});
 		let activeRequests = 0;
 		let maxActiveRequests = 0;
+		const getDraftOptions = vi.fn(() => ({
+			temperature: 1,
+			maxTokens: 2_048,
+			reasoning: "high" as const,
+			deferred: true,
+		}));
 		const complete: CreateComplete = async (_model, context, requestOptions) => {
 			const index = requests.length;
 			requests.push({ context, options: requestOptions });
@@ -298,7 +304,7 @@ describe("speculative action host", () => {
 			cwd,
 			getSettings: () => settings(8),
 			draftModel: model("draft"),
-			getDraftOptions: () => ({ temperature: 1, maxTokens: 2_048, reasoning: "high", deferred: true }),
+			getDraftOptions,
 			complete,
 			preflight: () => true,
 			onEvent: (event) => {
@@ -316,13 +322,20 @@ describe("speculative action host", () => {
 
 		expect(requests).toHaveLength(8);
 		expect(maxActiveRequests).toBe(8);
-		expect(new Set(requests.map((request) => request.options?.sessionId)).size).toBe(8);
+		expect(getDraftOptions).toHaveBeenCalledTimes(1);
+		expect(new Set(requests.map((request) => request.options?.sessionId))).toEqual(new Set(["session:draft:turn-1"]));
+		expect(requests.every((request) => request.context === requests[0]!.context)).toBe(true);
 		expect(requests.map((request) => request.options?.temperature)).toEqual([0, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7]);
 		for (const request of requests) {
 			expect(request.context.systemPrompt).toContain("Continue the conversation as the assistant");
 			expect(request.context.systemPrompt).not.toMatch(/drafter|predict|speculat|likely next/i);
 			expect(request.context.tools?.map((candidate) => candidate.name)).toEqual(["read"]);
-			expect(request.options).toMatchObject({ maxTokens: 128, reasoning: undefined, deferred: false });
+			expect(request.options).toMatchObject({
+				maxTokens: 128,
+				reasoning: undefined,
+				deferred: false,
+				cacheRetention: "short",
+			});
 		}
 		expect(executed.sort()).toEqual(["notes.txt", "other.txt"]);
 		await waitFor(

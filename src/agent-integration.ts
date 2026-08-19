@@ -180,6 +180,14 @@ export function createSpeculativeActionHost(
 	let openedPatternStore: Promise<PatternAwareStoreLease> | undefined;
 	let openedPatternStoreKey: string | undefined;
 	const authoritativeBatches = new Map<string, Map<number, PatternAwareEventInput>>();
+	const drafterBatches = new Map<
+		string,
+		Promise<{
+			readonly model: Model<Api>;
+			readonly context: Context;
+			readonly options: SimpleStreamOptions;
+		}>
+	>();
 	const authoritativeBatchKey = (batchSessionID: string, turnID: string) => JSON.stringify([batchSessionID, turnID]);
 	const clearAuthoritativeSession = (batchSessionID: string) => {
 		for (const [key, batch] of authoritativeBatches) {
@@ -234,6 +242,7 @@ export function createSpeculativeActionHost(
 		return (await openedPatternStore).store;
 	};
 	const finishPatternSession = async (): Promise<void> => {
+		drafterBatches.clear();
 		clearAuthoritativeSession(sessionID);
 		const store = options.patternStore
 			? await options.patternStore
@@ -248,7 +257,11 @@ export function createSpeculativeActionHost(
 			// Persistence failure must not change Agent lifecycle semantics.
 		}
 	};
-	const prepareSandbox = async (tools: readonly string[], signal?: AbortSignal): Promise<void> => {
+	const prepareSandbox = async (
+		tools: readonly string[],
+		signal?: AbortSignal,
+		routeContexts?: readonly ToolInvocation[],
+	): Promise<void> => {
 		const modes = [
 			...new Set(
 				tools.flatMap((tool) => {
@@ -261,6 +274,7 @@ export function createSpeculativeActionHost(
 		await options.sandbox?.prepare?.({
 			cwd: options.cwd,
 			modes,
+			...(routeContexts?.length ? { routeContexts } : {}),
 			...(signal ? { signal } : {}),
 		});
 	};
@@ -304,39 +318,54 @@ export function createSpeculativeActionHost(
 		id: "drafter",
 		enabled: (settings) => settings.drafterEnabled ?? DEFAULTS.drafterEnabled,
 		timeoutMs: (settings) => settings.predictionTimeoutMs,
+		requestLifetime: "actor_action",
 		proposalCount: (settings) => clampCandidateLimit(settings.candidateLimit ?? DEFAULTS.candidateLimit),
 		propose: async ({ startInput: input, candidateNames, proposalIndex, signal }): Promise<PlanProposal> => {
 			const proposalID = `drafter:${input.turnID}:${proposalIndex}`;
-			const configuredDraftModel =
-				typeof options.draftModel === "function" ? await options.draftModel(input.actorModel) : options.draftModel;
-			const draftModel = configuredDraftModel ?? input.actorModel;
-			const configuredDraftOptions = options.getDraftOptions
-				? await options.getDraftOptions({
-						actorModel: input.actorModel,
-						draftModel,
-						actorOptions: input.actorOptions,
-						signal,
-					})
-				: input.actorOptions;
+			const batchKey = JSON.stringify([input.sessionID, input.turnID]);
+			let batch = drafterBatches.get(batchKey);
+			if (!batch) {
+				batch = (async () => {
+					const configuredDraftModel =
+						typeof options.draftModel === "function"
+							? await options.draftModel(input.actorModel)
+							: options.draftModel;
+					const model = configuredDraftModel ?? input.actorModel;
+					const configuredDraftOptions = options.getDraftOptions
+						? await options.getDraftOptions({
+								actorModel: input.actorModel,
+								draftModel: model,
+								actorOptions: input.actorOptions,
+								signal,
+							})
+						: input.actorOptions;
+					const enabledTools = new Set(candidateNames);
+					return {
+						model,
+						context: {
+							systemPrompt: [input.context.systemPrompt, buildSingleToolCallPrompt()]
+								.filter(Boolean)
+								.join("\n\n"),
+							messages: input.context.messages,
+							tools: (input.context.tools ?? []).filter((tool) => enabledTools.has(tool.name)),
+						},
+						options: configuredDraftOptions ?? {},
+					};
+				})();
+				drafterBatches.set(batchKey, batch);
+			}
+			const prepared = await batch;
 			const draftOptions: SimpleStreamOptions = {
-				...configuredDraftOptions,
+				...prepared.options,
 				signal,
 				temperature: proposalIndex === 0 ? 0 : 0.7,
 				maxTokens: 128,
 				reasoning: undefined,
 				deferred: false,
-				sessionId: `${sessionID}:${input.turnID}:${proposalIndex}`,
+				sessionId: `${sessionID}:draft:${input.turnID}`,
+				cacheRetention: prepared.options.cacheRetention ?? "short",
 			};
-			const enabledTools = new Set(candidateNames);
-			const message = await options.complete(
-				draftModel,
-				{
-					systemPrompt: [input.context.systemPrompt, buildSingleToolCallPrompt()].filter(Boolean).join("\n\n"),
-					messages: input.context.messages,
-					tools: (input.context.tools ?? []).filter((tool) => enabledTools.has(tool.name)),
-				},
-				draftOptions,
-			);
+			const message = await options.complete(prepared.model, prepared.context, draftOptions);
 			if (message.stopReason === "error" || message.stopReason === "aborted") {
 				throw new Error(message.errorMessage ?? `Drafter stopped with ${message.stopReason}`);
 			}
@@ -511,13 +540,19 @@ export function createSpeculativeActionHost(
 			let worldFingerprint: string | undefined;
 			try {
 				invocation = await options.resolveInvocation?.(toolName, validated);
-				const mode = actionSemantics.sandboxMode(toolName);
-				if (mode && mode !== "none" && options.sandbox?.fingerprint) {
-					worldFingerprint = await options.sandbox.fingerprint(mode);
-				}
 			} catch {
 				return undefined;
 			}
+			const mode = actionSemantics.sandboxMode(toolName);
+			if (mode && mode !== "none" && options.sandbox?.fingerprint) {
+				try {
+					worldFingerprint = await options.sandbox.fingerprint(mode, invocation);
+				} catch {
+					worldFingerprint = undefined;
+				}
+			}
+			const routedInvocation =
+				invocation && worldFingerprint ? { ...invocation, isolationFingerprint: worldFingerprint } : invocation;
 			const schemaHash =
 				context.type === "consume" ? stableHash(tool.parameters ?? null) : context.data.schemaHashes[toolName];
 			return actionSemantics.buildKey(
@@ -525,10 +560,10 @@ export function createSpeculativeActionHost(
 				validated,
 				options.cwd,
 				schemaHash,
-				invocation || worldFingerprint
+				routedInvocation || worldFingerprint
 					? {
-							fingerprint: stableHash({ invocation: invocation ?? null, world: worldFingerprint ?? null }),
-							...(invocation ? { context: invocation } : {}),
+							fingerprint: stableHash({ invocation: routedInvocation ?? null, world: worldFingerprint ?? null }),
+							...(routedInvocation ? { context: routedInvocation } : {}),
 						}
 					: undefined,
 			);
@@ -543,8 +578,27 @@ export function createSpeculativeActionHost(
 			if (action.execution === "sandbox" && (!mode || !options.sandbox?.supports(mode))) {
 				return { ok: false, reason: "sandbox_unavailable" };
 			}
-			if (mode === "workspace_snapshot" && !asToolInvocation(action.executionContext)?.process) {
+			const processInvocation = asToolInvocation(action.executionContext);
+			if (mode === "workspace_snapshot" && !processInvocation?.process) {
 				return { ok: false, reason: "execution_context_unavailable" };
+			}
+			if (mode === "workspace_snapshot" && !processInvocation?.isolationFingerprint) {
+				return { ok: false, reason: "sandbox_unavailable" };
+			}
+			if (action.execution === "sandbox" && mode && options.sandbox?.fingerprint) {
+				try {
+					const invocation = asToolInvocation(action.executionContext);
+					const actualFingerprint = await options.sandbox.fingerprint(mode, invocation);
+					if (invocation?.isolationFingerprint && invocation.isolationFingerprint !== actualFingerprint) {
+						return { ok: false, reason: "sandbox_backend_changed" };
+					}
+				} catch (error) {
+					return {
+						ok: false,
+						reason: "sandbox_unavailable",
+						detail: error instanceof Error ? error.message : String(error),
+					};
+				}
 			}
 			const result = await options.preflight({ tool, toolName, args, action, signal });
 			return typeof result === "boolean"
@@ -606,11 +660,12 @@ export function createSpeculativeActionHost(
 		watchResourceVersion: ({ candidate, onInvalidated }) =>
 			watchResourceVersion(candidate.resourceVersion, onInvalidated),
 		projectionRules,
-		prepareCandidate: async ({ candidate, signal }) => {
+		prepareCandidate: async ({ candidate, action, signal }) => {
 			if (candidate.execution !== "sandbox" && actionSemantics.execution(candidate.tool) !== "sandbox") return;
 			const mode = executionWorldMode(candidate.tool);
 			if (!mode || !options.sandbox?.supports(mode)) throw new Error(`Sandbox unavailable for ${candidate.tool}`);
-			await prepareSandbox([candidate.tool], signal);
+			const invocation = asToolInvocation(action?.executionContext);
+			await prepareSandbox([candidate.tool], signal, invocation ? [invocation] : undefined);
 		},
 		onTurnStarted: async ({ startInput, settings, signal }) => {
 			authoritativeBatches.delete(authoritativeBatchKey(startInput.sessionID, startInput.turnID));
@@ -627,6 +682,7 @@ export function createSpeculativeActionHost(
 			});
 		},
 		onTurnFinished: async ({ startInput, settings, terminal, durationMs }) => {
+			drafterBatches.delete(JSON.stringify([startInput.sessionID, startInput.turnID]));
 			const key = authoritativeBatchKey(startInput.sessionID, startInput.turnID);
 			const batch = authoritativeBatches.get(key);
 			authoritativeBatches.delete(key);

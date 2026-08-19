@@ -34,6 +34,12 @@ describe("speculative trace reduction", () => {
 			actorFallbacks: 1,
 			hitRate: 1 / 2,
 			actorCandidateRejections: { "compatibility:backend_indeterminate": 1 },
+			tasks: 1,
+			endToEndMs: 100,
+			nonToolMs: 70,
+			toolExecutionMs: 42,
+			serializedMs: 112,
+			hiddenLatencyMs: 12,
 			speculativeExecutionMs: 40,
 			actorExecutionMs: 12,
 			executionAheadMs: 30,
@@ -51,6 +57,22 @@ function authoritativeEvents(): SpeculativeActionEvent<string>[] {
 	const prediction = { id: "prediction", source: "pattern_aware", proposalID: "proposal", actionID: "action" };
 	const exact = { kind: "exact" as const, distance: 0 as const };
 	return [
+		{
+			...base,
+			type: "task",
+			timing: {
+				startedAt: 0,
+				completedAt: 100,
+				endToEndMs: 100,
+				nonToolMs: 70,
+				actorPhaseMs: 65,
+				orchestrationMs: 5,
+				toolExecutionMs: 42,
+				serializedMs: 112,
+				hiddenLatencyMs: 12,
+				authoritativeToolCount: 2,
+			},
+		},
 		{
 			...base,
 			type: "source_request",
@@ -144,6 +166,7 @@ function authoritativeEvents(): SpeculativeActionEvent<string>[] {
 					candidateID: "candidate",
 					match: exact,
 					timing: { executionAheadMs: 30, attemptLeadMs: 80, hitLatencyMs: 10 },
+					toolExecution: { startedAt: 0, completedAt: 30 },
 				},
 			},
 		},
@@ -157,7 +180,12 @@ function authoritativeEvents(): SpeculativeActionEvent<string>[] {
 				tool: "read",
 				matchedPredictions: [],
 				rejections: [],
-				provider: { kind: "actor", durationMs: 12, isError: false },
+				provider: {
+					kind: "actor",
+					durationMs: 12,
+					isError: false,
+					toolExecution: { startedAt: 40, completedAt: 52 },
+				},
 			},
 		},
 	];

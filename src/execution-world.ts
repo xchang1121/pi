@@ -63,18 +63,19 @@ export interface WorldBranch<Output> {
 	readonly commit: () => Promise<Output>;
 }
 
-export interface ExecutionWorldPreparation {
+export interface ExecutionWorldPreparation<RouteContext = never> {
 	readonly cwd: string;
 	readonly modes: readonly ExecutionWorldMode[];
+	readonly routeContexts?: readonly RouteContext[];
 	readonly signal?: AbortSignal;
 }
 
 /** Source-independent lifecycle for isolating, sealing, and committing speculative effects. */
-export interface ExecutionWorld<Context extends { readonly mode: ExecutionWorldMode }, Output> {
+export interface ExecutionWorld<Context extends { readonly mode: ExecutionWorldMode }, Output, RouteContext = never> {
 	readonly supports: (mode: ExecutionWorldMode) => boolean;
 	/** Stable identity of the concrete isolation backend used by K(a). */
-	readonly fingerprint?: (mode: ExecutionWorldMode) => string | Promise<string>;
-	readonly prepare?: (input: ExecutionWorldPreparation) => Promise<void>;
+	readonly fingerprint?: (mode: ExecutionWorldMode, routeContext?: RouteContext) => string | Promise<string>;
+	readonly prepare?: (input: ExecutionWorldPreparation<RouteContext>) => Promise<void>;
 	readonly fork: (context: Context) => Promise<WorldBranch<Output>>;
 	readonly dispose?: () => Promise<void>;
 }

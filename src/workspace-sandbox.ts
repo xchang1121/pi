@@ -17,7 +17,7 @@ import type {
 	WorldExecutionMetrics,
 } from "./execution-world.ts";
 import { ResourceVersionManager, type ResourceVersionToken } from "./resource-version.ts";
-import type { ToolInvocation, ToolSettlement } from "./tool-settlement.ts";
+import type { ToolInvocation, ToolProcessInvocation, ToolSettlement } from "./tool-settlement.ts";
 
 export interface SandboxFileChange {
 	readonly root: string;
@@ -57,7 +57,7 @@ export interface SpeculativeSandboxExecuteContext {
 	readonly parentCheckpoint?: WorldCheckpoint;
 }
 
-export type SpeculativeAgentSandbox = ExecutionWorld<SpeculativeSandboxExecuteContext, ToolSettlement>;
+export type SpeculativeAgentSandbox = ExecutionWorld<SpeculativeSandboxExecuteContext, ToolSettlement, ToolInvocation>;
 
 export interface SandboxProcessRunnerInput {
 	readonly command: string;
@@ -97,9 +97,17 @@ export interface SandboxProcessSession {
 /** Process isolation lifecycle. A session owns one branch and cannot be shared concurrently. */
 export interface SandboxProcessBackend {
 	readonly check: (options?: { readonly refresh?: boolean }) => Promise<SandboxProcessBackendStatus>;
-	readonly fingerprint: () => Promise<string>;
-	readonly prepare: (input: { readonly signal?: AbortSignal }) => Promise<void>;
-	readonly open: (input: { readonly parent: string; readonly signal: AbortSignal }) => Promise<SandboxProcessSession>;
+	readonly supports?: (invocation: ToolProcessInvocation) => boolean;
+	readonly fingerprint: (invocation?: ToolProcessInvocation) => Promise<string>;
+	readonly prepare: (input: {
+		readonly signal?: AbortSignal;
+		readonly invocation?: ToolProcessInvocation;
+	}) => Promise<void>;
+	readonly open: (input: {
+		readonly parent: string;
+		readonly signal: AbortSignal;
+		readonly invocation?: ToolProcessInvocation;
+	}) => Promise<SandboxProcessSession>;
 	readonly dispose: () => Promise<void>;
 }
 
@@ -136,20 +144,16 @@ export function createSandboxBackendRouter(
 	if (new Set(routes.map((route) => route.id)).size !== routes.length || routes.some((route) => !route.id.trim())) {
 		throw new Error("Speculative process backend route IDs must be unique and non-empty.");
 	}
-	let selected: SandboxBackendRoute | undefined;
 	let disposed = false;
 	const inspect = async ({ refresh = false }: { readonly refresh?: boolean } = {}) => {
-		if (refresh) selected = undefined;
 		const checked = await Promise.all(
 			routes.map(async (route) => [route, await safeBackendCheck(route.backend, refresh)] as const),
 		);
 		const candidates = Object.freeze(
 			Object.fromEntries(checked.map(([route, status]) => [route.id, status])),
 		) as Readonly<Record<string, SandboxProcessBackendStatus>>;
-		if (!selected) {
-			const eligible = configured === "auto" ? checked : checked.filter(([route]) => route.id === configured);
-			selected = eligible.find(([, status]) => status.state === "ready")?.[0];
-		}
+		const eligible = configured === "auto" ? checked : checked.filter(([route]) => route.id === configured);
+		const selected = eligible.find(([, status]) => status.state === "ready")?.[0];
 		const active = selected
 			? candidates[selected.id]
 			: unavailableBackendStatus(
@@ -159,24 +163,42 @@ export function createSandboxBackendRouter(
 				);
 		return Object.freeze({ configured, active, candidates });
 	};
-	const select = async () => {
+	const select = async (invocation?: ToolProcessInvocation) => {
 		if (disposed) throw new Error("Speculative process backend is disposed.");
-		if (!selected) await inspect();
-		if (!selected) throw new Error((await inspect()).active.detail);
-		return selected.backend;
+		const checked = await Promise.all(
+			routes.map(async (route) => [route, await safeBackendCheck(route.backend, false)] as const),
+		);
+		const eligible = (configured === "auto" ? checked : checked.filter(([route]) => route.id === configured)).filter(
+			([route, status]) =>
+				status.state === "ready" && (!invocation || route.backend.supports?.(invocation) !== false),
+		);
+		const selected = eligible[0]?.[0];
+		if (selected) return selected.backend;
+		const detail = (configured === "auto" ? checked : checked.filter(([route]) => route.id === configured))
+			.map(([route, status]) =>
+				status.state === "ready" && invocation && route.backend.supports?.(invocation) === false
+					? `${route.id}: incompatible with ${invocation.shell}`
+					: status.detail,
+			)
+			.join("; ");
+		throw new Error(detail || "No speculative process backend is configured.");
 	};
 	return {
 		configured,
 		inspect,
 		check: async (options) => (await inspect(options)).active,
-		fingerprint: async () => (await select()).fingerprint(),
+		supports: (invocation) =>
+			(configured === "auto" ? routes : routes.filter((route) => route.id === configured)).some(
+				(route) => route.backend.supports?.(invocation) !== false,
+			),
+		fingerprint: async (invocation) => (await select(invocation)).fingerprint(invocation),
 		prepare: async (input) => {
 			if (disposed) throw new Error("Speculative process backend is disposed.");
-			await (await select()).prepare(input);
+			await (await select(input.invocation)).prepare(input);
 		},
 		open: async (input) => {
 			if (disposed) throw new Error("Speculative process backend is disposed.");
-			return (await select()).open(input);
+			return (await select(input.invocation)).open(input);
 		},
 		dispose: async () => {
 			if (disposed) return;
@@ -292,14 +314,29 @@ export function createWorkspaceSandbox(options: WorkspaceSandboxOptions = {}): S
 		mode === "file_mutation" || (mode === "workspace_snapshot" && !!options.processBackend);
 	return {
 		supports,
-		fingerprint: (mode) =>
-			mode === "file_mutation" ? "git-worktree:v1" : requireProcessBackend(options).fingerprint(),
-		prepare: async ({ cwd, modes, signal }) => {
+		fingerprint: (mode, invocation) =>
+			mode === "file_mutation" ? "git-worktree:v1" : requireProcessBackend(options).fingerprint(invocation?.process),
+		prepare: async ({ cwd, modes, routeContexts, signal }) => {
 			const supported = modes.filter(supports);
 			if (supported.length === 0) return;
 			roots.add(path.resolve(cwd));
 			await prepareSandboxWorkspace(cwd, { ...(options.gitBinary ? { gitBinary: options.gitBinary } : {}), signal });
-			if (supported.includes("workspace_snapshot")) await requireProcessBackend(options).prepare({ signal });
+			if (supported.includes("workspace_snapshot")) {
+				const invocations = routeContexts?.flatMap((context) => (context.process ? [context] : [])) ?? [];
+				if (invocations.length) {
+					await Promise.all(
+						invocations.map(async (invocation) => {
+							const actual = await requireProcessBackend(options).fingerprint(invocation.process);
+							if (invocation.isolationFingerprint && invocation.isolationFingerprint !== actual) {
+								throw new Error("Speculative process backend changed after K(a) construction.");
+							}
+							await requireProcessBackend(options).prepare({ signal, invocation: invocation.process });
+						}),
+					);
+				} else {
+					await requireProcessBackend(options).prepare({ signal });
+				}
+			}
 		},
 		fork: async (context) => {
 			if (!supports(context.mode)) throw new Error(`Execution world does not support mode ${context.mode}`);
@@ -557,6 +594,10 @@ async function executeWorkspaceSnapshot(
 ): Promise<WorkspaceExecutionSnapshot> {
 	const invocation = context.invocation?.process;
 	if (!invocation) throw new Error(`${context.toolName} has no isolated process invocation`);
+	const actualFingerprint = await backend.fingerprint(invocation);
+	if (context.invocation?.isolationFingerprint && context.invocation.isolationFingerprint !== actualFingerprint) {
+		throw new Error("Speculative process backend changed after K(a) construction.");
+	}
 	const sourceRoot = path.resolve(context.cwd);
 	const invocationCwd = path.resolve(invocation.cwd);
 	if (!contains(sourceRoot, invocationCwd)) throw new Error(`${context.toolName}.cwd escapes workspace`);
@@ -593,6 +634,7 @@ async function executeWorkspaceSnapshot(
 		backend,
 		context.signal,
 		parent,
+		invocation,
 	);
 }
 
@@ -601,6 +643,7 @@ async function createPrivateGitWorkspace(
 	gitBinary: string,
 	processBackend?: SandboxProcessBackend,
 	signal?: AbortSignal,
+	invocation?: ToolProcessInvocation,
 ): Promise<PrivateGitWorkspace> {
 	const sourceRoot = path.resolve(cwd);
 	await assertNoSymlinkPath(sourceRoot, sourceRoot);
@@ -609,7 +652,11 @@ async function createPrivateGitWorkspace(
 	try {
 		const commit = await acquireSandboxBaseline(pool, SANDBOX_AUTHOR_ENVIRONMENT);
 		processSession = processBackend
-			? await processBackend.open({ parent: pool.parent, signal: signal ?? new AbortController().signal })
+			? await processBackend.open({
+					parent: pool.parent,
+					signal: signal ?? new AbortController().signal,
+					...(invocation ? { invocation } : {}),
+				})
 			: undefined;
 		const workspace = processSession
 			? await attachSandboxWorkspace(pool, commit, processSession.processRoot)
@@ -1077,8 +1124,9 @@ async function withPrivateGitWorkspace<T>(
 	processBackend?: SandboxProcessBackend,
 	signal?: AbortSignal,
 	checkpoint?: GitWorldCheckpoint,
+	invocation?: ToolProcessInvocation,
 ): Promise<T> {
-	const workspace = await createPrivateGitWorkspace(cwd, gitBinary, processBackend, signal);
+	const workspace = await createPrivateGitWorkspace(cwd, gitBinary, processBackend, signal, invocation);
 	try {
 		if (checkpoint) await materializeCheckpoint(workspace, checkpoint);
 		return await run(workspace);

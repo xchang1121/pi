@@ -14,6 +14,18 @@ import {
 } from "../src/native-sandbox.ts";
 
 describe("M5 native sandbox broker", () => {
+	it("declares Windows MSYS shells incompatible without narrowing other platforms", async () => {
+		const windows = createNativeSandboxProcessBackend({ platform: "win32" });
+		const linux = createNativeSandboxProcessBackend({ platform: "linux" });
+		const gitBash = processInvocation("C:\\Program Files\\Git\\bin\\bash.exe");
+		const cmd = processInvocation("C:\\Windows\\System32\\cmd.exe");
+
+		expect(windows.supports?.(gitBash)).toBe(false);
+		expect(windows.supports?.(cmd)).toBe(true);
+		expect(linux.supports?.(processInvocation("/bin/bash"))).toBe(true);
+		await expect(windows.fingerprint(gitBash)).rejects.toThrow("incompatible with shell");
+	});
+
 	it("probes a ready broker and exposes its protocol status", async () => {
 		await withPlaceholderBinary(async (binaryPath) => {
 			const invoker: NativeSandboxInvoker = async (input) => {
@@ -365,6 +377,17 @@ function commandInput(sourceRoot: string, processRoot: string, cwd = processRoot
 		workspaceRoot: cwd,
 		sourceRoot,
 		signal: new AbortController().signal,
+	};
+}
+
+function processInvocation(shell: string) {
+	return {
+		command: "echo ok",
+		cwd: process.cwd(),
+		environment: {},
+		shell,
+		shellArgs: ["-c"],
+		commandTransport: "argv" as const,
 	};
 }
 

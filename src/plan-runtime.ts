@@ -46,7 +46,7 @@ interface PlanRuntimeNodeBase {
 	readonly actionKey?: ActionKey;
 	readonly anchorActionSeq: number;
 	readonly expectedActionSeq: number;
-	readonly launchActionSeq: number;
+	readonly criticalPathMs: number;
 	readonly execution: PlanNodeExecution;
 	readonly readiness: PlanNodeReadiness;
 }
@@ -188,7 +188,7 @@ type MutableNode = {
 	actionKey?: ActionKey;
 	anchorActionSeq: number;
 	expectedActionSeq: number;
-	launchActionSeq: number;
+	criticalPathMs: number;
 	execution: MutableNodeExecution;
 	opportunity?: PredictionOpportunity;
 };
@@ -218,7 +218,7 @@ export class PlanRuntime {
 
 	takeReady(
 		settledSequence: number,
-		shouldLaunch: (node: PlanRuntimeNode) => boolean = (node) => node.launchActionSeq <= settledSequence,
+		shouldLaunch: (node: PlanRuntimeNode) => boolean = (node) => node.expectedActionSeq <= settledSequence + 1,
 	): readonly PlanRuntimeNode[] {
 		const ready = this.mutableValues()
 			.filter(({ plan, node }) => {
@@ -469,7 +469,7 @@ export class PlanRuntime {
 			...(node.actionKey ? { actionKey: node.actionKey } : {}),
 			anchorActionSeq: node.anchorActionSeq,
 			expectedActionSeq: node.expectedActionSeq,
-			launchActionSeq: node.launchActionSeq,
+			criticalPathMs: node.criticalPathMs,
 			execution: executionProjection(node.execution),
 			readiness: this.readiness(plan, node),
 		};
@@ -506,10 +506,10 @@ export class PlanRuntime {
 	}
 
 	private recompute(plan: MutablePlan): void {
-		const memo = new Map<string, number>();
+		const expectedMemo = new Map<string, number>();
 		const visiting = new Set<string>();
 		const expected = (node: MutableNode): number => {
-			const cached = memo.get(node.action.id);
+			const cached = expectedMemo.get(node.action.id);
 			if (cached !== undefined) return cached;
 			if (visiting.has(node.action.id)) return node.anchorActionSeq + horizon(node.action) + 1;
 			visiting.add(node.action.id);
@@ -522,12 +522,30 @@ export class PlanRuntime {
 				if (parent) value = Math.max(value, expected(parent) + 1);
 			}
 			visiting.delete(node.action.id);
-			memo.set(node.action.id, value);
+			expectedMemo.set(node.action.id, value);
+			return value;
+		};
+		const dependents = new Map<string, MutableNode[]>();
+		for (const node of plan.nodes.values()) {
+			for (const dependency of node.action.dependsOn ?? []) {
+				const values = dependents.get(dependency.actionID) ?? [];
+				values.push(node);
+				dependents.set(dependency.actionID, values);
+			}
+		}
+		const criticalMemo = new Map<string, number>();
+		const criticalPath = (node: MutableNode): number => {
+			const cached = criticalMemo.get(node.action.id);
+			if (cached !== undefined) return cached;
+			const own = Math.max(1, finiteMetric(node.action.expectedDurationMs));
+			const descendants = dependents.get(node.action.id) ?? [];
+			const value = own + descendants.reduce((longest, child) => Math.max(longest, criticalPath(child)), 0);
+			criticalMemo.set(node.action.id, value);
 			return value;
 		};
 		for (const node of plan.nodes.values()) {
 			node.expectedActionSeq = expected(node);
-			node.launchActionSeq = Math.max(node.anchorActionSeq, node.expectedActionSeq - 1);
+			node.criticalPathMs = criticalPath(node);
 		}
 	}
 }
@@ -551,7 +569,7 @@ function newNode(
 		actionKey: undefined,
 		anchorActionSeq,
 		expectedActionSeq: anchorActionSeq + horizon(action) + 1,
-		launchActionSeq: anchorActionSeq + horizon(action),
+		criticalPathMs: Math.max(1, finiteMetric(action.expectedDurationMs)),
 		execution: { status: "deferred" },
 		...(action.type === "tool_call" ? { opportunity: new PredictionOpportunity(identity) } : {}),
 	};
@@ -644,8 +662,8 @@ function compareMutableNodes(
 	right: { readonly plan: MutablePlan; readonly node: MutableNode },
 ): number {
 	return (
-		left.node.launchActionSeq - right.node.launchActionSeq ||
 		left.node.expectedActionSeq - right.node.expectedActionSeq ||
+		right.node.criticalPathMs - left.node.criticalPathMs ||
 		left.plan.id.localeCompare(right.plan.id) ||
 		left.node.action.id.localeCompare(right.node.action.id)
 	);

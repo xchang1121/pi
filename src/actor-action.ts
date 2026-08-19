@@ -7,6 +7,7 @@ import type {
 	PredictionIdentity,
 	ResolutionCause,
 } from "./settlement.ts";
+import type { TimelineInterval } from "./task-timing.ts";
 
 export type ActorActionState =
 	| { readonly status: "matching" }
@@ -60,6 +61,7 @@ export class ActorAction {
 		candidateID: string,
 		match: ActionKeyMatch,
 		timing: ActorHitTiming,
+		toolExecution: TimelineInterval,
 		matchedPredictions: readonly PredictionIdentity[] = [],
 	): ActorActionSettlement | undefined {
 		if (
@@ -79,6 +81,7 @@ export class ActorAction {
 				candidateID,
 				match: Object.freeze({ ...match }),
 				timing: normalizeTiming(timing),
+				toolExecution: normalizeInterval(toolExecution),
 			}),
 		});
 	}
@@ -92,15 +95,26 @@ export class ActorAction {
 		return true;
 	}
 
-	settleActor(durationMs: number, isError: boolean): ActorActionSettlement | undefined {
+	settleActor(
+		durationMs: number,
+		isError: boolean,
+		completedAt = performance.now(),
+	): ActorActionSettlement | undefined {
 		if (this.stateValue.status !== "awaiting_fallback") return undefined;
+		const duration = finite(durationMs);
+		const completed = finite(completedAt);
 		return this.finish({
 			actorAction: this.identity,
 			tool: this.tool,
 			...(this.actionKey ? { actionKeyHash: this.actionKey.hash } : {}),
 			matchedPredictions: this.stateValue.matchedPredictions,
 			rejections: Object.freeze([...this.rejections]),
-			provider: Object.freeze({ kind: "actor", durationMs: finite(durationMs), isError }),
+			provider: Object.freeze({
+				kind: "actor",
+				durationMs: duration,
+				isError,
+				toolExecution: Object.freeze({ startedAt: Math.max(0, completed - duration), completedAt: completed }),
+			}),
 		});
 	}
 
@@ -109,6 +123,11 @@ export class ActorAction {
 		this.stateValue = Object.freeze({ status: "settled", value: settlement });
 		return settlement;
 	}
+}
+
+function normalizeInterval(interval: TimelineInterval): TimelineInterval {
+	const startedAt = finite(interval.startedAt);
+	return Object.freeze({ startedAt, completedAt: Math.max(startedAt, finite(interval.completedAt)) });
 }
 
 function normalizeTiming(timing: ActorHitTiming): ActorHitTiming {

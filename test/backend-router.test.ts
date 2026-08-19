@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import type { ToolProcessInvocation } from "../src/tool-settlement.ts";
 import {
 	createSandboxBackendRouter,
 	type SandboxProcessBackend,
@@ -6,7 +7,7 @@ import {
 } from "../src/workspace-sandbox.ts";
 
 describe("SandboxBackendRouter", () => {
-	it("routes health, fingerprint, preparation, and execution through one selected backend", async () => {
+	it("routes health, fingerprint, preparation, and execution through a ready backend", async () => {
 		const container = backend(unavailable("container missing"), "container");
 		const native = backend(ready("native", "native:v1"), "native");
 		const router = createSandboxBackendRouter("auto", [
@@ -41,7 +42,7 @@ describe("SandboxBackendRouter", () => {
 		expect(native.calls).not.toContain("fingerprint");
 	});
 
-	it("changes active health and K(a) fingerprint together after an explicit refresh", async () => {
+	it("does not retain a stale global route when backend readiness changes", async () => {
 		let containerStatus = unavailable("starting");
 		const container = backend(() => containerStatus, "container");
 		const native = backend(ready("native", "native:v1"), "native");
@@ -52,21 +53,42 @@ describe("SandboxBackendRouter", () => {
 
 		await expect(router.fingerprint()).resolves.toBe("native:v1");
 		containerStatus = ready("container", "container:v2");
-		await expect(router.inspect()).resolves.toMatchObject({ active: { backend: "native" } });
-		await expect(router.inspect({ refresh: true })).resolves.toMatchObject({ active: { backend: "container" } });
+		await expect(router.inspect()).resolves.toMatchObject({ active: { backend: "container" } });
 		await expect(router.fingerprint()).resolves.toBe("container:v2");
+	});
+
+	it("selects a backend for each concrete process invocation", async () => {
+		const native = backend(ready("native", "native:v1"), "native", (invocation) =>
+			invocation.shell.toLowerCase().endsWith("cmd.exe"),
+		);
+		const container = backend(ready("container", "container:v2"), "container");
+		const router = createSandboxBackendRouter("auto", [
+			{ id: "native", backend: native.value },
+			{ id: "container", backend: container.value },
+		]);
+		const cmd = invocation("C:\\Windows\\System32\\cmd.exe");
+		const gitBash = invocation("C:\\Program Files\\Git\\bin\\bash.exe");
+
+		await expect(router.fingerprint(cmd)).resolves.toBe("native:v1");
+		await expect(router.fingerprint(gitBash)).resolves.toBe("container:v2");
+		await router.prepare({ invocation: gitBash });
+		await router.open({ parent: "root", signal: new AbortController().signal, invocation: cmd });
+		expect(native.calls.filter((call) => call === "open")).toHaveLength(1);
+		expect(container.calls.filter((call) => call === "prepare")).toHaveLength(1);
 	});
 });
 
 function backend(
 	status: SandboxProcessBackendStatus | (() => SandboxProcessBackendStatus),
 	name: string,
+	supports?: (invocation: ToolProcessInvocation) => boolean,
 ): { readonly value: SandboxProcessBackend; readonly calls: string[] } {
 	const calls: string[] = [];
 	const current = () => (typeof status === "function" ? status() : status);
 	return {
 		calls,
 		value: {
+			...(supports ? { supports } : {}),
 			check: vi.fn(async () => {
 				calls.push("check");
 				return current();
@@ -84,6 +106,17 @@ function backend(
 			}),
 			dispose: vi.fn(),
 		},
+	};
+}
+
+function invocation(shell: string): ToolProcessInvocation {
+	return {
+		command: "echo ok",
+		cwd: "C:\\workspace",
+		environment: {},
+		shell,
+		shellArgs: ["-c"],
+		commandTransport: "argv",
 	};
 }
 
