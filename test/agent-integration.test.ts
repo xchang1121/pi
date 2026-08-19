@@ -396,7 +396,19 @@ describe("speculative action host", () => {
 		});
 
 		await host.startTurn(startInput(tool));
-		await waitFor(() => executed.length === 3);
+		await waitFor(() => executed.length === 1);
+		for (const [index, file] of ["notes.txt", "other.txt", "third.txt"].entries()) {
+			expect(
+				await host.consume({
+					turnID: "turn-1",
+					id: `actor-${index}`,
+					tool: "read",
+					args: { path: file },
+					tools: [tool],
+				}),
+			).toMatchObject({ result: { content: [{ type: "text", text: `${file}:result` }] } });
+			if (index < 2) await waitFor(() => executed.length === index + 2);
+		}
 		expect(executed).toEqual(["notes.txt", "other.txt", "third.txt"]);
 		expect(requests).toHaveLength(3);
 		const replayedAssistant = requests[1]!.context.messages.at(-2);
@@ -414,18 +426,6 @@ describe("speculative action host", () => {
 			isError: false,
 		});
 		expect(requests[2]!.context.messages.filter((message) => message.role === "toolResult")).toHaveLength(2);
-
-		for (const [index, file] of ["notes.txt", "other.txt", "third.txt"].entries()) {
-			expect(
-				await host.consume({
-					turnID: "turn-1",
-					id: `actor-${index}`,
-					tool: "read",
-					args: { path: file },
-					tools: [tool],
-				}),
-			).toMatchObject({ result: { content: [{ type: "text", text: `${file}:result` }] } });
-		}
 		await host.dispose();
 	});
 
