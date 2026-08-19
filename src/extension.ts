@@ -17,7 +17,6 @@ import {
 	type ExtensionUIContext,
 	getAgentDir,
 	type ModelRegistry,
-	type ReadToolInput,
 	type SourceInfo,
 	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
@@ -28,7 +27,7 @@ import { createContainerSandboxProcessBackend, DEFAULT_CONTAINER_SANDBOX_IMAGE }
 import { createNativeSandboxProcessBackend } from "./native-sandbox.ts";
 import { createOciSetupService, type OciSetupService } from "./oci-setup.ts";
 import { PATTERN_AWARE_DEFAULTS, type PatternAwareSettings, patternAwareSettings } from "./pattern-aware.ts";
-import { PI_READ_RANGE_PROJECTION_RULE, withPiReadCoverage } from "./pi-read-projection.ts";
+import { PI_READ_RANGE_PROJECTION_RULE, withPiProjectionCoverage } from "./pi-read-projection.ts";
 import { resolvePiToolInvocation } from "./pi-tool-invocation.ts";
 import type { SpeculativeActionEvent } from "./runtime.ts";
 import {
@@ -427,7 +426,7 @@ async function installController(
 			}
 			const startedAt = performance.now();
 			try {
-				const result = decorateToolResult(
+				const result = withPiProjectionCoverage(
 					tool,
 					input,
 					await definition.execute(callID, input as never, signal, onUpdate as never, nextContext),
@@ -568,26 +567,12 @@ function toAgentTool(base: BaseToolDefinition, context: () => ExtensionContext):
 		...(base.prepareArguments ? { prepareArguments: base.prepareArguments } : {}),
 		...(base.executionMode ? { executionMode: base.executionMode } : {}),
 		execute: async (callID, input, signal, onUpdate) =>
-			decorateToolResult(
+			withPiProjectionCoverage(
 				base.name,
 				input,
 				await base.execute(callID, input as never, signal, onUpdate as never, context()),
 			),
 	};
-}
-
-function decorateToolResult(tool: string, input: unknown, result: AgentToolResult<unknown>): AgentToolResult<unknown> {
-	if (tool !== "read" || !isReadToolInput(input)) return result;
-	return withPiReadCoverage(input, result as Parameters<typeof withPiReadCoverage>[1]);
-}
-
-function isReadToolInput(value: unknown): value is ReadToolInput {
-	return (
-		!!value &&
-		typeof value === "object" &&
-		!Array.isArray(value) &&
-		typeof (value as { path?: unknown }).path === "string"
-	);
 }
 
 function errorToolSettlement(error: unknown): ToolSettlement {

@@ -20,7 +20,7 @@ import { createSpeculativeActionHost, type SpeculativeAgentSettingsInput } from 
 import { createContainerSandboxProcessBackend } from "../src/container-sandbox.ts";
 import { createNativeSandboxProcessBackend } from "../src/native-sandbox.ts";
 import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
-import { PI_READ_RANGE_PROJECTION_RULE } from "../src/pi-read-projection.ts";
+import { PI_READ_RANGE_PROJECTION_RULE, withPiProjectionCoverage } from "../src/pi-read-projection.ts";
 import type { SpeculativeActionEvent } from "../src/runtime.ts";
 import type { ToolInvocation } from "../src/tool-settlement.ts";
 import { summarizeSpeculativeTrace } from "../src/trace-summary.ts";
@@ -493,7 +493,11 @@ function instrumentTool(tool: AgentTool, addedLatencyMs: number, counters: ToolC
 			counters.executions[tool.name] = (counters.executions[tool.name] ?? 0) + 1;
 			try {
 				await delay(addedLatencyMs, signal);
-				return await tool.execute(callID, args as never, signal, onUpdate as never);
+				return withPiProjectionCoverage(
+					tool.name,
+					args,
+					await tool.execute(callID, args as never, signal, onUpdate as never),
+				);
 			} finally {
 				counters.serviceMs[tool.name] =
 					(counters.serviceMs[tool.name] ?? 0) + Math.max(0, performance.now() - startedAt);

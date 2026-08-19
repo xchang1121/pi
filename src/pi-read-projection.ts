@@ -165,6 +165,16 @@ export function withPiReadCoverage(
 	};
 }
 
+/** Attach Pi-specific realized coverage without changing the underlying tool result. */
+export function withPiProjectionCoverage(
+	tool: string,
+	input: unknown,
+	result: AgentToolResult<unknown>,
+): AgentToolResult<unknown> {
+	if (tool !== "read" || !isReadToolInput(input)) return result;
+	return withPiReadCoverage(input, result as AgentToolResult<ReadToolDetails | undefined>);
+}
+
 function inferPiReadCoverage(
 	input: ReadToolInput,
 	result: AgentToolResult<ReadToolDetails | undefined>,
@@ -216,4 +226,13 @@ function totalLinesFromTruncationNotice(text: string): number | undefined {
 
 function finiteInteger(value: unknown): number | undefined {
 	return typeof value === "number" && Number.isInteger(value) ? value : undefined;
+}
+
+function isReadToolInput(value: unknown): value is ReadToolInput {
+	return (
+		!!value &&
+		typeof value === "object" &&
+		!Array.isArray(value) &&
+		typeof (value as { path?: unknown }).path === "string"
+	);
 }
