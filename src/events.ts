@@ -29,6 +29,7 @@ export interface CandidateEventDescriptor {
 	readonly actionKeyHash: string;
 	readonly execution: SpeculativeExecution;
 	readonly source: string;
+	readonly depth: number;
 	readonly predictedAction: string;
 	readonly predictionLatencyMs: number;
 	readonly draftTokens: number;

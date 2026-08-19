@@ -404,6 +404,7 @@ function candidateEventDescriptor<Output, StartInput, StateData>(
 ): CandidateEventDescriptor {
 	return {
 		source: candidate.owner.draft.source ?? "cache",
+		depth: candidate.owner.draft.depth ?? 0,
 		id: candidate.id,
 		tool: candidate.key.tool,
 		actionKeyHash: candidate.key.hash,

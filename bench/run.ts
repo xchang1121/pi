@@ -341,6 +341,13 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 		}
 		return counts;
 	}, {});
+	const speculativeHitsByDepth = events.reduce<Record<string, number>>((counts, event) => {
+		if (event.type === "actor_action" && event.settlement.provider.kind === "speculative") {
+			const depth = String(event.candidate?.depth ?? 0);
+			counts[depth] = (counts[depth] ?? 0) + 1;
+		}
+		return counts;
+	}, {});
 	const agentPromptMs = Math.max(0, (taskCompletedAt ?? performance.now()) - taskStartedAt);
 	const actualEndToEndMs = Math.max(agentPromptMs, summary.endToEndMs);
 	const boundaryNonToolMs = Math.max(0, actualEndToEndMs - summary.endToEndMs);
@@ -397,6 +404,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 			accelerationRatio: actualEndToEndMs > 0 ? serializedCounterfactualMs / actualEndToEndMs : 1,
 			actorActions: summary.actorActions,
 			speculativeHits: summary.speculativeHits,
+			speculativeHitsByDepth,
 			actorFallbacks: summary.actorFallbacks,
 			hitRate: summary.hitRate,
 			sourceRequests: summary.sourceRequests,

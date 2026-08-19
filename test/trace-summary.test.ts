@@ -204,6 +204,7 @@ function candidate(id: string): CandidateEventDescriptor {
 		actionKeyHash: `hash-${id}`,
 		execution: "resource_cached",
 		source: "pattern_aware",
+		depth: 0,
 		predictedAction: "read README.md",
 		predictionLatencyMs: 2,
 		draftTokens: 7,
