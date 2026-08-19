@@ -3,7 +3,12 @@ import { READ_RANGE_ACTION_KEY_PROJECTOR } from "../src/action-key-projection.ts
 import { buildPiActionKey } from "../src/action-semantics.ts";
 import type { SpeculativeActionEvent, SpeculativeActionSettings, SpeculativePlanSource } from "../src/runtime.ts";
 import { makeStructuralSpeculativeActionRuntime } from "../src/runtime-engine.ts";
-import { cause, type PredictionSettlement, zeroValidationMetrics } from "../src/settlement.ts";
+import {
+	cause,
+	type PredictionSettlement,
+	type ResourceValidation,
+	zeroValidationMetrics,
+} from "../src/settlement.ts";
 
 interface Start {
 	readonly sessionID: string;
@@ -46,6 +51,8 @@ function harness(input: {
 		signal: AbortSignal,
 	) => unknown | Promise<unknown>;
 	readonly expired?: () => boolean | Promise<boolean>;
+	readonly capture?: () => unknown | Promise<unknown>;
+	readonly validate?: (version: unknown) => ResourceValidation;
 	readonly projection?: boolean;
 	readonly onEvent?: (event: SpeculativeActionEvent<string>) => void | Promise<void>;
 	readonly actionKey?: (tool: string, args: unknown) => ReturnType<typeof buildPiActionKey>;
@@ -64,15 +71,17 @@ function harness(input: {
 			executions++;
 			return ((await input.execute?.(tool, concrete, signal)) as string) ?? "speculative";
 		},
-		captureResourceVersion: () => ({ version: 1 }),
-		validateResourceVersion: async () =>
-			(await input.expired?.())
-				? {
-						status: "stale",
-						cause: cause("freshness", "resource_changed"),
-						metrics: zeroValidationMetrics(),
-					}
-				: { status: "valid", metrics: zeroValidationMetrics() },
+		captureResourceVersion: input.capture ?? (() => ({ version: 1 })),
+		validateResourceVersion: async ({ candidate }) =>
+			input.validate
+				? input.validate(candidate.resourceVersion)
+				: (await input.expired?.())
+					? {
+							status: "stale",
+							cause: cause("freshness", "resource_changed"),
+							metrics: zeroValidationMetrics(),
+						}
+					: { status: "valid", metrics: zeroValidationMetrics() },
 		projectionRules: input.projection
 			? [
 					{
@@ -175,6 +184,39 @@ describe("structural speculative runtime", () => {
 		expect(actionKey).toHaveBeenCalledTimes(2);
 	});
 
+	it("waits for an in-flight candidate to capture its resource baseline before validation", async () => {
+		let releaseCapture!: () => void;
+		const captured = new Promise<{ version: number }>((resolve) => {
+			releaseCapture = () => resolve({ version: 1 });
+		});
+		const validate = vi.fn((version: unknown) =>
+			version
+				? { status: "valid" as const, metrics: zeroValidationMetrics() }
+				: {
+						status: "indeterminate" as const,
+						cause: cause("freshness", "resource_version_missing"),
+						metrics: zeroValidationMetrics(),
+					},
+		);
+		const source: Source = {
+			id: "source",
+			enabled: () => true,
+			propose: () => plan("source", "in-flight", { path: "README.md" }),
+		};
+		const fixture = harness({ source, capture: () => captured, validate });
+		await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn" });
+		await waitFor(() => fixture.runtime.inspect().sharedCandidates === 1);
+
+		const consumed = fixture.runtime.consume(call("turn"));
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		expect(validate).not.toHaveBeenCalled();
+		releaseCapture();
+		await expect(consumed).resolves.toBe("speculative");
+		expect(validate).toHaveBeenCalledOnce();
+		expect(validate).toHaveBeenCalledWith({ version: 1 });
+		await fixture.runtime.finishTurn({ ...call("turn"), terminal: true });
+	});
+
 	it("keeps slow observers off the hit path and freezes event attribution before cleanup", async () => {
 		let release!: () => void;
 		const blocked = new Promise<void>((resolve) => {
@@ -211,10 +253,6 @@ describe("structural speculative runtime", () => {
 		const validationGate = new Promise<void>((resolve) => {
 			releaseValidation = resolve;
 		});
-		let releaseExecution!: () => void;
-		const executionGate = new Promise<void>((resolve) => {
-			releaseExecution = resolve;
-		});
 		const settlements: PredictionSettlement[] = [];
 		const source: Source = {
 			id: "source",
@@ -226,10 +264,6 @@ describe("structural speculative runtime", () => {
 		};
 		const fixture = harness({
 			source,
-			execute: async () => {
-				await executionGate;
-				return "too late";
-			},
 			expired: async () => {
 				validationEntered();
 				await validationGate;
@@ -245,7 +279,6 @@ describe("structural speculative runtime", () => {
 		releaseValidation();
 		expect(await consumed).toBeUndefined();
 		await disabling;
-		releaseExecution();
 		await waitFor(() => settlements.length === 1);
 
 		expect(settlements[0]).toMatchObject({

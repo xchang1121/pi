@@ -1434,6 +1434,18 @@ export function makeStructuralSpeculativeActionRuntime<
 				| undefined;
 			let rejection: ResolutionCause = cause("matching", ranked.length ? "candidate_unavailable" : "no_candidate");
 			let rejectedCandidateID: string | undefined;
+			const stopCandidate = (candidate: Candidate, reservationOwner: string): boolean => {
+				const failure = signal?.aborted
+					? cause("control", "actor_aborted")
+					: masterEnabled === false || state.lifecycle !== "active" || turns.get(state.key) !== state
+						? cause("control", "disabled")
+						: undefined;
+				if (!failure) return false;
+				candidate.work.release(reservationOwner);
+				rejection = failure;
+				rejectedCandidateID = candidate.id;
+				return true;
+			};
 
 			for (const choice of ranked) {
 				const candidate = choice.candidate;
@@ -1456,6 +1468,7 @@ export function makeStructuralSpeculativeActionRuntime<
 				}
 				admission.release();
 				const authorization = await authorize(state, input, actualKey, actualCall, candidate, signal);
+				if (stopCandidate(candidate, reservationOwner)) break;
 				if (authorization) {
 					candidate.work.release(reservationOwner);
 					actorAction.reject(candidate.id, choice.match, authorization);
@@ -1463,18 +1476,22 @@ export function makeStructuralSpeculativeActionRuntime<
 					rejectedCandidateID = candidate.id;
 					continue;
 				}
-				const before = await validateCandidate(state, input, actualKey, candidate);
-				if (before.status !== "valid") {
-					candidate.work.release(reservationOwner);
-					actorAction.reject(candidate.id, choice.match, before.cause);
-					rejection = before.cause;
-					rejectedCandidateID = candidate.id;
-					if (before.status === "stale") discardCandidate(state.session, candidate, before.cause);
-					continue;
-				}
 				const wasRunning =
 					candidate.work.execution.status === "queued" || candidate.work.execution.status === "running";
+				if (!wasRunning) {
+					const before = await validateCandidate(state, input, actualKey, candidate);
+					if (stopCandidate(candidate, reservationOwner)) break;
+					if (before.status !== "valid") {
+						candidate.work.release(reservationOwner);
+						actorAction.reject(candidate.id, choice.match, before.cause);
+						rejection = before.cause;
+						rejectedCandidateID = candidate.id;
+						if (before.status === "stale") discardCandidate(state.session, candidate, before.cause);
+						continue;
+					}
+				}
 				const execution = await waitForCandidate(candidate.work.completion, signal);
+				if (stopCandidate(candidate, reservationOwner)) break;
 				if (!execution) {
 					candidate.work.release(reservationOwner);
 					rejection = cause("control", "actor_aborted");
@@ -1489,6 +1506,7 @@ export function makeStructuralSpeculativeActionRuntime<
 				}
 				if (wasRunning) {
 					const after = await validateCandidate(state, input, actualKey, candidate);
+					if (stopCandidate(candidate, reservationOwner)) break;
 					if (after.status !== "valid") {
 						candidate.work.release(reservationOwner);
 						actorAction.reject(candidate.id, choice.match, after.cause);
@@ -1522,6 +1540,7 @@ export function makeStructuralSpeculativeActionRuntime<
 					choice.match,
 					projectionRules,
 				);
+				if (stopCandidate(candidate, reservationOwner)) break;
 				if (!projection.ok) {
 					candidate.work.release(reservationOwner);
 					actorAction.reject(candidate.id, choice.match, projection.cause);
