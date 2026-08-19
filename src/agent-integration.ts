@@ -41,8 +41,6 @@ import { cause, type ResourceValidation } from "./settlement.ts";
 import type { ToolInvocation, ToolSettlement } from "./tool-settlement.ts";
 import type { SpeculativeAgentSandbox } from "./workspace-sandbox.ts";
 
-const DRAFTER_TEMPERATURES = [0, 0.35, 0.5, 0.65, 0.8, 0.95, 1.1, 1.25] as const;
-
 export interface SpeculativeAgentSettingsInput {
 	readonly enabled?: boolean;
 	readonly drafterEnabled?: boolean;
@@ -360,7 +358,7 @@ export function createSpeculativeActionHost(
 			const draftOptions: SimpleStreamOptions = {
 				...prepared.options,
 				signal,
-				temperature: DRAFTER_TEMPERATURES[proposalIndex]!,
+				temperature: proposalIndex === 0 ? 0 : 0.7,
 				maxTokens: 128,
 				reasoning: undefined,
 				deferred: false,
