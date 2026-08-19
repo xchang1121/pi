@@ -31,8 +31,12 @@ Remove-Item Env:DEEPSEEK_API_KEY
 
 Latency profiles add the same deterministic delay to Actor and speculative
 executions. `native` adds nothing; `remote`, `sandbox`, and `heavy` model
-increasingly remote or isolated tools. The result records the profile and raw
-tool execution counts.
+increasingly remote or isolated tools. The runner uses the package's production
+OCI/native backend router and exact stock-Pi Bash invocation descriptor. The
+result records backend health, invocation-specific Bash availability, the
+profile, and raw tool execution counts. If no compatible isolated process
+backend is ready, Bash candidates fail closed and the run must not be used to
+draw conclusions about Bash hit rate.
 
 Set `--drafter-max-depth 0` for the one-step Drafter ablation. Positive values
 bound output-informed continuation steps after the first action.
@@ -60,8 +64,8 @@ Required ablation discipline:
    correctness or resource regression.
 
 The API key is read only from `DEEPSEEK_API_KEY`; it is never written to an
-artifact. Workspaces and JSON results default to the operating-system temporary
-directory.
+artifact or exposed to benchmark shell processes. Workspaces and JSON results
+default to the operating-system temporary directory.
 
 Use `--prepare-only` to verify dataset lookup and the fresh checkout without a
 model request. Patch cleanliness and changed-file overlap are integrity signals,

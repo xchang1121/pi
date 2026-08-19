@@ -166,6 +166,7 @@ export {
 	projectPatternAwareObservation,
 } from "./pattern-aware.ts";
 export { PI_READ_RANGE_PROJECTION_RULE, withPiReadCoverage } from "./pi-read-projection.ts";
+export { type PiToolInvocationOptions, resolvePiToolInvocation } from "./pi-tool-invocation.ts";
 export type {
 	MaterializedPlan,
 	PlanAction,

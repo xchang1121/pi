@@ -16,7 +16,6 @@ import {
 	type ExtensionFactory,
 	type ExtensionUIContext,
 	getAgentDir,
-	getShellConfig,
 	type ModelRegistry,
 	type ReadToolInput,
 	type SourceInfo,
@@ -30,13 +29,14 @@ import { createNativeSandboxProcessBackend } from "./native-sandbox.ts";
 import { createOciSetupService, type OciSetupService } from "./oci-setup.ts";
 import { PATTERN_AWARE_DEFAULTS, type PatternAwareSettings, patternAwareSettings } from "./pattern-aware.ts";
 import { PI_READ_RANGE_PROJECTION_RULE, withPiReadCoverage } from "./pi-read-projection.ts";
+import { resolvePiToolInvocation } from "./pi-tool-invocation.ts";
 import type { SpeculativeActionEvent } from "./runtime.ts";
 import {
 	type SpeculativeActionPackageSettings,
 	SpeculativeActionSettingsStore,
 	type SpeculativeSettingsScope,
 } from "./settings-store.ts";
-import type { ToolInvocation, ToolSettlement } from "./tool-settlement.ts";
+import type { ToolSettlement } from "./tool-settlement.ts";
 import { emptySpeculativeTraceSummary, reduceSpeculativeTrace, type SpeculativeTraceSummary } from "./trace-summary.ts";
 import {
 	createSandboxBackendRouter,
@@ -327,7 +327,13 @@ async function installController(
 			}),
 		preflight: ({ toolName }) =>
 			latestContext.isProjectTrusted() && baseDefinitions.has(toolName) && pi.getActiveTools().includes(toolName),
-		resolveInvocation: (tool, input) => resolveToolInvocation(tool, input, latestContext, piToolSettings),
+		resolveInvocation: (tool, input) =>
+			resolvePiToolInvocation(tool, input, {
+				cwd: latestContext.cwd,
+				environment: piShellEnvironment(latestContext),
+				...(piToolSettings.shellPath ? { shellPath: piToolSettings.shellPath } : {}),
+				...(piToolSettings.shellCommandPrefix ? { shellCommandPrefix: piToolSettings.shellCommandPrefix } : {}),
+			}),
 		projectionRules: [PI_READ_RANGE_PROJECTION_RULE],
 		sandbox,
 		patternStateDirectory: getAgentDir(),
@@ -589,32 +595,6 @@ function errorToolSettlement(error: unknown): ToolSettlement {
 	return {
 		result: { content: [{ type: "text", text: message }], details: {} },
 		isError: true,
-	};
-}
-
-function resolveToolInvocation(
-	tool: string,
-	input: unknown,
-	context: ExtensionContext,
-	settings: PiToolSettings,
-): ToolInvocation | undefined {
-	if (tool !== "bash" || !input || typeof input !== "object" || Array.isArray(input)) return undefined;
-	const record = input as Record<string, unknown>;
-	if (typeof record.command !== "string") return undefined;
-	const command = settings.shellCommandPrefix ? `${settings.shellCommandPrefix}\n${record.command}` : record.command;
-	const shell = getShellConfig(settings.shellPath);
-	const environment = piShellEnvironment(context);
-	return {
-		executor: "pi.bash.local.v2",
-		process: {
-			command,
-			cwd: context.cwd,
-			environment,
-			shell: shell.shell,
-			shellArgs: [...shell.args],
-			commandTransport: shell.commandTransport ?? "argv",
-			...(typeof record.timeout === "number" ? { timeout: record.timeout } : {}),
-		},
 	};
 }
 

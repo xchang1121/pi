@@ -17,10 +17,18 @@ import {
 	createWriteTool,
 } from "@earendil-works/pi-coding-agent";
 import { createSpeculativeActionHost, type SpeculativeAgentSettingsInput } from "../src/agent-integration.ts";
+import { createContainerSandboxProcessBackend } from "../src/container-sandbox.ts";
+import { createNativeSandboxProcessBackend } from "../src/native-sandbox.ts";
+import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import { PI_READ_RANGE_PROJECTION_RULE } from "../src/pi-read-projection.ts";
 import type { SpeculativeActionEvent } from "../src/runtime.ts";
+import type { ToolInvocation } from "../src/tool-settlement.ts";
 import { summarizeSpeculativeTrace } from "../src/trace-summary.ts";
-import { createWorkspaceSandbox } from "../src/workspace-sandbox.ts";
+import {
+	createSandboxBackendRouter,
+	createWorkspaceSandbox,
+	type SandboxProcessBackend,
+} from "../src/workspace-sandbox.ts";
 
 const DATASET_ROWS =
 	"https://datasets-server.huggingface.co/rows?dataset=TokenRhythm%2FClaw-SWE-Bench&config=lite&split=test&offset=0&length=100";
@@ -170,16 +178,36 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 	const events: SpeculativeActionEvent<string>[] = [];
 	const counters: ToolCounters = { executions: {}, serviceMs: {} };
 	const profile = latencyProfiles[input.latency];
+	const shellEnvironment = benchmarkShellEnvironment();
 	const tools = [
 		createReadTool(task.workspace),
 		createGrepTool(task.workspace),
 		createFindTool(task.workspace),
 		createLsTool(task.workspace),
-		createBashTool(task.workspace),
+		createBashTool(task.workspace, {
+			exposeSessionEnvironment: false,
+			spawnHook: (context) => ({ ...context, env: shellEnvironment }),
+		}),
 		createEditTool(task.workspace),
 		createWriteTool(task.workspace),
 	].map((tool) => instrumentTool(tool, profile[tool.name as keyof typeof profile] ?? 0, counters));
-	const sandbox = createWorkspaceSandbox();
+	const backendRouter = createSandboxBackendRouter("auto", [
+		{
+			id: "container",
+			backend: createContainerSandboxProcessBackend({ maxWorkers: input.maxConcurrentActions }),
+		},
+		{ id: "native", backend: createNativeSandboxProcessBackend() },
+	]);
+	const sandbox = createWorkspaceSandbox({
+		processBackend: instrumentProcessBackend(backendRouter, profile.bash, counters),
+	});
+	const sandboxHealth = await backendRouter.inspect();
+	const resolveInvocation = (tool: string, args: unknown) =>
+		resolvePiToolInvocation(tool, args, { cwd: task.workspace, environment: shellEnvironment });
+	const bashIsolation = await inspectBashIsolation(
+		backendRouter,
+		resolveInvocation("bash", { command: "printf pi-speculative-benchmark" }),
+	);
 	let drafterCost = 0;
 	let drafterTokens = 0;
 	let drafterInputTokens = 0;
@@ -213,6 +241,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 			return message;
 		},
 		preflight: () => true,
+		resolveInvocation,
 		projectionRules: [PI_READ_RANGE_PROJECTION_RULE],
 		sandbox,
 		patternStateDirectory: path.join(task.runDirectory, "patterns"),
@@ -393,6 +422,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 			latencyProfile: input.latency,
 			latencyMs: profile,
 			patternAware: input.patternAware,
+			sandbox: { health: sandboxHealth, bash: bashIsolation },
 			workspace: task.workspace,
 		},
 		summary: {
@@ -470,6 +500,59 @@ function instrumentTool(tool: AgentTool, addedLatencyMs: number, counters: ToolC
 			}
 		},
 	};
+}
+
+function instrumentProcessBackend(
+	backend: SandboxProcessBackend,
+	addedLatencyMs: number,
+	counters: ToolCounters,
+): SandboxProcessBackend {
+	return {
+		check: (options) => backend.check(options),
+		...(backend.supports ? { supports: (invocation) => backend.supports!(invocation) } : {}),
+		fingerprint: (invocation) => backend.fingerprint(invocation),
+		prepare: (input) => backend.prepare(input),
+		open: async (input) => {
+			const session = await backend.open(input);
+			return {
+				processRoot: session.processRoot,
+				execute: async (invocation) => {
+					const startedAt = performance.now();
+					counters.executions.bash = (counters.executions.bash ?? 0) + 1;
+					try {
+						await delay(addedLatencyMs, invocation.signal);
+						return await session.execute(invocation);
+					} finally {
+						counters.serviceMs.bash =
+							(counters.serviceMs.bash ?? 0) + Math.max(0, performance.now() - startedAt);
+					}
+				},
+				close: session.close,
+			};
+		},
+		dispose: () => backend.dispose(),
+	};
+}
+
+async function inspectBashIsolation(backend: SandboxProcessBackend, invocation: ToolInvocation | undefined) {
+	if (!invocation?.process) return { state: "unavailable" as const, detail: "Bash invocation is unresolved." };
+	try {
+		return { state: "ready" as const, fingerprint: await backend.fingerprint(invocation.process) };
+	} catch (error) {
+		return {
+			state: "unavailable" as const,
+			detail: error instanceof Error ? error.message : String(error),
+		};
+	}
+}
+
+function benchmarkShellEnvironment(): Record<string, string> {
+	return Object.fromEntries(
+		Object.entries(process.env).filter(
+			(entry): entry is [string, string] =>
+				entry[1] !== undefined && !/(?:API_KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)/i.test(entry[0]),
+		),
+	);
 }
 
 async function datasetRow(instanceID: string): Promise<DatasetRow> {

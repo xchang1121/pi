@@ -16,12 +16,20 @@ import { afterEach, describe, expect, it } from "vitest";
 import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { createSpeculativeActionHost, type SpeculativeAgentSettingsInput } from "../src/agent-integration.ts";
 import { PATTERN_AWARE_DEFAULTS, type PatternAwareSettings, PatternAwareStore } from "../src/pattern-aware.ts";
+import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import type { SpeculativeActionEvent } from "../src/runtime.ts";
+import type { ToolInvocation } from "../src/tool-settlement.ts";
 import { summarizeSpeculativeTrace } from "../src/trace-summary.ts";
+import {
+	createWorkspaceSandbox,
+	type SandboxProcessBackend,
+	type SpeculativeAgentSandbox,
+} from "../src/workspace-sandbox.ts";
 
 const roots: string[] = [];
 const readSchema = Type.Object({ path: Type.String() });
 const grepSchema = Type.Object({ pattern: Type.String(), path: Type.Optional(Type.String()) });
+const bashSchema = Type.Object({ command: Type.String() });
 
 afterEach(async () => {
 	await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
@@ -125,6 +133,45 @@ describe("faux LLM speculative action end to end", () => {
 		expect(result.summary.hitLatencyMs).toBeGreaterThan(35);
 		expect(result.summary.hitLatencyMs).toBeLessThan(135);
 		expect(result.summary.attemptLeadMs).toBeGreaterThan(result.summary.executionAheadMs);
+	});
+
+	it("adopts one isolated Bash branch across fragmented model streams", async () => {
+		const cwd = await workspace();
+		const backendExecutions = { value: 0 };
+		const sandbox = createWorkspaceSandbox({ processBackend: mockProcessBackend(backendExecutions, 120) });
+		const result = await runAgent({
+			cwd,
+			sessionID: "bash-branch-hit",
+			tools: [fallbackBash(cwd)],
+			actorTurns: [
+				turn([
+					fauxThinking("prepare and validate the workspace command before invoking it ".repeat(5)),
+					fauxToolCall("bash", { command: "generate artifact" }),
+				]),
+				turn("done"),
+			],
+			actorTokensPerSecond: 180,
+			draftTurns: [turn(fauxToolCall("bash", { command: "generate artifact" })), turn("no tool")],
+			draftTokensPerSecond: 2_000,
+			settings: {
+				...drafterSettings(),
+				tools: { resourceCached: [], sandbox: ["bash"] },
+			},
+			sandbox,
+			resolveInvocation: (tool, args) =>
+				resolvePiToolInvocation(tool, args, {
+					cwd,
+					environment: { PATH: "mock" },
+					shellPath: process.execPath,
+				}),
+		});
+
+		expect(result.streamEvents).toEqual(expect.arrayContaining(["thinking_delta", "toolcall_delta"]));
+		expect(result.summary).toMatchObject({ actorActions: 1, speculativeHits: 1, actorFallbacks: 0 });
+		expect(result.summary.hiddenLatencyMs).toBeGreaterThanOrEqual(100);
+		expect(backendExecutions.value).toBe(1);
+		expect(result.executions.bash ?? 0).toBe(0);
+		expect(await readFile(path.join(cwd, "generated.txt"), "utf8")).toBe("speculative");
 	});
 
 	it("falls back once when Drafter delivery is late or terminates with an error", async () => {
@@ -236,6 +283,8 @@ type RunAgentInput = {
 	readonly draftTokensPerSecond?: number;
 	readonly settings: SpeculativeAgentSettingsInput;
 	readonly patternStore?: PatternAwareStore;
+	readonly sandbox?: SpeculativeAgentSandbox;
+	readonly resolveInvocation?: (tool: string, input: unknown) => ToolInvocation | undefined;
 };
 
 function turn(content: ScriptedTurn["content"], delayMs = 0): ScriptedTurn {
@@ -295,6 +344,8 @@ async function runAgent(input: RunAgentInput) {
 		complete: (model, context, options) => drafter.streamSimple(model, context, options).result(),
 		preflight: () => true,
 		...(input.patternStore ? { patternStore: input.patternStore } : {}),
+		...(input.sandbox ? { sandbox: input.sandbox } : {}),
+		...(input.resolveInvocation ? { resolveInvocation: input.resolveInvocation } : {}),
 		onEvent: (event) => {
 			events.push(event);
 		},
@@ -424,6 +475,48 @@ function delayedRead(cwd: string, durationMs: number): AgentTool<typeof readSche
 			await delay(durationMs, signal);
 			return textResult(await readFile(path.join(cwd, args.path), "utf8"));
 		},
+	};
+}
+
+function fallbackBash(cwd: string): AgentTool<typeof bashSchema> {
+	return {
+		name: "bash",
+		label: "bash",
+		description: "Execute a workspace command",
+		parameters: bashSchema,
+		execute: async () => {
+			await writeFile(path.join(cwd, "generated.txt"), "actor", "utf8");
+			return textResult("actor");
+		},
+	};
+}
+
+function mockProcessBackend(executions: { value: number }, durationMs: number): SandboxProcessBackend {
+	return {
+		check: async () => ({
+			backend: "native",
+			state: "ready",
+			source: "test",
+			detail: "mock process boundary ready",
+			fingerprint: "mock-process:v1",
+		}),
+		supports: () => true,
+		fingerprint: async () => "mock-process:v1",
+		prepare: async () => {},
+		open: async ({ parent }) => {
+			const processRoot = await mkdtemp(path.join(parent, "mock-process-"));
+			return {
+				processRoot,
+				execute: async (input) => {
+					executions.value++;
+					await delay(durationMs, input.signal);
+					await writeFile(path.join(input.cwd, "generated.txt"), "speculative", "utf8");
+					return { result: textResult("speculative"), isError: false };
+				},
+				close: async () => rm(processRoot, { recursive: true, force: true }),
+			};
+		},
+		dispose: async () => {},
 	};
 }
 

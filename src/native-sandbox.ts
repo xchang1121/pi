@@ -259,7 +259,14 @@ export async function resolveNativeSandboxBinary(
 	}
 
 	for (const candidate of developmentCandidates(platform)) {
-		if (await isFile(candidate)) return { path: candidate, source: "development" };
+		if (!(await isFile(candidate))) continue;
+		const sha256 = await fileSha256(candidate);
+		if (!sha256) continue;
+		return {
+			path: await materializeAsset(candidate, sha256, options.cacheRoot, platform),
+			source: "development",
+			sha256,
+		};
 	}
 	return undefined;
 }
