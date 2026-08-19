@@ -39,8 +39,10 @@ export function measureSpeculativeTask(input: {
 	const toolExecutionMs = durationSum(authoritativeTools);
 	const coveredMs = unionDuration([...actorPhases, ...authoritativeTools]);
 	const orchestrationMs = Math.max(0, endToEndMs - coveredMs);
-	const nonToolMs = actorPhaseMs + orchestrationMs;
-	const serializedMs = nonToolMs + toolExecutionMs;
+	const measuredNonToolMs = actorPhaseMs + orchestrationMs;
+	const hiddenLatencyMs = nonNegativeDifference(measuredNonToolMs + toolExecutionMs, endToEndMs);
+	const serializedMs = endToEndMs + hiddenLatencyMs;
+	const nonToolMs = Math.max(0, serializedMs - toolExecutionMs);
 	return Object.freeze({
 		startedAt,
 		completedAt,
@@ -50,9 +52,15 @@ export function measureSpeculativeTask(input: {
 		orchestrationMs,
 		toolExecutionMs,
 		serializedMs,
-		hiddenLatencyMs: Math.max(0, serializedMs - endToEndMs),
+		hiddenLatencyMs,
 		authoritativeToolCount: authoritativeTools.length,
 	});
+}
+
+function nonNegativeDifference(left: number, right: number): number {
+	const difference = left - right;
+	const tolerance = Number.EPSILON * Math.max(1, left, right) * 16;
+	return difference > tolerance ? difference : 0;
 }
 
 function clip(interval: TimelineInterval, startedAt: number, completedAt: number): TimelineInterval {

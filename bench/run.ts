@@ -388,10 +388,9 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 	}, {});
 	const agentPromptMs = Math.max(0, (taskCompletedAt ?? performance.now()) - taskStartedAt);
 	const actualEndToEndMs = Math.max(agentPromptMs, summary.endToEndMs);
-	const boundaryNonToolMs = Math.max(0, actualEndToEndMs - summary.endToEndMs);
-	const nonToolMs = summary.nonToolMs + boundaryNonToolMs;
-	const serializedCounterfactualMs = nonToolMs + summary.toolExecutionMs;
-	const hiddenLatencyMs = Math.max(0, serializedCounterfactualMs - actualEndToEndMs);
+	const hiddenLatencyMs = summary.hiddenLatencyMs;
+	const serializedCounterfactualMs = actualEndToEndMs + hiddenLatencyMs;
+	const nonToolMs = Math.max(0, serializedCounterfactualMs - summary.toolExecutionMs);
 	const actorUsage = agent.state.messages
 		.filter((message) => message.role === "assistant")
 		.reduce(

@@ -77,6 +77,17 @@ describe("single-run serialized counterfactual timing", () => {
 			}),
 		).toMatchObject({ endToEndMs: 100, actorPhaseMs: 100, nonToolMs: 100, hiddenLatencyMs: 0 });
 	});
+
+	it("does not report floating-point residue as hidden latency", () => {
+		const timing = measureSpeculativeTask({
+			startedAt: 0,
+			completedAt: 100_000,
+			actorPhases: [interval(0, 100_000)],
+			authoritativeTools: [interval(0, 2e-11)],
+		});
+		expect(timing.hiddenLatencyMs).toBe(0);
+		expect(timing.serializedMs).toBe(timing.endToEndMs);
+	});
 });
 
 function interval(startedAt: number, completedAt: number) {
