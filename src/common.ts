@@ -9,7 +9,7 @@ export interface DrafterToolDefinition {
 export const DEFAULTS = {
 	enabled: false,
 	drafterEnabled: true,
-	drafterMaxDepth: 2,
+	drafterMaxDepth: 0,
 	candidateLimit: 8,
 	maxConcurrentActions: 8,
 	resourceCacheMaxEntries: 512,

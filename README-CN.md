@@ -90,7 +90,7 @@ spec: on · Windows AppContainer · 3/4 hits · 1.2s ahead · 5/512 results
 | Pattern beam width | 4 | 在每个学习到的前沿只保留预期延迟收益最高的动作 |
 | Pattern prediction depth | 6 | 限制递归多步展开深度，同时允许有界的重复模式 |
 | Drafter requests | 8 | 每轮并行发起的独立单动作请求数；结果由 K(a) 去重 |
-| Drafter rollout depth | 2 | 把已完成的投机结果回放给 Drafter，最多继续两个动作；`0` 表示关闭 rollout |
+| Drafter rollout depth | 0 | 可选的结果驱动 continuation；正数表示最多继续的动作数 |
 | Concurrent actions | 8 | 最大并行投机动作数 |
 | Resource cache | 512 项 / 256 MiB | `read`、`grep`、`find` 结果缓存 |
 | Prediction timeout | 300 秒 | 单轮预测生命周期上限 |
@@ -117,7 +117,7 @@ spec: on · Windows AppContainer · 3/4 hits · 1.2s ahead · 5/512 results
   "drafterEnabled": true,
   "draftModel": "provider/model",
   "candidateLimit": 8,
-  "drafterMaxDepth": 2,
+  "drafterMaxDepth": 0,
   "maxConcurrentActions": 8,
   "resourceCacheMaxEntries": 512,
   "resourceCacheMaxBytes": 268435456,

@@ -85,7 +85,7 @@ const { values } = parseArgs({
 		actor: { type: "string", default: "deepseek/deepseek-v4-pro" },
 		drafter: { type: "string", default: "deepseek/deepseek-v4-flash" },
 		"candidate-limit": { type: "string", default: "8" },
-		"drafter-max-depth": { type: "string", default: "2" },
+		"drafter-max-depth": { type: "string", default: "0" },
 		"max-concurrent-actions": { type: "string", default: "8" },
 		"max-turns": { type: "string", default: "16" },
 		"timeout-ms": { type: "string", default: "900000" },

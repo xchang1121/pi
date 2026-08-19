@@ -27,7 +27,7 @@
 - Added production Pi `read` range projection backed by structured realized-output coverage; grep and find remain exact-key-only.
 - Added probation/protected speculative cache tiers: new results remain eviction-first until a successful actor hit promotes them, with bounded protected occupancy by entries and bytes.
 - Added aggregate, input-free K(a) rejection counts to hit and miss telemetry.
-- Added adoption-gated, output-informed Drafter rollouts on Runtime-owned target-action budgets, with bounded cross-turn cancellation.
+- Added opt-in, adoption-gated Drafter rollouts on Runtime-owned target-action budgets; real-task ablation keeps the default depth at zero.
 
 ### Changed
 

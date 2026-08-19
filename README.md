@@ -90,7 +90,7 @@ The master switch is off by default. After `/speculative-action on`, the followi
 | Pattern beam width | 4 | Retain the highest expected-latency-reduction actions at each learned frontier |
 | Pattern prediction depth | 6 | Bound recursive multi-step expansion, including recurring motifs |
 | Drafter requests | 8 | Independent, concurrent one-action requests per Drafter round; K(a) deduplicates their results |
-| Drafter rollout depth | 2 | Feed completed speculative results back to the Drafter for at most two additional actions; `0` disables rollout |
+| Drafter rollout depth | 0 | Optional output-informed continuation; positive values retain that many additional actions |
 | Concurrent actions | 8 | Maximum concurrent speculative actions |
 | Resource cache | 512 entries / 256 MiB | Cache for `read`, `grep`, and `find` results |
 | Prediction timeout | 300 seconds | Maximum lifecycle of one prediction round |
@@ -117,7 +117,7 @@ Complete example:
   "drafterEnabled": true,
   "draftModel": "provider/model",
   "candidateLimit": 8,
-  "drafterMaxDepth": 2,
+  "drafterMaxDepth": 0,
   "maxConcurrentActions": 8,
   "resourceCacheMaxEntries": 512,
   "resourceCacheMaxBytes": 268435456,

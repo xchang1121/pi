@@ -348,7 +348,7 @@ describe("zero-modification Pi extension", () => {
 		await fixture.emit("session_start", {}, fixture.context);
 		await fixture.commands.get("speculative-action")?.handler("", fixture.context as ExtensionCommandContext);
 
-		expect(menus.get("Drafter")).toEqual(expect.arrayContaining(["Rollout depth: 2"]));
+		expect(menus.get("Drafter")).toEqual(expect.arrayContaining(["Rollout depth: 0"]));
 	});
 });
 

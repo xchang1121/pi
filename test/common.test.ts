@@ -24,6 +24,7 @@ describe("speculative action common", () => {
 		expect(prompt).toContain("exactly one tool call");
 		expect(prompt).not.toMatch(/drafter|predict|speculat|likely next/i);
 		expect(DEFAULTS.drafterEnabled).toBe(true);
+		expect(DEFAULTS.drafterMaxDepth).toBe(0);
 	});
 
 	it("clamps the per-turn candidate limit to the source range", () => {
