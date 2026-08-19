@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { READ_RANGE_ACTION_KEY_PROJECTOR } from "../src/action-key-projection.ts";
+import { type ActionProjectionRule, READ_RANGE_ACTION_KEY_PROJECTOR } from "../src/action-key-projection.ts";
 import { buildPiActionKey } from "../src/action-semantics.ts";
 import type { SpeculativeActionEvent, SpeculativeActionSettings, SpeculativePlanSource } from "../src/runtime.ts";
 import { makeStructuralSpeculativeActionRuntime } from "../src/runtime-engine.ts";
@@ -49,6 +49,7 @@ function harness(input: {
 	readonly capture?: () => unknown | Promise<unknown>;
 	readonly validate?: (version: unknown) => ResourceValidation;
 	readonly projection?: boolean;
+	readonly coveringAction?: ActionProjectionRule<string>["coveringAction"];
 	readonly onEvent?: (event: SpeculativeActionEvent<string>) => void | Promise<void>;
 	readonly actionKey?: (tool: string, args: unknown) => ReturnType<typeof buildPiActionKey>;
 }) {
@@ -81,6 +82,7 @@ function harness(input: {
 			? [
 					{
 						...READ_RANGE_ACTION_KEY_PROJECTOR,
+						...(input.coveringAction ? { coveringAction: input.coveringAction } : {}),
 						captureCoverage: () => ({ complete: true }),
 						projectOutput: () => undefined,
 					},
@@ -522,6 +524,29 @@ describe("structural speculative runtime", () => {
 
 		expect(await fixture.runtime.consume(call("turn", { path: "README.md", offset: 10, limit: 10 }))).toBeUndefined();
 		expect(commit).not.toHaveBeenCalled();
+	});
+
+	it("ignores a covering action that cannot prove K(a) containment", async () => {
+		const executed: Record<string, unknown>[] = [];
+		const source: Source = {
+			id: "source",
+			enabled: () => true,
+			propose: () => plan("source", "unsafe-cover", { path: "README.md", offset: 2, limit: 2 }),
+		};
+		const fixture = harness({
+			source,
+			projection: true,
+			coveringAction: () => buildPiActionKey("read", { path: "other.ts" }, "/workspace"),
+			execute: (_tool, input) => {
+				executed.push({ ...input });
+				return "output";
+			},
+		});
+
+		await fixture.runtime.startTurn({ sessionID: "session", turnID: "unsafe-cover" });
+		await waitFor(() => executed.length === 1);
+
+		expect(executed[0]).toMatchObject({ path: expect.stringMatching(/README\.md$/), offset: 2, limit: 2 });
 	});
 
 	it("settles a K(a) match as incompatible without committing backend effects", async () => {

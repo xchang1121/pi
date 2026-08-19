@@ -13,12 +13,26 @@ import {
 	READ_RANGE_COVERAGE_DETAILS_KEY,
 	type ReadRangeCoverage,
 } from "./action-key-projection.ts";
-import { READ_DEFAULT_LIMIT, readActionRange } from "./action-semantics.ts";
+import { buildActionKey, READ_DEFAULT_LIMIT, readActionRange } from "./action-semantics.ts";
 import type { ToolSettlement } from "./tool-settlement.ts";
 
 /** Production Pi read projection. Other tools remain exact-only. */
 export const PI_READ_RANGE_PROJECTION_RULE: ActionProjectionRule<ToolSettlement> = {
 	...READ_RANGE_ACTION_KEY_PROJECTOR,
+	coveringAction: (action) => {
+		const range = readActionRange(action);
+		if (!range || range.limit === 0 || range.limit >= READ_DEFAULT_LIMIT) return undefined;
+		return buildActionKey({
+			tool: action.tool,
+			execution: action.execution,
+			resources: action.resources,
+			input: { ...action.input, limit: READ_DEFAULT_LIMIT },
+			schemaHash: action.schemaHash,
+			semanticsEpoch: action.semanticsEpoch,
+			executionFingerprint: action.executionFingerprint,
+			...(action.executionContext !== undefined ? { executionContext: action.executionContext } : {}),
+		});
+	},
 	captureCoverage: (action, output) => {
 		if (action.tool !== "read" || output.isError) return undefined;
 		return parseReadCoverage(readCoverageValue(output.result.details));

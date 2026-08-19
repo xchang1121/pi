@@ -5,7 +5,7 @@ import type {
 	ActionSemanticsRegistry,
 	ProjectedActionKeyMatch,
 } from "./action-semantics.ts";
-import { actionKeyMatch, PI_ACTION_SEMANTICS } from "./action-semantics.ts";
+import { actionKeyCovers, actionKeyMatch, PI_ACTION_SEMANTICS } from "./action-semantics.ts";
 import { ActorAction } from "./actor-action.ts";
 import { CandidateExecution, type CandidateReservation, CandidateResources } from "./candidate-execution.ts";
 import { ActionStore, ResultCache, type ResultCacheEvidence, speculativeCacheValue } from "./candidate-stores.ts";
@@ -67,6 +67,18 @@ function uniqueProjectionRules<Output>(
 		if (semantics.supportsProjector(rule.id) && !unique.has(rule.id)) unique.set(rule.id, rule);
 	}
 	return [...unique.values()];
+}
+
+function coveringAction<Output>(predicted: ActionKey, rules: readonly ActionProjectionRule<Output>[]): ActionKey {
+	for (const rule of rules) {
+		try {
+			const covering = rule.coveringAction?.(predicted);
+			if (covering && actionKeyCovers(covering, predicted, [rule])) return covering;
+		} catch {
+			// A projection optimization cannot change the predicted action.
+		}
+	}
+	return predicted;
 }
 
 function asUpdates(value: PlanUpdate | readonly PlanUpdate[] | undefined): readonly PlanUpdate[] {
@@ -1049,6 +1061,12 @@ export function makeStructuralSpeculativeActionRuntime<
 			failUnlaunchable(session, node, cause("matching", "action_not_keyable"));
 			return;
 		}
+		key = coveringAction(key, projectionRules);
+		const executionInput = asConcreteInput(key.input);
+		if (!executionInput) {
+			failUnlaunchable(session, node, cause("matching", "action_not_keyable"));
+			return;
+		}
 		const callID = `spec_${session.candidateSequence + 1}`;
 		let preflight: CandidatePreflight;
 		try {
@@ -1058,7 +1076,7 @@ export function makeStructuralSpeculativeActionRuntime<
 				settings: context.settings,
 				candidate: context.draft,
 				tool: node.action.tool,
-				concrete,
+				concrete: executionInput,
 				action: key,
 				callID,
 				index: session.candidateSequence,

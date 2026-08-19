@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { READ_RANGE_COVERAGE_DETAILS_KEY, type ReadRangeCoverage } from "../src/action-key-projection.ts";
-import { actionKeyMatch, buildPiActionKey } from "../src/action-semantics.ts";
+import { actionKeyCovers, actionKeyMatch, buildPiActionKey, readActionRange } from "../src/action-semantics.ts";
 import { PI_READ_RANGE_PROJECTION_RULE } from "../src/pi-read-projection.ts";
 import type { ToolSettlement } from "../src/tool-settlement.ts";
 
@@ -76,6 +76,16 @@ function outputText(output: ToolSettlement | undefined): string | undefined {
 }
 
 describe("Pi read range projection", () => {
+	it("executes a narrow prediction as the default covering view", () => {
+		const predicted = readKey("notes.txt", 20, 5);
+		const covering = PI_READ_RANGE_PROJECTION_RULE.coveringAction?.(predicted);
+
+		expect(covering && readActionRange(covering)).toMatchObject({ offset: 20, limit: 2000 });
+		expect(covering && actionKeyCovers(covering, predicted, [PI_READ_RANGE_PROJECTION_RULE])).toBe(true);
+		expect(PI_READ_RANGE_PROJECTION_RULE.coveringAction?.(readKey("notes.txt", 20))).toBeUndefined();
+		expect(PI_READ_RANGE_PROJECTION_RULE.coveringAction?.(readKey("notes.txt", 20, 0))).toBeUndefined();
+	});
+
 	it("reconstructs a middle subrange and its exact continuation notice", async () => {
 		const lines = Array.from({ length: 10 }, (_, index) => `line-${index + 1}`);
 		const projected = await project(

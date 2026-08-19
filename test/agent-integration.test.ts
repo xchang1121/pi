@@ -136,31 +136,35 @@ describe("speculative action host", () => {
 
 	it("projects a wider read result only when its realized coverage proves containment", async () => {
 		const cwd = await temporaryWorkspace();
+		let executedInput: { path: string; offset?: number; limit?: number } | undefined;
 		const tool: AgentTool<typeof readSchema> = {
 			name: "read",
 			label: "read",
 			description: "read",
 			parameters: readSchema,
-			execute: async () => ({
-				content: [{ type: "text", text: "one\ntwo\nthree\nfour" }],
-				details: {
-					[READ_RANGE_COVERAGE_DETAILS_KEY]: {
-						kind: "text",
-						startLine: 1,
-						endLineExclusive: 5,
-						totalLines: 4,
-						payloadTextLength: 18,
-						maxLines: 2000,
-						maxBytes: 50 * 1024,
+			execute: async (_id, input) => {
+				executedInput = input;
+				return {
+					content: [{ type: "text", text: "one\ntwo\nthree\nfour" }],
+					details: {
+						[READ_RANGE_COVERAGE_DETAILS_KEY]: {
+							kind: "text",
+							startLine: 1,
+							endLineExclusive: 5,
+							totalLines: 4,
+							payloadTextLength: 18,
+							maxLines: 2000,
+							maxBytes: 50 * 1024,
+						},
 					},
-				},
-			}),
+				};
+			},
 		};
 		const host = createSpeculativeActionHost("session", {
 			cwd,
 			getSettings: settings,
 			draftModel: model("draft"),
-			complete: async () => drafterCall({ path: "notes.txt", offset: 1, limit: 4 }),
+			complete: async () => drafterCall({ path: "notes.txt", offset: 1, limit: 1 }),
 			preflight: () => true,
 			projectionRules: [PI_READ_RANGE_PROJECTION_RULE],
 		});
@@ -178,6 +182,7 @@ describe("speculative action host", () => {
 			type: "text",
 			text: "two\nthree\n\n[1 more lines in file. Use offset=4 to continue.]",
 		});
+		expect(executedInput).toMatchObject({ offset: 1, limit: 2000 });
 		await host.dispose();
 	});
 
