@@ -336,9 +336,11 @@ describe("PatternAware", () => {
 		expect(store.predict("probe").find((item) => item.tool === "read")?.horizon).toBe(3);
 	});
 
-	test("does not expose a pattern until objective replay support is reached", () => {
-		const store = new PatternAwareStore(settings({ minOccurrences: 2 }));
-		trainGrepRead(store, "one", "src/a.ts");
+	test("does not count multiple gap views of one target as independent mapper support", () => {
+		const store = new PatternAwareStore(settings({ maxContextLength: 1, maxFutureGap: 1, minOccurrences: 2 }));
+		store.observe(input({ sessionID: "one", tool: "grep", input: { pattern: "a" }, outputPaths: ["src"] }));
+		store.observe(input({ sessionID: "one", tool: "grep", input: { pattern: "b" }, outputPaths: ["src/a.ts"] }));
+		store.observe(input({ sessionID: "one", tool: "read", input: { filePath: "src/a.ts" } }));
 		store.observe(input({ sessionID: "probe", tool: "grep", input: { pattern: "TODO" }, outputPaths: ["src/b.ts"] }));
 
 		expect(store.predict("probe").filter((item) => item.tool === "read")).toHaveLength(0);
@@ -386,7 +388,7 @@ describe("PatternAware", () => {
 
 		const raw = await fs.readFile(file, "utf8");
 		expect(raw).not.toContain('"history"');
-		expect(JSON.parse(raw).version).toBe(13);
+		expect(JSON.parse(raw).version).toBe(14);
 		const second = new PatternAwareStore(settings(), file);
 		await second.load();
 		second.observe(input({ sessionID: "three", tool: "grep", input: {}, outputPaths: ["src/c.ts"] }));
@@ -402,7 +404,7 @@ describe("PatternAware", () => {
 		await fs.writeFile(
 			file,
 			JSON.stringify({
-				version: 13,
+				version: 14,
 				patterns: [
 					valid,
 					{ ...valid, id: "bad-context", context: [{ tool: 7, outcome: "success" }] },
@@ -515,7 +517,7 @@ describe("PatternAware", () => {
 		await first.flush();
 
 		const persisted = JSON.parse(await fs.readFile(file, "utf8"));
-		expect(persisted.version).toBe(13);
+		expect(persisted.version).toBe(14);
 		expect(persisted.sequenceCounts.length).toBeGreaterThan(0);
 		const restored = new PatternAwareStore(configured, file);
 		await restored.load();
@@ -924,6 +926,23 @@ describe("PatternAware", () => {
 		expect(ranked).toHaveLength(1);
 		expect(ranked[0]?.id).toBe(initial?.id);
 		expect(ranked[0]?.bindings['["filePath"]']?.variantCounts).toEqual({ "0": 1, "1": 2 });
+	});
+
+	test("retires the old mapper revision when the same control pattern learns a new binding", () => {
+		const store = new PatternAwareStore(settings());
+		trainOutputRead(store, "one", { primary: "src/a.ts" }, "src/a.ts");
+		trainOutputRead(store, "two", { primary: "src/b.ts" }, "src/b.ts");
+		const previous = store.snapshot().find((pattern) => pattern.targetTool === "read");
+		expect(previous?.bindings['["filePath"]']).toMatchObject({ type: "event", path: ["primary"] });
+
+		trainOutputRead(store, "three", { secondary: "src/c.ts" }, "src/c.ts");
+		const current = store.snapshot().filter((pattern) => pattern.targetTool === "read");
+
+		expect(current).toHaveLength(1);
+		expect(current[0]?.id).not.toBe(previous?.id);
+		expect(current[0]?.bindings['["filePath"]']).toMatchObject({ type: "coalesce" });
+		store.settled(previous!.id, adoptedSettlement());
+		expect(store.snapshot()[0]?.feedback.adopted).toBe(0);
 	});
 
 	test("contains non-finite persisted variant counts instead of emitting invalid probabilities", async () => {
@@ -1512,24 +1531,6 @@ describe("PatternAware", () => {
 		expect(store.recent("session").some((event) => event.tool !== "$llm")).toBe(true);
 	});
 
-	test("validates overlapping occurrences of the same future pattern independently", () => {
-		const store = new PatternAwareStore(settings({ maxFutureGap: 2 }));
-		trainGappedRead(store, "one", "src/a.ts");
-		trainGappedRead(store, "two", "src/b.ts");
-		const before = store
-			.snapshot()
-			.find((item) => item.targetTool === "read" && item.context.length === 1 && item.context[0]?.tool === "grep");
-		expect(before).toBeDefined();
-
-		store.observe(input({ sessionID: "overlap", tool: "grep", input: {}, outputPaths: ["src/c.ts"] }));
-		store.observe(input({ sessionID: "overlap", tool: "grep", input: {}, outputPaths: ["src/d.ts"] }));
-		store.observe(input({ sessionID: "overlap", tool: "read", input: { filePath: "src/d.ts" } }));
-
-		const after = store.snapshot().find((item) => item.id === before?.id);
-		expect(after?.historicalOpportunities).toBe((before?.historicalOpportunities ?? 0) + 2);
-		expect(after?.historicalMatches).toBe((before?.historicalMatches ?? 0) + 1);
-	});
-
 	test("keeps waiting through a different invocation of the target tool while the gap remains", () => {
 		const store = new PatternAwareStore(settings({ maxFutureGap: 2 }));
 		const pattern = validatedGapPattern(
@@ -1680,6 +1681,7 @@ function validatedGapPattern(
 		bindings: { '["path"]': { type: "constant", value: "README.md" } },
 		gapCounts,
 		gapLastSeen: Object.fromEntries(Object.keys(gapCounts).map((gap) => [gap, 1])),
+		targetOccurrences: 10,
 		occurrences: 10,
 		replayMatches: 10,
 		historicalOpportunities: 10,

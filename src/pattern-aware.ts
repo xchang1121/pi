@@ -129,6 +129,8 @@ export type PatternAwarePattern = {
 	readonly targetSchemaHash?: string;
 	readonly gapCounts: Readonly<Record<string, number>>;
 	readonly gapLastSeen?: Readonly<Record<string, number>>;
+	/** Distinct authoritative target calls supporting this mapper; repeated gap views count only once. */
+	readonly targetOccurrences: number;
 	readonly occurrences: number;
 	readonly replayMatches: number;
 	readonly historicalOpportunities: number;
@@ -201,6 +203,7 @@ type MutablePattern = {
 	targetSchemaHash?: string;
 	gapCounts: Record<string, number>;
 	gapLastSeen: Record<string, number>;
+	targetOccurrences: number;
 	occurrences: number;
 	replayMatches: number;
 	historicalOpportunities: number;
@@ -243,6 +246,7 @@ type PatternPool = {
 	readonly targetTool: string;
 	readonly targetSchemaHash?: string;
 	readonly samples: PatternSample[];
+	patternID?: string;
 	inferred?: Record<string, PatternAwareBinding>;
 	observations?: number;
 	nextInferenceAt?: number;
@@ -278,7 +282,7 @@ export const PATTERN_AWARE_DEFAULTS: PatternAwareSettings = {
 const MAX_BINDING_VARIANTS = 32;
 const MAX_PATH_SOURCES = 24;
 const PERSIST_DEBOUNCE_MS = 200;
-const PERSISTENCE_VERSION = 13;
+const PERSISTENCE_VERSION = 14;
 
 class PredictiveContextTrie {
 	private readonly root: TrieNode = { children: new Map(), patterns: new Set() };
@@ -916,12 +920,16 @@ export class PatternAwareStore {
 		const sampleLimit = patternPoolSampleLimit(this.settings);
 		if (pool.samples.length > sampleLimit) pool.samples.splice(0, pool.samples.length - sampleLimit);
 		this.pools.set(poolKey, pool);
-		if (pool.samples.length < this.settings.minOccurrences) return;
+		const targetOccurrences = distinctTargetOccurrences(pool.samples);
+		if (targetOccurrences < this.settings.minOccurrences) {
+			this.retirePoolPattern(pool);
+			return;
+		}
 		let inferred = pool.inferred;
 		const invalidated =
 			inferred !== undefined &&
 			!this.bindingsCoverSample(inferred, pool.targetTool, pool.targetSchemaHash, pool.samples.at(-1)!);
-		if (!inferred || invalidated) {
+		if (!inferred || invalidated || pool.observations >= (pool.nextInferenceAt ?? 0)) {
 			if (!invalidated && pool.observations < (pool.nextInferenceAt ?? this.settings.minOccurrences)) return;
 			inferred = inferBindingsFromSamples(
 				pool.samples,
@@ -933,6 +941,7 @@ export class PatternAwareStore {
 			}
 			pool.inferred = inferred;
 			if (!inferred) {
+				this.retirePoolPattern(pool);
 				pool.inferenceBackoff = Math.min(8, Math.max(2, (pool.inferenceBackoff ?? 1) * 2));
 				pool.nextInferenceAt = pool.observations + pool.inferenceBackoff;
 				return;
@@ -944,7 +953,10 @@ export class PatternAwareStore {
 			this.bindingsCoverSample(inferred, pool.targetTool, pool.targetSchemaHash, sample),
 		).length;
 		const bindingReplayProbability = replayMatches / pool.samples.length;
-		if (bindingReplayProbability < this.settings.minBindingReplayProbability) return;
+		if (bindingReplayProbability < this.settings.minBindingReplayProbability) {
+			this.retirePoolPattern(pool);
+			return;
+		}
 		const id = hash(
 			stableStringify({
 				context: signatures,
@@ -953,18 +965,20 @@ export class PatternAwareStore {
 				targetSchemaHash: target.schemaHash,
 			}),
 		);
+		if (pool.patternID && pool.patternID !== id) this.retirePoolPattern(pool);
+		pool.patternID = id;
 		const existing = this.patterns.get(id);
 		if (existing) {
 			existing.bindings = inferred;
 			existing.dependencies = bindingDependencies(inferred);
+			existing.targetOccurrences = targetOccurrences;
 			existing.occurrences = pool.samples.length;
 			existing.replayMatches = replayMatches;
 			existing.historicalOpportunities = Math.max(existing.historicalOpportunities, pool.samples.length);
 			existing.historicalMatches = Math.max(existing.historicalMatches, replayMatches);
-			existing.gapCounts[String(gap)] = (existing.gapCounts[String(gap)] ?? 0) + 1;
-			existing.gapLastSeen[String(gap)] = target.sequence;
-			existing.averageDurationMs +=
-				(Math.max(0, target.durationMs) - existing.averageDurationMs) / Math.max(1, existing.occurrences);
+			existing.gapCounts = sampleGapCounts(pool.samples);
+			existing.gapLastSeen = sampleGapLastSeen(pool.samples);
+			existing.averageDurationMs = averageTargetDuration(pool.samples);
 			existing.lastSeenSequence = target.sequence;
 			return;
 		}
@@ -977,15 +991,28 @@ export class PatternAwareStore {
 			...(target.schemaHash ? { targetSchemaHash: target.schemaHash } : {}),
 			gapCounts: sampleGapCounts(pool.samples),
 			gapLastSeen: sampleGapLastSeen(pool.samples),
+			targetOccurrences,
 			occurrences: pool.samples.length,
 			replayMatches,
 			historicalOpportunities: pool.samples.length,
 			historicalMatches: replayMatches,
 			feedback: emptyPatternFeedback(target.sequence),
-			averageDurationMs: Math.max(0, target.durationMs),
+			averageDurationMs: averageTargetDuration(pool.samples),
 			lastSeenSequence: target.sequence,
 		});
 		this.indexDirty = true;
+	}
+
+	private retirePoolPattern(pool: PatternPool) {
+		const patternID = pool.patternID;
+		if (!patternID) return;
+		pool.patternID = undefined;
+		if (this.patterns.delete(patternID)) this.indexDirty = true;
+		for (const [sessionID, pending] of this.pending) {
+			const retained = pending.filter((item) => item.patternID !== patternID);
+			if (retained.length) this.pending.set(sessionID, retained);
+			else this.pending.delete(sessionID);
+		}
 	}
 
 	private resolvePendingBatch(sessionID: string, events: ReadonlyArray<PatternAwareEvent>) {
@@ -1124,7 +1151,7 @@ export class PatternAwareStore {
 	}
 
 	private persistedPools(): ReadonlyArray<PatternPool> {
-		const sampleLimit = bindingEvidenceThreshold(this.settings);
+		const sampleLimit = patternPoolSampleLimit(this.settings);
 		return [...this.pools.values()]
 			.sort(
 				(left, right) =>
@@ -2039,7 +2066,7 @@ function leaves(value: unknown, prefix: Array<string | number> = []): Array<[Arr
 
 function structurallyEligible(pattern: MutablePattern, settings: PatternAwareSettings) {
 	return (
-		pattern.occurrences >= settings.minOccurrences &&
+		pattern.targetOccurrences >= settings.minOccurrences &&
 		pattern.replayMatches / Math.max(1, pattern.occurrences) >= settings.minBindingReplayProbability
 	);
 }
@@ -2327,6 +2354,7 @@ function mutablePattern(value: PatternAwarePattern): MutablePattern | undefined 
 		!gapCounts ||
 		!feedback ||
 		![
+			record.targetOccurrences,
 			record.occurrences,
 			record.replayMatches,
 			record.historicalOpportunities,
@@ -2355,6 +2383,7 @@ function mutablePattern(value: PatternAwarePattern): MutablePattern | undefined 
 				isFiniteNumber(value.gapLastSeen?.[gap]) ? value.gapLastSeen[gap]! : finite(value.lastSeenSequence),
 			]),
 		),
+		targetOccurrences: finite(value.targetOccurrences),
 		occurrences: finite(value.occurrences),
 		replayMatches: finite(value.replayMatches),
 		historicalOpportunities: Math.max(1, value.historicalOpportunities),
@@ -2462,6 +2491,7 @@ function mutablePool(value: unknown): PatternPool | undefined {
 		targetTool: record.targetTool,
 		...(typeof record.targetSchemaHash === "string" ? { targetSchemaHash: record.targetSchemaHash } : {}),
 		samples,
+		...(typeof record.patternID === "string" ? { patternID: record.patternID } : {}),
 		observations,
 		...(isFiniteNumber(record.nextInferenceAt)
 			? { nextInferenceAt: Math.min(observations + 8, Math.max(0, Math.floor(record.nextInferenceAt))) }
@@ -2497,6 +2527,18 @@ function sampleGapLastSeen(samples: ReadonlyArray<PatternSample>) {
 		lastSeen[gap] = Math.max(lastSeen[gap] ?? 0, sample.target.sequence);
 	}
 	return lastSeen;
+}
+
+function distinctTargetOccurrences(samples: ReadonlyArray<PatternSample>) {
+	return new Set(samples.map((sample) => `${sample.target.sessionID}\0${sample.target.sequence}`)).size;
+}
+
+function averageTargetDuration(samples: ReadonlyArray<PatternSample>) {
+	const targets = new Map<string, number>();
+	for (const sample of samples) {
+		targets.set(`${sample.target.sessionID}\0${sample.target.sequence}`, Math.max(0, sample.target.durationMs));
+	}
+	return [...targets.values()].reduce((total, duration) => total + duration, 0) / Math.max(1, targets.size);
 }
 
 function bindingEvidenceThreshold(settings: Pick<PatternAwareSettings, "minOccurrences">) {
