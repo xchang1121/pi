@@ -34,6 +34,20 @@ describe("SpeculationScheduler", () => {
 		expect(scheduler.launchDelay(forecast({ stepsUntilCall: 1, sourceLatencyMs: 1_000 }))).toBe(0);
 	});
 
+	it("prioritizes explicit expected latency benefit without requiring it from every source", () => {
+		const scheduler = new SpeculationScheduler<object>();
+		const unlikelyLong = {};
+		const likelyShort = {};
+		scheduler.admit(unlikelyLong, [forecast({ expectedDurationMs: 500, expectedLatencyBenefitMs: 10 })], 2);
+		scheduler.admit(likelyShort, [forecast({ expectedDurationMs: 50, expectedLatencyBenefitMs: 40 })], 2);
+
+		expect(scheduler.preemptForAuthoritative({ class: "filesystem", units: 1 }, 2)).toEqual([unlikelyLong]);
+		expect(scheduler.evaluate([forecast({ expectedDurationMs: 50 })])).toMatchObject({
+			criticalPathMs: 50,
+			priorityMs: 50,
+		});
+	});
+
 	it("preempts the latest and least critical work for an authoritative action", () => {
 		const scheduler = new SpeculationScheduler<object>();
 		const nearCritical = {};

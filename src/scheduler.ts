@@ -16,6 +16,7 @@ export interface PredictionForecast {
 	readonly stepsUntilCall?: number;
 	readonly sourceLatencyMs?: number;
 	readonly criticalPathMs?: number;
+	readonly expectedLatencyBenefitMs?: number;
 }
 
 export interface ScheduledWork {
@@ -23,6 +24,7 @@ export interface ScheduledWork {
 	readonly resource: SpeculativeResourceProfile;
 	readonly stepsUntilCall: number;
 	readonly criticalPathMs: number;
+	readonly priorityMs: number;
 }
 
 export type SchedulerAdmission =
@@ -120,6 +122,7 @@ export class SpeculationScheduler<Job extends object> {
 			resource,
 			stepsUntilCall: Math.min(...evaluated.map((item) => item.stepsUntilCall)),
 			criticalPathMs: Math.max(...evaluated.map((item) => item.criticalPathMs)),
+			priorityMs: Math.max(...evaluated.map((item) => item.priorityMs)),
 		};
 	}
 
@@ -173,11 +176,16 @@ export class SpeculationScheduler<Job extends object> {
 			class: baseResource.class,
 			units: Math.max(baseResource.units, units(forecast.resourceDemand)),
 		};
+		const criticalPathMs = Math.max(expectedDurationMs, finite(forecast.criticalPathMs));
 		return {
 			expectedDurationMs,
 			resource,
 			stepsUntilCall: sequence(forecast.stepsUntilCall),
-			criticalPathMs: Math.max(expectedDurationMs, finite(forecast.criticalPathMs)),
+			criticalPathMs,
+			priorityMs:
+				forecast.expectedLatencyBenefitMs === undefined
+					? criticalPathMs
+					: finite(forecast.expectedLatencyBenefitMs),
 		};
 	}
 
@@ -212,12 +220,14 @@ function emptyWork(): ScheduledWork {
 		resource: { class: "filesystem", units: 1 },
 		stepsUntilCall: 0,
 		criticalPathMs: 0,
+		priorityMs: 0,
 	};
 }
 
 function compareVictim<Job>(left: SchedulerEntry<Job>, right: SchedulerEntry<Job>): number {
 	return (
 		right.work.stepsUntilCall - left.work.stepsUntilCall ||
+		left.work.priorityMs - right.work.priorityMs ||
 		left.work.criticalPathMs - right.work.criticalPathMs ||
 		right.sequence - left.sequence
 	);

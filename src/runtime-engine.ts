@@ -137,6 +137,9 @@ function forecastFor(
 		stepsUntilCall: Math.max(0, node.expectedActionSeq - sequence),
 		sourceLatencyMs,
 		criticalPathMs: node.criticalPathMs,
+		...(node.action.expectedLatencyBenefitMs !== undefined
+			? { expectedLatencyBenefitMs: node.action.expectedLatencyBenefitMs }
+			: {}),
 	};
 }
 
@@ -575,6 +578,7 @@ interface CandidateRecord<Output, StartInput, StateData> {
 	expectedDurationMs: number;
 	expectedActionSeq: number;
 	criticalPathMs: number;
+	priorityMs: number;
 	estimatedBytes: number;
 	readonly resources: CandidateResources;
 	projectionCoverage: readonly ActionProjectionCoverage[];
@@ -1218,7 +1222,8 @@ export function makeStructuralSpeculativeActionRuntime<
 			totalDraftTokens: context.totalDraftTokens,
 			expectedDurationMs: scheduled.expectedDurationMs,
 			expectedActionSeq: node.expectedActionSeq,
-			criticalPathMs: node.criticalPathMs,
+			criticalPathMs: scheduled.criticalPathMs,
+			priorityMs: scheduled.priorityMs,
 			estimatedBytes: 0,
 			resources: new CandidateResources(),
 			projectionCoverage: [],
@@ -1246,7 +1251,8 @@ export function makeStructuralSpeculativeActionRuntime<
 		const scheduled = session.scheduler.evaluate(forecastsForCandidate(session, candidate, node));
 		candidate.expectedDurationMs = Math.max(candidate.expectedDurationMs, scheduled.expectedDurationMs);
 		candidate.expectedActionSeq = Math.min(candidate.expectedActionSeq, node.expectedActionSeq);
-		candidate.criticalPathMs = Math.max(candidate.criticalPathMs, node.criticalPathMs);
+		candidate.criticalPathMs = Math.max(candidate.criticalPathMs, scheduled.criticalPathMs);
+		candidate.priorityMs = Math.max(candidate.priorityMs, scheduled.priorityMs);
 		const execution = candidate.work.execution;
 		if (execution.status === "succeeded") {
 			queueContinuation(session, node, candidate, execution.output, "execution_succeeded");
@@ -1268,6 +1274,7 @@ export function makeStructuralSpeculativeActionRuntime<
 					Number(!reservationAvailable(right.work.reservation)) -
 						Number(!reservationAvailable(left.work.reservation)) ||
 					left.expectedActionSeq - right.expectedActionSeq ||
+					right.priorityMs - left.priorityMs ||
 					right.criticalPathMs - left.criticalPathMs ||
 					right.expectedDurationMs - left.expectedDurationMs ||
 					left.createdAt - right.createdAt,
