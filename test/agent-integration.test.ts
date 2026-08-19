@@ -338,7 +338,7 @@ describe("speculative action host", () => {
 			expect(request.context.systemPrompt).not.toMatch(/drafter|predict|speculat|likely next/i);
 			expect(request.context.tools?.map((candidate) => candidate.name)).toEqual(["read"]);
 			expect(request.options).toMatchObject({
-				maxTokens: 128,
+				maxTokens: 256,
 				reasoning: undefined,
 				deferred: false,
 				cacheRetention: "short",
