@@ -1,0 +1,18 @@
+{
+	"swe_js": [
+		"axios__axios-5316",
+		"preactjs__preact-2757",
+		"preactjs__preact-4182",
+		"vuejs__core-11589"
+	],
+	"swe_diverse": [
+		"google__gson-1100",
+		"caddyserver__caddy-5995",
+		"burntsushi__ripgrep-2576",
+		"axios__axios-5316",
+		"fmtlib__fmt-2310",
+		"faker-ruby__faker-2705",
+		"briannesbitt__carbon-2752",
+		"django__django-11790"
+	]
+}

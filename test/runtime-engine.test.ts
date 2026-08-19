@@ -293,6 +293,38 @@ describe("structural speculative runtime", () => {
 		);
 	});
 
+	it("counts one shared execution once when it serves multiple Actor actions", async () => {
+		const source: Source = {
+			id: "source",
+			enabled: () => true,
+			propose: () => plan("source", "shared-timing", { path: "README.md" }),
+		};
+		const fixture = harness({
+			source,
+			execute: async () => {
+				await new Promise((resolve) => setTimeout(resolve, 10));
+				return "shared";
+			},
+		});
+		await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn" });
+		await waitFor(() => fixture.runtime.inspect().sharedCandidates === 1);
+
+		expect(await fixture.runtime.consume(call("turn"))).toBe("shared");
+		expect(await fixture.runtime.consume({ ...call("turn"), id: "call:repeat" })).toBe("shared");
+		await fixture.runtime.finishTurn({ ...call("turn"), terminal: true });
+
+		const actorEvents = fixture.events.filter((event) => event.type === "actor_action");
+		expect(actorEvents).toHaveLength(2);
+		const candidateIDs = actorEvents.flatMap((event) =>
+			event.settlement.provider.kind === "speculative" ? [event.settlement.provider.candidateID] : [],
+		);
+		expect(candidateIDs).toHaveLength(2);
+		expect(new Set(candidateIDs).size).toBe(1);
+		expect(fixture.events.find((event) => event.type === "task")).toMatchObject({
+			timing: { authoritativeToolCount: 1 },
+		});
+	});
+
 	it("cancels next-action source requests when the Actor intent arrives", async () => {
 		let entered = 0;
 		const source: Source = {

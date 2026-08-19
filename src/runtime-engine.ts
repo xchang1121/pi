@@ -574,6 +574,7 @@ interface SessionState<SessionID, Output, StartInput, StateData> {
 	readonly turns: Set<string>;
 	readonly actorPhaseIntervals: TimelineInterval[];
 	readonly authoritativeToolIntervals: TimelineInterval[];
+	readonly authoritativeCandidateIDs: Set<string>;
 	actorAdmissionTail: Promise<void>;
 	settings: SpeculativeActionSettings;
 	taskStartedAt?: number;
@@ -676,6 +677,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			turns: new Set(),
 			actorPhaseIntervals: [],
 			authoritativeToolIntervals: [],
+			authoritativeCandidateIDs: new Set(),
 			actorAdmissionTail: Promise.resolve(),
 			settings,
 			sequence: 0,
@@ -720,6 +722,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			session.taskStartedAt = startedAt;
 			session.actorPhaseIntervals.length = 0;
 			session.authoritativeToolIntervals.length = 0;
+			session.authoritativeCandidateIDs.clear();
 		}
 		const state: Turn = {
 			key,
@@ -1489,7 +1492,15 @@ export function makeStructuralSpeculativeActionRuntime<
 	): void => {
 		const settlement = actorAction.settlement;
 		if (!settlement) return;
-		state.session.authoritativeToolIntervals.push(settlement.provider.toolExecution);
+		if (
+			settlement.provider.kind === "actor" ||
+			!state.session.authoritativeCandidateIDs.has(settlement.provider.candidateID)
+		) {
+			state.session.authoritativeToolIntervals.push(settlement.provider.toolExecution);
+			if (settlement.provider.kind === "speculative") {
+				state.session.authoritativeCandidateIDs.add(settlement.provider.candidateID);
+			}
+		}
 		const key = actorAction.actionKey;
 		const settledCandidate =
 			candidate ??
@@ -2084,6 +2095,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		session.lastActorArrivedAt = undefined;
 		session.actorPhaseIntervals.length = 0;
 		session.authoritativeToolIntervals.length = 0;
+		session.authoritativeCandidateIDs.clear();
 		await session.effects.flush();
 		pruneActionContexts(session);
 	};
@@ -2178,6 +2190,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		session.lastActorArrivedAt = undefined;
 		session.actorPhaseIntervals.length = 0;
 		session.authoritativeToolIntervals.length = 0;
+		session.authoritativeCandidateIDs.clear();
 		const event: SpeculativeActionEvent<SessionID> = {
 			type: "task",
 			sessionID: session.id,
