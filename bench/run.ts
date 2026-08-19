@@ -224,6 +224,8 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 	let drafterCacheReadTokens = 0;
 	let drafterCacheWriteTokens = 0;
 	const drafterStopReasons: Record<string, number> = {};
+	const drafterToolCalls: Record<string, number> = {};
+	const drafterNoToolStopReasons: Record<string, number> = {};
 	const settings: SpeculativeAgentSettingsInput = {
 		enabled: true,
 		drafterEnabled: input.drafterEnabled,
@@ -243,6 +245,12 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 		complete: async (draftModel, context, streamOptions) => {
 			const message = await streamSimple(draftModel, context, streamOptions).result();
 			drafterStopReasons[message.stopReason] = (drafterStopReasons[message.stopReason] ?? 0) + 1;
+			const call = message.content.find((item) => item.type === "toolCall");
+			if (call) drafterToolCalls[call.name] = (drafterToolCalls[call.name] ?? 0) + 1;
+			else {
+				drafterNoToolStopReasons[message.stopReason] =
+					(drafterNoToolStopReasons[message.stopReason] ?? 0) + 1;
+			}
 			drafterCost += message.usage.cost.total;
 			drafterTokens += message.usage.totalTokens;
 			drafterInputTokens += message.usage.input;
@@ -491,6 +499,8 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 			drafterCacheReadTokens,
 			drafterCacheWriteTokens,
 			drafterStopReasons,
+			drafterToolCalls,
+			drafterNoToolStopReasons,
 			turns: turnSequence,
 			turnLimitReached,
 			timedOut,
