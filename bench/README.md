@@ -21,6 +21,10 @@ DEEPSEEK_API_KEY=... npm run bench:ablation -- \
   --drafter-max-depth 2
 ```
 
+The default 64-turn budget is deliberate: shorter 16-turn runs repeatedly ended
+before the Agent produced a patch. A result with `turnLimitReached=true` is an
+incomplete trajectory and cannot support an algorithm-retention decision.
+
 PowerShell:
 
 ```powershell
@@ -72,7 +76,12 @@ Required ablation discipline:
 3. Require a clean patch (`git diff --check`) and retain task completion signals.
 4. Compare hit rate, `serializedCounterfactualMs / actualEndToEndMs`, serialized
    overlap, execution ahead, tool work, and model cost together.
-5. Retain an implementation only when repeated runs improve latency without a
+5. Require `patchCandidate=true` before using a run for latency comparison. This
+   means the Agent ended below its turn limit with a clean, non-empty patch that
+   overlaps a gold-patch file and no timeout or Agent error.
+6. Treat `patchCandidate` as a screening gate, not correctness proof. Grade the
+   recorded `FAIL_TO_PASS` and `PASS_TO_PASS` tests with the dataset harness.
+7. Retain an implementation only when repeated runs improve latency without a
    correctness or resource regression.
 
 The API key is read only from `DEEPSEEK_API_KEY`; it is never written to an

@@ -47,9 +47,12 @@ interface DatasetRow {
 	readonly repo: string;
 	readonly base_commit: string;
 	readonly patch: string;
+	readonly test_patch: string;
 	readonly problem_statement: string;
 	readonly language: string;
 	readonly source_dataset: string;
+	readonly FAIL_TO_PASS: readonly string[];
+	readonly PASS_TO_PASS: readonly string[];
 }
 
 interface PreparedTask {
@@ -97,7 +100,7 @@ const { values } = parseArgs({
 		"candidate-limit": { type: "string", default: "8" },
 		"drafter-max-depth": { type: "string", default: "0" },
 		"max-concurrent-actions": { type: "string", default: "8" },
-		"max-turns": { type: "string", default: "16" },
+		"max-turns": { type: "string", default: "64" },
 		"timeout-ms": { type: "string", default: "900000" },
 		latency: { type: "string", default: "remote" },
 		"repo-cache": { type: "string" },
@@ -406,6 +409,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 		);
 	const changedFiles = lines((await command("git", ["-C", task.workspace, "diff", "--name-only"])).stdout);
 	const goldFiles = patchFiles(task.row.patch);
+	const testPatchFiles = patchFiles(task.row.test_patch);
 	let patchClean = true;
 	try {
 		await command("git", ["-C", task.workspace, "diff", "--check"]);
@@ -413,6 +417,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 		patchClean = false;
 	}
 	const coveredGoldFiles = goldFiles.filter((file) => changedFiles.includes(file));
+	const turnLimitReached = turnSequence >= input.maxTurns;
 	return {
 		metadata: {
 			label: input.label,
@@ -428,6 +433,8 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 			drafterMaxDepth: input.drafterMaxDepth,
 			drafterEnabled: input.drafterEnabled,
 			maxConcurrentActions: input.maxConcurrentActions,
+			maxTurns: input.maxTurns,
+			timeoutMs: input.timeoutMs,
 			latencyProfile: input.latency,
 			latencyMs: profile,
 			patternAware: input.patternAware,
@@ -481,6 +488,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 			drafterCacheReadTokens,
 			drafterCacheWriteTokens,
 			turns: turnSequence,
+			turnLimitReached,
 			timedOut,
 			agentError: agent.state.errorMessage,
 			toolIntentMs,
@@ -488,9 +496,19 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 			toolServiceMs: counters.serviceMs,
 			changedFiles,
 			goldFiles,
+			testPatchFiles,
+			failToPassTests: task.row.FAIL_TO_PASS,
+			passToPassTests: task.row.PASS_TO_PASS,
 			coveredGoldFiles,
 			goldFileRecall: goldFiles.length ? coveredGoldFiles.length / goldFiles.length : 0,
 			patchClean,
+			patchCandidate:
+				!timedOut &&
+				!turnLimitReached &&
+				!agent.state.errorMessage &&
+				patchClean &&
+				changedFiles.length > 0 &&
+				coveredGoldFiles.length > 0,
 		},
 	};
 }
@@ -592,11 +610,15 @@ function validDatasetRow(value: unknown): DatasetRow | undefined {
 		"repo",
 		"base_commit",
 		"patch",
+		"test_patch",
 		"problem_statement",
 		"language",
 		"source_dataset",
 	] as const) {
 		if (typeof row[key] !== "string") return undefined;
+	}
+	for (const key of ["FAIL_TO_PASS", "PASS_TO_PASS"] as const) {
+		if (!Array.isArray(row[key]) || !row[key].every((item) => typeof item === "string")) return undefined;
 	}
 	return row as DatasetRow;
 }
