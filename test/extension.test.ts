@@ -326,6 +326,30 @@ describe("zero-modification Pi extension", () => {
 		);
 		expect(discover).toHaveBeenCalledOnce();
 	});
+
+	it("exposes the bounded Drafter rollout in the Drafter submenu", async () => {
+		const fixture = await createFixture({ oci: unavailable("docker missing"), native: readyNative() });
+		const menus = new Map<string, string[]>();
+		const visits = new Map<string, number>();
+		fixture.ui.select = async (title, options) => {
+			menus.set(title, [...options]);
+			const visit = visits.get(title) ?? 0;
+			visits.set(title, visit + 1);
+			if (title === "Speculative action" && visit === 0) {
+				return options.find((option) => option.startsWith("Prediction sources"));
+			}
+			if (title === "Prediction sources" && visit === 0) {
+				return options.find((option) => option.startsWith("Drafter"));
+			}
+			if (title === "Drafter") return "Back";
+			if (title === "Prediction sources") return "Back";
+			return "Close";
+		};
+		await fixture.emit("session_start", {}, fixture.context);
+		await fixture.commands.get("speculative-action")?.handler("", fixture.context as ExtensionCommandContext);
+
+		expect(menus.get("Drafter")).toEqual(expect.arrayContaining(["Rollout depth: 2"]));
+	});
 });
 
 interface FixtureOptions {
@@ -548,6 +572,7 @@ function effectiveSettings() {
 	return {
 		enabled: true,
 		drafterEnabled: true,
+		drafterMaxDepth: 2,
 		candidateLimit: 1,
 		maxConcurrentActions: 1,
 		resourceCacheMaxEntries: 8,

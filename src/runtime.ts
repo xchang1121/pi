@@ -122,6 +122,8 @@ export interface SpeculativePlanSource<
 		readonly trigger: "execution_succeeded" | "actor_adopted";
 		readonly signal: AbortSignal;
 	}) => MaybePromise<PlanUpdate | readonly PlanUpdate[] | undefined>;
+	/** Restrict continuation callbacks without coupling Runtime scheduling to a concrete source. */
+	readonly continueOn?: readonly ("execution_succeeded" | "actor_adopted")[];
 	readonly observe?: (input: {
 		readonly startInput: StartInput;
 		readonly data: StateData;

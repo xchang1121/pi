@@ -60,6 +60,7 @@ export {
 export {
 	buildSingleToolCallPrompt,
 	clampCandidateLimit,
+	clampDrafterDepth,
 	DEFAULTS,
 	type DrafterToolDefinition,
 	usageTokenCount,
@@ -226,6 +227,7 @@ export {
 	type ResourceValidation,
 	type SettledSourceRequest,
 	type SourceRequestIdentity,
+	type SourceRequestKind,
 	type SourceRequestSettlement,
 	type ValidationMetrics,
 	zeroValidationMetrics,

@@ -1807,6 +1807,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		const source = context ? sourcesByID.get(context.identity.source) : undefined;
 		if (!context || !source?.continue) return;
 		if (source.multiStepEnabled?.(context.settings) === false) return;
+		if (source.continueOn && !source.continueOn.includes(trigger)) return;
 		if (context.continuationTriggers.has(trigger)) return;
 		context.continuationTriggers.add(trigger);
 		const targetActionSequence = Math.max(session.sequence + 1, node.expectedActionSeq + 1);

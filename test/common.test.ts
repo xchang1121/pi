@@ -12,7 +12,7 @@ import {
 	buildPiActionKey,
 	inferredExecution,
 } from "../src/action-semantics.ts";
-import { buildSingleToolCallPrompt, clampCandidateLimit, DEFAULTS } from "../src/common.ts";
+import { buildSingleToolCallPrompt, clampCandidateLimit, clampDrafterDepth, DEFAULTS } from "../src/common.ts";
 import { candidateToolNames } from "../src/runtime.ts";
 
 describe("speculative action common", () => {
@@ -31,6 +31,7 @@ describe("speculative action common", () => {
 		expect(clampCandidateLimit(4.9)).toBe(4);
 		expect(clampCandidateLimit(100)).toBe(8);
 		expect(clampCandidateLimit("4")).toBe(1);
+		expect([clampDrafterDepth(-1), clampDrafterDepth(2.9), clampDrafterDepth(9)]).toEqual([0, 2, 4]);
 	});
 
 	it("canonicalizes Pi defaults and rejects paths outside the workspace", () => {

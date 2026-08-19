@@ -61,6 +61,7 @@ interface BenchmarkOptions {
 	readonly actor: Model<Api>;
 	readonly drafter: Model<Api>;
 	readonly candidateLimit: number;
+	readonly drafterMaxDepth: number;
 	readonly maxConcurrentActions: number;
 	readonly maxTurns: number;
 	readonly timeoutMs: number;
@@ -84,6 +85,7 @@ const { values } = parseArgs({
 		actor: { type: "string", default: "deepseek/deepseek-v4-pro" },
 		drafter: { type: "string", default: "deepseek/deepseek-v4-flash" },
 		"candidate-limit": { type: "string", default: "8" },
+		"drafter-max-depth": { type: "string", default: "2" },
 		"max-concurrent-actions": { type: "string", default: "8" },
 		"max-turns": { type: "string", default: "16" },
 		"timeout-ms": { type: "string", default: "900000" },
@@ -107,6 +109,7 @@ const options: BenchmarkOptions = {
 	actor: model(values.actor ?? "deepseek/deepseek-v4-pro"),
 	drafter: model(values.drafter ?? "deepseek/deepseek-v4-flash"),
 	candidateLimit: positiveInteger(values["candidate-limit"], "--candidate-limit"),
+	drafterMaxDepth: nonNegativeInteger(values["drafter-max-depth"], "--drafter-max-depth", 4),
 	maxConcurrentActions: positiveInteger(values["max-concurrent-actions"], "--max-concurrent-actions"),
 	maxTurns: positiveInteger(values["max-turns"], "--max-turns"),
 	timeoutMs: positiveInteger(values["timeout-ms"], "--timeout-ms"),
@@ -186,6 +189,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 	const settings: SpeculativeAgentSettingsInput = {
 		enabled: true,
 		drafterEnabled: true,
+		drafterMaxDepth: input.drafterMaxDepth,
 		candidateLimit: input.candidateLimit,
 		maxConcurrentActions: input.maxConcurrentActions,
 		predictionTimeoutMs: input.timeoutMs,
@@ -331,6 +335,12 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 		await host.dispose();
 	}
 	const summary = summarizeSpeculativeTrace(events);
+	const sourceRequestKinds = events.reduce<Record<string, number>>((counts, event) => {
+		if (event.type === "source_request") {
+			counts[event.request.request.kind] = (counts[event.request.request.kind] ?? 0) + 1;
+		}
+		return counts;
+	}, {});
 	const agentPromptMs = Math.max(0, (taskCompletedAt ?? performance.now()) - taskStartedAt);
 	const actualEndToEndMs = Math.max(agentPromptMs, summary.endToEndMs);
 	const boundaryNonToolMs = Math.max(0, actualEndToEndMs - summary.endToEndMs);
@@ -371,6 +381,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 			actor: `${input.actor.provider}/${input.actor.id}`,
 			drafter: `${input.drafter.provider}/${input.drafter.id}`,
 			candidateLimit: input.candidateLimit,
+			drafterMaxDepth: input.drafterMaxDepth,
 			maxConcurrentActions: input.maxConcurrentActions,
 			latencyProfile: input.latency,
 			latencyMs: profile,
@@ -389,6 +400,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 			actorFallbacks: summary.actorFallbacks,
 			hitRate: summary.hitRate,
 			sourceRequests: summary.sourceRequests,
+			sourceRequestKinds,
 			sourceOutcomes: summary.sourceOutcomes,
 			predictionsSettled: summary.predictionsSettled,
 			predictionsObserved: summary.predictionsObserved,
@@ -528,6 +540,14 @@ function latencyProfile(value: string | undefined): LatencyProfile {
 function positiveInteger(value: string | undefined, option: string): number {
 	const parsed = Number(value);
 	if (!Number.isInteger(parsed) || parsed <= 0) throw new Error(`${option} must be a positive integer`);
+	return parsed;
+}
+
+function nonNegativeInteger(value: string | undefined, option: string, maximum: number): number {
+	const parsed = Number(value);
+	if (!Number.isInteger(parsed) || parsed < 0 || parsed > maximum) {
+		throw new Error(`${option} must be an integer from 0 through ${maximum}`);
+	}
 	return parsed;
 }
 

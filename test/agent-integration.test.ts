@@ -62,6 +62,7 @@ function settings(candidateLimit = 1) {
 		enabled: true,
 		drafterEnabled: true,
 		candidateLimit,
+		drafterMaxDepth: 0,
 		maxConcurrentActions: candidateLimit,
 		tools: { resourceCached: ["read"], sandbox: [] },
 		patternAware: { enabled: false },
@@ -341,6 +342,90 @@ describe("speculative action host", () => {
 		await waitFor(
 			() => events.filter((event) => event.type === "candidate" && event.state.status === "running").length === 2,
 		);
+		await host.dispose();
+	});
+
+	it("rolls one Drafter trajectory forward with authoritative tool results and a hard depth bound", async () => {
+		const cwd = await temporaryWorkspace();
+		await Promise.all([
+			writeFile(path.join(cwd, "other.txt"), "other", "utf8"),
+			writeFile(path.join(cwd, "third.txt"), "third", "utf8"),
+			writeFile(path.join(cwd, "ignored.txt"), "ignored", "utf8"),
+		]);
+		const requests: Array<{ context: Parameters<CreateComplete>[1]; options: Parameters<CreateComplete>[2] }> = [];
+		const executed: string[] = [];
+		const complete: CreateComplete = async (_model, context, requestOptions) => {
+			requests.push({ context, options: requestOptions });
+			const depth = context.messages.filter((message) => message.role === "toolResult").length;
+			if (depth === 0) {
+				return assistant(
+					[
+						{ type: "toolCall", id: "draft-0", name: "read", arguments: { path: "notes.txt" } },
+						{ type: "toolCall", id: "ignored", name: "read", arguments: { path: "ignored.txt" } },
+					],
+					"toolUse",
+				);
+			}
+			if (depth === 1) {
+				return assistant(
+					[{ type: "toolCall", id: "draft-1", name: "read", arguments: { path: "other.txt" } }],
+					"toolUse",
+				);
+			}
+			return assistant(
+				[{ type: "toolCall", id: "draft-2", name: "read", arguments: { path: "third.txt" } }],
+				"toolUse",
+			);
+		};
+		const tool: AgentTool<typeof readSchema> = {
+			name: "read",
+			label: "read",
+			description: "read",
+			parameters: readSchema,
+			execute: async (_id, args) => {
+				executed.push(args.path);
+				return { content: [{ type: "text", text: `${args.path}:result` }], details: { path: args.path } };
+			},
+		};
+		const host = createSpeculativeActionHost("session", {
+			cwd,
+			getSettings: () => ({ ...settings(1), drafterMaxDepth: 2 }),
+			draftModel: model("draft"),
+			complete,
+			preflight: () => true,
+		});
+
+		await host.startTurn(startInput(tool));
+		await waitFor(() => executed.length === 3);
+		expect(executed).toEqual(["notes.txt", "other.txt", "third.txt"]);
+		expect(requests).toHaveLength(3);
+		const replayedAssistant = requests[1]!.context.messages.at(-2);
+		expect(replayedAssistant).toMatchObject({ role: "assistant" });
+		expect(
+			replayedAssistant?.role === "assistant"
+				? replayedAssistant.content.filter((item) => item.type === "toolCall").map((item) => item.id)
+				: [],
+		).toEqual(["draft-0"]);
+		expect(requests[1]!.context.messages.at(-1)).toMatchObject({
+			role: "toolResult",
+			toolCallId: "draft-0",
+			toolName: "read",
+			content: [{ type: "text", text: "notes.txt:result" }],
+			isError: false,
+		});
+		expect(requests[2]!.context.messages.filter((message) => message.role === "toolResult")).toHaveLength(2);
+
+		for (const [index, file] of ["notes.txt", "other.txt", "third.txt"].entries()) {
+			expect(
+				await host.consume({
+					turnID: "turn-1",
+					id: `actor-${index}`,
+					tool: "read",
+					args: { path: file },
+					tools: [tool],
+				}),
+			).toMatchObject({ result: { content: [{ type: "text", text: `${file}:result` }] } });
+		}
 		await host.dispose();
 	});
 

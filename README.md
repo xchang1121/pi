@@ -89,8 +89,8 @@ The master switch is off by default. After `/speculative-action on`, the followi
 | PatternAware multi-step | On | Admit future actions and expand multi-step speculation |
 | Pattern beam width | 4 | Retain the highest expected-latency-reduction actions at each learned frontier |
 | Pattern prediction depth | 6 | Bound recursive multi-step expansion, including recurring motifs |
-| Adaptive drafter | On | Skip redundant drafter requests when a useful template is already available |
 | Drafter requests | 8 | Independent, concurrent one-action requests per Drafter round; K(a) deduplicates their results |
+| Drafter rollout depth | 2 | Feed completed speculative results back to the Drafter for at most two additional actions; `0` disables rollout |
 | Concurrent actions | 8 | Maximum concurrent speculative actions |
 | Resource cache | 512 entries / 256 MiB | Cache for `read`, `grep`, and `find` results |
 | Prediction timeout | 300 seconds | Maximum lifecycle of one prediction round |
@@ -117,6 +117,7 @@ Complete example:
   "drafterEnabled": true,
   "draftModel": "provider/model",
   "candidateLimit": 8,
+  "drafterMaxDepth": 2,
   "maxConcurrentActions": 8,
   "resourceCacheMaxEntries": 512,
   "resourceCacheMaxBytes": 268435456,
@@ -303,6 +304,6 @@ The engine remains available through `createSpeculativeActionHost()` for non-Pi 
 
 ## Implementation overview
 
-The actor and Drafter run concurrently. Each Drafter round launches `candidateLimit` independent requests in parallel. Every request sees the actor conversation and eligible tool schemas, is instructed to act as the assistant with exactly one tool call, disables reasoning, and uses a small output budget; the first request uses temperature 0 for accuracy and the rest use 0.7 for diversity. Only the first tool call from each response is admitted, and the existing K(a) relation deduplicates equivalent work before execution. Candidates then pass schema validation, preflight, resource-version capture, and execution-strategy selection. Completed candidates enter either `ResultCache` or an exact-only `ActionStore`; isolated effects are represented by a sealed `WorldBranch`. When the actor calls a wrapped stock tool, the package tries to reuse an exact match or a conservatively projected result and otherwise delegates to that stock tool. PatternAware persists its templates and bounded PPM count trie by workspace hash, retains a small expected-benefit beam, and leaves DAG execution, freshness, and resource scheduling to the source-neutral runtime.
+The actor and Drafter run concurrently. Each Drafter round launches `candidateLimit` independent requests in parallel. Every request sees the actor conversation and eligible tool schemas, is instructed to act as the assistant with exactly one tool call, disables reasoning, and uses a small output budget; the first request uses temperature 0 for accuracy and the rest use 0.7 for diversity. Only the first tool call from each response is admitted, and the existing K(a) relation deduplicates equivalent work before execution. After a candidate succeeds, its exact assistant call and tool result can extend the same bounded Drafter trajectory. Runtime-owned target-action budgets keep these continuations from duplicating the next turn's request fanout, cancel late branches, and invalidate descendants when the parent was not adopted. Candidates pass schema validation, preflight, resource-version capture, and execution-strategy selection. Completed candidates enter either `ResultCache` or an exact-only `ActionStore`; isolated effects are represented by a sealed `WorldBranch`. PatternAware persists its templates and bounded PPM count trie by workspace hash, while DAG execution, freshness, and scheduling remain source-neutral.
 
 Hits, misses, cancellation, actual execution, draft tokens, cache state, and sandbox-stage timings are exposed as typed events for experiment collection and visualization.

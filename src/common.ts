@@ -9,6 +9,7 @@ export interface DrafterToolDefinition {
 export const DEFAULTS = {
 	enabled: false,
 	drafterEnabled: true,
+	drafterMaxDepth: 2,
 	candidateLimit: 8,
 	maxConcurrentActions: 8,
 	resourceCacheMaxEntries: 512,
@@ -35,6 +36,12 @@ Rules:
 
 export function clampCandidateLimit(value: unknown): number {
 	return typeof value === "number" && Number.isFinite(value) ? Math.max(1, Math.min(8, Math.floor(value))) : 1;
+}
+
+export function clampDrafterDepth(value: unknown): number {
+	return typeof value === "number" && Number.isFinite(value)
+		? Math.max(0, Math.min(4, Math.floor(value)))
+		: DEFAULTS.drafterMaxDepth;
 }
 
 export function usageTokenCount(

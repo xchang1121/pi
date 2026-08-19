@@ -10,6 +10,7 @@
 - Replaced inferred hit `savedMs`, `waitedMs`, `consumeOverheadMs`, `actorLeadMs`, and wall-clock speedup telemetry with monotonic `executionAheadMs`, `hitLatencyMs`, and diagnostic `attemptLeadMs`; execution overlap is capped by measured execution time, and matching leases no longer rewrite the timing owner of a deduplicated or cached job.
 - Replaced copied plan/candidate statuses and split feedback callbacks with authoritative execution, prediction, and Actor-action settlements. Preparation hints no longer emit Actor prediction outcomes.
 - Renamed ambiguous summary and inspection fields to `predictionRejectedAfterMatch`, `actorCandidateRejections`, `candidateTerminalCauses`, and `exclusiveCandidates`/`sharedCandidates`.
+- Renamed the plan dependency and continuation signal from `actor_confirmed` to `actor_adopted`; a key match without a usable result no longer satisfies downstream work.
 
 ### Added
 
@@ -26,6 +27,7 @@
 - Added production Pi `read` range projection backed by structured realized-output coverage; grep and find remain exact-key-only.
 - Added probation/protected speculative cache tiers: new results remain eviction-first until a successful actor hit promotes them, with bounded protected occupancy by entries and bytes.
 - Added aggregate, input-free K(a) rejection counts to hit and miss telemetry.
+- Added bounded, output-informed Drafter rollouts on Runtime-owned target-action budgets, with cross-turn cancellation and conditional-descendant invalidation.
 
 ### Changed
 

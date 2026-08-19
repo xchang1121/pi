@@ -24,7 +24,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { IDEMPOTENT_ACTION_TOOLS, KEYABLE_TOOLS, SANDBOX_ACTION_TOOLS } from "./action-semantics.ts";
 import { createSpeculativeActionHost } from "./agent-integration.ts";
-import { clampCandidateLimit, DEFAULTS } from "./common.ts";
+import { clampCandidateLimit, clampDrafterDepth, DEFAULTS } from "./common.ts";
 import { createContainerSandboxProcessBackend, DEFAULT_CONTAINER_SANDBOX_IMAGE } from "./container-sandbox.ts";
 import { createNativeSandboxProcessBackend } from "./native-sandbox.ts";
 import { createOciSetupService, type OciSetupService } from "./oci-setup.ts";
@@ -66,6 +66,7 @@ type BaseToolDefinition =
 export interface EffectiveSpeculativeActionSettings {
 	readonly enabled: boolean;
 	readonly drafterEnabled: boolean;
+	readonly drafterMaxDepth: number;
 	readonly draftModel?: string;
 	readonly candidateLimit: number;
 	readonly maxConcurrentActions: number;
@@ -142,6 +143,7 @@ export function normalizeSpeculativeActionSettings(
 	return {
 		enabled: typeof input?.enabled === "boolean" ? input.enabled : DEFAULTS.enabled,
 		drafterEnabled: typeof input?.drafterEnabled === "boolean" ? input.drafterEnabled : DEFAULTS.drafterEnabled,
+		drafterMaxDepth: clampDrafterDepth(input?.drafterMaxDepth),
 		...(typeof input?.draftModel === "string" && input.draftModel.trim()
 			? { draftModel: input.draftModel.trim() }
 			: {}),
@@ -935,6 +937,7 @@ async function openDrafterSettings(ctx: ExtensionContext, controller: Speculativ
 		const choice = await ctx.ui.select("Drafter", [
 			`Enabled: ${settings.drafterEnabled ? "On" : "Off"}`,
 			`Model › ${settings.draftModel ?? activeModelReference(ctx)}`,
+			`Rollout depth: ${settings.drafterMaxDepth}`,
 			`Prediction timeout: ${formatDuration(settings.predictionTimeoutMs)}`,
 			BACK,
 		]);
@@ -942,6 +945,9 @@ async function openDrafterSettings(ctx: ExtensionContext, controller: Speculativ
 		if (choice.startsWith("Enabled:"))
 			controller.setSettings({ ...settings, drafterEnabled: !settings.drafterEnabled });
 		if (choice.startsWith("Model")) await editDraftModel(ctx, controller, settings);
+		if (choice.startsWith("Rollout depth:")) {
+			await editDrafterDepth(ctx, controller, settings);
+		}
 		if (choice.startsWith("Prediction timeout:")) {
 			await editPositiveInteger(ctx, controller, settings, "predictionTimeoutMs", "Prediction timeout (ms)");
 		}
@@ -1248,6 +1254,22 @@ async function editPositiveInteger(
 		...settings,
 		[field]: field === "candidateLimit" || field === "maxConcurrentActions" ? clampCandidateLimit(parsed) : parsed,
 	});
+}
+
+async function editDrafterDepth(
+	ctx: ExtensionContext,
+	controller: SpeculativeActionController,
+	settings: EffectiveSpeculativeActionSettings,
+): Promise<void> {
+	const title = "Drafter rollout depth (0-4)";
+	const value = await ctx.ui.input(title, String(settings.drafterMaxDepth));
+	if (value === undefined) return;
+	const parsed = Number(value.trim());
+	if (!Number.isInteger(parsed) || parsed < 0 || parsed > 4) {
+		ctx.ui.notify(`${title} must be an integer from 0 through 4.`, "warning");
+		return;
+	}
+	controller.setSettings({ ...settings, drafterMaxDepth: parsed });
 }
 
 async function editDraftModel(

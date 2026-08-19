@@ -17,7 +17,8 @@ DEEPSEEK_API_KEY=... npm run bench:ablation -- \
   --instance axios__axios-5316 \
   --label baseline \
   --latency remote \
-  --candidate-limit 8
+  --candidate-limit 8 \
+  --drafter-max-depth 2
 ```
 
 PowerShell:
@@ -32,6 +33,9 @@ Latency profiles add the same deterministic delay to Actor and speculative
 executions. `native` adds nothing; `remote`, `sandbox`, and `heavy` model
 increasingly remote or isolated tools. The result records the profile and raw
 tool execution counts.
+
+Set `--drafter-max-depth 0` for the one-step Drafter ablation. Positive values
+bound output-informed continuation steps after the first action.
 
 `actualEndToEndMs` is the single speculative Agent invocation. Its serialized
 counterfactual is reconstructed from that same run as:
