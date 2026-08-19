@@ -275,7 +275,7 @@ export const PATTERN_AWARE_DEFAULTS: PatternAwareSettings = {
 	maxFutureGap: 8,
 	futureGapCoverage: 0.9,
 	decayHalfLifeEvents: 2048,
-	minOccurrences: 2,
+	minOccurrences: 3,
 	minBindingReplayProbability: 0.75,
 	maxPatterns: 4096,
 };

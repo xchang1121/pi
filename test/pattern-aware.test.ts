@@ -651,6 +651,16 @@ describe("PatternAware", () => {
 		});
 	});
 
+	test("requires three positive examples before admitting a default mapper", () => {
+		const store = new PatternAwareStore(PATTERN_AWARE_DEFAULTS);
+		trainGrepRead(store, "one", "src/a.ts");
+		trainGrepRead(store, "two", "src/b.ts");
+		expect(store.snapshot()).toEqual([]);
+
+		trainGrepRead(store, "three", "src/c.ts");
+		expect(store.snapshot()).toContainEqual(expect.objectContaining({ targetTool: "read", targetOccurrences: 3 }));
+	});
+
 	test("emits weak control-flow candidates for bounded utility admission", () => {
 		const store = new PatternAwareStore(settings({ minBindingReplayProbability: 0.75 }));
 		trainGrepRead(store, "one", "src/a.ts");
@@ -1719,7 +1729,7 @@ function trainResultReads(
 }
 
 function settings(overrides: Partial<typeof PATTERN_AWARE_DEFAULTS> = {}) {
-	return { ...PATTERN_AWARE_DEFAULTS, ...overrides };
+	return { ...PATTERN_AWARE_DEFAULTS, minOccurrences: 2, ...overrides };
 }
 
 function piActionSemantics() {
