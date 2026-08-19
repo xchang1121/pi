@@ -401,7 +401,12 @@ export function createSpeculativeActionHost(
 		multiStepEnabled: (settings) => sourceDrafterMaxDepth(settings) > 0,
 		continueOn: ["actor_adopted"],
 		proposalCount: (settings) => clampCandidateLimit(settings.candidateLimit ?? DEFAULTS.candidateLimit),
-		propose: async ({ startInput: input, candidateNames, proposalIndex, signal }): Promise<PlanProposal> => {
+		propose: async ({
+			startInput: input,
+			candidateNames,
+			proposalIndex,
+			signal,
+		}): Promise<PlanProposal | undefined> => {
 			const proposalID = `drafter:${input.turnID}:${proposalIndex}`;
 			const batchKey = JSON.stringify([input.sessionID, input.turnID]);
 			let batch = drafterBatches.get(batchKey);
@@ -450,14 +455,13 @@ export function createSpeculativeActionHost(
 				throw new Error(message.errorMessage ?? `Drafter stopped with ${message.stopReason}`);
 			}
 			const call = message.content.find((item): item is AgentToolCall => item.type === "toolCall");
-			const feedback = call
-				? drafterFeedback(prepared.model, prepared.context, draftOptions, message, call, 0)
-				: undefined;
+			if (!call) return undefined;
+			const feedback = drafterFeedback(prepared.model, prepared.context, draftOptions, message, call, 0);
 			return {
 				id: proposalID,
 				source: "drafter",
 				revision: 0,
-				actions: call && feedback ? [drafterPlanAction(`${proposalIndex}:${call.id}`, call, feedback)] : [],
+				actions: [drafterPlanAction(`${proposalIndex}:${call.id}`, call, feedback)],
 				draftTokens: usageTokenCount(message.usage),
 			};
 		},

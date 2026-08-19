@@ -214,6 +214,12 @@ describe("speculative action host", () => {
 			},
 		});
 		await host.startTurn(startInput(tool));
+		await waitFor(() => actualEvents.filter((event) => event.type === "source_request").length === 1);
+		expect(
+			actualEvents
+				.filter((event) => event.type === "source_request")
+				.every((event) => event.request.settlement.status === "empty"),
+		).toBe(true);
 		expect(
 			await host.consume({
 				turnID: "turn-1",
