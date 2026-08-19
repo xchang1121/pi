@@ -791,7 +791,9 @@ export function makeStructuralSpeculativeActionRuntime<
 			// Host analysis does not own runtime state.
 		}
 		dispatchReady(session);
-		launchSourceRequests(state);
+		setTimeout(() => {
+			if (state.lifecycle === "active" && !state.generation.signal.aborted) launchSourceRequests(state);
+		}, 0);
 	};
 
 	const claimSourceSlot = (

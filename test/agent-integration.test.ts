@@ -451,6 +451,7 @@ describe("speculative action host", () => {
 		};
 
 		for (const draftModel of [undefined, model("actor")]) {
+			const expectedRequests = usedModels.length + 1;
 			const host = createSpeculativeActionHost("session", {
 				cwd,
 				getSettings: settings,
@@ -459,6 +460,7 @@ describe("speculative action host", () => {
 				preflight: () => true,
 			});
 			await host.startTurn(startInput(tool));
+			await waitFor(() => usedModels.length === expectedRequests);
 			await waitFor(() => !host.runtime.inspect("session").pendingPredictions);
 			await host.dispose();
 		}

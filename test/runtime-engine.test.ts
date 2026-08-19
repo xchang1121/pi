@@ -307,6 +307,7 @@ describe("structural speculative runtime", () => {
 		};
 		const fixture = harness({ source });
 		await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn" });
+		expect(entered).toBe(0);
 		await waitFor(() => entered === 8);
 		release();
 		await waitFor(() => fixture.runtime.inspect().pendingPredictions === 0);
@@ -584,7 +585,11 @@ describe("structural speculative runtime", () => {
 		};
 		const fixture = harness({ source });
 		await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn" });
-		await waitFor(() => fixture.runtime.inspect().pendingPredictions === 0);
+		await waitFor(() =>
+			fixture.events.some(
+				(event) => event.type === "source_request" && event.request.settlement.status === "timeout",
+			),
+		);
 		release();
 		await new Promise((resolve) => setTimeout(resolve, 10));
 		expect(fixture.runtime.inspect().sharedCandidates).toBe(0);
