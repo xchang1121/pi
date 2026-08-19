@@ -444,7 +444,7 @@ export function createSpeculativeActionHost(
 			const draftOptions: SimpleStreamOptions = {
 				...prepared.options,
 				temperature: proposalIndex === 0 ? 0 : 0.7,
-				maxTokens: 256,
+				maxTokens: 128,
 				reasoning: undefined,
 				deferred: false,
 				sessionId: `${sessionID}:draft:${input.turnID}`,
