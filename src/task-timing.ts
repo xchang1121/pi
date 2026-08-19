@@ -29,15 +29,15 @@ export function measureSpeculativeTask(input: {
 		.map(normalizeInterval)
 		.map((interval) => clip(interval, startedAt, completedAt))
 		.filter((interval) => interval.completedAt > interval.startedAt);
-	const authoritativeTools = input.authoritativeTools.map(normalizeInterval);
+	const authoritativeTools = input.authoritativeTools
+		.map(normalizeInterval)
+		.filter((interval) => interval.startedAt >= startedAt && interval.startedAt < completedAt)
+		.map((interval) => clip(interval, startedAt, completedAt))
+		.filter((interval) => interval.completedAt > interval.startedAt);
 	const endToEndMs = completedAt - startedAt;
 	const actorPhaseMs = unionDuration(actorPhases);
 	const toolExecutionMs = durationSum(authoritativeTools);
-	const coveredMs = unionDuration(
-		[...actorPhases, ...authoritativeTools.map((interval) => clip(interval, startedAt, completedAt))].filter(
-			(interval) => interval.completedAt > interval.startedAt,
-		),
-	);
+	const coveredMs = unionDuration([...actorPhases, ...authoritativeTools]);
 	const orchestrationMs = Math.max(0, endToEndMs - coveredMs);
 	const nonToolMs = actorPhaseMs + orchestrationMs;
 	const serializedMs = nonToolMs + toolExecutionMs;

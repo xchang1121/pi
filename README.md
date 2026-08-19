@@ -205,6 +205,7 @@ Run `/speculative-action status` and inspect these fields:
 | `Execution ahead` | Adopted tool-execution time that elapsed before Actor interception, capped at each execution's measured duration |
 | `Hit latency` | Time from Actor interception until the adopted result finishes validation, remaining execution, projection, world commit if needed, and synchronous hit settlement |
 | `Attempt lead` | Diagnostic interval from the request that produced the execution-owning candidate to Actor interception |
+| `Serialized overlap` | Difference between actual task duration and the same run's fully serial `non-tool + authoritative tool` counterfactual; includes native parallel Actor tools as well as speculation |
 | `Actual` | Native actor tool time after speculation did not settle the action |
 | `Draft tokens` | Total drafter token usage |
 | `Cache` | Current entries, capacity, memory, and in-flight jobs |
@@ -213,7 +214,7 @@ Run `/speculative-action status` and inspect these fields:
 | `OCI worker` | Docker/Podman worker health, independent of native health |
 | `Native sandbox` | AppContainer/Seatbelt/Linux-native health, independent of OCI health |
 
-`Execution ahead` is directly observed overlap, not counterfactual saved time. A completed cached action contributes at most its measured execution duration; an in-flight action contributes only the execution elapsed before Actor interception. `Attempt lead` may be much larger and is diagnostic only. None of these metrics invents the unexecuted Actor tool path, so use paired baseline/full wall-clock measurements under the same tasks, model, and environment to establish end-to-end benefit.
+`Execution ahead` is the directly observed speculative part, not invented time for an Actor tool that never ran. A completed cached action contributes at most its measured execution duration; an in-flight action contributes only execution elapsed before Actor interception. `Attempt lead` may be much larger and is diagnostic only. Task timing compares one speculative run's actual end-to-end duration with that same authoritative trajectory serialized as `non-tool + tool`; because that counterfactual also removes native parallel tool overlap, do not attribute all `Serialized overlap` to speculation.
 
 ## Common ablations
 

@@ -3,12 +3,7 @@ import { READ_RANGE_ACTION_KEY_PROJECTOR } from "../src/action-key-projection.ts
 import { buildPiActionKey } from "../src/action-semantics.ts";
 import type { SpeculativeActionEvent, SpeculativeActionSettings, SpeculativePlanSource } from "../src/runtime.ts";
 import { makeStructuralSpeculativeActionRuntime } from "../src/runtime-engine.ts";
-import {
-	cause,
-	type PredictionSettlement,
-	type ResourceValidation,
-	zeroValidationMetrics,
-} from "../src/settlement.ts";
+import { cause, type PredictionSettlement, type ResourceValidation, zeroValidationMetrics } from "../src/settlement.ts";
 
 interface Start {
 	readonly sessionID: string;

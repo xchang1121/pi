@@ -496,14 +496,12 @@ export function createSpeculativeActionHost(
 		multiStepEnabled: (settings) => sourcePatternSettings(settings).multiStepEnabled,
 		propose: async ({ startInput, settings, definitions }) => {
 			const patternSettings = sourcePatternSettings(settings);
-			if (!patternSettings.enabled) {
-				return { id: `pattern:${startInput.turnID}`, source: "pattern_aware", revision: 0, actions: [] };
-			}
+			if (!patternSettings.enabled) return undefined;
 			const store = await resolvePatternStore(settings);
-			const proposalID = `pattern:${startInput.turnID}`;
 			const candidates = store.predict(startInput.sessionID, definitionSchemaHashes(definitions), patternSettings);
+			if (!candidates.length) return undefined;
 			return {
-				id: proposalID,
+				id: `pattern:${startInput.turnID}`,
 				source: "pattern_aware",
 				revision: 0,
 				actions: candidates.map((candidate) =>

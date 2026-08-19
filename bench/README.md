@@ -54,18 +54,24 @@ counterfactual is reconstructed from that same run as:
 serializedCounterfactualMs = nonToolMs + authoritativeToolMs
 ```
 
-`authoritativeToolMs` includes only tool work that produced the results on the
-Actor's final path, including the full service time of an adopted speculative
-execution. It excludes unused predictions. Agent-boundary overhead is counted
-as non-tool time, while teardown after the Agent has completed is excluded.
+`authoritativeToolMs` includes only tool work started during this measured task
+that produced results on the Actor's final path, including the service time of
+an adopted speculative execution. It excludes unused predictions and cache work
+from an earlier task. Agent-boundary overhead is counted as non-tool time, while
+teardown after the Agent has completed is excluded.
+
+`hiddenLatencyMs` is the total overlap exposed by this serialization and can
+include native parallel Actor tool calls. `executionAheadMs` is the narrower,
+directly observed execution head start of adopted speculative work. The two are
+reported separately and are not subtracted into an invented causal estimate.
 
 Required ablation discipline:
 
 1. Keep task, model, candidate count, latency profile, and task timeout fixed.
 2. Change one algorithmic factor per commit.
 3. Require a clean patch (`git diff --check`) and retain task completion signals.
-4. Compare hit rate, `serializedCounterfactualMs / actualEndToEndMs`, hidden
-   latency, tool work, and model cost together.
+4. Compare hit rate, `serializedCounterfactualMs / actualEndToEndMs`, serialized
+   overlap, execution ahead, tool work, and model cost together.
 5. Retain an implementation only when repeated runs improve latency without a
    correctness or resource regression.
 

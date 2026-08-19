@@ -56,15 +56,15 @@ describe("single-run serialized counterfactual timing", () => {
 		});
 	});
 
-	it("counts a previously cached adopted result as avoided current-task tool service", () => {
+	it("does not charge a previous task's cached execution to the current serial counterfactual", () => {
 		expect(
 			measureSpeculativeTask({
 				startedAt: 100,
 				completedAt: 200,
 				actorPhases: [interval(100, 200)],
-				authoritativeTools: [interval(20, 70)],
+				authoritativeTools: [interval(80, 130)],
 			}),
-		).toMatchObject({ endToEndMs: 100, serializedMs: 150, hiddenLatencyMs: 50 });
+		).toMatchObject({ endToEndMs: 100, toolExecutionMs: 0, serializedMs: 100, hiddenLatencyMs: 0 });
 	});
 
 	it("clips and unions Actor phases at the measured task boundary", () => {

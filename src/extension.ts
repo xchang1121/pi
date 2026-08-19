@@ -194,7 +194,7 @@ export function formatSpeculativeActionStatus(input: {
 		`Prediction rejections after match: ${countSummary(metrics.predictionRejectedAfterMatch)}`,
 		`Actor candidate rejections: ${countSummary(metrics.actorCandidateRejections)}`,
 		`Candidates: ${metrics.candidateStarted} started; ${metrics.candidateSucceeded} succeeded; ${metrics.candidateFailed} failed; ${metrics.candidateCancelled} cancelled`,
-		`Task timing: ${formatDuration(metrics.endToEndMs)} actual; ${formatDuration(metrics.serializedMs)} serialized; ${formatDuration(metrics.hiddenLatencyMs)} hidden; ${formatDuration(metrics.nonToolMs)} non-tool; ${formatDuration(metrics.toolExecutionMs)} tools`,
+		`Task timing: ${formatDuration(metrics.endToEndMs)} actual; ${formatDuration(metrics.serializedMs)} serialized; ${formatDuration(metrics.hiddenLatencyMs)} serialized overlap; ${formatDuration(metrics.nonToolMs)} non-tool; ${formatDuration(metrics.toolExecutionMs)} tools`,
 		`Execution ahead: ${formatDuration(metrics.executionAheadMs)}; hit latency: ${formatDuration(metrics.hitLatencyMs)}; attempt lead: ${formatDuration(metrics.attemptLeadMs)}; Actor execution: ${formatDuration(metrics.actorExecutionMs)}`,
 		`Draft tokens: ${metrics.totalDraftTokens}`,
 		`Results: ${cache.resultEntries}/${cache.cacheCapacity}, ${formatBytes(cache.resultBytes)}/${formatBytes(cache.cacheByteCapacity ?? 0)}; cold: ${cache.cacheCold}; hot: ${cache.cacheHot}; jobs: ${cache.inFlightJobs}; branches: ${cache.branchEntries} (${formatBytes(cache.branchBytes)})`,
@@ -308,7 +308,7 @@ async function installController(
 			: "unchecked";
 		ui.setStatus(
 			STATUS_KEY,
-			`spec: on · ${healthText}${conflictText} · ${currentMetrics.speculativeHits}/${currentMetrics.actorActions} hits · ${formatDuration(currentMetrics.hiddenLatencyMs)} hidden (${formatDuration(currentMetrics.endToEndMs)}/${formatDuration(currentMetrics.serializedMs)}) · ${currentMetrics.cache.resultEntries}/${currentMetrics.cache.cacheCapacity} results (${formatBytes(currentMetrics.cache.resultBytes)}) · ${currentMetrics.cache.inFlightJobs} jobs · ${currentMetrics.cache.branchEntries} branches`,
+			`spec: on · ${healthText}${conflictText} · ${currentMetrics.speculativeHits}/${currentMetrics.actorActions} hits · ${formatDuration(currentMetrics.hiddenLatencyMs)} serialized overlap (${formatDuration(currentMetrics.endToEndMs)}/${formatDuration(currentMetrics.serializedMs)}) · ${currentMetrics.cache.resultEntries}/${currentMetrics.cache.cacheCapacity} results (${formatBytes(currentMetrics.cache.resultBytes)}) · ${currentMetrics.cache.inFlightJobs} jobs · ${currentMetrics.cache.branchEntries} branches`,
 		);
 	}
 	const host = (dependencies.createHost ?? createSpeculativeActionHost)(context.sessionManager.getSessionId(), {
@@ -1390,7 +1390,7 @@ export function formatSpeculativeActionEvent(event: SpeculativeActionEvent<strin
 			parts.push(
 				`${formatDuration(event.timing.endToEndMs)} actual`,
 				`${formatDuration(event.timing.serializedMs)} serialized`,
-				`${formatDuration(event.timing.hiddenLatencyMs)} hidden`,
+				`${formatDuration(event.timing.hiddenLatencyMs)} serialized overlap`,
 			);
 			break;
 		case "source_request":

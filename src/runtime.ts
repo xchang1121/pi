@@ -108,7 +108,7 @@ export interface SpeculativePlanSource<
 		readonly proposalIndex: number;
 		readonly proposalCount: number;
 		readonly signal: AbortSignal;
-	}) => MaybePromise<PlanProposal | readonly PlanProposal[]>;
+	}) => MaybePromise<PlanProposal | readonly PlanProposal[] | undefined>;
 	readonly continue?: (input: {
 		readonly startInput: StartInput;
 		readonly data: StateData;
