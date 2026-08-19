@@ -488,7 +488,7 @@ describe("PatternAware", () => {
 		expect(store.snapshot()).toEqual([]);
 	});
 
-	test("migrates v14 evidence by gap without loading its mixed mapper patterns", async () => {
+	test.each([13, 14])("migrates v%s evidence by gap without loading its mixed mapper patterns", async (version) => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "pi-pattern-gap-migration-"));
 		temporary.push(directory);
 		const file = path.join(directory, "patterns.json");
@@ -500,14 +500,17 @@ describe("PatternAware", () => {
 		await fs.writeFile(
 			file,
 			JSON.stringify({
-				version: 14,
-				patterns: [validatedGapPattern({ "0": 10 }, { id: "stale-v14" })],
+				version,
+				patterns: [validatedGapPattern({ "0": 10 }, { id: "stale-legacy" })],
 				pools: [
 					{
 						key: "legacy-mixed-gap",
 						context: [{ tool: "grep", outcome: "success" }],
 						targetTool: "read",
 						samples: [sample("immediate", "src/a.ts", 0), sample("delayed", "src/b.ts", 1)],
+						inferred: { '["filePath"]': { type: "constant", value: "src/c.ts" } },
+						observations: 2,
+						nextInferenceAt: 100,
 					},
 				],
 				sequenceCounts: [],
@@ -520,7 +523,7 @@ describe("PatternAware", () => {
 		trainGrepRead(store, "fresh", "src/c.ts");
 
 		expect(store.snapshot()).toEqual([
-			expect.objectContaining({ targetTool: "read", targetOccurrences: 2, gapCounts: { "0": 2 } }),
+			expect.objectContaining({ targetTool: "read", occurrences: 2, gapCounts: { "0": 2 } }),
 		]);
 	});
 
@@ -658,7 +661,7 @@ describe("PatternAware", () => {
 		expect(store.snapshot()).toEqual([]);
 
 		trainGrepRead(store, "three", "src/c.ts");
-		expect(store.snapshot()).toContainEqual(expect.objectContaining({ targetTool: "read", targetOccurrences: 3 }));
+		expect(store.snapshot()).toContainEqual(expect.objectContaining({ targetTool: "read", occurrences: 3 }));
 	});
 
 	test("emits weak control-flow candidates for bounded utility admission", () => {
@@ -702,7 +705,7 @@ describe("PatternAware", () => {
 		store.observe(input({ sessionID: "noise", tool: "read", input: { filePath: "manual.ts" } }));
 
 		const pattern = store.snapshot().find((item) => item.targetTool === "read");
-		expect(pattern).toMatchObject({ targetOccurrences: 4, occurrences: 4, replayMatches: 3 });
+		expect(pattern).toMatchObject({ occurrences: 4, replayMatches: 3 });
 		store.observe(input({ sessionID: "probe", tool: "grep", input: {}, outputPaths: ["src/d.ts"] }));
 		expect(store.predict("probe").find((item) => item.tool === "read")?.input).toEqual({ filePath: "src/d.ts" });
 	});
@@ -1751,7 +1754,6 @@ function validatedGapPattern(
 		bindings: { '["path"]': { type: "constant", value: "README.md" } },
 		gapCounts,
 		gapLastSeen: Object.fromEntries(Object.keys(gapCounts).map((gap) => [gap, 1])),
-		targetOccurrences: 10,
 		occurrences: 10,
 		replayMatches: 10,
 		historicalOpportunities: 10,
