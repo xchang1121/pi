@@ -375,7 +375,7 @@ describe("speculative action host", () => {
 		await host.dispose();
 	});
 
-	it("rolls one Drafter trajectory forward with authoritative tool results and a hard depth bound", async () => {
+	it("rolls one Drafter trajectory forward from speculative outputs before Actor adoption", async () => {
 		const cwd = await temporaryWorkspace();
 		await Promise.all([
 			writeFile(path.join(cwd, "other.txt"), "other", "utf8"),
@@ -427,7 +427,8 @@ describe("speculative action host", () => {
 		});
 
 		await host.startTurn(startInput(tool));
-		await waitFor(() => executed.length === 1);
+		await waitFor(() => executed.length === 3);
+		expect(executed).toEqual(["notes.txt", "other.txt", "third.txt"]);
 		for (const [index, file] of ["notes.txt", "other.txt", "third.txt"].entries()) {
 			const turnID = `turn-${index + 1}`;
 			if (index > 0) await host.startTurn(startInput(tool, turnID));
@@ -441,12 +442,10 @@ describe("speculative action host", () => {
 				}),
 			).toMatchObject({ result: { content: [{ type: "text", text: `${file}:result` }] } });
 			if (index < 2) {
-				await waitFor(() => executed.length === index + 2);
 				await host.finishTurn(turnID);
 				currentSettings = { ...currentSettings, drafterEnabled: false };
 			}
 		}
-		expect(executed).toEqual(["notes.txt", "other.txt", "third.txt"]);
 		expect(requests).toHaveLength(3);
 		const replayedAssistant = requests[1]!.context.messages.at(-2);
 		expect(replayedAssistant).toMatchObject({ role: "assistant" });

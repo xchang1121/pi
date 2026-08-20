@@ -411,7 +411,7 @@ export function createSpeculativeActionHost(
 		timeoutMs: (settings) => settings.predictionTimeoutMs,
 		requestLifetime: "actor_decision",
 		multiStepEnabled: (settings) => sourceDrafterMaxDepth(settings) > 0,
-		continueOn: ["actor_adopted"],
+		continueOn: ["execution_succeeded"],
 		proposalCount: (settings) => clampCandidateLimit(settings.candidateLimit ?? DEFAULTS.candidateLimit),
 		propose: async ({
 			startInput: input,
@@ -503,7 +503,7 @@ export function createSpeculativeActionHost(
 				revision,
 				upsert: [
 					drafterPlanAction(`${actionID}/rollout:${next.depth}:${call.id}`, call, next, [
-						{ actionID, condition: "actor_adopted" },
+						{ actionID, condition: "execution_succeeded" },
 					]),
 				],
 				draftTokens: usageTokenCount(message.usage),
