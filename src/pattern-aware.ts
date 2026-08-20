@@ -915,31 +915,26 @@ export class PatternAwareStore {
 		);
 	}
 
-	private minimizeProjectedBindings(
-		bindings: Readonly<Record<string, PatternAwareBinding>>,
-		targetTool: string,
-		targetSchemaHash: string | undefined,
-		samples: ReadonlyArray<PatternSample>,
-	) {
-		if (!this.actionSemantics) return bindings;
+	private minimizeProjectedBindings(bindings: Readonly<Record<string, PatternAwareBinding>>, pool: PatternPool) {
+		const supportingSamples = (candidate: Readonly<Record<string, PatternAwareBinding>>) =>
+			pool.samples.filter((sample) =>
+				this.bindingsCoverSample(candidate, pool.targetTool, pool.targetSchemaHash, sample),
+			);
+		if (!this.actionSemantics) return { bindings, support: supportingSamples(bindings) };
 		const minimized = { ...bindings };
-		let covered = samples.filter((sample) =>
-			this.bindingsCoverSample(minimized, targetTool, targetSchemaHash, sample),
-		).length;
+		let support = supportingSamples(minimized);
 		for (const key of Object.keys(bindings)) {
 			const binding = minimized[key];
 			if (!binding) continue;
 			delete minimized[key];
-			const next = samples.filter((sample) =>
-				this.bindingsCoverSample(minimized, targetTool, targetSchemaHash, sample),
-			).length;
-			if (next > covered || (covered > 0 && next === covered)) {
-				covered = next;
+			const next = supportingSamples(minimized);
+			if (next.length > support.length || (support.length > 0 && next.length === support.length)) {
+				support = next;
 				continue;
 			}
 			minimized[key] = binding;
 		}
-		return minimized;
+		return { bindings: minimized, support };
 	}
 
 	private learnOccurrence(context: ReadonlyArray<PatternAwareEvent>, target: PatternAwareEvent, gap: number) {
@@ -982,11 +977,8 @@ export class PatternAwareStore {
 		);
 
 		const retained = new Set<string>();
-		for (let bindings of candidates.values()) {
-			bindings = this.minimizeProjectedBindings(bindings, pool.targetTool, pool.targetSchemaHash, pool.samples);
-			const support = pool.samples.filter((sample) =>
-				this.bindingsCoverSample(bindings, pool.targetTool, pool.targetSchemaHash, sample),
-			);
+		for (const candidate of candidates.values()) {
+			const { bindings, support } = this.minimizeProjectedBindings(candidate, pool);
 			if (support.length < this.settings.minOccurrences) continue;
 			const id = hash(
 				stableStringify({
