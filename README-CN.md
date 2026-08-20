@@ -311,6 +311,6 @@ package 只通过 Pi 原生公开 API 接入：生命周期事件提供模型上
 
 ## 实现概览
 
-Actor 与 Drafter 并行运行。每轮 Drafter 会并行发起 `candidateLimit` 个独立请求：每个请求看到 Actor 的对话和可投机工具 schema，以 Assistant 身份只调用一个工具，关闭 reasoning，并使用配置的输出预算。可配置数量的前置请求使用 temperature 0；其余请求针对任意候选数在配置的 temperature 区间中等距分层。每个响应只接收第一个工具调用，再由现有 K(a) 关系在执行前合并等价工作。Actor 采纳候选后，可把准确的 Assistant 调用和工具结果回放给同一条有界 Drafter 轨迹，并在 Actor 形成下一次意图期间执行。Runtime 按目标 Actor 序号统一分配请求预算，避免 continuation 与下一 turn 的扇出重复。候选仍经过 schema 校验、preflight、资源版本捕获和执行策略选择。完成结果进入 `ResultCache` 或仅支持精确匹配的 `ActionStore`，隔离副作用由封存的 `WorldBranch` 表示。PatternAware 按 workspace hash 持久化模板和有界 PPM 计数 trie；DAG 执行、新鲜度和调度保持来源无关。
+Actor 与 Drafter 并行运行。每轮 Drafter 会并行发起 `candidateLimit` 个独立请求：每个请求看到 Actor 的对话和可投机工具 schema，以 Assistant 身份只调用一个工具，关闭 reasoning，并使用配置的输出预算。可配置数量的前置请求使用 temperature 0；其余请求针对任意候选数在配置的 temperature 区间中等距分层。每个响应只接收第一个工具调用，再由现有 K(a) 关系在执行前合并等价工作。Actor 采纳候选后，已确认的 Assistant 调用和工具结果会为下一意图重新启动一轮完整的 `candidateLimit` 路请求；未被采纳的输出不会继续递归消耗 Drafter 请求。Runtime 按目标 Actor 序号把这轮确认前缀请求与下一 turn 的常规扇出合并，而每个响应一到达就独立接纳，不等待最慢请求。候选仍经过 schema 校验、preflight、资源版本捕获和执行策略选择。完成结果进入 `ResultCache` 或仅支持精确匹配的 `ActionStore`，隔离副作用由封存的 `WorldBranch` 表示。PatternAware 按 workspace hash 持久化模板和有界 PPM 计数 trie；DAG 执行、新鲜度和调度保持来源无关。
 
 所有命中、未命中、取消、实际执行、草稿 token、缓存和沙箱阶段耗时均以 typed event 暴露，供实验记录与可视化使用。

@@ -18,6 +18,7 @@ import { PlanRuntime, type PlanRuntimeNode, type PredictionOpportunity, type Ret
 import { PostSettlementQueue } from "./post-settlement.ts";
 import { resourceProfile } from "./resource-budget.ts";
 import type {
+	AdoptedAction,
 	CandidatePreflight,
 	SpeculativeActionEvent,
 	SpeculativeActionRuntime,
@@ -537,7 +538,7 @@ interface PlanActionContext<StartInput, StateData> {
 	draft: SpeculativeDraftCandidate;
 	readonly admissionSignal: AbortSignal;
 	readonly sourceSlot?: SourceRequestSlot;
-	continuationSlot?: SourceRequestSlot;
+	readonly continuationSlots: Set<SourceRequestSlot>;
 	readonly continuationTriggers: Set<"execution_succeeded" | "actor_adopted">;
 	continuationTail: Promise<void>;
 }
@@ -1018,6 +1019,7 @@ export function makeStructuralSpeculativeActionRuntime<
 					admissionSignal: scope.signal,
 					...(scope.slot ? { sourceSlot: scope.slot } : {}),
 					continuationTriggers: new Set(),
+					continuationSlots: new Set(),
 					continuationTail: Promise.resolve(),
 				});
 				if (node.prediction && source.onIssued) {
@@ -1109,9 +1111,9 @@ export function makeStructuralSpeculativeActionRuntime<
 			context.sourceSlot.owners.delete(id);
 			releaseUnusedSourceSlot(session, context.sourceSlot);
 		}
-		if (!keepContinuation && context.continuationSlot) {
-			releaseSourceSlot(session, context.continuationSlot, cause("control", "parent_prediction_not_adopted"));
-		}
+		if (!keepContinuation)
+			for (const slot of context.continuationSlots)
+				releaseSourceSlot(session, slot, cause("control", "parent_prediction_not_adopted"));
 	};
 
 	const runPreparationHint = async (session: Session, node: PlanRuntimeNode): Promise<void> => {
@@ -1379,11 +1381,15 @@ export function makeStructuralSpeculativeActionRuntime<
 			if (candidate.work.reservation.kind === "shared") results.insert(session.id, candidate);
 			else branches.insert(session.id, candidate);
 			installWatcher(session, candidate);
-			for (const node of nodesForCandidate(session, candidate.id)) {
-				const current = session.plan.get(node.proposalID, node.action.id);
-				if (current?.predictionState?.status === "pending")
-					queueContinuation(session, current, candidate, output, "execution_succeeded");
-			}
+			queueCandidateContinuations(
+				session,
+				nodesForCandidate(session, candidate.id).filter(
+					(node) => session.plan.get(node.proposalID, node.action.id)?.predictionState?.status === "pending",
+				),
+				candidate,
+				output,
+				"execution_succeeded",
+			);
 			trimResults(session, candidate.owner.settings);
 			queueCandidateEvent(session, candidate);
 			dispatchReady(session);
@@ -1646,8 +1652,17 @@ export function makeStructuralSpeculativeActionRuntime<
 					candidateID: selected.candidate.id,
 				};
 				reconcileAdoptedCandidate(state.session, actualKey, selected.candidate);
-				for (const { node } of matchingPredictions)
-					queueContinuation(state.session, node, selected.candidate, selected.output, "actor_adopted");
+				queueCandidateContinuations(
+					state.session,
+					matchingPredictions.map(({ node }) => node),
+					selected.candidate,
+					selected.output,
+					"actor_adopted",
+					{
+						key: actualKey,
+						input: asConcreteInput(actualCall.input) ?? actualKey.input,
+					},
+				);
 				confirmPredictions(state.session, matchingPredictions, identity, adoption);
 				queueActorSettlement(state, input, actualCall, actorAction, selected.output, selected.candidate);
 				state.session.effects.enqueue(() => dispatchReady(state.session));
@@ -1849,12 +1864,30 @@ export function makeStructuralSpeculativeActionRuntime<
 		if (settlement) predictionSettled(session, node, settlement);
 	};
 
+	const queueCandidateContinuations = (
+		session: Session,
+		nodes: readonly PlanRuntimeNode[],
+		candidate: Candidate,
+		output: Output,
+		trigger: "execution_succeeded" | "actor_adopted",
+		adoptedAction?: AdoptedAction,
+	): void => {
+		const candidateScoped = new Set<string>();
+		for (const node of nodes) {
+			const source = sourcesByID.get(node.source);
+			if (source?.continuationMode === "candidate_round" && candidateScoped.has(node.source)) continue;
+			if (source?.continuationMode === "candidate_round") candidateScoped.add(node.source);
+			queueContinuation(session, node, candidate, output, trigger, adoptedAction);
+		}
+	};
+
 	const queueContinuation = (
 		session: Session,
 		node: PlanRuntimeNode,
 		candidate: Candidate,
 		output: Output,
 		trigger: "execution_succeeded" | "actor_adopted",
+		adoptedAction?: AdoptedAction,
 	): void => {
 		if (!node.prediction) return;
 		const current = session.plan.get(node.proposalID, node.action.id);
@@ -1871,74 +1904,78 @@ export function makeStructuralSpeculativeActionRuntime<
 				? (current.predictionState.actorAction.decisionSequence ?? current.expectedDecisionSeq)
 				: current.expectedDecisionSeq;
 		const targetDecisionSequence = parentDecisionSequence + 1;
-		let slot = context.continuationSlot;
-		if (!slot?.active) {
-			slot = claimSourceSlot(
-				session,
-				source.id,
-				targetDecisionSequence,
-				clampCandidateLimit(source.proposalCount?.(context.settings)),
-			);
-			if (!slot) return;
-			context.continuationSlot = slot;
-		}
-		const continuationSlot = slot;
-		retainSourceRequest(continuationSlot);
+		const continuationCount =
+			source.continuationMode === "candidate_round"
+				? clampCandidateLimit(source.proposalCount?.(context.settings))
+				: 1;
+		const requestLimit = clampCandidateLimit(source.proposalCount?.(context.settings));
 		const pending = context.continuationTail
 			.then(async () => {
-				if (session.disposed || !continuationSlot.active) {
-					releaseSourceRequest(session, continuationSlot);
-					return;
-				}
-				const revision = session.plan.reserveRevision(node.proposalID);
-				if (revision === undefined) {
-					releaseSourceRequest(session, continuationSlot);
-					return;
-				}
-				const generation = new SourceGeneration();
-				continuationSlot.generations.add(generation);
-				session.pendingSourceRequests++;
-				const request = await runSourceRequest({
-					request: {
-						source: source.id,
-						turnID: context.startInput.turnID,
-						index: session.sourceRequestSequence++,
-						kind: "continuation",
-						targetDecisionSequence: continuationSlot.targetDecisionSequence,
-					},
-					generation,
-					timeoutMs: source.timeoutMs?.(context.settings),
-					produce: (requestSignal) =>
-						source.continue!({
-							startInput: context.startInput,
-							data: context.data,
-							settings: context.settings,
-							candidate: predictionCandidate(candidate, node),
-							proposalID: node.proposalID,
-							actionID: node.action.id,
-							revision,
-							feedback: context.feedback,
-							output,
-							trigger,
-							signal: requestSignal,
-						}),
-					count: (value) => asUpdates(value).length,
+				const requests = Array.from({ length: continuationCount }, (_, continuationIndex) => {
+					const slot = claimSourceSlot(session, source.id, targetDecisionSequence, requestLimit);
+					if (!slot) return undefined;
+					context.continuationSlots.add(slot);
+					retainSourceRequest(slot);
+					return (async () => {
+						if (session.disposed || !slot.active) {
+							releaseSourceRequest(session, slot);
+							return;
+						}
+						const revision = session.plan.reserveRevision(node.proposalID);
+						if (revision === undefined) {
+							releaseSourceRequest(session, slot);
+							return;
+						}
+						const generation = new SourceGeneration();
+						slot.generations.add(generation);
+						session.pendingSourceRequests++;
+						const request = await runSourceRequest({
+							request: {
+								source: source.id,
+								turnID: context.startInput.turnID,
+								index: session.sourceRequestSequence++,
+								kind: "continuation",
+								targetDecisionSequence: slot.targetDecisionSequence,
+							},
+							generation,
+							timeoutMs: source.timeoutMs?.(context.settings),
+							produce: (requestSignal) =>
+								source.continue!({
+									startInput: context.startInput,
+									data: context.data,
+									settings: context.settings,
+									candidate: predictionCandidate(candidate, node),
+									...(adoptedAction ? { adoptedAction } : {}),
+									proposalID: node.proposalID,
+									actionID: node.action.id,
+									revision,
+									feedback: context.feedback,
+									output,
+									trigger,
+									continuationIndex,
+									continuationCount,
+									signal: requestSignal,
+								}),
+							count: (value) => asUpdates(value).length,
+						});
+						await sourceRequestFinished(
+							{
+								session,
+								startInput: context.startInput,
+								data: context.data,
+								settings: context.settings,
+								signal: generation.signal,
+								slot,
+							},
+							context.startInput.turnID,
+							source,
+							slot,
+							generation,
+							request,
+						);
+					})();
 				});
-				await sourceRequestFinished(
-					{
-						session,
-						startInput: context.startInput,
-						data: context.data,
-						settings: context.settings,
-						signal: generation.signal,
-						slot: continuationSlot,
-					},
-					context.startInput.turnID,
-					source,
-					continuationSlot,
-					generation,
-					request,
-				);
+				await Promise.allSettled(requests.filter((request) => request !== undefined));
 			})
 			.catch(() => {
 				// Continuation failure cannot revoke completed work or Actor adoption.

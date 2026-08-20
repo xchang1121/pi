@@ -135,9 +135,10 @@ describe("speculative action host", () => {
 		await host.dispose();
 	});
 
-	it("projects a wider read result only when its realized coverage proves containment", async () => {
+	it("projects proven read coverage and replays the adopted Actor call to the next Drafter round", async () => {
 		const cwd = await temporaryWorkspace();
 		let executedInput: { path: string; offset?: number; limit?: number } | undefined;
+		const contexts: Parameters<CreateComplete>[1][] = [];
 		const tool: AgentTool<typeof readSchema> = {
 			name: "read",
 			label: "read",
@@ -163,9 +164,14 @@ describe("speculative action host", () => {
 		};
 		const host = createSpeculativeActionHost("session", {
 			cwd,
-			getSettings: settings,
+			getSettings: () => ({ ...settings(), drafterMaxDepth: 1 }),
 			draftModel: model("draft"),
-			complete: async () => drafterCall({ path: "notes.txt", offset: 1, limit: 1 }),
+			complete: async (_model, context) => {
+				contexts.push(context);
+				return contexts.length === 1
+					? drafterCall({ path: "notes.txt", offset: 1, limit: 1 })
+					: assistant([], "stop");
+			},
 			preflight: () => true,
 			projectionRules: [PI_READ_RANGE_PROJECTION_RULE],
 		});
@@ -184,6 +190,19 @@ describe("speculative action host", () => {
 			text: "two\nthree\n\n[1 more lines in file. Use offset=4 to continue.]",
 		});
 		expect(executedInput).toMatchObject({ offset: 1, limit: 2000 });
+		await waitFor(() => contexts.length === 2);
+		expect(contexts[1]?.messages).toEqual([
+			expect.objectContaining({
+				role: "assistant",
+				content: [
+					expect.objectContaining({
+						type: "toolCall",
+						arguments: { path: "notes.txt", offset: 2, limit: 2 },
+					}),
+				],
+			}),
+			expect.objectContaining({ role: "toolResult" }),
+		]);
 		await host.dispose();
 	});
 
@@ -375,35 +394,34 @@ describe("speculative action host", () => {
 		await host.dispose();
 	});
 
-	it("rolls one Drafter trajectory forward from speculative outputs before Actor adoption", async () => {
+	it("resets arbitrary Drafter width after adoption without batch blocking", async () => {
 		const cwd = await temporaryWorkspace();
 		await Promise.all([
 			writeFile(path.join(cwd, "other.txt"), "other", "utf8"),
-			writeFile(path.join(cwd, "third.txt"), "third", "utf8"),
 			writeFile(path.join(cwd, "ignored.txt"), "ignored", "utf8"),
 		]);
 		const requests: Array<{ context: Parameters<CreateComplete>[1]; options: Parameters<CreateComplete>[2] }> = [];
 		const executed: string[] = [];
+		const requestCounts = [0, 0];
+		let releaseSlow!: () => void;
+		const slow = new Promise<void>((resolve) => {
+			releaseSlow = resolve;
+		});
 		const complete: CreateComplete = async (_model, context, requestOptions) => {
 			requests.push({ context, options: requestOptions });
 			const depth = context.messages.filter((message) => message.role === "toolResult").length;
-			if (depth === 0) {
-				return assistant(
-					[
-						{ type: "toolCall", id: "draft-0", name: "read", arguments: { path: "notes.txt" } },
-						{ type: "toolCall", id: "ignored", name: "read", arguments: { path: "ignored.txt" } },
-					],
-					"toolUse",
-				);
-			}
-			if (depth === 1) {
-				return assistant(
-					[{ type: "toolCall", id: "draft-1", name: "read", arguments: { path: "other.txt" } }],
-					"toolUse",
-				);
-			}
+			const index = requestCounts[depth]++;
+			if (depth === 1 && index === 0) await slow;
+			if (depth === 1 && index === 1) return assistant([], "error");
 			return assistant(
-				[{ type: "toolCall", id: "draft-2", name: "read", arguments: { path: "third.txt" } }],
+				[
+					{
+						type: "toolCall",
+						id: `draft-${depth}-${index}`,
+						name: "read",
+						arguments: { path: depth === 0 ? "notes.txt" : index === 0 ? "other.txt" : "ignored.txt" },
+					},
+				],
 				"toolUse",
 			);
 		};
@@ -417,51 +435,33 @@ describe("speculative action host", () => {
 				return { content: [{ type: "text", text: `${args.path}:result` }], details: { path: args.path } };
 			},
 		};
-		let currentSettings = { ...settings(1), drafterMaxDepth: 2 };
 		const host = createSpeculativeActionHost("session", {
 			cwd,
-			getSettings: () => currentSettings,
+			getSettings: () => ({ ...settings(4), drafterMaxDepth: 1 }),
 			draftModel: model("draft"),
 			complete,
 			preflight: () => true,
 		});
 
 		await host.startTurn(startInput(tool));
-		await waitFor(() => executed.length === 3);
-		expect(executed).toEqual(["notes.txt", "other.txt", "third.txt"]);
-		for (const [index, file] of ["notes.txt", "other.txt", "third.txt"].entries()) {
-			const turnID = `turn-${index + 1}`;
-			if (index > 0) await host.startTurn(startInput(tool, turnID));
-			expect(
-				await host.consume({
-					turnID,
-					id: `actor-${index}`,
-					tool: "read",
-					args: { path: file },
-					tools: [tool],
-				}),
-			).toMatchObject({ result: { content: [{ type: "text", text: `${file}:result` }] } });
-			if (index < 2) {
-				await host.finishTurn(turnID);
-				currentSettings = { ...currentSettings, drafterEnabled: false };
-			}
-		}
-		expect(requests).toHaveLength(3);
-		const replayedAssistant = requests[1]!.context.messages.at(-2);
-		expect(replayedAssistant).toMatchObject({ role: "assistant" });
+		await waitFor(() => requestCounts[0] === 4 && executed.length === 1);
+		expect(executed).toEqual(["notes.txt"]);
 		expect(
-			replayedAssistant?.role === "assistant"
-				? replayedAssistant.content.filter((item) => item.type === "toolCall").map((item) => item.id)
-				: [],
-		).toEqual(["draft-0"]);
-		expect(requests[1]!.context.messages.at(-1)).toMatchObject({
-			role: "toolResult",
-			toolCallId: "draft-0",
-			toolName: "read",
-			content: [{ type: "text", text: "notes.txt:result" }],
-			isError: false,
-		});
-		expect(requests[2]!.context.messages.filter((message) => message.role === "toolResult")).toHaveLength(2);
+			await host.consume({
+				turnID: "turn-1",
+				id: "actor",
+				tool: "read",
+				args: { path: "notes.txt" },
+				tools: [tool],
+			}),
+		).toMatchObject({ result: { content: [{ type: "text", text: "notes.txt:result" }] } });
+		await waitFor(() => requestCounts[1] === 4 && executed.includes("ignored.txt"));
+		expect(executed).not.toContain("other.txt");
+		releaseSlow();
+		await waitFor(() => executed.includes("other.txt"));
+		expect(requests).toHaveLength(8);
+		expect(executed.sort()).toEqual(["ignored.txt", "notes.txt", "other.txt"]);
+		await host.finishTurn("turn-1", true);
 		await host.dispose();
 	});
 

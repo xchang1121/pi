@@ -78,6 +78,9 @@ export interface SpeculativeCandidate {
 	readonly planDependencies?: PlanAction["dependsOn"];
 }
 
+/** The concrete Actor action represented by an `actor_adopted` continuation output. */
+export type AdoptedAction = Pick<SpeculativeCandidate, "key" | "input">;
+
 interface TurnInput<SessionID> {
 	readonly sessionID: SessionID;
 	readonly turnID: string;
@@ -100,6 +103,8 @@ export interface SpeculativePlanSource<
 	readonly requestLifetime?: "actor_decision" | "turn";
 	readonly multiStepEnabled?: (settings: SpeculativeActionSettings) => boolean;
 	readonly proposalCount?: (settings: SpeculativeActionSettings) => number;
+	/** A candidate round collapses equivalent parents and restores `proposalCount` breadth. */
+	readonly continuationMode?: "per_prediction" | "candidate_round";
 	readonly propose: (input: {
 		readonly startInput: StartInput;
 		readonly data: StateData;
@@ -115,12 +120,15 @@ export interface SpeculativePlanSource<
 		readonly data: StateData;
 		readonly settings: SpeculativeActionSettings;
 		readonly candidate: SpeculativeCandidate;
+		readonly adoptedAction?: AdoptedAction;
 		readonly proposalID: string;
 		readonly actionID: string;
 		readonly revision: number;
 		readonly feedback: unknown;
 		readonly output: Output;
 		readonly trigger: "execution_succeeded" | "actor_adopted";
+		readonly continuationIndex: number;
+		readonly continuationCount: number;
 		readonly signal: AbortSignal;
 	}) => MaybePromise<PlanUpdate | readonly PlanUpdate[] | undefined>;
 	/** Restrict continuation callbacks without coupling Runtime scheduling to a concrete source. */

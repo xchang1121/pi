@@ -411,7 +411,8 @@ export function createSpeculativeActionHost(
 		timeoutMs: (settings) => settings.predictionTimeoutMs,
 		requestLifetime: "actor_decision",
 		multiStepEnabled: (settings) => sourceDrafterMaxDepth(settings) > 0,
-		continueOn: ["execution_succeeded"],
+		continuationMode: "candidate_round",
+		continueOn: ["actor_adopted"],
 		proposalCount: (settings) => clampCandidateLimit(settings.candidateLimit ?? DEFAULTS.candidateLimit),
 		propose: async ({
 			startInput: input,
@@ -481,31 +482,49 @@ export function createSpeculativeActionHost(
 				draftTokens: usageTokenCount(message.usage),
 			};
 		},
-		continue: async ({ proposalID, actionID, revision, feedback, output, signal, settings }) => {
+		continue: async ({
+			proposalID,
+			actionID,
+			feedback,
+			output,
+			adoptedAction,
+			signal,
+			settings,
+			continuationIndex,
+			continuationCount,
+		}) => {
 			const previous = asDrafterPlanFeedback(feedback);
 			if (!previous || previous.depth >= sourceDrafterMaxDepth(settings) || signal.aborted) return undefined;
 			const previousCall = previous.message.content.find((item): item is AgentToolCall => item.type === "toolCall");
 			if (!previousCall) return undefined;
+			const replayedCall = adoptedAction
+				? { ...previousCall, name: adoptedAction.key.tool, arguments: structuredClone(adoptedAction.input) }
+				: previousCall;
+			const replayedMessage: AssistantMessage = {
+				...previous.message,
+				content: previous.message.content.map((item) => (item === previousCall ? replayedCall : item)),
+			};
 			const context: Context = {
 				...previous.context,
-				messages: [...previous.context.messages, previous.message, drafterToolResult(previousCall, output)],
+				messages: [...previous.context.messages, replayedMessage, drafterToolResult(replayedCall, output)],
 			};
-			const message = await options.complete(previous.model, context, { ...previous.options, signal });
+			const drafter = sourceDrafterSettings(settings);
+			const requestOptions = {
+				...previous.options,
+				temperature: drafterRequestTemperature(continuationIndex, continuationCount, drafter),
+			};
+			const message = await options.complete(previous.model, context, { ...requestOptions, signal });
 			if (message.stopReason === "error" || message.stopReason === "aborted") {
 				throw new Error(message.errorMessage ?? `Drafter stopped with ${message.stopReason}`);
 			}
 			const call = message.content.find((item): item is AgentToolCall => item.type === "toolCall");
 			if (!call) return undefined;
-			const next = drafterFeedback(previous.model, context, previous.options, message, call, previous.depth + 1);
+			const next = drafterFeedback(previous.model, context, requestOptions, message, call, previous.depth + 1);
 			return {
-				proposalID,
+				id: `${proposalID}/rollout:${next.depth}:${continuationIndex}`,
 				source: "drafter",
-				revision,
-				upsert: [
-					drafterPlanAction(`${actionID}/rollout:${next.depth}:${call.id}`, call, next, [
-						{ actionID, condition: "execution_succeeded" },
-					]),
-				],
+				revision: 0,
+				actions: [drafterPlanAction(`${actionID}/rollout:${next.depth}:${call.id}`, call, next)],
 				draftTokens: usageTokenCount(message.usage),
 			};
 		},
@@ -534,6 +553,7 @@ export function createSpeculativeActionHost(
 			data,
 			settings,
 			candidate,
+			adoptedAction,
 			proposalID,
 			actionID,
 			revision,
@@ -545,9 +565,10 @@ export function createSpeculativeActionHost(
 			if (signal.aborted) return undefined;
 			const context = asPatternPlanFeedback(feedback);
 			if (!context) return undefined;
+			const action = adoptedAction ?? candidate;
 			const observation = projectPatternAwareObservation(
 				output.result,
-				extractOutputPaths(candidate.key.tool, output.result),
+				extractOutputPaths(action.key.tool, output.result),
 				options.cwd,
 			);
 			const next = context.store.continue(
@@ -555,13 +576,13 @@ export function createSpeculativeActionHost(
 				{
 					sessionID: startInput.sessionID,
 					turnID: startInput.turnID,
-					tool: candidate.key.tool,
-					input: structuredClone(candidate.input) as Record<string, unknown>,
+					tool: action.key.tool,
+					input: structuredClone(action.input) as Record<string, unknown>,
 					outcome: output.isError ? "failure" : "success",
 					...observation,
 					durationMs: candidateExecutionMs(candidate),
-					schemaHash: candidate.key.schemaHash,
-					...(typeof candidate.input.operation === "string" ? { operation: candidate.input.operation } : {}),
+					schemaHash: action.key.schemaHash,
+					...(typeof action.input.operation === "string" ? { operation: action.input.operation } : {}),
 					learnTarget: false,
 				},
 				data.schemaHashes,
