@@ -93,3 +93,22 @@ Use `--prepare-only` to verify dataset lookup and the fresh checkout without a
 model request. Patch cleanliness and changed-file overlap are integrity signals,
 not an official SWE-bench correctness score; official grading still requires the
 dataset's language toolchain and container harness.
+
+Run a checked-in suite serially with identical arguments:
+
+```sh
+npm run bench:suite -- \
+  --suite swe_diverse \
+  --repeats 3 \
+  --label baseline \
+  --latency remote \
+  --candidate-limit 8 \
+  --drafter-max-depth 0
+```
+
+The suite runner fails immediately if a task process fails, writes every task to
+its own result file, and emits `suite-result.json`. Pooled acceleration is the
+ratio of total serialized time to total actual time, and pooled hit rate is total
+hits divided by total Actor actions. Runs that fail `patchCandidate` remain
+listed with explicit reasons but are excluded from pooled latency and hit-rate
+statistics. Use `--output-root` to choose the artifact directory.

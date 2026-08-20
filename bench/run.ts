@@ -748,7 +748,7 @@ function delay(durationMs: number, signal?: AbortSignal): Promise<void> {
 
 function command(file: string, args: readonly string[], cwd?: string): Promise<CommandResult> {
 	return new Promise((resolve, reject) => {
-		execFile(file, args, { cwd, maxBuffer: 32 * 1024 * 1024 }, (error, stdout, stderr) => {
+		execFile(file, args, { cwd, env: benchmarkShellEnvironment(), maxBuffer: 32 * 1024 * 1024 }, (error, stdout, stderr) => {
 			if (error) {
 				reject(new Error(`${file} ${args.join(" ")} failed: ${stderr || error.message}`));
 				return;

@@ -35,6 +35,7 @@
 		"build:native": "node ./native/sandbox/build.mjs",
 		"build:worker": "node ./native/worker/build.mjs",
 		"bench:ablation": "tsx ./bench/run.ts",
+		"bench:suite": "tsx ./bench/suite.ts",
 		"bench:check": "tsgo --noEmit -p ./bench/tsconfig.json",
 		"generate:native-manifest": "node ./native/sandbox/generate-manifest.mjs",
 		"smoke:native": "node ./native/sandbox/smoke.mjs",
