@@ -25,7 +25,11 @@ export const PI_READ_RANGE_PROJECTION_RULE: ActionProjectionRule<ToolSettlement>
 		return buildActionKey({
 			tool: action.tool,
 			resources: action.resources,
-			input: { ...action.input, limit: READ_DEFAULT_LIMIT },
+			input: {
+				...action.input,
+				offset: Math.max(1, range.end - READ_DEFAULT_LIMIT + 1),
+				limit: READ_DEFAULT_LIMIT,
+			},
 			schemaHash: action.schemaHash,
 			semanticsEpoch: action.semanticsEpoch,
 			executionFingerprint: action.executionFingerprint,

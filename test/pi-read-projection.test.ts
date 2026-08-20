@@ -76,12 +76,15 @@ function outputText(output: ToolSettlement | undefined): string | undefined {
 }
 
 describe("Pi read range projection", () => {
-	it("executes a narrow prediction as the default covering view", () => {
+	it("executes a narrow prediction through its earliest default covering view", () => {
 		const predicted = readKey("notes.txt", 20, 5);
 		const covering = PI_READ_RANGE_PROJECTION_RULE.coveringAction?.(predicted);
+		const deepCovering = PI_READ_RANGE_PROJECTION_RULE.coveringAction?.(readKey("notes.txt", 2500, 5));
 
-		expect(covering && readActionRange(covering)).toMatchObject({ offset: 20, limit: 2000 });
+		expect(covering && readActionRange(covering)).toMatchObject({ offset: 1, limit: 2000 });
 		expect(covering && actionKeyCovers(covering, predicted, [PI_READ_RANGE_PROJECTION_RULE])).toBe(true);
+		expect(PI_READ_RANGE_PROJECTION_RULE.coveringAction?.(readKey("notes.txt", 100, 5))?.key).toBe(covering?.key);
+		expect(deepCovering && readActionRange(deepCovering)).toMatchObject({ offset: 505, limit: 2000 });
 		expect(PI_READ_RANGE_PROJECTION_RULE.coveringAction?.(readKey("notes.txt", 20))).toBeUndefined();
 		expect(PI_READ_RANGE_PROJECTION_RULE.coveringAction?.(readKey("notes.txt", 20, 0))).toBeUndefined();
 	});
