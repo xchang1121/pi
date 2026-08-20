@@ -233,6 +233,12 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 	const drafterStopReasons: Record<string, number> = {};
 	const drafterToolCalls: Record<string, number> = {};
 	const drafterNoToolStopReasons: Record<string, number> = {};
+	const drafterPredictionTrace: Array<{
+		readonly stopReason: string;
+		readonly outputTokens: number;
+		readonly tool?: string;
+		readonly input?: unknown;
+	}> = [];
 	const settings: SpeculativeAgentSettingsInput = {
 		enabled: true,
 		drafterEnabled: input.drafterEnabled,
@@ -257,6 +263,11 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 			const message = await streamSimple(draftModel, context, streamOptions).result();
 			drafterStopReasons[message.stopReason] = (drafterStopReasons[message.stopReason] ?? 0) + 1;
 			const call = message.content.find((item) => item.type === "toolCall");
+			drafterPredictionTrace.push({
+				stopReason: message.stopReason,
+				outputTokens: message.usage.output,
+				...(call ? { tool: call.name, input: call.arguments } : {}),
+			});
 			if (call) drafterToolCalls[call.name] = (drafterToolCalls[call.name] ?? 0) + 1;
 			else {
 				drafterNoToolStopReasons[message.stopReason] =
@@ -414,6 +425,21 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 	const speculativeHitsByRelation: Record<string, number> = {};
 	const speculativeHitProvidersBySource: Record<string, number> = {};
 	const actorActionMatchesByPredictionSource: Record<string, number> = {};
+	const candidateStartTrace: Array<{
+		readonly source: string;
+		readonly tool: string;
+		readonly depth: number;
+		readonly action: string;
+	}> = [];
+	const actorActionTrace: Array<{
+		readonly sequence: number;
+		readonly tool: string;
+		readonly action: string;
+		readonly provider: "actor" | "speculative";
+		readonly matchedPredictionSources: readonly string[];
+		readonly candidateSource?: string;
+		readonly predictedAction?: string;
+	}> = [];
 	for (const event of events) {
 		if (event.type === "source_request") {
 			increment(sourceRequestKinds, event.request.request.kind);
@@ -436,14 +462,33 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 			increment(candidateStartsBySource, event.candidate.source);
 			increment(candidateStartsByTool, event.candidate.tool);
 			increment(candidateStartsByDepth, String(event.candidate.depth));
+			candidateStartTrace.push({
+				source: event.candidate.source,
+				tool: event.candidate.tool,
+				depth: event.candidate.depth,
+				action: event.candidate.predictedAction,
+			});
 			continue;
 		}
 		if (event.type !== "actor_action") continue;
 		const { provider, tool } = event.settlement;
 		actorActionsByTool[tool] = (actorActionsByTool[tool] ?? 0) + 1;
-		for (const source of new Set(event.settlement.matchedPredictions.map((prediction) => prediction.source))) {
+		const matchedPredictionSources = [
+			...new Set(event.settlement.matchedPredictions.map((prediction) => prediction.source)),
+		];
+		for (const source of matchedPredictionSources) {
 			increment(actorActionMatchesByPredictionSource, source);
 		}
+		actorActionTrace.push({
+			sequence: event.settlement.actorAction.sequence,
+			tool,
+			action: event.actualAction,
+			provider: provider.kind,
+			matchedPredictionSources,
+			...(event.candidate
+				? { candidateSource: event.candidate.source, predictedAction: event.candidate.predictedAction }
+				: {}),
+		});
 		if (provider.kind === "actor") {
 			actorFallbacksByTool[tool] = (actorFallbacksByTool[tool] ?? 0) + 1;
 			continue;
@@ -614,6 +659,11 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 				patchClean &&
 				changedFiles.length > 0 &&
 				coveredGoldFiles.length > 0,
+		},
+		traces: {
+			drafterPredictions: drafterPredictionTrace,
+			candidateStarts: candidateStartTrace,
+			actorActions: actorActionTrace,
 		},
 	};
 }
