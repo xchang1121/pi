@@ -996,6 +996,50 @@ describe("structural speculative runtime", () => {
 		).toBe("child.ts:output");
 	});
 
+	it("retains a queued confirmation continuation after an empty speculative continuation", async () => {
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const triggers: string[] = [];
+		const executed: string[] = [];
+		const source: Source = {
+			id: "source",
+			enabled: () => true,
+			propose: () => plan("source", "parent", { path: "parent.ts" }),
+			continue: async ({ proposalID, revision, trigger }) => {
+				triggers.push(trigger);
+				if (trigger === "execution_succeeded") {
+					await gate;
+					return undefined;
+				}
+				return {
+					proposalID,
+					source: "source",
+					revision,
+					upsert: [{ id: "confirmed-child", type: "tool_call", tool: "read", input: { path: "child.ts" } }],
+				};
+			},
+		};
+		const fixture = harness({
+			source,
+			execute: (_tool, input) => {
+				executed.push(String(input.path));
+				return `${String(input.path)}:output`;
+			},
+		});
+
+		await fixture.runtime.startTurn({ sessionID: "session", turnID: "queued-confirmation" });
+		await waitFor(() => triggers.includes("execution_succeeded"));
+		expect(await fixture.runtime.consume(call("queued-confirmation", { path: "parent.ts" }))).toBe(
+			"parent.ts:output",
+		);
+		release();
+		await waitFor(() => triggers.includes("actor_adopted"));
+		await waitFor(() => executed.includes("child.ts"));
+		await fixture.runtime.finishTurn({ ...call("queued-confirmation"), terminal: true });
+	});
+
 	it("keeps a next-decision continuation alive across parallel tools in one Actor decision", async () => {
 		let release!: () => void;
 		const gate = new Promise<void>((resolve) => {

@@ -67,4 +67,20 @@ describe("source request ownership", () => {
 		]);
 		expect(outcomes.map((outcome) => outcome.settlement.status)).toEqual(["produced", "empty", "error"]);
 	});
+
+	it("settles a malformed produced value instead of rejecting its owner task", async () => {
+		const settled = await runSourceRequest({
+			request,
+			generation: new SourceGeneration(),
+			produce: () => ["value"],
+			count: () => {
+				throw new Error("malformed result");
+			},
+		});
+
+		expect(settled.settlement).toMatchObject({
+			status: "error",
+			cause: { stage: "source", code: "result_error", detail: "Error: malformed result" },
+		});
+	});
 });

@@ -553,8 +553,7 @@ interface SourceRequestSlot {
 	readonly expiresAtTarget: boolean;
 	readonly generations: Set<SourceGeneration>;
 	readonly owners: Set<string>;
-	pendingAdmissions: number;
-	requestFinished: boolean;
+	pendingRequests: number;
 	active: boolean;
 }
 
@@ -824,8 +823,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			expiresAtTarget,
 			generations: new Set(),
 			owners: new Set(),
-			pendingAdmissions: 0,
-			requestFinished: false,
+			pendingRequests: 0,
 			active: true,
 		};
 		session.sourceSlots.add(slot);
@@ -841,9 +839,18 @@ export function makeStructuralSpeculativeActionRuntime<
 	};
 
 	const releaseUnusedSourceSlot = (session: Session, slot: SourceRequestSlot): void => {
-		if (slot.requestFinished && slot.pendingAdmissions === 0 && slot.owners.size === 0) {
+		if (slot.pendingRequests === 0 && slot.owners.size === 0) {
 			releaseSourceSlot(session, slot, cause("control", "source_slot_unused"));
 		}
+	};
+
+	const retainSourceRequest = (slot: SourceRequestSlot): void => {
+		slot.pendingRequests++;
+	};
+
+	const releaseSourceRequest = (session: Session, slot: SourceRequestSlot): void => {
+		slot.pendingRequests = Math.max(0, slot.pendingRequests - 1);
+		releaseUnusedSourceSlot(session, slot);
 	};
 
 	const expireSourceHorizon = (session: Session, decisionSequence: number, failure: ResolutionCause): void => {
@@ -887,6 +894,7 @@ export function makeStructuralSpeculativeActionRuntime<
 				if (!slot) break;
 				const generation = new SourceGeneration(state.generation.signal);
 				slot.generations.add(generation);
+				retainSourceRequest(slot);
 				state.session.pendingSourceRequests++;
 				const pending = runSourceRequest({
 					request: {
@@ -943,38 +951,36 @@ export function makeStructuralSpeculativeActionRuntime<
 		const session = scope.session;
 		session.pendingSourceRequests = Math.max(0, session.pendingSourceRequests - 1);
 		slot.generations.delete(generation);
-		queueSourceRequestEvent(session, turnID, scope.settings, request);
-		if (
-			request.settlement.status !== "produced" ||
-			request.value === undefined ||
-			!slot.active ||
-			scope.signal.aborted
-		) {
-			slot.requestFinished = true;
-			releaseUnusedSourceSlot(session, slot);
-			return;
+		try {
+			queueSourceRequestEvent(session, turnID, scope.settings, request);
+			if (
+				request.settlement.status !== "produced" ||
+				request.value === undefined ||
+				!slot.active ||
+				scope.signal.aborted
+			) {
+				return;
+			}
+			session.pendingAdmissions++;
+			const admission = session.planAdmissionTail
+				.then(async () => {
+					if (session.disposed || !slot.active || scope.signal.aborted) return;
+					for (const update of asUpdates(request.value)) {
+						if (session.disposed || !slot.active || scope.signal.aborted) break;
+						await admitUpdate(scope, source, update, request);
+					}
+				})
+				.catch(() => {
+					// One malformed proposal cannot poison later independent admissions.
+				})
+				.finally(() => {
+					session.pendingAdmissions = Math.max(0, session.pendingAdmissions - 1);
+				});
+			session.planAdmissionTail = admission;
+			await admission;
+		} finally {
+			releaseSourceRequest(session, slot);
 		}
-		session.pendingAdmissions++;
-		slot.pendingAdmissions++;
-		const admission = session.planAdmissionTail
-			.then(async () => {
-				if (session.disposed || !slot.active || scope.signal.aborted) return;
-				for (const update of asUpdates(request.value)) {
-					if (session.disposed || !slot.active || scope.signal.aborted) break;
-					await admitUpdate(scope, source, update, request);
-				}
-			})
-			.catch(() => {
-				// One malformed proposal cannot poison later independent admissions.
-			})
-			.finally(() => {
-				session.pendingAdmissions = Math.max(0, session.pendingAdmissions - 1);
-				slot.pendingAdmissions = Math.max(0, slot.pendingAdmissions - 1);
-				slot.requestFinished = true;
-				releaseUnusedSourceSlot(session, slot);
-			});
-		session.planAdmissionTail = admission;
-		await admission;
 	};
 
 	const admitUpdate = async (
@@ -1874,14 +1880,20 @@ export function makeStructuralSpeculativeActionRuntime<
 			context.continuationSlot = slot;
 		}
 		const continuationSlot = slot;
+		retainSourceRequest(continuationSlot);
 		const pending = context.continuationTail
 			.then(async () => {
-				if (session.disposed || !continuationSlot.active) return;
+				if (session.disposed || !continuationSlot.active) {
+					releaseSourceRequest(session, continuationSlot);
+					return;
+				}
 				const revision = session.plan.reserveRevision(node.proposalID);
-				if (revision === undefined) return;
+				if (revision === undefined) {
+					releaseSourceRequest(session, continuationSlot);
+					return;
+				}
 				const generation = new SourceGeneration();
 				continuationSlot.generations.add(generation);
-				continuationSlot.requestFinished = false;
 				session.pendingSourceRequests++;
 				const request = await runSourceRequest({
 					request: {

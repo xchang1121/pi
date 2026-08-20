@@ -110,7 +110,15 @@ export async function runSourceRequest<Value>(input: {
 				cause: sourceCause("producer_error", errorDetail(outcome.error)),
 			});
 		}
-		const proposalCount = finiteCount(input.count(outcome.value));
+		let proposalCount: number;
+		try {
+			proposalCount = finiteCount(input.count(outcome.value));
+		} catch (error) {
+			return result(input.request, startedAt, {
+				status: "error",
+				cause: sourceCause("result_error", errorDetail(error)),
+			});
+		}
 		return {
 			...result(
 				input.request,
