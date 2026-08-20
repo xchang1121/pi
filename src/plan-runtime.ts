@@ -521,11 +521,21 @@ export class PlanRuntime {
 		});
 	}
 
+	private actorPrefixSatisfied(plan: MutablePlan, node: MutableNode): boolean {
+		return (node.action.dependsOn ?? []).every((dependency) => {
+			const parent = plan.nodes.get(dependency.actionID);
+			if (!parent) return false;
+			return parent.action.type === "preparation_hint"
+				? dependencySatisfied(parent, dependency.condition)
+				: predictionAdopted(parent.opportunity?.settlement);
+		});
+	}
+
 	private isMatchable(plan: MutablePlan, node: MutableNode, decisionSequence: number): boolean {
 		return (
 			node.opportunity?.state.status === "pending" &&
 			node.earliestDecisionSeq <= decisionSequence &&
-			this.dependenciesSatisfied(plan, node)
+			this.actorPrefixSatisfied(plan, node)
 		);
 	}
 

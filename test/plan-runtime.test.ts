@@ -99,7 +99,7 @@ describe("PlanRuntime", () => {
 		expect(Object.isFrozen(plan.get("plan", "keyed")?.action.input)).toBe(true);
 	});
 
-	it("uses explicit dependency predicates and derives blocking", () => {
+	it("uses execution predicates for launch without exposing an unadopted Actor prefix", () => {
 		const plan = new PlanRuntime();
 		plan.apply(
 			proposal([
@@ -122,7 +122,7 @@ describe("PlanRuntime", () => {
 				.matchable(2)
 				.map((node) => node.action.id)
 				.sort(),
-		).toEqual(["parent", "settled", "succeeded"]);
+		).toEqual(["parent"]);
 		expect(
 			plan
 				.launchable()
