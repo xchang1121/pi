@@ -102,6 +102,21 @@ describe("speculative action resource versions", () => {
 		expect((await validateResourceVersion(token)).expired).toBe(true);
 	});
 
+	test("keeps ls results for content writes and expires them for entry changes", async () => {
+		const root = await workspace();
+		const file = path.join(root, "value.ts");
+		await fs.writeFile(file, "one\n");
+		const token = await captureResourceVersion(action("ls", ["."]), root);
+
+		await fs.writeFile(file, "two\n");
+		await settleWatcher();
+		expect((await validateResourceVersion(token)).expired).toBe(false);
+
+		await fs.writeFile(path.join(root, "added.ts"), "added\n");
+		await settleWatcher();
+		expect((await validateResourceVersion(token)).expired).toBe(true);
+	});
+
 	test("expires find results when ignore rules change", async () => {
 		const root = await workspace();
 		await fs.mkdir(path.join(root, "src"), { recursive: true });
@@ -234,11 +249,11 @@ describe("speculative action resource versions", () => {
 	});
 });
 
-function action(tool: "read" | "grep" | "find", resources: ReadonlyArray<string>) {
+function action(tool: "read" | "grep" | "find" | "ls", resources: ReadonlyArray<string>) {
 	return buildActionKey({
 		tool,
 		resources,
-		input: tool === "read" ? { path: resources[0] } : { path: resources[0], pattern: "*" },
+		input: tool === "read" || tool === "ls" ? { path: resources[0] } : { path: resources[0], pattern: "*" },
 	});
 }
 

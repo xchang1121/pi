@@ -16,7 +16,7 @@ Execution routes use this fixed priority:
 | Priority | Route | Scope |
 |---|---|---|
 | 1 | `runtime_sandbox` | An injected runtime-wide sandbox; preferred for every enabled tool |
-| 2 | `resource_snapshot` | Local fallback for `read`, `grep`, and `find` using versioned resource evidence |
+| 2 | `resource_snapshot` | Local fallback for `read`, `grep`, `find`, and `ls` using versioned resource evidence |
 | 2 | `file_mutation` | Local fallback for `write` and `edit` using a private Git worktree and conflict-checked commit |
 | 3 | Actor fallback | If no safe route exists, no speculative tool invocation occurs |
 
@@ -33,7 +33,7 @@ This arrangement is intentional: a future OS-level agent runtime can provide one
 - A tool with neither a runtime sandbox nor a registered local fallback is execution-blocked but remains matchable for learning and counterfactual measurement.
 - Same-name custom tools remain authoritative and are excluded unless the host explicitly supplies matching semantics and execution capability.
 
-`read` supports lossless range projection backed by realized output coverage. `grep` and `find` remain exact-key-only.
+`read` supports lossless range projection backed by realized output coverage. `grep`, `find`, and `ls` remain exact-key-only.
 
 ## Pi package use
 
@@ -66,7 +66,7 @@ Example:
   "candidateLimit": 8,
   "maxConcurrentActions": 8,
   "drafterMaxTokens": 128,
-  "tools": ["read", "grep", "find", "bash", "write", "edit"],
+  "tools": ["read", "grep", "find", "ls", "bash", "write", "edit"],
   "patternAware": {
     "enabled": true,
     "multiStepEnabled": true

@@ -252,7 +252,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 		maxConcurrentActions: input.maxConcurrentActions,
 		predictionTimeoutMs: input.timeoutMs,
 		patternAware: { enabled: input.patternAware },
-		tools: ["read", "grep", "find", "bash", "edit", "write"],
+		tools: ["read", "grep", "find", "ls", "bash", "edit", "write"],
 	};
 	const sessionID = `${input.label}:${task.row.instance_id}:${Date.now()}`;
 	const host = createSpeculativeActionHost(sessionID, {

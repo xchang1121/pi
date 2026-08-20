@@ -35,7 +35,7 @@
 - Added aggregate, input-free K(a) rejection counts to hit and miss telemetry.
 - Added opt-in, adoption-gated Drafter continuation rounds: every confirmed prefix restores the configured independent-request width, shares the next-action budget with normal turn fanout, and admits fast responses without waiting for the batch; real-task ablation keeps the default depth at zero.
 - Added a uniform route resolver with the priority `runtime_sandbox` → registered local isolation → Actor fallback.
-- Added `resource_snapshot` as the local route for `read`, `grep`, and `find`, and `file_mutation` as the Git-worktree route for `write` and `edit`.
+- Added `resource_snapshot` as the local route for `read`, `grep`, `find`, and `ls`, and `file_mutation` as the Git-worktree route for `write` and `edit`.
 - Added an explicit `execution_blocked` plan state. Blocked predictions remain matchable without being confused with an impossible dependency.
 - Added counterfactual timing for isolation-blocked matches using the same capped lead-time decomposition as adopted speculative work.
 

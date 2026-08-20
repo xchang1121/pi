@@ -170,6 +170,7 @@ export const READ_DEFAULT_OFFSET = 1;
 export const READ_DEFAULT_LIMIT = 2000;
 export const GREP_DEFAULT_LIMIT = 100;
 export const FIND_DEFAULT_LIMIT = 1000;
+export const LS_DEFAULT_LIMIT = 500;
 
 /** π_read narrows a cached read action to the actor's requested interval. */
 export const READ_RANGE_ACTION_KEY_PROJECTOR: ActionKeyProjector = {
@@ -217,6 +218,13 @@ export const PI_ACTION_SEMANTICS = new ActionSemanticsRegistry([
 		localIsolation: "resource_snapshot",
 		resourceScope: "tree_query",
 		canonicalize: canonicalFind,
+	},
+	{
+		tool: "ls",
+		epoch: "pi.ls.v1",
+		localIsolation: "resource_snapshot",
+		resourceScope: "tree_entries",
+		canonicalize: canonicalLs,
 	},
 	{
 		tool: "bash",
@@ -499,6 +507,17 @@ function canonicalFind(input: unknown, cwd: string): CanonicalAction | undefined
 			path: root,
 			limit: normalizePositiveInteger(record.limit, FIND_DEFAULT_LIMIT),
 		},
+	};
+}
+
+function canonicalLs(input: unknown, cwd: string): CanonicalAction | undefined {
+	const record = asRecord(input);
+	if (!record || !validOptionalInteger(record.limit, 1)) return undefined;
+	const root = normalizeRelativeRoot(record.path, cwd);
+	if (root === undefined) return undefined;
+	return {
+		resources: [root],
+		input: { path: root, limit: normalizePositiveInteger(record.limit, LS_DEFAULT_LIMIT) },
 	};
 }
 

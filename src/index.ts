@@ -30,6 +30,7 @@ export {
 	inferredLocalIsolation,
 	KEYABLE_TOOLS,
 	type LocalIsolationMechanism,
+	LS_DEFAULT_LIMIT,
 	NO_LOCAL_ISOLATION_ACTION_TOOLS,
 	normalizeReadLimit,
 	normalizeReadOffset,

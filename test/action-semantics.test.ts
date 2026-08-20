@@ -17,15 +17,19 @@ import {
 
 describe("ActionSemanticsRegistry", () => {
 	it("defines K(a) resource evidence and host-local fallback without choosing an execution route", () => {
-		expect(PI_ACTION_SEMANTICS.toolNames()).toEqual(["read", "grep", "find", "bash", "write", "edit"]);
+		expect(PI_ACTION_SEMANTICS.toolNames()).toEqual(["read", "grep", "find", "ls", "bash", "write", "edit"]);
 		expect(KEYABLE_TOOLS).toEqual(PI_ACTION_SEMANTICS.toolNames());
-		expect(RESOURCE_SNAPSHOT_ACTION_TOOLS).toEqual(["read", "grep", "find"]);
+		expect(RESOURCE_SNAPSHOT_ACTION_TOOLS).toEqual(["read", "grep", "find", "ls"]);
 		expect(FILE_MUTATION_ACTION_TOOLS).toEqual(["write", "edit"]);
 		expect(NO_LOCAL_ISOLATION_ACTION_TOOLS).toEqual(["bash"]);
 
 		expect(PI_ACTION_SEMANTICS.definition("read")).toMatchObject({
 			localIsolation: "resource_snapshot",
 			resourceScope: "content",
+		});
+		expect(PI_ACTION_SEMANTICS.definition("ls")).toMatchObject({
+			localIsolation: "resource_snapshot",
+			resourceScope: "tree_entries",
 		});
 		expect(PI_ACTION_SEMANTICS.definition("bash")).toMatchObject({
 			localIsolation: "none",
@@ -34,6 +38,22 @@ describe("ActionSemanticsRegistry", () => {
 			localIsolation: "file_mutation",
 		});
 		expect(PI_ACTION_SEMANTICS.resourceScope("write")).toBeUndefined();
+	});
+
+	it("canonicalizes equivalent ls defaults and rejects unstable views", () => {
+		const implicit = buildPiActionKey("ls", {}, "/workspace");
+		const explicit = buildPiActionKey("ls", { path: ".", limit: 500 }, "/workspace");
+
+		expect(implicit?.key).toBe(explicit?.key);
+		expect(implicit).toMatchObject({
+			tool: "ls",
+			semanticsEpoch: "pi.ls.v1",
+			resources: ["."],
+			input: { path: ".", limit: 500 },
+		});
+		expect(buildPiActionKey("ls", { path: "../outside" }, "/workspace")).toBeUndefined();
+		expect(buildPiActionKey("ls", { limit: 0 }, "/workspace")).toBeUndefined();
+		expect(buildPiActionKey("ls", { limit: 1.5 }, "/workspace")).toBeUndefined();
 	});
 
 	it("keeps read's omitted-limit view distinct inside its versioned K(a)", () => {

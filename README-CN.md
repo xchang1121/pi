@@ -16,7 +16,7 @@ Runtime 分为四个相互独立的层次：
 | 优先级 | 路线 | 范围 |
 |---|---|---|
 | 1 | `runtime_sandbox` | 注入的 Runtime 全局沙箱；对所有启用工具优先 |
-| 2 | `resource_snapshot` | `read`、`grep`、`find` 的本地后备，通过资源版本证据保证新鲜度 |
+| 2 | `resource_snapshot` | `read`、`grep`、`find`、`ls` 的本地后备，通过资源版本证据保证新鲜度 |
 | 2 | `file_mutation` | `write`、`edit` 的本地后备，在私有 Git worktree 中执行并进行冲突检查后提交 |
 | 3 | Actor 回退 | 没有安全路线时完全不发起投机工具执行 |
 
@@ -33,7 +33,7 @@ Runtime 分为四个相互独立的层次：
 - 同时缺少 Runtime 沙箱和已注册本地后备的工具会被标记为 execution-blocked，但仍可参与匹配、学习和反事实计时。
 - 同名自定义工具保持权威；除非宿主显式提供一致的语义与执行能力，否则不会参与投机。
 
-`read` 支持由真实输出覆盖范围证明的无损区间投影；`grep` 和 `find` 暂时只做精确 K(a) 匹配。
+`read` 支持由真实输出覆盖范围证明的无损区间投影；`grep`、`find` 和 `ls` 暂时只做精确 K(a) 匹配。
 
 ## 在 Pi 中运行
 
@@ -66,7 +66,7 @@ pi -e ./packages/speculative-action
   "candidateLimit": 8,
   "maxConcurrentActions": 8,
   "drafterMaxTokens": 128,
-  "tools": ["read", "grep", "find", "bash", "write", "edit"],
+  "tools": ["read", "grep", "find", "ls", "bash", "write", "edit"],
   "patternAware": {
     "enabled": true,
     "multiStepEnabled": true

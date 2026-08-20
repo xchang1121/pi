@@ -8,6 +8,7 @@ import {
 	createEditToolDefinition,
 	createFindToolDefinition,
 	createGrepToolDefinition,
+	createLsToolDefinition,
 	createReadToolDefinition,
 	createWriteToolDefinition,
 	type ExtensionAPI,
@@ -60,7 +61,8 @@ type BaseToolDefinition =
 	| ReturnType<typeof createEditToolDefinition>
 	| ReturnType<typeof createWriteToolDefinition>
 	| ReturnType<typeof createGrepToolDefinition>
-	| ReturnType<typeof createFindToolDefinition>;
+	| ReturnType<typeof createFindToolDefinition>
+	| ReturnType<typeof createLsToolDefinition>;
 
 export interface EffectiveSpeculativeActionSettings {
 	readonly enabled: boolean;
@@ -465,6 +467,7 @@ function createBaseToolDefinitions(cwd: string, settings: PiToolSettings): Map<s
 		["write", createWriteToolDefinition(cwd)],
 		["grep", createGrepToolDefinition(cwd)],
 		["find", createFindToolDefinition(cwd)],
+		["ls", createLsToolDefinition(cwd)],
 	]);
 }
 

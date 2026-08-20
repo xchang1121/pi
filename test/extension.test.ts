@@ -10,6 +10,7 @@ import {
 	createEditToolDefinition,
 	createFindToolDefinition,
 	createGrepToolDefinition,
+	createLsToolDefinition,
 	createReadToolDefinition,
 	createWriteToolDefinition,
 	DefaultResourceLoader,
@@ -42,7 +43,8 @@ type StockToolDefinition =
 	| ReturnType<typeof createEditToolDefinition>
 	| ReturnType<typeof createWriteToolDefinition>
 	| ReturnType<typeof createGrepToolDefinition>
-	| ReturnType<typeof createFindToolDefinition>;
+	| ReturnType<typeof createFindToolDefinition>
+	| ReturnType<typeof createLsToolDefinition>;
 
 afterEach(async () => {
 	await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
@@ -69,7 +71,7 @@ describe("zero-modification Pi extension", () => {
 		});
 		await fixture.emit("session_start", {}, fixture.context);
 
-		expect([...fixture.tools.keys()].sort()).toEqual(["bash", "edit", "find", "grep", "read", "write"]);
+		expect([...fixture.tools.keys()].sort()).toEqual(["bash", "edit", "find", "grep", "ls", "read", "write"]);
 		const read = fixture.tools.get("read");
 		expect(read).toMatchObject({ name: "read", label: "read" });
 		await fixture.emit("context", { messages: [] }, fixture.context);
@@ -84,7 +86,7 @@ describe("zero-modification Pi extension", () => {
 		const fixture = await createFixture();
 		await fixture.emit("session_start", {}, fixture.context);
 
-		for (const name of ["bash", "edit", "find", "grep", "read", "write"]) {
+		for (const name of ["bash", "edit", "find", "grep", "ls", "read", "write"]) {
 			const tool = fixture.tools.get(name);
 			expect(tool?.renderCall, `${name} renderCall`).toBeTypeOf("function");
 			expect(tool?.renderResult, `${name} renderResult`).toBeTypeOf("function");
@@ -179,7 +181,7 @@ describe("zero-modification Pi extension", () => {
 		await fixture.emit("session_start", {}, fixture.context);
 		await fixture.commands.get("speculative-action")?.handler("status", fixture.context as ExtensionCommandContext);
 
-		expect([...fixture.tools.keys()].sort()).toEqual(["bash", "edit", "find", "grep", "read", "write"]);
+		expect([...fixture.tools.keys()].sort()).toEqual(["bash", "edit", "find", "grep", "ls", "read", "write"]);
 		expect(fixture.ui.notify).toHaveBeenLastCalledWith(
 			expect.stringContaining("Custom tool conflicts: none"),
 			"warning",
@@ -317,6 +319,7 @@ async function createFixture(options: FixtureOptions = {}) {
 	baseTools.set("write", createWriteToolDefinition(cwd));
 	baseTools.set("grep", createGrepToolDefinition(cwd));
 	baseTools.set("find", createFindToolDefinition(cwd));
+	baseTools.set("ls", createLsToolDefinition(cwd));
 	const actorTools = new Map<string, StockToolDefinition | ToolDefinition>(baseTools);
 	const toolSources = new Map<string, SourceInfo>(
 		[...baseTools.keys()].map((name) => [name, sourceInfo(`<builtin:${name}>`, "builtin")]),

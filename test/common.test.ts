@@ -219,7 +219,7 @@ describe("speculative action common", () => {
 	});
 
 	it("selects prediction tools independently from their execution route", () => {
-		expect(DEFAULTS.tools).toEqual(["read", "grep", "find", "bash", "write", "edit"]);
+		expect(DEFAULTS.tools).toEqual(["read", "grep", "find", "ls", "bash", "write", "edit"]);
 		expect(
 			candidateToolNames({
 				enabled: true,
