@@ -5,7 +5,6 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { contains } from "./action-semantics.ts";
-import type { ToolProcessInvocation } from "./tool-settlement.ts";
 import type {
 	SandboxProcessBackend,
 	SandboxProcessBackendStatus,
@@ -115,22 +114,18 @@ let cachedDefaultStatus: Promise<NativeSandboxStatus> | undefined;
 export function createNativeSandboxProcessBackend(options: NativeSandboxOptions = {}): SandboxProcessBackend {
 	return {
 		check: (input) => checkNativeSandboxRuntime({ ...options, ...input }),
-		supports: (invocation) => nativeInvocationSupported(invocation, options.platform ?? process.platform),
-		fingerprint: async (invocation) => {
-			assertNativeInvocationSupported(invocation, options.platform ?? process.platform);
+		fingerprint: async () => {
 			const status = await checkNativeSandboxRuntime(options);
 			if (status.state !== "ready" || !status.fingerprint) throw new Error(status.detail);
 			return status.fingerprint;
 		},
-		prepare: async ({ signal, invocation }) => {
-			assertNativeInvocationSupported(invocation, options.platform ?? process.platform);
+		prepare: async ({ signal }) => {
 			throwIfAborted(signal);
 			const status = await checkNativeSandboxRuntime(options);
 			if (status.state !== "ready") throw new Error(status.detail);
 			throwIfAborted(signal);
 		},
-		open: async ({ parent, signal, invocation }) => {
-			assertNativeInvocationSupported(invocation, options.platform ?? process.platform);
+		open: async ({ parent, signal }) => {
 			throwIfAborted(signal);
 			const processRoot = await mkdtemp(path.join(parent, "action-"));
 			let closed = false;
@@ -146,21 +141,6 @@ export function createNativeSandboxProcessBackend(options: NativeSandboxOptions 
 		},
 		dispose: async () => {},
 	};
-}
-
-function nativeInvocationSupported(invocation: ToolProcessInvocation, platform: NodeJS.Platform): boolean {
-	if (platform !== "win32") return true;
-	const shell = path.win32.basename(invocation.shell).toLowerCase();
-	return shell !== "bash" && shell !== "bash.exe";
-}
-
-function assertNativeInvocationSupported(
-	invocation: ToolProcessInvocation | undefined,
-	platform: NodeJS.Platform,
-): void {
-	if (invocation && !nativeInvocationSupported(invocation, platform)) {
-		throw new Error(`Native sandbox is incompatible with shell ${invocation.shell}.`);
-	}
 }
 
 /** Execute one command through the versioned native broker protocol. */

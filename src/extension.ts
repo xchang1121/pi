@@ -1099,7 +1099,7 @@ async function openToolsAndSandbox(
 		}
 		if (choice === "Isolation guarantees") {
 			ctx.ui.notify(
-				"Speculative file edits run in private Git worktrees. Bash additionally runs in the selected process boundary: an OCI worker, or the native OS sandbox. Git for Windows requires OCI because MSYS cannot initialize in AppContainer. Only conflict-checked file changes are committed; failed candidates are discarded and the actor executes normally.",
+				"Speculative file edits run in private Git worktrees. Bash additionally runs in the selected process boundary: an OCI worker, or the native OS sandbox. Only conflict-checked file changes are committed; failed candidates are discarded and the actor executes normally.",
 				"info",
 			);
 		}
