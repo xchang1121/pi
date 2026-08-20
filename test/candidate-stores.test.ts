@@ -74,17 +74,14 @@ describe("ResultCache", () => {
 		expect(cache.evidenceOf("one", shared)).toMatchObject({
 			segment: "cold",
 			actorHits: 1,
-			decisionBatches: 0,
 		});
 		expect(cache.evidenceOf("one", valuable)).toMatchObject({
 			segment: "hot",
 			actorHits: 1,
-			decisionBatches: 0,
 		});
 		expect(cache.evidenceOf("two", shared)).toMatchObject({
 			segment: "cold",
 			actorHits: 0,
-			decisionBatches: 0,
 		});
 		expect(cache.trim("one", { maxEntries: 2, maxBytes: 16 })).toEqual([worthless]);
 		expect(cache.trim("one", { maxEntries: 1, maxBytes: 8 })).toEqual([shared]);
@@ -127,35 +124,6 @@ describe("ResultCache", () => {
 		expect(cache.evidenceOf("session", fresh)).toBeDefined();
 		expect(cache.delete("session", fresh)).toBe(true);
 		expect(cache.values("session")).toEqual([older]);
-	});
-
-	it("ages only cold entries by decision batches or cold-segment wall time", () => {
-		let now = 1_000;
-		const cache = new ResultCache<string, Entry>(
-			[],
-			() => 0,
-			() => now,
-		);
-		const missed = entry("missed", "missed.ts");
-		const hotEntry = entry("hot", "hot.ts");
-		cache.insert("session", missed);
-		cache.insert("session", hotEntry);
-		cache.recordActorHit("session", hotEntry);
-
-		const policy = { maxAgeMs: 1_000, maxDecisionBatches: 2 };
-		expect(cache.advanceDecisionBatch("session", policy)).toEqual([]);
-		expect(cache.advanceDecisionBatch("session", policy)).toEqual([]);
-		expect(cache.advanceDecisionBatch("session", policy)).toEqual([missed]);
-		expect(cache.evidenceOf("session", hotEntry)).toMatchObject({
-			segment: "hot",
-			actorHits: 1,
-			decisionBatches: 0,
-		});
-
-		const timedOut = entry("timed-out", "timed.ts");
-		cache.insert("session", timedOut);
-		now += 1_000;
-		expect(cache.advanceDecisionBatch("session", policy)).toEqual([timedOut]);
 	});
 
 	it("decays proven reuse value while keeping validation and projection costs honest", () => {

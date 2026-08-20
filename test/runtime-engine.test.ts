@@ -899,7 +899,7 @@ describe("structural speculative runtime", () => {
 		).toEqual([1, 2]);
 	});
 
-	it("retains a completed result through its prediction deadline", async () => {
+	it("retains a fresh completed result after its prediction is settled", async () => {
 		const source: Source = {
 			id: "source",
 			enabled: () => true,
@@ -914,7 +914,6 @@ describe("structural speculative runtime", () => {
 									tool: "read",
 									input: { path: "future.ts" },
 									horizon: 0,
-									latestHorizon: 12,
 								},
 							],
 						}

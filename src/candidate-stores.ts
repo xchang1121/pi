@@ -180,12 +180,6 @@ export interface ResultCacheLimits {
 	readonly hotFraction?: number;
 }
 
-export interface ResultCacheColdPolicy {
-	readonly maxAgeMs: number;
-	/** A cold entry is evicted after more than this many Actor decision batches pass without a hit. */
-	readonly maxDecisionBatches: number;
-}
-
 export interface SpeculativeCacheValueMetrics {
 	readonly executionMs: number;
 	readonly expectedValidationMs: number;
@@ -219,8 +213,6 @@ export function speculativeCacheValue(
 export interface ResultCacheEvidence {
 	readonly segment: ResultCacheSegment;
 	readonly insertedAt: number;
-	readonly segmentEnteredAt: number;
-	readonly decisionBatches: number;
 	readonly actorHits: number;
 	readonly lastActorHitAt?: number;
 }
@@ -274,36 +266,11 @@ export class ResultCache<Scope, Entry extends SizedActionStoreEntry> {
 		this.metadataFor(scope).set(entry, {
 			...current,
 			segment: "hot",
-			segmentEnteredAt: current.segment === "hot" ? current.segmentEnteredAt : now,
-			decisionBatches: 0,
 			actorHits: current.actorHits + 1,
 			lastActorHitAt: now,
 		});
 		this.index.touch(scope, entry);
 		return limits ? this.rebalanceHot(scope, limits) : [];
-	}
-
-	advanceDecisionBatch(
-		scope: Scope,
-		policy: ResultCacheColdPolicy,
-		canEvict: (entry: Entry) => boolean = () => true,
-	): readonly Entry[] {
-		const now = this.now();
-		const maxAgeMs = expirationLimit(policy.maxAgeMs);
-		const maxDecisionBatches = expirationLimit(policy.maxDecisionBatches);
-		const expired: Entry[] = [];
-		for (const entry of this.index.values(scope)) {
-			const current = this.metadata.get(scope)?.get(entry);
-			if (!current || current.segment !== "cold") continue;
-			const decisionBatches = current.decisionBatches + 1;
-			if ((now - current.segmentEnteredAt >= maxAgeMs || decisionBatches > maxDecisionBatches) && canEvict(entry)) {
-				this.delete(scope, entry);
-				expired.push(entry);
-				continue;
-			}
-			this.metadataFor(scope).set(entry, { ...current, decisionBatches });
-		}
-		return expired;
 	}
 
 	evidenceOf(scope: Scope, entry: Entry): ResultCacheEvidence | undefined {
@@ -388,8 +355,6 @@ export class ResultCache<Scope, Entry extends SizedActionStoreEntry> {
 		this.metadataFor(scope).set(entry, {
 			segment: "cold",
 			insertedAt: now,
-			segmentEnteredAt: now,
-			decisionBatches: 0,
 			actorHits: 0,
 		});
 	}
@@ -413,8 +378,6 @@ export class ResultCache<Scope, Entry extends SizedActionStoreEntry> {
 			this.metadataFor(scope).set(victim, {
 				...current,
 				segment: "cold",
-				segmentEnteredAt: now,
-				decisionBatches: 0,
 			});
 			demoted.push(victim);
 		}
@@ -445,10 +408,6 @@ function finiteFraction(value: number): number {
 
 function finiteValue(value: number): number {
 	return Number.isFinite(value) ? Math.max(0, value) : 0;
-}
-
-function expirationLimit(value: number): number {
-	return Number.isFinite(value) ? Math.max(0, value) : Number.POSITIVE_INFINITY;
 }
 
 function entryBytes(entry: SizedActionStoreEntry): number {

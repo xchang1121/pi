@@ -656,9 +656,6 @@ type ProjectionResult<Output> =
 	| { readonly ok: true; readonly output: Output; readonly durationMs: number }
 	| { readonly ok: false; readonly cause: ResolutionCause };
 
-const CACHE_COLD_MAX_AGE_MS = 5 * 60 * 1000;
-const CACHE_COLD_MAX_DECISION_BATCHES = 8;
-
 /** Structural runtime: plans own predictions, candidates own execution, ActorAction owns adoption. */
 export function makeStructuralSpeculativeActionRuntime<
 	SessionID,
@@ -2310,23 +2307,6 @@ export function makeStructuralSpeculativeActionRuntime<
 		}
 	};
 
-	const advanceColdCache = (session: Session, settings: SpeculativeActionSettings): void => {
-		for (const candidate of results.advanceDecisionBatch(
-			session.id,
-			{
-				maxAgeMs: CACHE_COLD_MAX_AGE_MS,
-				maxDecisionBatches: CACHE_COLD_MAX_DECISION_BATCHES,
-			},
-			(candidate) =>
-				!nodesForCandidate(session, candidate.id).some(
-					(node) => node.predictionState && node.predictionState.status !== "settled",
-				),
-		)) {
-			removeCandidate(session, candidate);
-		}
-		trimResults(session, settings);
-	};
-
 	const reconcileAdoptedCandidate = (session: Session, action: ActionKey, adopted: Candidate): void => {
 		invalidateChangedResources(session, action, adopted);
 		adopted.actorAdopted = true;
@@ -2365,7 +2345,6 @@ export function makeStructuralSpeculativeActionRuntime<
 		const completedAt = performance.now();
 		closeActorPhase(state, completedAt);
 		settlePredictionFrontier(state);
-		if (state.actorActions.length) advanceColdCache(state.session, state.settings);
 		state.lifecycle = "closing";
 		state.generation.expire(cause("control", terminal ? "terminal_turn" : "turn_finished"));
 		if (terminal) {
