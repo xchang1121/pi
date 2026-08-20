@@ -544,7 +544,10 @@ export class PlanRuntime {
 					: node.anchorDecisionSeq + relativeHorizon(node.action) + 1;
 				for (const dependency of node.action.dependsOn ?? []) {
 					const parent = plan.nodes.get(dependency.actionID);
-					if (parent) value = Math.max(value, calculate(parent) + 1);
+					if (parent) {
+						const actorDecisionDistance = parent.action.type === "preparation_hint" ? 0 : 1;
+						value = Math.max(value, calculate(parent) + actorDecisionDistance);
+					}
 				}
 				visiting.delete(node.action.id);
 				memo.set(node.action.id, value);

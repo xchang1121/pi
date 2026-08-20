@@ -101,7 +101,7 @@ function call(turnID: string, input: Record<string, unknown> = { path: "README.m
 }
 
 describe("structural speculative runtime", () => {
-	it("executes preparation work without issuing or settling an Actor prediction", async () => {
+	it("keeps preparation outside prediction settlement while launching its child for the same decision", async () => {
 		const issued = vi.fn();
 		const settled = vi.fn();
 		const source: Source = {
@@ -119,6 +119,13 @@ describe("structural speculative runtime", () => {
 						input: { path: "README.md" },
 						feedback: "warm",
 					},
+					{
+						id: "after-warm",
+						type: "tool_call",
+						tool: "read",
+						input: { path: "README.md" },
+						dependsOn: [{ actionID: "warm", condition: "execution_succeeded" }],
+					},
 				],
 			}),
 			onIssued: issued,
@@ -126,12 +133,13 @@ describe("structural speculative runtime", () => {
 		};
 		const fixture = harness({ source });
 		await fixture.runtime.startTurn({ sessionID: "session", turnID: "prepare" });
-		await waitFor(() => fixture.events.some((event) => event.type === "source_request"));
+		await waitFor(() => fixture.runtime.inspect().sharedCandidates === 1);
+		expect(await fixture.runtime.consume(call("prepare"))).toBe("speculative");
 		await fixture.runtime.finishTurn({ ...call("prepare"), terminal: true });
 
-		expect(issued).not.toHaveBeenCalled();
-		expect(settled).not.toHaveBeenCalled();
-		expect(fixture.events.filter((event) => event.type === "prediction")).toEqual([]);
+		expect(issued).toHaveBeenCalledTimes(1);
+		expect(settled).toHaveBeenCalledTimes(1);
+		expect(fixture.events.filter((event) => event.type === "prediction")).toHaveLength(1);
 	});
 
 	it("settles matched and adopted as orthogonal facts exactly once", async () => {

@@ -195,6 +195,12 @@ describe("PlanRuntime", () => {
 		execution.succeed(undefined, 2, 1);
 
 		expect(plan.get("plan", "prepare")).toMatchObject({ execution: { status: "succeeded" }, readiness: "settled" });
+		expect(plan.get("plan", "after")).toMatchObject({
+			earliestDecisionSeq: 1,
+			expectedDecisionSeq: 1,
+			latestDecisionSeq: 1,
+		});
+		expect(plan.matchable(1).map((node) => node.action.id)).toEqual(["after"]);
 		expect(plan.launchable().map((node) => node.action.id)).toEqual(["after"]);
 		expect(plan.unobserve("plan", "prepare", cause("control", "should_not_exist"))).toBeUndefined();
 
