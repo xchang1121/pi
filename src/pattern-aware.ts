@@ -281,7 +281,7 @@ export const PATTERN_AWARE_DEFAULTS: PatternAwareSettings = {
 	maxFutureGap: 8,
 	futureGapCoverage: 0.25,
 	decayHalfLifeEvents: 2048,
-	minOccurrences: 3,
+	minOccurrences: 2,
 	minBindingReplayProbability: 0.75,
 	maxPatterns: 4096,
 };
@@ -969,7 +969,10 @@ export class PatternAwareStore {
 			candidates.set(stableStringify(bindingMapStructure(bindings)), bindings);
 		};
 		for (const patternID of pool.patternIDs ?? []) remember(this.patterns.get(patternID)?.bindings);
-		remember(inferBindings(context, target.input));
+		const currentBindings = inferBindings(context, target.input);
+		if (hasSufficientBindingProvenance(currentBindings, pool.samples, bindingEvidenceThreshold(this.settings))) {
+			remember(currentBindings);
+		}
 		remember(
 			inferBindingsFromSamples(
 				pool.samples,
@@ -1522,6 +1525,22 @@ function requiresProvenance(targetPath: PatternAwarePath, value: unknown): boole
 function stablePayloadConstant(samples: ReadonlyArray<PatternSample>, minimum: number): boolean {
 	if (samples.length < minimum) return false;
 	return new Set(samples.map((sample) => `${sample.target.sessionID}:${sample.target.turnID}`)).size >= minimum;
+}
+
+function hasSufficientBindingProvenance(
+	bindings: Readonly<Record<string, PatternAwareBinding>>,
+	samples: ReadonlyArray<PatternSample>,
+	minimum: number,
+) {
+	return Object.entries(bindings).every(([encodedPath, binding]) => {
+		const targetPath = decodePath(encodedPath);
+		return (
+			!targetPath ||
+			binding.type !== "constant" ||
+			!requiresProvenance(targetPath, binding.value) ||
+			stablePayloadConstant(samples, minimum)
+		);
+	});
 }
 
 const MISSING = Symbol("missing");

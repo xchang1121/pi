@@ -677,14 +677,13 @@ describe("PatternAware", () => {
 		});
 	});
 
-	test("requires three positive examples before admitting a default mapper", () => {
+	test("admits a replayable relation after two positive examples", () => {
 		const store = new PatternAwareStore(PATTERN_AWARE_DEFAULTS);
 		trainGrepRead(store, "one", "src/a.ts");
-		trainGrepRead(store, "two", "src/b.ts");
 		expect(store.snapshot()).toEqual([]);
 
-		trainGrepRead(store, "three", "src/c.ts");
-		expect(store.snapshot()).toContainEqual(expect.objectContaining({ targetTool: "read", occurrences: 3 }));
+		trainGrepRead(store, "two", "src/b.ts");
+		expect(store.snapshot()).toContainEqual(expect.objectContaining({ targetTool: "read", occurrences: 2 }));
 	});
 
 	test("emits weak control-flow candidates for bounded utility admission", () => {
@@ -1112,16 +1111,23 @@ describe("PatternAware", () => {
 		expect(probabilities.reduce((sum, value) => sum + value, 0)).toBeLessThanOrEqual(1);
 	});
 
-	test("uses the configured support floor for recurring constant actions", () => {
+	test("does not let single-sample mappers bypass constant provenance evidence", () => {
 		const store = new PatternAwareStore(settings());
-		for (const sessionID of ["one", "two"]) {
+		for (const sessionID of ["one", "two", "three"]) {
 			store.observe(input({ sessionID, tool: "inspect", input: {}, output: { kind: "path" } }));
 			store.observe(input({ sessionID, tool: "read", input: { filePath: "README.md" } }));
 			store.finishSession(sessionID);
 		}
 
 		store.observe(input({ sessionID: "probe", tool: "inspect", input: {}, output: { kind: "path" } }));
-		expect(store.predict("probe")).toContainEqual(
+		expect(store.predict("probe")).toEqual([]);
+		store.finishSession("probe");
+		store.observe(input({ sessionID: "four", tool: "inspect", input: {}, output: { kind: "path" } }));
+		store.observe(input({ sessionID: "four", tool: "read", input: { filePath: "README.md" } }));
+		store.finishSession("four");
+
+		store.observe(input({ sessionID: "probe-after-four", tool: "inspect", input: {}, output: { kind: "path" } }));
+		expect(store.predict("probe-after-four")).toContainEqual(
 			expect.objectContaining({ tool: "read", input: { filePath: "README.md" } }),
 		);
 	});
