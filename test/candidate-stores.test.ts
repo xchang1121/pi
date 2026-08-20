@@ -71,9 +71,21 @@ describe("ResultCache", () => {
 		]);
 		cache.insert("one", worthless);
 
-		expect(cache.evidenceOf("one", shared)).toMatchObject({ segment: "cold", actorHits: 1, actorSteps: 0 });
-		expect(cache.evidenceOf("one", valuable)).toMatchObject({ segment: "hot", actorHits: 1, actorSteps: 0 });
-		expect(cache.evidenceOf("two", shared)).toMatchObject({ segment: "cold", actorHits: 0, actorSteps: 0 });
+		expect(cache.evidenceOf("one", shared)).toMatchObject({
+			segment: "cold",
+			actorHits: 1,
+			decisionBatches: 0,
+		});
+		expect(cache.evidenceOf("one", valuable)).toMatchObject({
+			segment: "hot",
+			actorHits: 1,
+			decisionBatches: 0,
+		});
+		expect(cache.evidenceOf("two", shared)).toMatchObject({
+			segment: "cold",
+			actorHits: 0,
+			decisionBatches: 0,
+		});
 		expect(cache.trim("one", { maxEntries: 2, maxBytes: 16 })).toEqual([worthless]);
 		expect(cache.trim("one", { maxEntries: 1, maxBytes: 8 })).toEqual([shared]);
 		expect(cache.values("one")).toEqual([valuable]);
@@ -103,7 +115,7 @@ describe("ResultCache", () => {
 		expect(branches.values("session")).toEqual([branch]);
 	});
 
-	it("ages only cold entries by explicit Actor steps or cold-segment wall time", () => {
+	it("ages only cold entries by decision batches or cold-segment wall time", () => {
 		let now = 1_000;
 		const cache = new ResultCache<string, Entry>(
 			[],
@@ -116,16 +128,20 @@ describe("ResultCache", () => {
 		cache.insert("session", hotEntry);
 		cache.recordActorHit("session", hotEntry);
 
-		const policy = { maxAgeMs: 1_000, maxActorSteps: 2 };
-		expect(cache.advanceActorStep("session", policy)).toEqual([]);
-		expect(cache.advanceActorStep("session", policy)).toEqual([]);
-		expect(cache.advanceActorStep("session", policy)).toEqual([missed]);
-		expect(cache.evidenceOf("session", hotEntry)).toMatchObject({ segment: "hot", actorHits: 1, actorSteps: 0 });
+		const policy = { maxAgeMs: 1_000, maxDecisionBatches: 2 };
+		expect(cache.advanceDecisionBatch("session", policy)).toEqual([]);
+		expect(cache.advanceDecisionBatch("session", policy)).toEqual([]);
+		expect(cache.advanceDecisionBatch("session", policy)).toEqual([missed]);
+		expect(cache.evidenceOf("session", hotEntry)).toMatchObject({
+			segment: "hot",
+			actorHits: 1,
+			decisionBatches: 0,
+		});
 
 		const timedOut = entry("timed-out", "timed.ts");
 		cache.insert("session", timedOut);
 		now += 1_000;
-		expect(cache.advanceActorStep("session", policy)).toEqual([timedOut]);
+		expect(cache.advanceDecisionBatch("session", policy)).toEqual([timedOut]);
 	});
 
 	it("decays proven reuse value while keeping validation and projection costs honest", () => {

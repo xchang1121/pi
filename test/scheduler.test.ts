@@ -16,22 +16,27 @@ describe("SpeculationScheduler", () => {
 
 	it("merges duplicate K(a) forecasts without source-count inflation", () => {
 		const scheduler = new SpeculationScheduler<object>();
-		const one = scheduler.evaluate([forecast({ expectedDurationMs: 100, stepsUntilCall: 3, criticalPathMs: 120 })]);
+		const one = scheduler.evaluate([
+			forecast({ expectedDurationMs: 100, decisionBatchesUntilCall: 3, criticalPathMs: 120 }),
+		]);
 		const duplicate = scheduler.evaluate([
-			forecast({ expectedDurationMs: 100, stepsUntilCall: 3, criticalPathMs: 120 }),
-			forecast({ expectedDurationMs: 80, stepsUntilCall: 4, criticalPathMs: 100 }),
+			forecast({ expectedDurationMs: 100, decisionBatchesUntilCall: 3, criticalPathMs: 120 }),
+			forecast({ expectedDurationMs: 80, decisionBatchesUntilCall: 4, criticalPathMs: 100 }),
 		]);
 		expect(duplicate).toEqual(one);
 	});
 
 	it("uses conservative observed quantiles to schedule future actions", () => {
 		const scheduler = new SpeculationScheduler<object>();
-		for (const duration of [80, 100, 120, 200]) scheduler.observeActorStep(duration);
+		for (const duration of [80, 100, 120, 200]) scheduler.observeActorDecisionInterval(duration);
 		for (const duration of [20, 40, 60, 100]) scheduler.observeService("read", duration);
 		expect(
-			scheduler.launchDelay(forecast({ stepsUntilCall: 3, sourceLatencyMs: 20, expectedDurationMs: 40 }), 10),
+			scheduler.launchDelay(
+				forecast({ decisionBatchesUntilCall: 3, sourceLatencyMs: 20, expectedDurationMs: 40 }),
+				10,
+			),
 		).toBe(150);
-		expect(scheduler.launchDelay(forecast({ stepsUntilCall: 1, sourceLatencyMs: 1_000 }))).toBe(0);
+		expect(scheduler.launchDelay(forecast({ decisionBatchesUntilCall: 1, sourceLatencyMs: 1_000 }))).toBe(0);
 	});
 
 	it("prioritizes explicit expected latency benefit without requiring it from every source", () => {
@@ -52,8 +57,8 @@ describe("SpeculationScheduler", () => {
 		const scheduler = new SpeculationScheduler<object>();
 		const nearCritical = {};
 		const farNoncritical = {};
-		scheduler.admit(nearCritical, [forecast({ stepsUntilCall: 1, criticalPathMs: 500 })], 2);
-		scheduler.admit(farNoncritical, [forecast({ stepsUntilCall: 4, criticalPathMs: 10 })], 2);
+		scheduler.admit(nearCritical, [forecast({ decisionBatchesUntilCall: 1, criticalPathMs: 500 })], 2);
+		scheduler.admit(farNoncritical, [forecast({ decisionBatchesUntilCall: 4, criticalPathMs: 10 })], 2);
 		expect(scheduler.preemptForAuthoritative({ class: "filesystem", units: 1 }, 2)).toEqual([farNoncritical]);
 		expect(scheduler.snapshot().map((entry) => entry.job)).toEqual([nearCritical]);
 	});
@@ -62,8 +67,8 @@ describe("SpeculationScheduler", () => {
 		const scheduler = new SpeculationScheduler<object>();
 		const joined = {};
 		const idle = {};
-		scheduler.admit(joined, [forecast({ stepsUntilCall: 5 })], 2);
-		scheduler.admit(idle, [forecast({ stepsUntilCall: 1 })], 2);
+		scheduler.admit(joined, [forecast({ decisionBatchesUntilCall: 5 })], 2);
+		scheduler.admit(idle, [forecast({ decisionBatchesUntilCall: 1 })], 2);
 
 		expect(
 			scheduler.preemptForAuthoritative({ class: "filesystem", units: 1 }, 2, (candidate) => candidate !== joined),
@@ -100,7 +105,7 @@ function forecast(overrides: Partial<PredictionForecast> = {}): PredictionForeca
 		execution: "resource_cached",
 		sandboxMode: "none",
 		expectedDurationMs: 50,
-		stepsUntilCall: 1,
+		decisionBatchesUntilCall: 1,
 		...overrides,
 	};
 }

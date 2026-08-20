@@ -759,6 +759,42 @@ describe("structural speculative runtime", () => {
 		).toEqual([1, 2]);
 	});
 
+	it("retains a completed result through its prediction deadline", async () => {
+		const source: Source = {
+			id: "source",
+			enabled: () => true,
+			propose: ({ startInput }) =>
+				startInput.turnID === "turn-1"
+					? {
+							...plan("source", "future", { path: "future.ts" }),
+							actions: [
+								{
+									id: "next",
+									type: "tool_call",
+									tool: "read",
+									input: { path: "future.ts" },
+									horizon: 0,
+									latestHorizon: 8,
+								},
+							],
+						}
+					: { id: `empty:${startInput.turnID}`, source: "source", revision: 0, actions: [] },
+		};
+		const fixture = harness({ source, execute: () => "future" });
+		for (let index = 1; index <= 8; index++) {
+			const turnID = `turn-${index}`;
+			await fixture.runtime.startTurn({ sessionID: "session", turnID });
+			if (index === 1) await waitFor(() => fixture.runtime.inspect().sharedCandidates === 1);
+			const unrelated = { ...call(turnID, { path: `other-${index}.ts` }), id: `other-${index}` };
+			expect(await fixture.runtime.consume(unrelated)).toBeUndefined();
+			await fixture.runtime.actual({ ...unrelated, durationMs: 1, output: "other" });
+			await fixture.runtime.finishTurn({ ...unrelated, terminal: false });
+		}
+		await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn-9" });
+		expect(await fixture.runtime.consume(call("turn-9", { path: "future.ts" }))).toBe("future");
+		await fixture.runtime.finishTurn({ ...call("turn-9"), terminal: true });
+	});
+
 	it("recalculates a distant prediction deadline across Actor turns", async () => {
 		let executions = 0;
 		const source: Source = {

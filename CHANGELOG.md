@@ -48,6 +48,7 @@
 
 ### Fixed
 
+- Probation cache aging now advances after each Actor decision batch, after matching, so a completed multi-step prediction remains adoptable through its declared deadline even when a batch contains multiple tool calls.
 - Query K(a) now preserves `read`'s omitted-limit semantics and rejects numeric views that Pi tools do not interpret as stable integer ranges.
 - Tool error settlements are discarded before they can become reusable speculative cache entries.
 - Package shutdown now releases owned workspace sandbox pools immediately instead of retaining Windows file watchers until the idle timeout.

@@ -13,7 +13,7 @@ export interface PredictionForecast {
 	readonly sandboxMode: "none" | "workspace_snapshot" | "file_mutation";
 	readonly expectedDurationMs?: number;
 	readonly resourceDemand?: number;
-	readonly stepsUntilCall?: number;
+	readonly decisionBatchesUntilCall?: number;
 	readonly sourceLatencyMs?: number;
 	readonly criticalPathMs?: number;
 	readonly expectedLatencyBenefitMs?: number;
@@ -22,7 +22,7 @@ export interface PredictionForecast {
 export interface ScheduledWork {
 	readonly expectedDurationMs: number;
 	readonly resource: SpeculativeResourceProfile;
-	readonly stepsUntilCall: number;
+	readonly decisionBatchesUntilCall: number;
 	readonly criticalPathMs: number;
 	readonly priorityMs: number;
 }
@@ -53,7 +53,7 @@ interface SchedulerEntry<Job> {
 export class SpeculationScheduler<Job extends object> {
 	private readonly entries = new Map<Job, SchedulerEntry<Job>>();
 	private readonly serviceTimes = new Map<string, SampleWindow>();
-	private readonly actorSteps = new SampleWindow();
+	private readonly actorDecisionIntervals = new SampleWindow();
 	private sequence = 0;
 
 	admit(
@@ -120,20 +120,23 @@ export class SpeculationScheduler<Job extends object> {
 		return {
 			expectedDurationMs: Math.max(...evaluated.map((item) => item.expectedDurationMs)),
 			resource,
-			stepsUntilCall: Math.min(...evaluated.map((item) => item.stepsUntilCall)),
+			decisionBatchesUntilCall: Math.min(...evaluated.map((item) => item.decisionBatchesUntilCall)),
 			criticalPathMs: Math.max(...evaluated.map((item) => item.criticalPathMs)),
 			priorityMs: Math.max(...evaluated.map((item) => item.priorityMs)),
 		};
 	}
 
 	launchDelay(forecast: PredictionForecast, safetyMarginMs = 10): number {
-		const stepsUntilCall = sequence(forecast.stepsUntilCall);
-		if (stepsUntilCall <= 1) return 0;
+		const decisionBatchesUntilCall = sequence(forecast.decisionBatchesUntilCall);
+		if (decisionBatchesUntilCall <= 1) return 0;
 		const duration = this.duration(forecast, 0.9);
-		const actorStepMs = this.actorSteps.quantile(0.25, Math.max(50, duration * 2));
+		const actorDecisionMs = this.actorDecisionIntervals.quantile(0.25, Math.max(50, duration * 2));
 		return Math.max(
 			0,
-			stepsUntilCall * actorStepMs - duration - finite(forecast.sourceLatencyMs) - finite(safetyMarginMs),
+			decisionBatchesUntilCall * actorDecisionMs -
+				duration -
+				finite(forecast.sourceLatencyMs) -
+				finite(safetyMarginMs),
 		);
 	}
 
@@ -153,8 +156,8 @@ export class SpeculationScheduler<Job extends object> {
 			: { compatible: false, code: "execution_fingerprint_changed" };
 	}
 
-	observeActorStep(durationMs: number): void {
-		this.actorSteps.observe(durationMs);
+	observeActorDecisionInterval(durationMs: number): void {
+		this.actorDecisionIntervals.observe(durationMs);
 	}
 
 	observeService(tool: string, durationMs: number): void {
@@ -180,7 +183,7 @@ export class SpeculationScheduler<Job extends object> {
 		return {
 			expectedDurationMs,
 			resource,
-			stepsUntilCall: sequence(forecast.stepsUntilCall),
+			decisionBatchesUntilCall: sequence(forecast.decisionBatchesUntilCall),
 			criticalPathMs,
 			priorityMs:
 				forecast.expectedLatencyBenefitMs === undefined
@@ -218,7 +221,7 @@ function emptyWork(): ScheduledWork {
 	return {
 		expectedDurationMs: 0,
 		resource: { class: "filesystem", units: 1 },
-		stepsUntilCall: 0,
+		decisionBatchesUntilCall: 0,
 		criticalPathMs: 0,
 		priorityMs: 0,
 	};
@@ -226,7 +229,7 @@ function emptyWork(): ScheduledWork {
 
 function compareVictim<Job>(left: SchedulerEntry<Job>, right: SchedulerEntry<Job>): number {
 	return (
-		right.work.stepsUntilCall - left.work.stepsUntilCall ||
+		right.work.decisionBatchesUntilCall - left.work.decisionBatchesUntilCall ||
 		left.work.priorityMs - right.work.priorityMs ||
 		left.work.criticalPathMs - right.work.criticalPathMs ||
 		right.sequence - left.sequence

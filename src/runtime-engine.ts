@@ -146,7 +146,7 @@ function forecastFor(
 		sandboxMode: semantics.sandboxMode(node.action.tool) ?? "none",
 		...(node.action.expectedDurationMs !== undefined ? { expectedDurationMs: node.action.expectedDurationMs } : {}),
 		...(node.action.resourceDemand !== undefined ? { resourceDemand: node.action.resourceDemand } : {}),
-		stepsUntilCall: Math.max(0, node.expectedDecisionSeq - decisionSequence),
+		decisionBatchesUntilCall: Math.max(0, node.expectedDecisionSeq - decisionSequence),
 		sourceLatencyMs,
 		criticalPathMs: node.criticalPathMs,
 		...(node.action.expectedLatencyBenefitMs !== undefined
@@ -363,7 +363,7 @@ function callKey(turnID: string, callID: string): string {
 	return JSON.stringify([turnID, callID]);
 }
 
-function observeActorStep<SessionID, Output, StartInput, StateData>(
+function observeActorDecisionInterval<SessionID, Output, StartInput, StateData>(
 	session: SessionState<SessionID, Output, StartInput, StateData>,
 	arrivedAt: number,
 ): void {
@@ -371,7 +371,7 @@ function observeActorStep<SessionID, Output, StartInput, StateData>(
 	session.lastActorArrivedAt = arrivedAt;
 	if (previous === undefined) return;
 	const interval = Math.max(0, arrivedAt - previous);
-	if (interval >= 25) session.scheduler.observeActorStep(interval);
+	if (interval >= 25) session.scheduler.observeActorDecisionInterval(interval);
 }
 
 function closeActorPhase<SessionID, Output, StartInput, StateData>(
@@ -664,7 +664,7 @@ type ProjectionResult<Output> =
 	| { readonly ok: false; readonly cause: ResolutionCause };
 
 const CACHE_COLD_MAX_AGE_MS = 5 * 60 * 1000;
-const CACHE_COLD_MAX_ACTOR_STEPS = 8;
+const CACHE_COLD_MAX_DECISION_BATCHES = 8;
 
 /** Structural runtime: plans own predictions, candidates own execution, ActorAction owns adoption. */
 export function makeStructuralSpeculativeActionRuntime<
@@ -1404,9 +1404,8 @@ export function makeStructuralSpeculativeActionRuntime<
 		closeActorPhase(state, actorArrivedAt);
 		if (state.actorArrivedAt === undefined) {
 			state.actorArrivedAt = actorArrivedAt;
-			observeActorStep(state.session, actorArrivedAt);
+			observeActorDecisionInterval(state.session, actorArrivedAt);
 		}
-		advanceColdCache(state.session, state.settings);
 		const candidatesAtArrival = allCandidates(state.sessionID);
 		const sequence = ++state.session.sequence;
 		clearLaunchTimers(state.session);
@@ -2216,9 +2215,9 @@ export function makeStructuralSpeculativeActionRuntime<
 	};
 
 	const advanceColdCache = (session: Session, settings: SpeculativeActionSettings): void => {
-		for (const candidate of results.advanceActorStep(session.id, {
+		for (const candidate of results.advanceDecisionBatch(session.id, {
 			maxAgeMs: CACHE_COLD_MAX_AGE_MS,
-			maxActorSteps: CACHE_COLD_MAX_ACTOR_STEPS,
+			maxDecisionBatches: CACHE_COLD_MAX_DECISION_BATCHES,
 		})) {
 			removeCandidate(session, candidate);
 		}
@@ -2255,6 +2254,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		const completedAt = performance.now();
 		closeActorPhase(state, completedAt);
 		advancePredictionFrontier(state);
+		if (state.actorActions.length) advanceColdCache(state.session, state.settings);
 		state.lifecycle = "closing";
 		state.generation.expire(cause("control", terminal ? "terminal_turn" : "turn_finished"));
 		if (terminal) {

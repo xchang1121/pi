@@ -178,8 +178,8 @@ export interface ResultCacheLimits {
 
 export interface ResultCacheColdPolicy {
 	readonly maxAgeMs: number;
-	/** A cold entry is evicted after more than this many Actor actions pass without a hit. */
-	readonly maxActorSteps: number;
+	/** A cold entry is evicted after more than this many Actor decision batches pass without a hit. */
+	readonly maxDecisionBatches: number;
 }
 
 export interface SpeculativeCacheValueMetrics {
@@ -216,7 +216,7 @@ export interface ResultCacheEvidence {
 	readonly segment: ResultCacheSegment;
 	readonly insertedAt: number;
 	readonly segmentEnteredAt: number;
-	readonly actorSteps: number;
+	readonly decisionBatches: number;
 	readonly actorHits: number;
 	readonly lastActorHitAt?: number;
 }
@@ -271,7 +271,7 @@ export class ResultCache<Scope, Entry extends SizedActionStoreEntry> {
 			...current,
 			segment: "hot",
 			segmentEnteredAt: current.segment === "hot" ? current.segmentEnteredAt : now,
-			actorSteps: 0,
+			decisionBatches: 0,
 			actorHits: current.actorHits + 1,
 			lastActorHitAt: now,
 		});
@@ -279,21 +279,21 @@ export class ResultCache<Scope, Entry extends SizedActionStoreEntry> {
 		return limits ? this.rebalanceHot(scope, limits) : [];
 	}
 
-	advanceActorStep(scope: Scope, policy: ResultCacheColdPolicy): readonly Entry[] {
+	advanceDecisionBatch(scope: Scope, policy: ResultCacheColdPolicy): readonly Entry[] {
 		const now = this.now();
 		const maxAgeMs = expirationLimit(policy.maxAgeMs);
-		const maxActorSteps = expirationLimit(policy.maxActorSteps);
+		const maxDecisionBatches = expirationLimit(policy.maxDecisionBatches);
 		const expired: Entry[] = [];
 		for (const entry of this.index.values(scope)) {
 			const current = this.metadata.get(scope)?.get(entry);
 			if (!current || current.segment !== "cold") continue;
-			const actorSteps = current.actorSteps + 1;
-			if (now - current.segmentEnteredAt >= maxAgeMs || actorSteps > maxActorSteps) {
+			const decisionBatches = current.decisionBatches + 1;
+			if (now - current.segmentEnteredAt >= maxAgeMs || decisionBatches > maxDecisionBatches) {
 				this.delete(scope, entry);
 				expired.push(entry);
 				continue;
 			}
-			this.metadataFor(scope).set(entry, { ...current, actorSteps });
+			this.metadataFor(scope).set(entry, { ...current, decisionBatches });
 		}
 		return expired;
 	}
@@ -381,7 +381,7 @@ export class ResultCache<Scope, Entry extends SizedActionStoreEntry> {
 			segment: "cold",
 			insertedAt: now,
 			segmentEnteredAt: now,
-			actorSteps: 0,
+			decisionBatches: 0,
 			actorHits: 0,
 		});
 	}
@@ -406,7 +406,7 @@ export class ResultCache<Scope, Entry extends SizedActionStoreEntry> {
 				...current,
 				segment: "cold",
 				segmentEnteredAt: now,
-				actorSteps: 0,
+				decisionBatches: 0,
 			});
 			demoted.push(victim);
 		}
