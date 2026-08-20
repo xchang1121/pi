@@ -1388,9 +1388,9 @@ export function projectPatternAwareObservation(
 	resourceRoot?: string,
 ): PatternAwareObservation {
 	const structured = normalizeStructuredPaths(structuredOutput(output), "", resourceRoot);
-	const paths = uniqueStrings([...outputPaths, ...structuredPaths(structured)]).map((item) =>
-		normalizeResourcePath(item, resourceRoot),
-	);
+	const paths = uniqueStrings(
+		[...outputPaths, ...structuredPaths(structured)].map((item) => normalizeResourcePath(item, resourceRoot)),
+	).sort();
 	return {
 		...(structured !== undefined ? { output: structured } : {}),
 		...(paths.length ? { outputPaths: paths } : {}),

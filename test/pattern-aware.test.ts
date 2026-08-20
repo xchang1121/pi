@@ -1608,6 +1608,9 @@ describe("PatternAware", () => {
 			output: [{ entry: { path: "src/a.ts" }, line: 3, text: "TODO" }],
 			outputPaths: ["src/a.ts"],
 		});
+		expect(projectPatternAwareObservation(undefined, ["src/z.ts", "src/a.ts", "src/z.ts"])).toEqual({
+			outputPaths: ["src/a.ts", "src/z.ts"],
+		});
 		expect(
 			projectPatternAwareObservation({
 				metadata: { results: [{ path: "C:/repo/src/b.ts", line: 4 }] },
