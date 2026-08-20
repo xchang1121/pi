@@ -169,6 +169,7 @@ function planActionDraft(node: PlanRuntimeNode): SpeculativeDraftCandidate {
 		feedback: node.action.feedback,
 		...(node.action.dependsOn ? { dependsOn: node.action.dependsOn } : {}),
 		...(node.action.horizon !== undefined ? { horizon: node.action.horizon } : {}),
+		...(node.action.latestHorizon !== undefined ? { latestHorizon: node.action.latestHorizon } : {}),
 		...(node.action.empiricalProbability !== undefined
 			? { empiricalProbability: node.action.empiricalProbability }
 			: {}),

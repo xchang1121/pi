@@ -385,6 +385,7 @@ export function createSpeculativeActionHost(
 		missing: candidate.missing,
 		diagnostic: candidate.diagnostic,
 		horizon: candidate.horizon,
+		latestHorizon: candidate.latestHorizon,
 		empiricalProbability: candidate.empiricalProbability,
 		conditionalProbability: candidate.conditionalProbability,
 		expectedDurationMs: candidate.expectedDurationMs,

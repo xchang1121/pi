@@ -218,16 +218,19 @@ describe("PatternAware", () => {
 		store.observe(input({ sessionID: "probe", tool: "grep", input: {}, outputPaths: ["src/c.ts"] }));
 		const candidate = store.predict("probe").find((item) => item.tool === "read");
 		expect(candidate?.input).toEqual({ filePath: "src/c.ts" });
-		expect(candidate?.horizon).toBe(1);
+		expect(candidate).toMatchObject({ horizon: 1, latestHorizon: 1 });
 	});
 
-	test("uses weighted gap coverage instead of the largest observed gap", () => {
+	test("schedules at weighted gap coverage while retaining the largest observed deadline", () => {
 		const store = new PatternAwareStore(settings({ maxFutureGap: 8, futureGapCoverage: 0.8 }));
 		expect(store.registerValidatedPattern(validatedGapPattern({ "0": 9, "5": 1 }))).toBe(true);
 
 		store.observe(input({ sessionID: "probe", tool: "grep", input: { pattern: "TODO" } }));
 
-		expect(store.predict("probe").find((item) => item.tool === "read")?.horizon).toBe(0);
+		expect(store.predict("probe").find((item) => item.tool === "read")).toMatchObject({
+			horizon: 0,
+			latestHorizon: 5,
+		});
 	});
 
 	test("keeps a pattern eligible while runtime benefit and waste are tied", () => {

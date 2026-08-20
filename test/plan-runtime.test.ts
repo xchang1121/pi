@@ -44,16 +44,17 @@ describe("PlanRuntime", () => {
 		).toBeUndefined();
 	});
 
-	it("retains a prediction after execution cancellation until the Actor horizon settles", () => {
+	it("schedules at the expected horizon and retains the prediction until its latest horizon", () => {
 		const plan = new PlanRuntime();
-		plan.apply(proposal([action("future", { horizon: 2 })]), 4);
-		plan.takeReady(6);
+		plan.apply(proposal([action("future", { horizon: 0, latestHorizon: 2 })]), 4);
+		plan.takeReady(4);
 		const execution = new CandidateExecution<string>("shared");
 		plan.attachExecution("plan", "future", "candidate", execution);
 		execution.cancel(cause("admission", "scheduler_preempted"), 1, 0);
 
 		expect(plan.get("plan", "future")).toMatchObject({
-			expectedActionSeq: 7,
+			expectedActionSeq: 5,
+			latestActionSeq: 7,
 			execution: { status: "cancelled" },
 			predictionState: { status: "pending" },
 		});
@@ -68,6 +69,10 @@ describe("PlanRuntime", () => {
 			cause: cause("admission", "candidate_unavailable"),
 		});
 		expect(settlement).toMatchObject({ observation: "observed", match: { matched: true } });
+
+		const clamped = new PlanRuntime();
+		clamped.apply(proposal([action("clamped", { horizon: 2, latestHorizon: 0 })]), 4);
+		expect(clamped.get("plan", "clamped")).toMatchObject({ expectedActionSeq: 7, latestActionSeq: 7 });
 	});
 
 	it("binds one canonical action identity to an opportunity", () => {
@@ -265,6 +270,7 @@ function action(
 	options: {
 		readonly input?: unknown;
 		readonly horizon?: number;
+		readonly latestHorizon?: number;
 		readonly dependsOn?: PlanAction["dependsOn"];
 		readonly expectedDurationMs?: number;
 	} = {},
@@ -275,6 +281,7 @@ function action(
 		tool: "read",
 		input: options.input ?? { path: `${id}.ts` },
 		...(options.horizon !== undefined ? { horizon: options.horizon } : {}),
+		...(options.latestHorizon !== undefined ? { latestHorizon: options.latestHorizon } : {}),
 		...(options.dependsOn ? { dependsOn: options.dependsOn } : {}),
 		...(options.expectedDurationMs !== undefined ? { expectedDurationMs: options.expectedDurationMs } : {}),
 	};

@@ -165,6 +165,7 @@ export type PatternAwareCandidate = {
 	readonly actionIdentity: string;
 	readonly supportingPatternIDs: ReadonlyArray<string>;
 	readonly horizon: number;
+	readonly latestHorizon: number;
 	readonly empiricalProbability: number;
 	readonly conditionalProbability: number;
 	readonly adoptionProbability: number;
@@ -631,18 +632,10 @@ export class PatternAwareStore {
 					right.pattern.occurrences - left.pattern.occurrences,
 			);
 			const representative = ordered[0]!;
-			const horizon = learnedGroupHorizon(
-				ordered.map((item) => item.pattern),
-				settings,
-				this.clock,
-			);
-			const gapCoverage = groupGapCoverage(
-				ordered.map((item) => item.pattern),
-				horizon,
-				settings,
-				this.clock,
-			);
 			const patterns = ordered.map((item) => item.pattern);
+			const horizon = learnedGroupHorizon(patterns, settings, this.clock);
+			const latestHorizon = Math.max(horizon, learnedGroupHorizon(patterns, settings, this.clock, 1));
+			const gapCoverage = groupGapCoverage(patterns, horizon, settings, this.clock);
 			const replayProbability = backoffProbability(patterns, this.clock, settings.decayHalfLifeEvents);
 			const ppmEstimate = this.sequenceModel.estimate(sequenceContext, representative.pattern.targetTool);
 			const totalWeight = ordered.reduce(
@@ -684,6 +677,7 @@ export class PatternAwareStore {
 				ordered,
 				representative,
 				horizon,
+				latestHorizon,
 				gapCoverage,
 				replayProbability,
 				calibration,
@@ -714,6 +708,7 @@ export class PatternAwareStore {
 				ordered,
 				representative,
 				horizon,
+				latestHorizon,
 				gapCoverage,
 				replayProbability,
 				calibration,
@@ -741,6 +736,7 @@ export class PatternAwareStore {
 				actionIdentity,
 				supportingPatternIDs,
 				horizon,
+				latestHorizon,
 				empiricalProbability,
 				conditionalProbability,
 				adoptionProbability,
@@ -762,6 +758,8 @@ export class PatternAwareStore {
 						conditionalProbability,
 						adoptionProbability,
 						replayProbability,
+						horizon,
+						latestHorizon,
 						ppmProbability: ppmEstimate?.probability,
 						ppmWeight: calibration.ppmWeight,
 						ppmOrder: ppmEstimate?.order,
@@ -2152,11 +2150,16 @@ function learnedHorizon(pattern: MutablePattern, settings: PatternAwareSettings,
 	return gaps.at(-1)?.[0] ?? 0;
 }
 
-function learnedGroupHorizon(patterns: ReadonlyArray<MutablePattern>, settings: PatternAwareSettings, clock: number) {
+function learnedGroupHorizon(
+	patterns: ReadonlyArray<MutablePattern>,
+	settings: PatternAwareSettings,
+	clock: number,
+	coverage = settings.futureGapCoverage,
+) {
 	const gaps = combineWeightedGaps(patterns, settings, clock);
 	if (!gaps.length) return 0;
 	const total = gaps.reduce((sum, [, weight]) => sum + weight, 0);
-	const target = total * settings.futureGapCoverage;
+	const target = total * coverage;
 	let covered = 0;
 	for (const [gap, weight] of gaps) {
 		covered += weight;

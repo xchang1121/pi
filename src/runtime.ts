@@ -50,6 +50,7 @@ export interface SpeculativeDraftCandidate {
 	readonly feedback?: unknown;
 	readonly dependsOn?: PlanAction["dependsOn"];
 	readonly horizon?: number;
+	readonly latestHorizon?: number;
 	readonly empiricalProbability?: number;
 	readonly conditionalProbability?: number;
 	readonly expectedDurationMs?: number;

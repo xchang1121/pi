@@ -17,7 +17,10 @@ export interface PlanAction {
 	readonly missing?: readonly (readonly (string | number)[])[];
 	readonly execution?: SpeculativeExecution;
 	readonly diagnostic?: string;
+	/** Expected Actor steps before this action; used to schedule execution. */
 	readonly horizon?: number;
+	/** Latest Actor steps before this prediction becomes a miss. Defaults to horizon. */
+	readonly latestHorizon?: number;
 	readonly empiricalProbability?: number;
 	readonly conditionalProbability?: number;
 	readonly expectedDurationMs?: number;

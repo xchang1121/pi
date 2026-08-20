@@ -645,7 +645,7 @@ describe("structural speculative runtime", () => {
 		expect(fixture.runtime.inspect()).toMatchObject({ activeTurns: 0, pendingPredictions: 0 });
 	});
 
-	it("keeps a future prediction dormant until the preceding Actor step", async () => {
+	it("launches at the expected step but retains the prediction until its latest horizon", async () => {
 		let executions = 0;
 		const settlements: PredictionSettlement[] = [];
 		const source: Source = {
@@ -661,7 +661,8 @@ describe("structural speculative runtime", () => {
 									type: "tool_call",
 									tool: "read",
 									input: { path: "future.ts" },
-									horizon: 1,
+									horizon: 0,
+									latestHorizon: 1,
 									expectedDurationMs: 10,
 								},
 							],
@@ -679,9 +680,7 @@ describe("structural speculative runtime", () => {
 			},
 		});
 		await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn-1" });
-		await waitFor(() => fixture.runtime.inspect().pendingPredictions === 0);
-		await new Promise((resolve) => setTimeout(resolve, 10));
-		expect(executions).toBe(0);
+		await waitFor(() => executions === 1);
 
 		const unrelated: Call = {
 			sessionID: "session",
@@ -692,7 +691,7 @@ describe("structural speculative runtime", () => {
 		};
 		expect(await fixture.runtime.consume(unrelated)).toBeUndefined();
 		await fixture.runtime.actual({ ...unrelated, durationMs: 1, output: "files" });
-		await waitFor(() => executions === 1);
+		expect(settlements).toEqual([]);
 		await fixture.runtime.finishTurn({ ...call("turn-1"), terminal: false });
 		await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn-2" });
 		expect(

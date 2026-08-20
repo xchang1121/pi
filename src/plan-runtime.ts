@@ -46,6 +46,7 @@ interface PlanRuntimeNodeBase {
 	readonly actionKey?: ActionKey;
 	readonly anchorActionSeq: number;
 	readonly expectedActionSeq: number;
+	readonly latestActionSeq: number;
 	readonly criticalPathMs: number;
 	readonly execution: PlanNodeExecution;
 	readonly readiness: PlanNodeReadiness;
@@ -188,6 +189,7 @@ type MutableNode = {
 	actionKey?: ActionKey;
 	anchorActionSeq: number;
 	expectedActionSeq: number;
+	latestActionSeq: number;
 	criticalPathMs: number;
 	execution: MutableNodeExecution;
 	opportunity?: PredictionOpportunity;
@@ -324,7 +326,7 @@ export class PlanRuntime {
 	}
 
 	due(settledThrough: number): readonly PredictionPlanRuntimeNode[] {
-		return this.pending().filter((node) => node.expectedActionSeq <= settledThrough);
+		return this.pending().filter((node) => node.latestActionSeq <= settledThrough);
 	}
 
 	drainBlocked(): readonly PlanRuntimeNode[] {
@@ -469,6 +471,7 @@ export class PlanRuntime {
 			...(node.actionKey ? { actionKey: node.actionKey } : {}),
 			anchorActionSeq: node.anchorActionSeq,
 			expectedActionSeq: node.expectedActionSeq,
+			latestActionSeq: node.latestActionSeq,
 			criticalPathMs: node.criticalPathMs,
 			execution: executionProjection(node.execution),
 			readiness: this.readiness(plan, node),
@@ -506,25 +509,30 @@ export class PlanRuntime {
 	}
 
 	private recompute(plan: MutablePlan): void {
-		const expectedMemo = new Map<string, number>();
-		const visiting = new Set<string>();
-		const expected = (node: MutableNode): number => {
-			const cached = expectedMemo.get(node.action.id);
-			if (cached !== undefined) return cached;
-			if (visiting.has(node.action.id)) return node.anchorActionSeq + horizon(node.action) + 1;
-			visiting.add(node.action.id);
-			const settlement = node.opportunity?.settlement;
-			let value = predictionMatched(settlement)
-				? settlement.actorAction.sequence
-				: node.anchorActionSeq + horizon(node.action) + 1;
-			for (const dependency of node.action.dependsOn ?? []) {
-				const parent = plan.nodes.get(dependency.actionID);
-				if (parent) value = Math.max(value, expected(parent) + 1);
-			}
-			visiting.delete(node.action.id);
-			expectedMemo.set(node.action.id, value);
-			return value;
+		const actionSequence = (relativeHorizon: (action: PlanAction) => number) => {
+			const memo = new Map<string, number>();
+			const visiting = new Set<string>();
+			const calculate = (node: MutableNode): number => {
+				const cached = memo.get(node.action.id);
+				if (cached !== undefined) return cached;
+				if (visiting.has(node.action.id)) return node.anchorActionSeq + relativeHorizon(node.action) + 1;
+				visiting.add(node.action.id);
+				const settlement = node.opportunity?.settlement;
+				let value = predictionMatched(settlement)
+					? settlement.actorAction.sequence
+					: node.anchorActionSeq + relativeHorizon(node.action) + 1;
+				for (const dependency of node.action.dependsOn ?? []) {
+					const parent = plan.nodes.get(dependency.actionID);
+					if (parent) value = Math.max(value, calculate(parent) + 1);
+				}
+				visiting.delete(node.action.id);
+				memo.set(node.action.id, value);
+				return value;
+			};
+			return calculate;
 		};
+		const expected = actionSequence(horizon);
+		const latest = actionSequence(latestHorizon);
 		const dependents = new Map<string, MutableNode[]>();
 		for (const node of plan.nodes.values()) {
 			for (const dependency of node.action.dependsOn ?? []) {
@@ -545,6 +553,7 @@ export class PlanRuntime {
 		};
 		for (const node of plan.nodes.values()) {
 			node.expectedActionSeq = expected(node);
+			node.latestActionSeq = latest(node);
 			node.criticalPathMs = criticalPath(node);
 		}
 	}
@@ -569,6 +578,7 @@ function newNode(
 		actionKey: undefined,
 		anchorActionSeq,
 		expectedActionSeq: anchorActionSeq + horizon(action) + 1,
+		latestActionSeq: anchorActionSeq + latestHorizon(action) + 1,
 		criticalPathMs: Math.max(1, finiteMetric(action.expectedDurationMs)),
 		execution: { status: "deferred" },
 		...(action.type === "tool_call" ? { opportunity: new PredictionOpportunity(identity) } : {}),
@@ -796,6 +806,10 @@ function planNodeID(source: string, proposalID: string, actionID: string, revisi
 function horizon(action: PlanAction): number {
 	if (action.type === "preparation_hint") return 0;
 	return sequence(action.horizon ?? 0);
+}
+
+function latestHorizon(action: PlanAction): number {
+	return Math.max(horizon(action), sequence(action.latestHorizon ?? action.horizon ?? 0));
 }
 
 function validIdentity(proposalID: string, source: string): boolean {
