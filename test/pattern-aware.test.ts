@@ -389,7 +389,7 @@ describe("PatternAware", () => {
 		);
 	});
 
-	test("persists a deduplicated learning table without session history", async () => {
+	test("persists a deduplicated learning table and rebuilds its opportunity index", async () => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "pi-pattern-aware-"));
 		temporary.push(directory);
 		const file = path.join(directory, "patterns.json");
@@ -416,6 +416,8 @@ describe("PatternAware", () => {
 		second.observe(input({ sessionID: "three", tool: "grep", input: {}, outputPaths: ["src/c.ts"] }));
 
 		expect(second.predict("three").some((item) => item.tool === "read")).toBe(true);
+		second.observe(input({ sessionID: "three", tool: "read", input: { filePath: "src/c.ts" } }));
+		expect(second.snapshot().find((item) => item.targetTool === "read")?.historicalOpportunities).toBe(3);
 	});
 
 	test("stores a large event once when many inference pools reference it", async () => {
@@ -706,6 +708,23 @@ describe("PatternAware", () => {
 		const candidate = store.predict("probe").find((item) => item.tool === "read");
 		expect(candidate?.empiricalProbability).toBeGreaterThan(0);
 		expect(candidate?.empiricalProbability).toBeLessThan(0.75);
+	});
+
+	test("counts competing target branches through one indexed control context", () => {
+		const store = new PatternAwareStore(settings({ maxContextLength: 1, maxFutureGap: 0 }));
+		trainGrepRead(store, "read-one", "src/a.ts");
+		trainGrepRead(store, "read-two", "src/b.ts");
+		for (const sessionID of ["bash-one", "bash-two"]) {
+			store.observe(input({ sessionID, tool: "grep", input: { pattern: "TODO" } }));
+			store.observe(input({ sessionID, tool: "bash", input: { command: "npm test" } }));
+		}
+		trainGrepRead(store, "read-three", "src/c.ts");
+
+		const pattern = store
+			.snapshot()
+			.find((item) => item.targetTool === "read" && item.context.at(-1)?.tool === "grep");
+		expect(pattern?.historicalMatches).toBe(3);
+		expect(pattern?.historicalOpportunities).toBe(5);
 	});
 
 	test("still rejects unreliable argument mappers", () => {

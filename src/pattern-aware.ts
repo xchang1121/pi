@@ -333,6 +333,7 @@ class PredictiveContextTrie {
 export class PatternAwareStore {
 	private readonly patterns = new Map<string, MutablePattern>();
 	private readonly pools = new Map<string, PatternPool>();
+	private readonly controlOpportunitiesByContext = new Map<string, number>();
 	private readonly pending = new Map<string, PendingValidation[]>();
 	private readonly history = new Map<string, PatternAwareEvent[]>();
 	private trie = new PredictiveContextTrie();
@@ -394,7 +395,7 @@ export class PatternAwareStore {
 			for (const [gap, samples] of samplesByGap(pool.samples)) {
 				const key = patternPoolKey(pool.context, pool.targetTool, pool.targetSchemaHash, gap);
 				const compatible = parsed.version >= COMPATIBLE_PATTERN_VERSION && pool.gap === gap;
-				this.pools.set(key, {
+				const restored = {
 					key,
 					context: pool.context,
 					targetTool: pool.targetTool,
@@ -402,7 +403,9 @@ export class PatternAwareStore {
 					gap,
 					samples,
 					...(compatible && pool.patternIDs?.length ? { patternIDs: pool.patternIDs } : {}),
-				});
+				};
+				this.pools.set(key, restored);
+				this.addControlOpportunities(restored, restored.samples.length);
 			}
 			for (const sample of pool.samples) {
 				this.clock = Math.max(this.clock, sample.target.sequence, ...sample.context.map((event) => event.sequence));
@@ -948,10 +951,12 @@ export class PatternAwareStore {
 			gap,
 			samples: [],
 		};
+		const previousSampleCount = pool.samples.length;
 		pool.samples.push({ context: [...context], target, gap });
 		const sampleLimit = patternPoolSampleLimit(this.settings);
 		if (pool.samples.length > sampleLimit) pool.samples.splice(0, pool.samples.length - sampleLimit);
 		this.pools.set(poolKey, pool);
+		this.addControlOpportunities(pool, pool.samples.length - previousSampleCount);
 		if (pool.samples.length < this.settings.minOccurrences) {
 			this.retirePoolPatterns(pool, new Set());
 			return;
@@ -1028,11 +1033,18 @@ export class PatternAwareStore {
 	}
 
 	private controlOpportunities(pool: PatternPool) {
-		let total = 0;
-		for (const sibling of this.pools.values()) {
-			if (sibling.gap === pool.gap && sameValue(sibling.context, pool.context)) total += sibling.samples.length;
-		}
-		return Math.max(pool.samples.length, total);
+		return Math.max(
+			pool.samples.length,
+			this.controlOpportunitiesByContext.get(patternControlKey(pool.context, pool.gap)) ?? 0,
+		);
+	}
+
+	private addControlOpportunities(pool: PatternPool, count: number) {
+		if (count === 0) return;
+		const key = patternControlKey(pool.context, pool.gap);
+		const next = (this.controlOpportunitiesByContext.get(key) ?? 0) + count;
+		if (next > 0) this.controlOpportunitiesByContext.set(key, next);
+		else this.controlOpportunitiesByContext.delete(key);
 	}
 
 	private retirePoolPatterns(pool: PatternPool, retained: ReadonlySet<string>) {
@@ -1126,7 +1138,10 @@ export class PatternAwareStore {
 		const evicted = [...this.pools.values()]
 			.sort((left, right) => left.samples.length - right.samples.length)
 			.slice(0, this.pools.size - limit);
-		for (const pool of evicted) this.pools.delete(pool.key);
+		for (const pool of evicted) {
+			this.pools.delete(pool.key);
+			this.addControlOpportunities(pool, -pool.samples.length);
+		}
 	}
 
 	private trimPatterns() {
@@ -2620,6 +2635,10 @@ function patternPoolKey(
 	gap: number,
 ) {
 	return hash(stableStringify({ context, targetTool, targetSchemaHash, gap }));
+}
+
+function patternControlKey(context: ReadonlyArray<PatternAwareEventSignature>, gap: number) {
+	return stableStringify({ context, gap });
 }
 
 function samplesByGap(samples: ReadonlyArray<PatternSample>) {
