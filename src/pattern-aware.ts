@@ -2783,6 +2783,8 @@ function parsePath(value: string): Array<string | number> | undefined {
 }
 
 function sameValue(left: unknown, right: unknown) {
+	if (left === right) return true;
+	if (left === null || right === null || typeof left !== "object" || typeof right !== "object") return false;
 	return stableStringify(left) === stableStringify(right);
 }
 
