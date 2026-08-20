@@ -288,7 +288,9 @@ export const PATTERN_AWARE_DEFAULTS: PatternAwareSettings = {
 
 const MAX_BINDING_VARIANTS = 32;
 const MAX_PATH_SOURCES = 24;
-const PERSIST_DEBOUNCE_MS = 200;
+// Bound crash-loss while amortizing full-state serialization across active tool loops.
+// Terminal/dispose paths still flush immediately.
+const PERSIST_CHECKPOINT_INTERVAL_MS = 30_000;
 const PERSISTENCE_VERSION = 17;
 const MIN_MIGRATABLE_PERSISTENCE_VERSION = 13;
 const INDEXED_POOL_PERSISTENCE_VERSION = 16;
@@ -1166,7 +1168,7 @@ export class PatternAwareStore {
 		this.persistTimer = setTimeout(() => {
 			this.persistTimer = undefined;
 			this.enqueuePersist();
-		}, PERSIST_DEBOUNCE_MS);
+		}, PERSIST_CHECKPOINT_INTERVAL_MS);
 		this.persistTimer.unref?.();
 	}
 
