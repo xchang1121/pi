@@ -88,21 +88,30 @@ function harness(input: {
 						: undefined,
 		actual: (call) => ({ id: call.id, tool: call.tool, input: call.input }),
 		preflightCandidate: () => ({ ok: true }),
-		executeCandidate: async ({ tool, concrete, signal, parentWorld }) => {
+		executeCandidate: async ({ tool, concrete, action, route, signal, parentWorld }) => {
 			executions++;
-			return ((await input.execute?.(tool, concrete, signal, parentWorld)) as string) ?? "speculative";
-		},
-		captureResourceVersion: input.capture ?? (() => ({ version: 1 })),
-		validateResourceVersion: async ({ candidate }) =>
-			input.validate
-				? input.validate(candidate.resourceVersion)
-				: (await input.expired?.())
+			const version =
+				route.isolation === "resource_snapshot" ? await (input.capture?.() ?? { version: 1 }) : undefined;
+			const executed = await input.execute?.(tool, concrete, signal, parentWorld);
+			if (isWorldBranch(executed)) return executed;
+			return world((executed as string | undefined) ?? "speculative", {
+				executionFingerprint: action.executionFingerprint,
+				...(route.isolation === "resource_snapshot"
 					? {
-							status: "stale",
-							cause: cause("freshness", "resource_changed"),
-							metrics: zeroValidationMetrics(),
+							validate: async () =>
+								input.validate
+									? input.validate(version)
+									: (await input.expired?.())
+										? {
+												status: "stale" as const,
+												cause: cause("freshness", "resource_changed"),
+												metrics: zeroValidationMetrics(),
+											}
+										: { status: "valid" as const, metrics: zeroValidationMetrics() },
 						}
-					: { status: "valid", metrics: zeroValidationMetrics() },
+					: {}),
+			});
+		},
 		projectionRules: input.projection
 			? [
 					{
@@ -309,6 +318,34 @@ describe("structural speculative runtime", () => {
 		});
 	});
 
+	it("disposes a sealed backend branch that arrives after its candidate was cancelled", async () => {
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const dispose = vi.fn();
+		const source: Source = {
+			id: "source",
+			enabled: () => true,
+			propose: () => plan("source", "late-branch", { path: "README.md" }),
+		};
+		const fixture = harness({
+			source,
+			execute: async () => {
+				await gate;
+				return world("late", { onDispose: dispose });
+			},
+		});
+
+		await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn" });
+		await waitFor(() => fixture.runtime.inspect().sharedCandidates === 1);
+		const disabling = fixture.runtime.settingsChanged({ ...settings, enabled: false });
+		release();
+		await disabling;
+		await waitFor(() => dispose.mock.calls.length === 1);
+		expect(dispose).toHaveBeenCalledOnce();
+	});
+
 	it("preserves a claimed match when disable races in-flight validation", async () => {
 		let validationEntered!: () => void;
 		const entered = new Promise<void>((resolve) => {
@@ -319,6 +356,7 @@ describe("structural speculative runtime", () => {
 			releaseValidation = resolve;
 		});
 		const settlements: PredictionSettlement[] = [];
+		const dispose = vi.fn();
 		const source: Source = {
 			id: "source",
 			enabled: () => true,
@@ -329,11 +367,15 @@ describe("structural speculative runtime", () => {
 		};
 		const fixture = harness({
 			source,
-			expired: async () => {
-				validationEntered();
-				await validationGate;
-				return false;
-			},
+			execute: () =>
+				world("speculative", {
+					onDispose: dispose,
+					validate: async () => {
+						validationEntered();
+						await validationGate;
+						return { status: "valid", metrics: zeroValidationMetrics() };
+					},
+				}),
 		});
 		await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn" });
 		await waitFor(() => fixture.runtime.inspect().sharedCandidates === 1);
@@ -353,6 +395,7 @@ describe("structural speculative runtime", () => {
 				adoption: { status: "rejected", cause: { stage: "control", code: "disabled" } },
 			},
 		});
+		expect(dispose).toHaveBeenCalledOnce();
 	});
 
 	it("runs eight independent producers concurrently and deduplicates only by K(a)", async () => {
@@ -610,6 +653,7 @@ describe("structural speculative runtime", () => {
 				compatibility: { status: "compatible", backend: "test", executionFingerprint: "" },
 				state: "sealed",
 				commit,
+				dispose: () => {},
 			}),
 		});
 		await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn" });
@@ -664,6 +708,7 @@ describe("structural speculative runtime", () => {
 				compatibility: { status: "indeterminate", backend: "test", code: "attestation_missing" },
 				state: "sealed",
 				commit,
+				dispose: () => {},
 			}),
 		});
 		await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn" });
@@ -1343,6 +1388,9 @@ function world(
 		readonly checkpoint?: WorldCheckpoint;
 		readonly resources?: readonly string[];
 		readonly onCommit?: () => void;
+		readonly onDispose?: () => void;
+		readonly executionFingerprint?: string;
+		readonly validate?: () => Promise<ResourceValidation>;
 	} = {},
 ): WorldBranch<string> {
 	let state = "sealed" as "sealed" | "committing" | "committed" | "failed";
@@ -1353,7 +1401,12 @@ function world(
 		resources: options.resources ?? [],
 		capturedBytes: 0,
 		executionMetrics: {},
-		compatibility: { status: "compatible" as const, backend: "test", executionFingerprint: "" },
+		compatibility: {
+			status: "compatible" as const,
+			backend: "test",
+			executionFingerprint: options.executionFingerprint ?? "",
+		},
+		...(options.validate ? { validate: options.validate } : {}),
 		get state() {
 			return state;
 		},
@@ -1363,7 +1416,14 @@ function world(
 			state = "committed";
 			return output;
 		},
+		dispose: () => options.onDispose?.(),
 	};
+}
+
+function isWorldBranch(value: unknown): value is WorldBranch<string> {
+	return Boolean(
+		value && typeof value === "object" && typeof (value as Partial<WorldBranch<string>>).commit === "function",
+	);
 }
 
 async function waitFor(check: () => boolean, timeoutMs = 2_000): Promise<void> {

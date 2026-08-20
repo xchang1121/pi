@@ -11,6 +11,7 @@ import type {
 import { validateToolArguments } from "@earendil-works/pi-ai";
 import type { ActionProjectionRule } from "./action-key-projection.ts";
 import { type ActionKey, type ActionSemanticsRegistry, PI_ACTION_SEMANTICS } from "./action-semantics.ts";
+import { type SpeculativeAgentExecutionWorld, withResourceSnapshotExecutionWorld } from "./agent-execution-world.ts";
 import {
 	buildSingleToolCallPrompt,
 	clampCandidateLimit,
@@ -42,13 +43,6 @@ import {
 	projectPatternAwareObservation,
 } from "./pattern-aware.ts";
 import type { PlanAction, PlanProposal } from "./plan-proposal.ts";
-import {
-	captureResourceVersion,
-	type ResourceVersionValidation,
-	releaseResourceVersion,
-	validateResourceVersion,
-	watchResourceVersion,
-} from "./resource-version.ts";
 import type {
 	CandidatePreflight,
 	SpeculativeActionEvent,
@@ -57,9 +51,7 @@ import type {
 	SpeculativePlanSource,
 } from "./runtime.ts";
 import { candidateExecutionMs, candidateToolNames, makeSpeculativeActionRuntime } from "./runtime.ts";
-import { cause, type ResourceValidation } from "./settlement.ts";
 import type { ToolInvocation, ToolSettlement } from "./tool-settlement.ts";
-import type { SpeculativeAgentSandbox } from "./workspace-sandbox.ts";
 
 export interface SpeculativeAgentSettingsInput {
 	readonly enabled?: boolean;
@@ -129,7 +121,7 @@ export interface CreateSpeculativeActionHostOptions {
 	/** Lossless Π rules; each rule owns key relation, realized coverage, and output reconstruction. */
 	readonly projectionRules?: readonly ActionProjectionRule<ToolSettlement>[];
 	/** Ordered execution capabilities. A runtime-wide sandbox takes precedence over local fallbacks. */
-	readonly executionWorlds?: readonly SpeculativeAgentSandbox[];
+	readonly executionWorlds?: readonly SpeculativeAgentExecutionWorld[];
 	/** Optional persistence root for workspace-hashed PatternAware state. */
 	readonly patternStateDirectory?: string;
 	/** Stable logical workspace identity when physical checkout paths are ephemeral. */
@@ -197,7 +189,7 @@ export function createSpeculativeActionHost(
 ): SpeculativeActionHost {
 	const actionSemantics = options.actionSemantics ?? PI_ACTION_SEMANTICS;
 	const projectionRules = (options.projectionRules ?? []).filter((rule) => actionSemantics.supportsProjector(rule.id));
-	const executionWorlds = [...new Set(options.executionWorlds ?? [])];
+	const executionWorlds = withResourceSnapshotExecutionWorld(options.executionWorlds ?? [], actionSemantics);
 	const resolveExecutionRoute = (tool: string) =>
 		resolveSpeculativeExecutionRoute(actionSemantics.localIsolation(tool), executionWorlds);
 	const patternActionSemantics = {
@@ -292,9 +284,9 @@ export function createSpeculativeActionHost(
 		}
 	};
 	const prepareExecutionWorlds = async (tools: readonly string[], signal?: AbortSignal): Promise<void> => {
-		const preparations = new Map<SpeculativeAgentSandbox, Set<ExecutionWorldMode>>();
+		const preparations = new Map<SpeculativeAgentExecutionWorld, Set<ExecutionWorldMode>>();
 		for (const route of await Promise.all([...new Set(tools)].map(resolveExecutionRoute))) {
-			if (!route || route.isolation === "resource_snapshot") continue;
+			if (!route) continue;
 			const world = routeWorld(route);
 			const modes = preparations.get(world) ?? new Set<ExecutionWorldMode>();
 			modes.add(route.isolation);
@@ -720,44 +712,28 @@ export function createSpeculativeActionHost(
 		},
 		executeCandidate: async ({ data, tool: toolName, concrete, action, route, callID, signal, parentWorld }) => {
 			const tool = data.tools.get(toolName);
-			if (!tool) return errorSettlement(`Tool ${toolName} not found`);
+			if (!tool) throw new Error(`Tool ${toolName} not found`);
 			const args = validateCandidateArguments(tool, toolName, concrete, callID);
-			if (args === undefined) return errorSettlement(`Invalid arguments for tool ${toolName}`);
-			if (route.isolation !== "resource_snapshot") {
-				const world = routeWorld(route);
-				const branch = await world.fork({
-					mode: route.isolation,
-					cwd: options.cwd,
-					tool,
-					toolName,
-					args,
-					action,
-					callID,
-					signal,
-					...(parentWorld?.checkpoint ? { parentCheckpoint: parentWorld.checkpoint } : {}),
-				});
-				return branch;
-			}
-			try {
-				return { result: await tool.execute(callID, args as never, signal), isError: false };
-			} catch (error) {
-				return errorSettlement(error instanceof Error ? error.message : String(error));
-			}
+			if (args === undefined) throw new Error(`Invalid arguments for tool ${toolName}`);
+			return routeWorld(route).fork({
+				mode: route.isolation,
+				cwd: options.cwd,
+				tool,
+				toolName,
+				args,
+				action,
+				callID,
+				signal,
+				...(parentWorld?.checkpoint ? { parentCheckpoint: parentWorld.checkpoint } : {}),
+			});
 		},
 		rejectCandidateOutput: ({ output }) => (output.isError ? "tool_error_result" : undefined),
-		captureResourceVersion: ({ action }) => captureResourceVersion(action, options.cwd, actionSemantics),
-		releaseResourceVersion,
-		validateResourceVersion: async ({ candidate }) =>
-			toRuntimeResourceValidation(await validateResourceVersion(candidate.resourceVersion)),
-		watchResourceVersion: ({ candidate, onInvalidated }) =>
-			watchResourceVersion(candidate.resourceVersion, onInvalidated),
 		projectionRules,
 		prepareCandidate: async ({ candidate, route, signal }) => {
 			if (!route) {
 				await prepareExecutionWorlds([candidate.tool], signal);
 				return;
 			}
-			if (route.isolation === "resource_snapshot") return;
 			await prepareWorld(routeWorld(route), options.cwd, [route.isolation], signal);
 		},
 		onTurnStarted: async ({ startInput, settings, signal }) => {
@@ -852,30 +828,6 @@ function validateCandidateArguments(
 	}
 }
 
-function errorSettlement(message: string): ToolSettlement {
-	const result: AgentToolResult<unknown> = {
-		content: [{ type: "text", text: message }],
-		details: {},
-	};
-	return { result, isError: true };
-}
-
-function toRuntimeResourceValidation(validation: ResourceVersionValidation): ResourceValidation {
-	const metrics = {
-		durationMs: validation.durationMs,
-		bytesRead: validation.bytesRead,
-		filesRead: validation.filesRead,
-		mode: validation.mode,
-	};
-	return validation.expired
-		? {
-				status: "stale",
-				cause: cause("freshness", validation.reason ?? "resource_changed"),
-				metrics,
-			}
-		: { status: "valid", metrics };
-}
-
 function definitionSchemaHashes(
 	definitions: readonly { readonly name: string; readonly inputSchema?: unknown }[],
 ): Readonly<Record<string, string>> {
@@ -929,8 +881,8 @@ function normalizePositiveInteger(value: unknown, fallback: number): number {
 	return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
 }
 
-function routeWorld(route: SpeculativeExecutionRoute): SpeculativeAgentSandbox {
-	const world = route.context as SpeculativeAgentSandbox | undefined;
+function routeWorld(route: SpeculativeExecutionRoute): SpeculativeAgentExecutionWorld {
+	const world = route.context as SpeculativeAgentExecutionWorld | undefined;
 	if (!world || !world.supports(route.isolation as ExecutionWorldMode)) {
 		throw new Error(`Execution world ${route.backend} is unavailable for ${route.isolation}`);
 	}
@@ -938,7 +890,7 @@ function routeWorld(route: SpeculativeExecutionRoute): SpeculativeAgentSandbox {
 }
 
 async function prepareWorld(
-	world: SpeculativeAgentSandbox,
+	world: SpeculativeAgentExecutionWorld,
 	cwd: string,
 	modes: readonly ExecutionWorldMode[],
 	signal?: AbortSignal,

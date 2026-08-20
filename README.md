@@ -78,7 +78,7 @@ The former `resourceCached` / `sandbox` / `predictionOnly` object is accepted on
 
 ## Runtime sandbox integration
 
-Hosts provide ordered execution worlds through `executionWorlds`. A runtime-wide world advertises `supports("runtime_sandbox")`, forks an isolated branch for any tool, returns compatibility evidence, and commits adopted effects at most once. Local Git worktrees implement the same interface for `file_mutation`.
+Hosts provide ordered execution worlds through `executionWorlds`. A runtime-wide world advertises `supports("runtime_sandbox")` and forks an isolated branch for any tool. Every successful backend—including the built-in resource snapshot and the Git worktree fallback—returns the same `WorldBranch`; that branch owns compatibility evidence, freshness checks, adoption, and cleanup. The host automatically supplies the resource-snapshot backend when none is registered.
 
 ```ts
 createSpeculativeActionHost(sessionID, {

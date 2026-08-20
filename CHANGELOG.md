@@ -16,6 +16,7 @@
 - Replaced the three tool groups (`resourceCached`, `sandbox`, and `predictionOnly`) with one prediction-enabled `tools` list. Legacy grouped settings are accepted only at the configuration migration boundary.
 - Replaced the single sandbox option with ordered `executionWorlds`. A world supporting `runtime_sandbox` takes priority for every tool.
 - Renamed prediction-only fallback telemetry to the general execution-blocked terminology.
+- Unified every successful speculative tool exit as a backend-owned `WorldBranch`. Removed the adapter's parallel resource-version callbacks and the redundant `ResourceVersionPolicy`; validation, invalidation, commit, and disposal now follow the branch lifecycle.
 
 ### Added
 

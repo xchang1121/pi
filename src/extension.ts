@@ -26,6 +26,7 @@ import {
 	NO_LOCAL_ISOLATION_ACTION_TOOLS,
 	RESOURCE_SNAPSHOT_ACTION_TOOLS,
 } from "./action-semantics.ts";
+import { type SpeculativeAgentExecutionWorld, withResourceSnapshotExecutionWorld } from "./agent-execution-world.ts";
 import { createSpeculativeActionHost } from "./agent-integration.ts";
 import {
 	clampCandidateLimit,
@@ -44,7 +45,7 @@ import {
 } from "./settings-store.ts";
 import type { ToolSettlement } from "./tool-settlement.ts";
 import { emptySpeculativeTraceSummary, reduceSpeculativeTrace, type SpeculativeTraceSummary } from "./trace-summary.ts";
-import { createWorkspaceSandbox, type SpeculativeAgentSandbox } from "./workspace-sandbox.ts";
+import { createWorkspaceSandbox } from "./workspace-sandbox.ts";
 
 const STATUS_KEY = "speculative-action";
 const CLOSE = "Close";
@@ -119,7 +120,7 @@ interface SpeculativeActionController {
 }
 
 export interface SpeculativeActionExtensionDependencies {
-	readonly createExecutionWorlds?: () => readonly SpeculativeAgentSandbox[];
+	readonly createExecutionWorlds?: () => readonly SpeculativeAgentExecutionWorld[];
 	readonly createHost?: typeof createSpeculativeActionHost;
 	readonly createSettingsStore?: (cwd: string) => SpeculativeSettingsStore;
 }
@@ -237,7 +238,9 @@ async function installController(
 	await settingsStore.load();
 	let currentSettings = normalizeSpeculativeActionSettings(settingsStore.effective());
 	const settings = () => currentSettings;
-	const executionWorlds = dependencies.createExecutionWorlds?.() ?? [createWorkspaceSandbox()];
+	const executionWorlds = withResourceSnapshotExecutionWorld(
+		dependencies.createExecutionWorlds?.() ?? [createWorkspaceSandbox()],
+	);
 	const piToolSettings = await loadPiToolSettings(context.cwd);
 	const availableTools = new Map(pi.getAllTools().map((tool) => [tool.name, tool]));
 	const toolConflicts = new Map<string, string>();
@@ -1359,8 +1362,8 @@ function toolsSummary(tools: readonly string[]): string {
 	return tools.length > 0 ? tools.join(" ") : "none";
 }
 
-function executionWorldSummary(worlds: readonly SpeculativeAgentSandbox[]): string {
-	const supporting = (mode: "runtime_sandbox" | "file_mutation") =>
+function executionWorldSummary(worlds: readonly SpeculativeAgentExecutionWorld[]): string {
+	const supporting = (mode: "runtime_sandbox" | "resource_snapshot" | "file_mutation") =>
 		worlds.flatMap((world) => {
 			try {
 				return world.supports(mode) ? [world.id] : [];
@@ -1368,7 +1371,7 @@ function executionWorldSummary(worlds: readonly SpeculativeAgentSandbox[]): stri
 				return [];
 			}
 		});
-	return `Execution capabilities: runtime sandbox ${toolsSummary(supporting("runtime_sandbox"))}; file mutation ${toolsSummary(supporting("file_mutation"))}; resource snapshots built in`;
+	return `Execution capabilities: runtime sandbox ${toolsSummary(supporting("runtime_sandbox"))}; resource snapshot ${toolsSummary(supporting("resource_snapshot"))}; file mutation ${toolsSummary(supporting("file_mutation"))}`;
 }
 
 function countSummary(counts: Readonly<Record<string, number>>): string {

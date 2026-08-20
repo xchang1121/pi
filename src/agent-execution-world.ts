@@ -1,0 +1,159 @@
+import type { AgentTool } from "@earendil-works/pi-agent-core";
+import type { ActionKey, ActionSemanticsRegistry } from "./action-semantics.ts";
+import { PI_ACTION_SEMANTICS } from "./action-semantics.ts";
+import type {
+	ExecutionWorld,
+	ExecutionWorldMode,
+	WorldBranch,
+	WorldBranchState,
+	WorldCheckpoint,
+	WorldCompatibilityEvidence,
+} from "./execution-world.ts";
+import {
+	captureResourceVersion,
+	type ResourceVersionToken,
+	releaseResourceVersion,
+	validateResourceVersion,
+	watchResourceVersion,
+} from "./resource-version.ts";
+import type { ResourceValidation } from "./settlement.ts";
+import { cause } from "./settlement.ts";
+import type { ToolSettlement } from "./tool-settlement.ts";
+
+/** Host tool call supplied to any OS sandbox or safe local substitute. */
+export interface SpeculativeToolExecutionContext {
+	readonly mode: ExecutionWorldMode;
+	readonly cwd: string;
+	readonly tool: AgentTool;
+	readonly toolName: string;
+	readonly args: unknown;
+	readonly action: ActionKey;
+	readonly callID: string;
+	readonly signal: AbortSignal;
+	/** Optional immutable parent state for source-neutral multi-step execution. */
+	readonly parentCheckpoint?: WorldCheckpoint;
+}
+
+export type SpeculativeAgentExecutionWorld = ExecutionWorld<SpeculativeToolExecutionContext, ToolSettlement>;
+
+/** Install the intrinsic read-only fallback without duplicating an injected equivalent. */
+export function withResourceSnapshotExecutionWorld(
+	worlds: readonly SpeculativeAgentExecutionWorld[],
+	actionSemantics: ActionSemanticsRegistry = PI_ACTION_SEMANTICS,
+): SpeculativeAgentExecutionWorld[] {
+	const resolved = [...new Set(worlds)];
+	if (!resolved.some((world) => world.id === "resource_version" && supportsMode(world, "resource_snapshot"))) {
+		resolved.push(createResourceSnapshotExecutionWorld(actionSemantics));
+	}
+	return resolved;
+}
+
+/** Read-only local substitute: execute now, then prove the observed resources are still current. */
+export function createResourceSnapshotExecutionWorld(
+	actionSemantics: ActionSemanticsRegistry = PI_ACTION_SEMANTICS,
+): SpeculativeAgentExecutionWorld {
+	return {
+		id: "resource_version",
+		supports: (mode) => mode === "resource_snapshot",
+		fingerprint: () => "resource-version:v1",
+		fork: async (context) => {
+			if (context.mode !== "resource_snapshot") {
+				throw new Error(`Execution world does not support mode ${context.mode}`);
+			}
+			const setupStarted = performance.now();
+			const version = await captureResourceVersion(context.action, context.cwd, actionSemantics);
+			const setupMs = Math.max(0, performance.now() - setupStarted);
+			let output: ToolSettlement;
+			try {
+				output = {
+					result: await context.tool.execute(context.callID, context.args as never, context.signal),
+					isError: false,
+				};
+			} catch (error) {
+				output = errorSettlement(error);
+			}
+			return new ResourceSnapshotBranch(output, version, context.action.executionFingerprint, setupMs);
+		},
+	};
+}
+
+class ResourceSnapshotBranch implements WorldBranch<ToolSettlement> {
+	readonly backend = "resource_version" as const;
+	readonly resources: readonly string[] = Object.freeze([]);
+	readonly capturedBytes = 0;
+	readonly executionMetrics: { readonly setupMs: number };
+	readonly compatibility: WorldCompatibilityEvidence;
+	readonly output: ToolSettlement;
+	private readonly version: ResourceVersionToken;
+	private stateValue: WorldBranchState = "sealed";
+	private stopWatcher?: () => void;
+	private disposed = false;
+
+	constructor(output: ToolSettlement, version: ResourceVersionToken, executionFingerprint: string, setupMs: number) {
+		this.output = output;
+		this.version = version;
+		this.executionMetrics = Object.freeze({ setupMs });
+		this.compatibility = Object.freeze({
+			status: "compatible",
+			backend: this.backend,
+			executionFingerprint,
+		});
+	}
+
+	get state(): WorldBranchState {
+		return this.stateValue;
+	}
+
+	async validate(): Promise<ResourceValidation> {
+		const validation = await validateResourceVersion(this.version);
+		const metrics = {
+			durationMs: validation.durationMs,
+			bytesRead: validation.bytesRead,
+			filesRead: validation.filesRead,
+			mode: validation.mode,
+		};
+		return validation.expired
+			? {
+					status: "stale",
+					cause: cause("freshness", validation.reason ?? "resource_changed"),
+					metrics,
+				}
+			: { status: "valid", metrics };
+	}
+
+	watch(onInvalidated: (changedPath?: string) => void): void {
+		if (this.disposed || this.stopWatcher) return;
+		this.stopWatcher = watchResourceVersion(this.version, onInvalidated);
+	}
+
+	async commit(): Promise<ToolSettlement> {
+		this.stateValue = "committed";
+		return this.output;
+	}
+
+	dispose(): void {
+		if (this.disposed) return;
+		this.disposed = true;
+		this.stopWatcher?.();
+		this.stopWatcher = undefined;
+		releaseResourceVersion(this.version);
+	}
+}
+
+function errorSettlement(error: unknown): ToolSettlement {
+	return {
+		result: {
+			content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }],
+			details: {},
+		},
+		isError: true,
+	};
+}
+
+function supportsMode(world: SpeculativeAgentExecutionWorld, mode: ExecutionWorldMode): boolean {
+	try {
+		return world.supports(mode);
+	} catch {
+		return false;
+	}
+}

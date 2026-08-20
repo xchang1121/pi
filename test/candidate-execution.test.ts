@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { CandidateExecution, CandidateResources } from "../src/candidate-execution.ts";
+import { CandidateExecution } from "../src/candidate-execution.ts";
 import { cause } from "../src/settlement.ts";
 
 describe("CandidateExecution", () => {
@@ -69,22 +69,5 @@ describe("CandidateExecution", () => {
 		expect(candidate.release("turn-b")).toBe(true);
 		expect(candidate.consume("turn-a")).toBe(false);
 		expect(candidate.execution.status).toBe("succeeded");
-	});
-
-	it("releases owned handles once and closes handles that arrive after disposal", () => {
-		const released: string[] = [];
-		const resources = new CandidateResources<string>();
-		expect(resources.setVersion("v1", (version) => released.push(`version:${version}`))).toBe(true);
-		expect(resources.setWatcher(() => released.push("watcher:v1"))).toBe(true);
-		expect(resources.replaceVersion("v2", (version) => released.push(`version:${version}`))).toBe(true);
-		expect(resources.version).toBe("v2");
-		expect(released).toEqual(["watcher:v1", "version:v1"]);
-		expect(resources.dispose()).toBe(true);
-		expect(resources.dispose()).toBe(false);
-		expect(resources.version).toBeUndefined();
-
-		expect(resources.setWatcher(() => released.push("late-watcher"))).toBe(false);
-		expect(resources.setVersion("late", (version) => released.push(`late-version:${version}`))).toBe(false);
-		expect(released).toEqual(["watcher:v1", "version:v1", "version:v2", "late-watcher", "late-version:late"]);
 	});
 });

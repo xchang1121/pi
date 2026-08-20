@@ -24,13 +24,16 @@ describe("speculative execution route resolution", () => {
 	});
 
 	it("uses only the registered local mechanism and blocks actions with none", async () => {
+		const resource = world("resource_version", ["resource_snapshot"], "resource-version:v1");
 		const local = world("git", ["file_mutation"]);
-		expect(await resolveSpeculativeExecutionRoute("resource_snapshot", [local])).toEqual({
+		expect(await resolveSpeculativeExecutionRoute("resource_snapshot", [local, resource])).toMatchObject({
 			isolation: "resource_snapshot",
 			reuse: "shared_result",
 			backend: "resource_version",
 			fingerprint: "resource-version:v1",
+			context: resource,
 		});
+		expect(await resolveSpeculativeExecutionRoute("resource_snapshot", [local])).toBeUndefined();
 		expect(await resolveSpeculativeExecutionRoute("file_mutation", [local])).toMatchObject({
 			isolation: "file_mutation",
 			backend: "git",

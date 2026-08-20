@@ -25,16 +25,13 @@ describe("ActionSemanticsRegistry", () => {
 
 		expect(PI_ACTION_SEMANTICS.definition("read")).toMatchObject({
 			localIsolation: "resource_snapshot",
-			resourceVersion: "resources",
 			resourceScope: "content",
 		});
 		expect(PI_ACTION_SEMANTICS.definition("bash")).toMatchObject({
 			localIsolation: "none",
-			resourceVersion: "none",
 		});
 		expect(PI_ACTION_SEMANTICS.definition("write")).toMatchObject({
 			localIsolation: "file_mutation",
-			resourceVersion: "actor_time",
 		});
 		expect(PI_ACTION_SEMANTICS.resourceScope("write")).toBeUndefined();
 	});
@@ -168,8 +165,6 @@ describe("ActionSemanticsRegistry", () => {
 
 		expect(registry.toolNames()).toEqual(["stat"]);
 		expect(registry.localIsolation("stat")).toBe("resource_snapshot");
-		expect(registry.requiresRuntimeResourceVersion("stat")).toBe(true);
-		expect(registry.watchesResourceVersion("stat")).toBe(true);
 		expect(registry.resourceScope("stat")).toBe("content");
 		expect(registry.buildKey("stat", { path: "a.ts" }, "/workspace", "schema")).toMatchObject({
 			tool: "stat",
@@ -214,11 +209,9 @@ describe("ActionSemanticsRegistry", () => {
 						...definition,
 						tool: "write",
 						localIsolation: "file_mutation",
-						resourceVersion: "resources",
-						resourceScope: undefined,
 					},
 				]),
-		).toThrow("must validate at commit time");
+		).toThrow("cannot use resource evidence without a resource snapshot");
 		expect(
 			() =>
 				new ActionSemanticsRegistry([
@@ -236,13 +229,12 @@ describe("ActionSemanticsRegistry", () => {
 						...definition,
 						tool: "bad_observer",
 						localIsolation: "none",
-						resourceVersion: "none",
 						resourceScope: undefined,
 					},
 				]),
 		).not.toThrow();
 		expect(() => new ActionSemanticsRegistry([{ ...definition, tool: "bad_none", localIsolation: "none" }])).toThrow(
-			"without local isolation has local version state",
+			"cannot use resource evidence without a resource snapshot",
 		);
 	});
 
@@ -286,15 +278,6 @@ describe("ActionSemanticsRegistry", () => {
 			(registry.definition("one")?.projectors as ActionKeyProjector[]).push(projector("blocked")),
 		).toThrow();
 	});
-
-	it("distinguishes runtime-watched resources, unisolated actions, and Actor-time validation", () => {
-		expect(PI_ACTION_SEMANTICS.requiresRuntimeResourceVersion("read")).toBe(true);
-		expect(PI_ACTION_SEMANTICS.watchesResourceVersion("read")).toBe(true);
-		expect(PI_ACTION_SEMANTICS.requiresRuntimeResourceVersion("bash")).toBe(false);
-		expect(PI_ACTION_SEMANTICS.watchesResourceVersion("bash")).toBe(false);
-		expect(PI_ACTION_SEMANTICS.requiresRuntimeResourceVersion("write")).toBe(false);
-		expect(PI_ACTION_SEMANTICS.watchesResourceVersion("write")).toBe(false);
-	});
 });
 
 function resourceDefinition(
@@ -306,7 +289,6 @@ function resourceDefinition(
 		tool,
 		epoch,
 		localIsolation: "resource_snapshot",
-		resourceVersion: "resources",
 		resourceScope: "content",
 		canonicalize,
 	};

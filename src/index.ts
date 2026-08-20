@@ -42,10 +42,15 @@ export {
 	RESOURCE_SNAPSHOT_ACTION_TOOLS,
 	type ReadActionRange,
 	type ResourceDependencyScope,
-	type ResourceVersionPolicy,
 	readActionRange,
 	type SpeculativeExecution,
 } from "./action-semantics.ts";
+export {
+	createResourceSnapshotExecutionWorld,
+	type SpeculativeAgentExecutionWorld,
+	type SpeculativeToolExecutionContext,
+	withResourceSnapshotExecutionWorld,
+} from "./agent-execution-world.ts";
 export {
 	type CreateSpeculativeActionHostOptions,
 	createSpeculativeActionHost,
@@ -218,8 +223,6 @@ export {
 	type SandboxExecutionDelta,
 	type SandboxFileChange,
 	type SandboxWorkspaceContext,
-	type SpeculativeAgentSandbox,
-	type SpeculativeSandboxExecuteContext,
 	type WorkspaceSandboxOptions,
 	withSandboxWorkspace,
 } from "./workspace-sandbox.ts";

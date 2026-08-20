@@ -4,11 +4,9 @@ import { constants as fsConstants } from "node:fs";
 import { chmod, type FileHandle, lstat, mkdir, mkdtemp, open, readdir, rename, rm, rmdir } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import type { AgentTool } from "@earendil-works/pi-agent-core";
-import { type ActionKey, asRecord, contains, slash } from "./action-semantics.ts";
+import { asRecord, contains, slash } from "./action-semantics.ts";
+import type { SpeculativeAgentExecutionWorld, SpeculativeToolExecutionContext } from "./agent-execution-world.ts";
 import type {
-	ExecutionWorld,
-	ExecutionWorldMode,
 	WorldBranch,
 	WorldBranchState,
 	WorldCheckpoint,
@@ -42,21 +40,6 @@ export interface SandboxExecutionDelta {
 interface WorkspaceExecutionSnapshot extends SandboxExecutionDelta {
 	readonly executionMetrics: WorldExecutionMetrics;
 }
-
-export interface SpeculativeSandboxExecuteContext {
-	readonly mode: ExecutionWorldMode;
-	readonly cwd: string;
-	readonly tool: AgentTool;
-	readonly toolName: string;
-	readonly args: unknown;
-	readonly action: ActionKey;
-	readonly callID: string;
-	readonly signal: AbortSignal;
-	/** Optional immutable parent state for source-neutral multi-step execution. */
-	readonly parentCheckpoint?: WorldCheckpoint;
-}
-
-export type SpeculativeAgentSandbox = ExecutionWorld<SpeculativeSandboxExecuteContext, ToolSettlement>;
 
 export interface WorkspaceSandboxOptions {
 	readonly gitBinary?: string;
@@ -146,7 +129,7 @@ function resolveWorkspaceCheckpoint(
 }
 
 /** Create a copy-on-write execution world with transactional multi-file commit. */
-export function createWorkspaceSandbox(options: WorkspaceSandboxOptions = {}): SpeculativeAgentSandbox {
+export function createWorkspaceSandbox(options: WorkspaceSandboxOptions = {}): SpeculativeAgentExecutionWorld {
 	const roots = new Set<string>();
 	return {
 		id: "git_worktree",
@@ -232,6 +215,10 @@ class GitWorldBranch implements WorldBranch<ToolSettlement> {
 		);
 		return this.commitPromise;
 	};
+
+	dispose(): void {
+		// The private worktree is sealed and removed during fork; this branch owns only immutable bytes.
+	}
 }
 
 /** Low-level transactional commit primitive for execution-world implementations. */
@@ -347,7 +334,7 @@ export async function prepareSandboxWorkspace(
 }
 
 async function executeMutation(
-	context: SpeculativeSandboxExecuteContext,
+	context: SpeculativeToolExecutionContext,
 	parent: GitWorldCheckpoint | undefined,
 	gitBinary?: string,
 ): Promise<WorkspaceExecutionSnapshot> {

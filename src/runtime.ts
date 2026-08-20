@@ -5,7 +5,7 @@ import type { SpeculativeActionEvent } from "./events.ts";
 import type { SpeculativeExecutionRoute, WorldBranch } from "./execution-world.ts";
 import type { PlanAction, PlanProposal, PlanUpdate } from "./plan-proposal.ts";
 import { makeStructuralSpeculativeActionRuntime } from "./runtime-engine.ts";
-import type { PredictionSettlement, ResourceValidation } from "./settlement.ts";
+import type { PredictionSettlement } from "./settlement.ts";
 
 export { diagnosticAction, diagnosticJson, redactDiagnostics } from "./diagnostics.ts";
 
@@ -61,7 +61,6 @@ export interface SpeculativeCandidate {
 	readonly key: ActionKey;
 	readonly tool: string;
 	readonly input: Readonly<Record<string, unknown>>;
-	readonly resourceVersion?: unknown;
 	readonly work?: { readonly execution?: { readonly executionMs?: number } };
 	readonly source?: string;
 	readonly empiricalProbability?: number;
@@ -217,7 +216,7 @@ export interface SpeculativeActionRuntimeAdapter<
 		readonly index: number;
 		readonly signal: AbortSignal;
 		readonly parentWorld?: WorldBranch<Output>;
-	}) => MaybePromise<Output | WorldBranch<Output>>;
+	}) => MaybePromise<WorldBranch<Output>>;
 	readonly prepareCandidate?: (input: {
 		readonly startInput: StartInput;
 		readonly data: StateData;
@@ -227,30 +226,6 @@ export interface SpeculativeActionRuntimeAdapter<
 		readonly route?: SpeculativeExecutionRoute;
 		readonly signal: AbortSignal;
 	}) => MaybePromise<void>;
-	readonly captureResourceVersion?: (input: {
-		readonly startInput: StartInput;
-		readonly data: StateData;
-		readonly settings: SpeculativeActionSettings;
-		readonly candidate: SpeculativeDraftCandidate;
-		readonly tool: string;
-		readonly concrete: Record<string, unknown>;
-		readonly action: ActionKey;
-		readonly callID: string;
-		readonly index: number;
-	}) => MaybePromise<unknown>;
-	readonly releaseResourceVersion?: (version: unknown) => void;
-	readonly validateResourceVersion?: (input: {
-		readonly stateData: StateData;
-		readonly consumeInput?: ConsumeInput;
-		readonly action: ActionKey;
-		readonly candidate: SpeculativeCandidate;
-	}) => MaybePromise<ResourceValidation>;
-	readonly watchResourceVersion?: (input: {
-		readonly stateData: StateData;
-		readonly action: ActionKey;
-		readonly candidate: SpeculativeCandidate;
-		readonly onInvalidated: (changedPath?: string) => void;
-	}) => MaybePromise<(() => void) | undefined>;
 	readonly projectionRules?: readonly ActionProjectionRule<Output>[];
 	readonly rejectCandidateOutput?: (input: {
 		readonly output: Output;

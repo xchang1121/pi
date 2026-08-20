@@ -1,7 +1,8 @@
 import type { ActionReuseKind, LocalIsolationMechanism, SpeculativeExecution } from "./action-semantics.ts";
+import type { ResourceValidation } from "./settlement.ts";
 
-/** A runtime sandbox can handle every tool; local worlds may expose narrower fallbacks. */
-export type ExecutionWorldMode = Extract<SpeculativeExecution, "runtime_sandbox" | "file_mutation">;
+/** A runtime sandbox can handle every tool; local worlds expose narrower substitutes. */
+export type ExecutionWorldMode = SpeculativeExecution;
 
 /** One resolved execution capability. Absence of a route means speculation is blocked. */
 export interface SpeculativeExecutionRoute {
@@ -83,7 +84,13 @@ export interface WorldBranch<Output> {
 	readonly compatibility: WorldCompatibilityEvidence;
 	readonly state: WorldBranchState;
 	readonly commitMetrics?: WorldCommitMetrics;
+	/** Optional freshness proof owned by the backend that captured the branch. */
+	readonly validate?: () => Promise<ResourceValidation>;
+	/** Subscribe to invalidation; the branch owns and releases the subscription. */
+	readonly watch?: (onInvalidated: (changedPath?: string) => void) => void;
 	readonly commit: () => Promise<Output>;
+	/** Idempotently release every branch-local handle. Must be safe before or after commit. */
+	readonly dispose: () => void | Promise<void>;
 }
 
 export interface ExecutionWorldPreparation {
@@ -100,6 +107,7 @@ export interface ExecutionWorld<Context extends { readonly mode: ExecutionWorldM
 	readonly fingerprint?: (mode: ExecutionWorldMode) => string | Promise<string>;
 	readonly prepare?: (input: ExecutionWorldPreparation) => Promise<void>;
 	readonly fork: (context: Context) => Promise<WorldBranch<Output>>;
+	/** Abort and drain backend-owned forks and branch cleanup before resolving. */
 	readonly dispose?: () => Promise<void>;
 }
 
@@ -114,18 +122,12 @@ export async function resolveSpeculativeExecutionRoute<Context extends { readonl
 		localIsolation === "resource_snapshot" ? "shared_result" : "exclusive_branch",
 	);
 	if (runtimeRoute) return runtimeRoute;
-	if (localIsolation === "resource_snapshot") {
-		return Object.freeze({
-			isolation: "resource_snapshot",
-			reuse: "shared_result",
-			backend: "resource_version",
-			fingerprint: "resource-version:v1",
-		});
-	}
-	if (localIsolation === "file_mutation") {
-		return firstWorldRoute(worlds, "file_mutation", "exclusive_branch");
-	}
-	return undefined;
+	if (localIsolation === "none") return undefined;
+	return firstWorldRoute(
+		worlds,
+		localIsolation,
+		localIsolation === "resource_snapshot" ? "shared_result" : "exclusive_branch",
+	);
 }
 
 async function firstWorldRoute<Context extends { readonly mode: ExecutionWorldMode }, Output>(

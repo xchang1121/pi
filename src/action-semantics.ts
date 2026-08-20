@@ -3,7 +3,6 @@ import path from "node:path";
 /** Isolation selected for one speculative attempt, independent of action identity. */
 export type SpeculativeExecution = "runtime_sandbox" | "resource_snapshot" | "file_mutation";
 export type ActionReuseKind = "shared_result" | "exclusive_branch";
-export type ResourceVersionPolicy = "resources" | "actor_time" | "none";
 export type ResourceDependencyScope = "content" | "tree_entries" | "tree_query" | "tree_content";
 export type LocalIsolationMechanism = Exclude<SpeculativeExecution, "runtime_sandbox"> | "none";
 
@@ -77,7 +76,6 @@ export interface ActionSemanticsDefinition {
 	readonly epoch: string;
 	/** Safe host-local fallback when no runtime-wide sandbox is available. */
 	readonly localIsolation: LocalIsolationMechanism;
-	readonly resourceVersion: ResourceVersionPolicy;
 	/** Filesystem evidence required to prove that a completed action is still current. */
 	readonly resourceScope?: ResourceDependencyScope;
 	readonly canonicalize: (input: unknown, cwd: string) => CanonicalAction | undefined;
@@ -128,20 +126,8 @@ export class ActionSemanticsRegistry {
 		return this.definition(tool)?.localIsolation ?? "none";
 	}
 
-	resourceVersionPolicy(tool: string): ResourceVersionPolicy | undefined {
-		return this.definition(tool)?.resourceVersion;
-	}
-
 	resourceScope(tool: string): ResourceDependencyScope | undefined {
 		return this.definition(tool)?.resourceScope;
-	}
-
-	requiresRuntimeResourceVersion(tool: string): boolean {
-		return this.resourceVersionPolicy(tool) === "resources";
-	}
-
-	watchesResourceVersion(tool: string): boolean {
-		return this.resourceVersionPolicy(tool) === "resources";
 	}
 
 	projectors(): readonly ActionKeyProjector[] {
@@ -214,7 +200,6 @@ export const PI_ACTION_SEMANTICS = new ActionSemanticsRegistry([
 		tool: "read",
 		epoch: "pi.read.v2",
 		localIsolation: "resource_snapshot",
-		resourceVersion: "resources",
 		resourceScope: "content",
 		canonicalize: canonicalRead,
 		projectors: [READ_RANGE_ACTION_KEY_PROJECTOR],
@@ -223,7 +208,6 @@ export const PI_ACTION_SEMANTICS = new ActionSemanticsRegistry([
 		tool: "grep",
 		epoch: "pi.grep.v2",
 		localIsolation: "resource_snapshot",
-		resourceVersion: "resources",
 		resourceScope: "tree_content",
 		canonicalize: canonicalGrep,
 	},
@@ -231,7 +215,6 @@ export const PI_ACTION_SEMANTICS = new ActionSemanticsRegistry([
 		tool: "find",
 		epoch: "pi.find.v2",
 		localIsolation: "resource_snapshot",
-		resourceVersion: "resources",
 		resourceScope: "tree_query",
 		canonicalize: canonicalFind,
 	},
@@ -239,21 +222,18 @@ export const PI_ACTION_SEMANTICS = new ActionSemanticsRegistry([
 		tool: "bash",
 		epoch: "pi.bash.v2",
 		localIsolation: "none",
-		resourceVersion: "none",
 		canonicalize: canonicalBash,
 	},
 	{
 		tool: "write",
 		epoch: "pi.write.v1",
 		localIsolation: "file_mutation",
-		resourceVersion: "actor_time",
 		canonicalize: canonicalWrite,
 	},
 	{
 		tool: "edit",
 		epoch: "pi.edit.v1",
 		localIsolation: "file_mutation",
-		resourceVersion: "actor_time",
 		canonicalize: canonicalEdit,
 	},
 ]);
@@ -573,20 +553,14 @@ function readProjectionPartition(action: ActionKey): string | undefined {
 }
 
 function assertDefinitionCoherence(definition: ActionSemanticsDefinition): void {
-	if (definition.localIsolation === "none") {
-		if (definition.resourceVersion !== "none" || definition.resourceScope !== undefined) {
-			throw new Error(`action ${definition.tool} without local isolation has local version state`);
-		}
-		return;
-	}
 	if (definition.localIsolation === "resource_snapshot") {
-		if (definition.resourceVersion !== "resources" || definition.resourceScope === undefined) {
+		if (definition.resourceScope === undefined) {
 			throw new Error(`resource-snapshot action ${definition.tool} requires resource evidence`);
 		}
 		return;
 	}
-	if (definition.resourceVersion !== "actor_time" || definition.resourceScope !== undefined) {
-		throw new Error(`file-mutation action ${definition.tool} must validate at commit time`);
+	if (definition.resourceScope !== undefined) {
+		throw new Error(`action ${definition.tool} cannot use resource evidence without a resource snapshot`);
 	}
 }
 

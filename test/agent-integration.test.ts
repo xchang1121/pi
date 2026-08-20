@@ -6,11 +6,11 @@ import type { AssistantMessage, Model } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { READ_RANGE_COVERAGE_DETAILS_KEY } from "../src/action-key-projection.ts";
+import type { SpeculativeAgentExecutionWorld } from "../src/agent-execution-world.ts";
 import { createSpeculativeActionHost, patternPlanActionID } from "../src/agent-integration.ts";
 import { PATTERN_AWARE_DEFAULTS, PatternAwareStore } from "../src/pattern-aware.ts";
 import { PI_READ_RANGE_PROJECTION_RULE } from "../src/pi-read-projection.ts";
 import type { SpeculativeActionEvent } from "../src/runtime.ts";
-import type { SpeculativeAgentSandbox } from "../src/workspace-sandbox.ts";
 
 const roots: string[] = [];
 const readSchema = Type.Object({
@@ -221,7 +221,7 @@ describe("speculative action host", () => {
 				return { content: [{ type: "text", text: "actor" }], details: {} };
 			},
 		};
-		const sandbox: SpeculativeAgentSandbox = {
+		const sandbox: SpeculativeAgentExecutionWorld = {
 			id: "runtime",
 			supports: (mode) => mode === "runtime_sandbox",
 			fingerprint: () => "runtime:v1",
@@ -244,6 +244,7 @@ describe("speculative action host", () => {
 					},
 					state: "sealed",
 					commit: async () => output,
+					dispose: () => {},
 				};
 			},
 			dispose,
@@ -288,7 +289,7 @@ describe("speculative action host", () => {
 	it("prefers a runtime-wide sandbox over a read tool's resource-snapshot fallback", async () => {
 		const cwd = await temporaryWorkspace();
 		let hostExecutions = 0;
-		const fork = vi.fn(async (context: Parameters<SpeculativeAgentSandbox["fork"]>[0]) => {
+		const fork = vi.fn(async (context: Parameters<SpeculativeAgentExecutionWorld["fork"]>[0]) => {
 			const output = {
 				result: { content: [{ type: "text" as const, text: "runtime read" }], details: {} },
 				isError: false,
@@ -306,9 +307,10 @@ describe("speculative action host", () => {
 				},
 				state: "sealed" as const,
 				commit: async () => output,
+				dispose: () => {},
 			};
 		});
-		const runtimeWorld: SpeculativeAgentSandbox = {
+		const runtimeWorld: SpeculativeAgentExecutionWorld = {
 			id: "runtime",
 			supports: (mode) => mode === "runtime_sandbox",
 			fork,
@@ -357,7 +359,7 @@ describe("speculative action host", () => {
 		const cwd = await temporaryWorkspace();
 		const brokenPrepare = vi.fn();
 		const healthyPrepare = vi.fn();
-		const broken: SpeculativeAgentSandbox = {
+		const broken: SpeculativeAgentExecutionWorld = {
 			id: "broken",
 			supports: (mode) => mode === "runtime_sandbox",
 			fingerprint: () => {
@@ -372,7 +374,7 @@ describe("speculative action host", () => {
 			result: { content: [{ type: "text" as const, text: "sandbox" }], details: {} },
 			isError: false,
 		};
-		const healthy: SpeculativeAgentSandbox = {
+		const healthy: SpeculativeAgentExecutionWorld = {
 			id: "healthy",
 			supports: (mode) => mode === "runtime_sandbox",
 			fingerprint: () => "healthy:v1",
@@ -390,6 +392,7 @@ describe("speculative action host", () => {
 				},
 				state: "sealed",
 				commit: async () => output,
+				dispose: () => {},
 			}),
 		};
 		const tool: AgentTool<typeof bashSchema> = {
@@ -500,7 +503,7 @@ describe("speculative action host", () => {
 		const observed = vi.spyOn(patternStore, "observeBatch");
 		const actualEvents: SpeculativeActionEvent<string>[] = [];
 		let disposed = 0;
-		const sandbox: SpeculativeAgentSandbox = {
+		const sandbox: SpeculativeAgentExecutionWorld = {
 			id: "unavailable",
 			supports: () => false,
 			fork: async () => {

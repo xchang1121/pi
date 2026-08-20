@@ -78,7 +78,7 @@ pi -e ./packages/speculative-action
 
 ## 接入 Runtime 沙箱
 
-宿主通过 `executionWorlds` 提供有序的执行世界。Runtime 全局沙箱声明 `supports("runtime_sandbox")`，能够为任意工具创建隔离 branch，返回兼容性证据，并且至多一次提交被采纳的副作用。本地 Git worktree 通过同一接口实现 `file_mutation`。
+宿主通过 `executionWorlds` 提供有序的执行世界。Runtime 全局沙箱声明 `supports("runtime_sandbox")`，能够为任意工具创建隔离 branch。每个成功后端——包括内置资源快照和 Git worktree 后备——都返回同一种 `WorldBranch`，由 branch 自己拥有兼容性证据、新鲜度校验、采纳与清理。宿主在未注册资源快照后端时会自动补上内置实现。
 
 ```ts
 createSpeculativeActionHost(sessionID, {
