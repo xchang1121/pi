@@ -49,6 +49,7 @@
 
 ### Fixed
 
+- A newly captured exact-key result remains reachable when an older cache generation cannot be freshness-validated; bounded cache retention now owns both generations until one is proven stale or evicted.
 - Continuation work can be reused immediately, but its prediction is anchored to the first causally eligible Actor decision; same-batch reuse is no longer misattributed as a future-step match.
 - A continuation targeting the next Actor decision is no longer cancelled by a sibling tool call from the same parallel Actor response.
 - Probation cache aging now advances after each Actor decision batch, after matching, so a completed multi-step prediction remains adoptable through its declared deadline even when a batch contains multiple tool calls.

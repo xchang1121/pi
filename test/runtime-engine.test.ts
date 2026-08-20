@@ -214,6 +214,41 @@ describe("structural speculative runtime", () => {
 		await fixture.runtime.finishTurn({ ...call("turn"), terminal: true });
 	});
 
+	it("keeps a fresh exact generation reachable when an older version is indeterminate", async () => {
+		let captures = 0;
+		let runs = 0;
+		const source: Source = {
+			id: "source",
+			enabled: () => true,
+			propose: ({ startInput }) => plan("source", startInput.turnID, { path: "README.md" }),
+		};
+		const fixture = harness({
+			source,
+			capture: () => ({ version: ++captures }),
+			validate: (version) =>
+				(version as { version: number }).version === 1
+					? {
+							status: "indeterminate",
+							cause: cause("freshness", "validation_failed"),
+							metrics: zeroValidationMetrics(),
+						}
+					: { status: "valid", metrics: zeroValidationMetrics() },
+			execute: () => `generation:${++runs}`,
+		});
+
+		await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn-1" });
+		await waitFor(() => runs === 1);
+		const unrelated = call("turn-1", { path: "other.ts" });
+		expect(await fixture.runtime.consume(unrelated)).toBeUndefined();
+		await fixture.runtime.actual({ ...unrelated, durationMs: 1, output: "actor" });
+		await fixture.runtime.finishTurn({ ...unrelated, terminal: false });
+
+		await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn-2" });
+		await waitFor(() => runs === 2);
+		expect(await fixture.runtime.consume(call("turn-2"))).toBe("generation:2");
+		await fixture.runtime.finishTurn({ ...call("turn-2"), terminal: true });
+	});
+
 	it("keeps slow observers off the hit path and freezes event attribution before cleanup", async () => {
 		let release!: () => void;
 		const blocked = new Promise<void>((resolve) => {

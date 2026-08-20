@@ -115,6 +115,20 @@ describe("ResultCache", () => {
 		expect(branches.values("session")).toEqual([branch]);
 	});
 
+	it("retains exact freshness generations independently", () => {
+		const cache = new ResultCache<string, Entry>();
+		const older = entry("older", "same.ts");
+		const fresh = entry("fresh", "same.ts");
+		cache.insert("session", older);
+		cache.insert("session", fresh);
+
+		expect(cache.lookup("session", fresh.key).map((item) => item.entry.id)).toEqual(["fresh", "older"]);
+		expect(cache.evidenceOf("session", older)).toBeDefined();
+		expect(cache.evidenceOf("session", fresh)).toBeDefined();
+		expect(cache.delete("session", fresh)).toBe(true);
+		expect(cache.values("session")).toEqual([older]);
+	});
+
 	it("ages only cold entries by decision batches or cold-segment wall time", () => {
 		let now = 1_000;
 		const cache = new ResultCache<string, Entry>(

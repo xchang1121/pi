@@ -79,6 +79,10 @@ export class ActionStore<Scope, Entry extends ActionStoreEntry> {
 		return last(this.scopesByID.get(scope)?.exact.get(action.key));
 	}
 
+	has(scope: Scope, entry: Entry): boolean {
+		return this.scopesByID.get(scope)?.entries.has(entry) === true;
+	}
+
 	lookup(scope: Scope, action: ActionKey): readonly ActionStoreLookup<Entry>[] {
 		const state = this.scopesByID.get(scope);
 		return state ? this.lookupRecords(state, action).map(({ entry, match }) => ({ entry, match })) : [];
@@ -232,7 +236,7 @@ export interface ResultCacheSnapshot {
 	readonly hotBytes: number;
 }
 
-/** Completed shareable results. This aggregate exclusively owns reuse evidence and retention state. */
+/** Completed shareable results. Exact freshness generations may coexist until validation or retention retires them. */
 export class ResultCache<Scope, Entry extends SizedActionStoreEntry> {
 	private readonly index: ActionStore<Scope, Entry>;
 	private readonly metadata = new Map<Scope, Map<Entry, ResultCacheEvidence>>();
@@ -244,7 +248,7 @@ export class ResultCache<Scope, Entry extends SizedActionStoreEntry> {
 		score: (entry: Entry, evidence: ResultCacheEvidence, now: number) => number = () => 0,
 		now: () => number = Date.now,
 	) {
-		this.index = new ActionStore(projectors);
+		this.index = new ActionStore(projectors, true);
 		this.score = score;
 		this.now = now;
 	}
@@ -303,7 +307,7 @@ export class ResultCache<Scope, Entry extends SizedActionStoreEntry> {
 	}
 
 	evidenceOf(scope: Scope, entry: Entry): ResultCacheEvidence | undefined {
-		if (this.index.getExact(scope, entry.key) !== entry) return undefined;
+		if (!this.index.has(scope, entry)) return undefined;
 		const evidence = this.metadata.get(scope)?.get(entry);
 		return evidence ? { ...evidence } : undefined;
 	}
