@@ -3,7 +3,6 @@ import type { ActionKey, ActionSemanticsRegistry } from "./action-semantics.ts";
 import { PI_ACTION_SEMANTICS } from "./action-semantics.ts";
 import type {
 	ExecutionWorld,
-	ExecutionWorldMode,
 	WorldBranch,
 	WorldBranchState,
 	WorldCheckpoint,
@@ -22,7 +21,6 @@ import type { ToolSettlement } from "./tool-settlement.ts";
 
 /** Host tool call supplied to any OS sandbox or safe local substitute. */
 export interface SpeculativeToolExecutionContext {
-	readonly mode: ExecutionWorldMode;
 	readonly cwd: string;
 	readonly tool: AgentTool;
 	readonly toolName: string;
@@ -36,30 +34,17 @@ export interface SpeculativeToolExecutionContext {
 
 export type SpeculativeAgentExecutionWorld = ExecutionWorld<SpeculativeToolExecutionContext, ToolSettlement>;
 
-/** Install the intrinsic read-only fallback without duplicating an injected equivalent. */
-export function withResourceSnapshotExecutionWorld(
-	worlds: readonly SpeculativeAgentExecutionWorld[],
-	actionSemantics: ActionSemanticsRegistry = PI_ACTION_SEMANTICS,
-): SpeculativeAgentExecutionWorld[] {
-	const resolved = [...new Set(worlds)];
-	if (!resolved.some((world) => world.id === "resource_version" && supportsMode(world, "resource_snapshot"))) {
-		resolved.push(createResourceSnapshotExecutionWorld(actionSemantics));
-	}
-	return resolved;
-}
-
 /** Read-only local substitute: execute now, then prove the observed resources are still current. */
 export function createResourceSnapshotExecutionWorld(
 	actionSemantics: ActionSemanticsRegistry = PI_ACTION_SEMANTICS,
 ): SpeculativeAgentExecutionWorld {
 	return {
 		id: "resource_version",
-		supports: (mode) => mode === "resource_snapshot",
+		scope: "fallback",
+		isolation: "resource_snapshot",
+		supports: ({ tool, effect }) => effect === "observation" && actionSemantics.resourceScope(tool) !== undefined,
 		fingerprint: () => "resource-version:v1",
 		fork: async (context) => {
-			if (context.mode !== "resource_snapshot") {
-				throw new Error(`Execution world does not support mode ${context.mode}`);
-			}
 			const setupStarted = performance.now();
 			const version = await captureResourceVersion(context.action, context.cwd, actionSemantics);
 			const setupMs = Math.max(0, performance.now() - setupStarted);
@@ -148,12 +133,4 @@ function errorSettlement(error: unknown): ToolSettlement {
 		},
 		isError: true,
 	};
-}
-
-function supportsMode(world: SpeculativeAgentExecutionWorld, mode: ExecutionWorldMode): boolean {
-	try {
-		return world.supports(mode);
-	} catch {
-		return false;
-	}
 }

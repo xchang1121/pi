@@ -1,10 +1,8 @@
 import path from "node:path";
 
-/** Isolation selected for one speculative attempt, independent of action identity. */
-export type SpeculativeExecution = "runtime_sandbox" | "resource_snapshot" | "file_mutation";
-export type ActionReuseKind = "shared_result" | "exclusive_branch";
+/** Observable effects of an action, independent of any concrete isolation backend. */
+export type ActionEffect = "observation" | "workspace_mutation" | "unbounded";
 export type ResourceDependencyScope = "content" | "tree_entries" | "tree_query" | "tree_content";
-export type LocalIsolationMechanism = Exclude<SpeculativeExecution, "runtime_sandbox"> | "none";
 
 export interface ReadActionRange {
 	readonly path: string;
@@ -74,8 +72,8 @@ export interface CanonicalAction {
 export interface ActionSemanticsDefinition {
 	readonly tool: string;
 	readonly epoch: string;
-	/** Safe host-local fallback when no runtime-wide sandbox is available. */
-	readonly localIsolation: LocalIsolationMechanism;
+	/** Effects an isolation backend must contain or validate. */
+	readonly effect: ActionEffect;
 	/** Filesystem evidence required to prove that a completed action is still current. */
 	readonly resourceScope?: ResourceDependencyScope;
 	readonly canonicalize: (input: unknown, cwd: string) => CanonicalAction | undefined;
@@ -116,14 +114,14 @@ export class ActionSemanticsRegistry {
 		return this.definitionsByTool.get(tool);
 	}
 
-	toolNames(localIsolation?: LocalIsolationMechanism): readonly string[] {
+	toolNames(effect?: ActionEffect): readonly string[] {
 		return [...this.definitionsByTool.values()]
-			.filter((definition) => localIsolation === undefined || definition.localIsolation === localIsolation)
+			.filter((definition) => effect === undefined || definition.effect === effect)
 			.map((definition) => definition.tool);
 	}
 
-	localIsolation(tool: string): LocalIsolationMechanism {
-		return this.definition(tool)?.localIsolation ?? "none";
+	effect(tool: string): ActionEffect | undefined {
+		return this.definition(tool)?.effect;
 	}
 
 	resourceScope(tool: string): ResourceDependencyScope | undefined {
@@ -200,7 +198,7 @@ export const PI_ACTION_SEMANTICS = new ActionSemanticsRegistry([
 	{
 		tool: "read",
 		epoch: "pi.read.v2",
-		localIsolation: "resource_snapshot",
+		effect: "observation",
 		resourceScope: "content",
 		canonicalize: canonicalRead,
 		projectors: [READ_RANGE_ACTION_KEY_PROJECTOR],
@@ -208,47 +206,47 @@ export const PI_ACTION_SEMANTICS = new ActionSemanticsRegistry([
 	{
 		tool: "grep",
 		epoch: "pi.grep.v2",
-		localIsolation: "resource_snapshot",
+		effect: "observation",
 		resourceScope: "tree_content",
 		canonicalize: canonicalGrep,
 	},
 	{
 		tool: "find",
 		epoch: "pi.find.v2",
-		localIsolation: "resource_snapshot",
+		effect: "observation",
 		resourceScope: "tree_query",
 		canonicalize: canonicalFind,
 	},
 	{
 		tool: "ls",
 		epoch: "pi.ls.v1",
-		localIsolation: "resource_snapshot",
+		effect: "observation",
 		resourceScope: "tree_entries",
 		canonicalize: canonicalLs,
 	},
 	{
 		tool: "bash",
 		epoch: "pi.bash.v2",
-		localIsolation: "none",
+		effect: "unbounded",
 		canonicalize: canonicalBash,
 	},
 	{
 		tool: "write",
 		epoch: "pi.write.v1",
-		localIsolation: "file_mutation",
+		effect: "workspace_mutation",
 		canonicalize: canonicalWrite,
 	},
 	{
 		tool: "edit",
 		epoch: "pi.edit.v1",
-		localIsolation: "file_mutation",
+		effect: "workspace_mutation",
 		canonicalize: canonicalEdit,
 	},
 ]);
 
-export const RESOURCE_SNAPSHOT_ACTION_TOOLS = Object.freeze(PI_ACTION_SEMANTICS.toolNames("resource_snapshot"));
-export const FILE_MUTATION_ACTION_TOOLS = Object.freeze(PI_ACTION_SEMANTICS.toolNames("file_mutation"));
-export const NO_LOCAL_ISOLATION_ACTION_TOOLS = Object.freeze(PI_ACTION_SEMANTICS.toolNames("none"));
+export const OBSERVATION_ACTION_TOOLS = Object.freeze(PI_ACTION_SEMANTICS.toolNames("observation"));
+export const WORKSPACE_MUTATION_ACTION_TOOLS = Object.freeze(PI_ACTION_SEMANTICS.toolNames("workspace_mutation"));
+export const UNBOUNDED_ACTION_TOOLS = Object.freeze(PI_ACTION_SEMANTICS.toolNames("unbounded"));
 export const KEYABLE_TOOLS = Object.freeze(PI_ACTION_SEMANTICS.toolNames());
 
 export function buildActionKey(input: {
@@ -425,8 +423,8 @@ export function normalizeRelativeRoot(value: unknown, cwd: string): string | und
 	return normalizeWorkspacePath(value ?? ".", cwd);
 }
 
-export function inferredLocalIsolation(tool: string): LocalIsolationMechanism {
-	return PI_ACTION_SEMANTICS.localIsolation(tool);
+export function inferredActionEffect(tool: string): ActionEffect | undefined {
+	return PI_ACTION_SEMANTICS.effect(tool);
 }
 
 export function normalizeReadOffset(value: unknown): number {
@@ -572,14 +570,14 @@ function readProjectionPartition(action: ActionKey): string | undefined {
 }
 
 function assertDefinitionCoherence(definition: ActionSemanticsDefinition): void {
-	if (definition.localIsolation === "resource_snapshot") {
+	if (definition.effect === "observation") {
 		if (definition.resourceScope === undefined) {
-			throw new Error(`resource-snapshot action ${definition.tool} requires resource evidence`);
+			throw new Error(`observation action ${definition.tool} requires resource evidence`);
 		}
 		return;
 	}
 	if (definition.resourceScope !== undefined) {
-		throw new Error(`action ${definition.tool} cannot use resource evidence without a resource snapshot`);
+		throw new Error(`non-observation action ${definition.tool} cannot declare resource evidence`);
 	}
 }
 

@@ -8,7 +8,7 @@ Runtime 分为四个相互独立的层次：
 
 1. **投机源**：Drafter 与 PatternAware 只产生与执行方式无关的 `PlanAction`。
 2. **动作身份**：`K(a)` 规范化工具语义、已验证 schema、参数、资源与实际执行器身份；无损投影规则可以证明一个结果覆盖另一个动作。
-3. **执行路由**：统一解析器选择隔离能力。所选路由刻意不进入 `K(a)`。
+3. **执行路由**：动作语义只声明可观察效果，由唯一的 `ExecutionWorldRouter` 选择并准备隔离能力。所选路由刻意不进入 `K(a)`。
 4. **调度与结算**：Scheduler 决定启动时机与资源竞争；`ExecutionWorld` 管理隔离执行和采纳；唯一的结算生命周期记录匹配、采纳、回退与计时。
 
 执行路线具有固定优先级：
@@ -17,10 +17,10 @@ Runtime 分为四个相互独立的层次：
 |---|---|---|
 | 1 | `runtime_sandbox` | 注入的 Runtime 全局沙箱；对所有启用工具优先 |
 | 2 | `resource_snapshot` | `read`、`grep`、`find`、`ls` 的本地后备，通过资源版本证据保证新鲜度 |
-| 2 | `file_mutation` | `write`、`edit` 的本地后备，在私有 Git worktree 中执行并进行冲突检查后提交 |
+| 2 | `workspace_branch` | `write`、`edit` 的本地后备，在私有 Git worktree 中执行并进行冲突检查后提交 |
 | 3 | Actor 回退 | 没有安全路线时完全不发起投机工具执行 |
 
-本 package **不再内置进程沙箱**。因此默认 Pi 扩展仍可预测并匹配 `bash`，但不会投机执行 Bash；命令由 Actor 通过 Pi 正常路径执行。嵌入式 Runtime 可以注入支持 `runtime_sandbox` 的 `ExecutionWorld`，一次性为 Bash 和其余工具提供隔离。
+本 package **不再内置进程沙箱**。因此默认 Pi 扩展仍可预测并匹配 `bash`，但不会投机执行 Bash；命令由 Actor 通过 Pi 正常路径执行。嵌入式 Runtime 可以注入一个 runtime scope 的 `ExecutionWorld`，一次性为 Bash 和其余工具提供隔离。
 
 这样，未来 OS 层面的 Agent Runtime 只需接入一个完整执行世界，不需要 Pi 针对每种工具分别维护隔离实现。
 
@@ -78,7 +78,7 @@ pi -e ./packages/speculative-action
 
 ## 接入 Runtime 沙箱
 
-宿主通过 `executionWorlds` 提供有序的执行世界。Runtime 全局沙箱声明 `supports("runtime_sandbox")`，能够为任意工具创建隔离 branch。每个成功后端——包括内置资源快照和 Git worktree 后备——都返回同一种 `WorldBranch`，由 branch 自己拥有兼容性证据、新鲜度校验、采纳与清理。宿主在未注册资源快照后端时会自动补上内置实现。
+宿主通过 `executionWorlds` 提供执行世界。runtime scope 的 World 在类型上就是覆盖全部工具的 `runtime_sandbox`；只有 fallback World 才按工具效果声明有限能力。Router 在返回 route 前确认后端可用，因此不可用的 Runtime 沙箱会自然降级到兼容的本地后备。每个成功后端——包括内置资源快照和 Git worktree 后备——都返回同一种 `WorldBranch`，由 branch 自己拥有兼容性证据、新鲜度校验、采纳与清理。宿主在未注册资源快照后端时会自动补上内置实现。
 
 ```ts
 createSpeculativeActionHost(sessionID, {
@@ -88,7 +88,7 @@ createSpeculativeActionHost(sessionID, {
 })
 ```
 
-第一个支持 Runtime 全局沙箱的 World 对所有工具生效；不存在时，解析器才检查工具注册的本地后备。两者都不存在时返回空 route，Runtime 将其结算为 `execution:isolation_unavailable` 并回退 Actor。
+第一个可用的 Runtime 全局沙箱对所有工具生效；不存在时，Router 才检查与动作效果兼容的本地后备。两者都不存在时返回空 route，Runtime 将其结算为 `execution:isolation_unavailable` 并回退 Actor。解析、准备、fork 与 dispose 全部经过同一个 Router，工具侧不会持有可绕开的后端对象。
 
 ## 计时口径
 

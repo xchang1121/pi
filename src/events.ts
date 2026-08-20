@@ -1,4 +1,4 @@
-import type { SpeculativeExecution } from "./action-semantics.ts";
+import type { SpeculativeExecution } from "./execution-world.ts";
 import type {
 	ActorActionSettlement,
 	PredictionSettlement,

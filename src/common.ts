@@ -1,8 +1,8 @@
 import {
-	FILE_MUTATION_ACTION_TOOLS,
 	KEYABLE_TOOLS,
-	NO_LOCAL_ISOLATION_ACTION_TOOLS,
-	RESOURCE_SNAPSHOT_ACTION_TOOLS,
+	OBSERVATION_ACTION_TOOLS,
+	UNBOUNDED_ACTION_TOOLS,
+	WORKSPACE_MUTATION_ACTION_TOOLS,
 } from "./action-semantics.ts";
 
 export interface LegacySpeculativeToolGroups {
@@ -77,9 +77,9 @@ export function normalizeSpeculativeToolSelection(
 	if (!value || typeof value !== "object") return select(allowed);
 	const legacy = value as Record<string, unknown>;
 	return select([
-		...stringArrayOr(legacy.resourceCached, RESOURCE_SNAPSHOT_ACTION_TOOLS),
-		...stringArrayOr(legacy.sandbox, FILE_MUTATION_ACTION_TOOLS),
-		...stringArrayOr(legacy.predictionOnly, NO_LOCAL_ISOLATION_ACTION_TOOLS),
+		...stringArrayOr(legacy.resourceCached, OBSERVATION_ACTION_TOOLS),
+		...stringArrayOr(legacy.sandbox, WORKSPACE_MUTATION_ACTION_TOOLS),
+		...stringArrayOr(legacy.predictionOnly, UNBOUNDED_ACTION_TOOLS),
 	]);
 }
 

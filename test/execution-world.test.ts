@@ -1,66 +1,89 @@
-import { describe, expect, it } from "vitest";
-import type { ExecutionWorld, ExecutionWorldMode } from "../src/execution-world.ts";
-import { resolveSpeculativeExecutionRoute, sameSpeculativeExecutionRoute } from "../src/execution-world.ts";
+import { describe, expect, it, vi } from "vitest";
+import type { ExecutionWorld, ExecutionWorldRequest, SpeculativeExecution } from "../src/execution-world.ts";
+import { ExecutionWorldRouter, sameSpeculativeExecutionRoute } from "../src/execution-world.ts";
 
-type TestWorld = ExecutionWorld<{ readonly mode: ExecutionWorldMode }, void>;
+type TestWorld = ExecutionWorld<{ readonly value: string }, string>;
+const preparation = { cwd: "/workspace" };
 
-describe("speculative execution route resolution", () => {
-	it("prefers a runtime-wide world and preserves safe shared reuse for resource queries", async () => {
-		const local = world("git", ["file_mutation"]);
-		const runtime = world("runtime", ["runtime_sandbox"], "runtime:v1");
+describe("ExecutionWorldRouter", () => {
+	it("uses one runtime sandbox for every effect, then exact local fallbacks, then blocks", async () => {
+		const resource = fallback("resource", "resource_snapshot", ({ effect }) => effect === "observation");
+		const workspace = fallback("workspace", "workspace_branch", ({ effect }) => effect === "workspace_mutation");
+		const runtimeRouter = new ExecutionWorldRouter([resource, workspace, runtime("runtime")]);
+		const requests = [
+			{ tool: "read", effect: "observation" },
+			{ tool: "write", effect: "workspace_mutation" },
+			{ tool: "bash", effect: "unbounded" },
+		] as const;
 
-		expect(await resolveSpeculativeExecutionRoute("resource_snapshot", [local, runtime])).toMatchObject({
-			isolation: "runtime_sandbox",
-			reuse: "shared_result",
-			backend: "runtime",
-			fingerprint: "runtime:v1",
-			context: runtime,
-		});
-		expect(await resolveSpeculativeExecutionRoute("file_mutation", [local, runtime])).toMatchObject({
-			isolation: "runtime_sandbox",
-			reuse: "exclusive_branch",
-			backend: "runtime",
-		});
+		for (const request of requests) {
+			expect(await runtimeRouter.resolve(request, preparation)).toMatchObject({
+				backend: "runtime",
+				isolation: "runtime_sandbox",
+				reuse: request.effect === "observation" ? "shared_result" : "exclusive_branch",
+			});
+		}
+
+		const localRouter = new ExecutionWorldRouter([workspace, resource]);
+		expect(await localRouter.resolve(requests[0], preparation)).toMatchObject({ backend: "resource" });
+		expect(await localRouter.resolve(requests[1], preparation)).toMatchObject({ backend: "workspace" });
+		expect(await localRouter.resolve(requests[2], preparation)).toBeUndefined();
 	});
 
-	it("uses only the registered local mechanism and blocks actions with none", async () => {
-		const resource = world("resource_version", ["resource_snapshot"], "resource-version:v1");
-		const local = world("git", ["file_mutation"]);
-		expect(await resolveSpeculativeExecutionRoute("resource_snapshot", [local, resource])).toMatchObject({
-			isolation: "resource_snapshot",
-			reuse: "shared_result",
-			backend: "resource_version",
-			fingerprint: "resource-version:v1",
-			context: resource,
-		});
-		expect(await resolveSpeculativeExecutionRoute("resource_snapshot", [local])).toBeUndefined();
-		expect(await resolveSpeculativeExecutionRoute("file_mutation", [local])).toMatchObject({
-			isolation: "file_mutation",
-			backend: "git",
-		});
-		expect(await resolveSpeculativeExecutionRoute("none", [local])).toBeUndefined();
-	});
+	it("falls through unavailable worlds and exclusively owns backend lifecycle", async () => {
+		const unavailable = {
+			...runtime("unavailable"),
+			prepare: vi.fn(async () => {
+				throw new Error("unavailable");
+			}),
+		};
+		const resource = fallback("resource", "resource_snapshot", () => true);
+		const router = new ExecutionWorldRouter([unavailable, resource, resource]);
+		const route = await router.resolve({ tool: "read", effect: "observation" }, preparation);
 
-	it("skips a broken capability and keys reuse by stable route identity, not opaque context", async () => {
-		const broken = world("broken", ["runtime_sandbox"], new Error("fingerprint unavailable"));
-		const healthy = world("healthy", ["runtime_sandbox"], "healthy:v1");
-		const route = await resolveSpeculativeExecutionRoute("none", [broken, healthy]);
-		expect(route).toMatchObject({ backend: "healthy", fingerprint: "healthy:v1" });
-		expect(route && sameSpeculativeExecutionRoute(route, { ...route, context: { different: true } })).toBe(true);
-		expect(route && sameSpeculativeExecutionRoute(route, { ...route, fingerprint: "healthy:v2" })).toBe(false);
+		expect(route).toMatchObject({ backend: "resource", scope: "fallback" });
+		expect(unavailable.prepare).toHaveBeenCalledOnce();
+		expect(route && (await router.fork(route, { value: "captured" })).output).toBe("captured");
+		expect(route && sameSpeculativeExecutionRoute(route, { ...route })).toBe(true);
+		expect(route && sameSpeculativeExecutionRoute(route, { ...route, fingerprint: "changed" })).toBe(false);
+		await router.dispose();
+		expect(unavailable.dispose).toHaveBeenCalledOnce();
+		expect(resource.dispose).toHaveBeenCalledOnce();
+
+		expect(
+			() => new ExecutionWorldRouter([runtime("same"), fallback("same", "resource_snapshot", () => true)]),
+		).toThrow("duplicate execution world same");
 	});
 });
 
-function world(id: string, modes: readonly ExecutionWorldMode[], fingerprint: string | Error = `${id}:v1`): TestWorld {
+function runtime(id: string): TestWorld {
+	return { ...lifecycle(id), scope: "runtime", isolation: "runtime_sandbox" };
+}
+
+function fallback(
+	id: string,
+	isolation: Exclude<SpeculativeExecution, "runtime_sandbox">,
+	supports: (request: ExecutionWorldRequest) => boolean,
+): TestWorld {
+	return { ...lifecycle(id), scope: "fallback", isolation, supports };
+}
+
+function lifecycle(id: string) {
+	const dispose = vi.fn(async () => {});
 	return {
 		id,
-		supports: (mode) => modes.includes(mode),
-		fingerprint: () => {
-			if (fingerprint instanceof Error) throw fingerprint;
-			return fingerprint;
-		},
-		fork: async () => {
-			throw new Error("not used by route resolution");
-		},
+		fingerprint: () => `${id}:v1`,
+		fork: async ({ value }: { readonly value: string }) => ({
+			output: value,
+			backend: id,
+			resources: [],
+			capturedBytes: 0,
+			executionMetrics: {},
+			compatibility: { status: "compatible" as const, backend: id, executionFingerprint: "executor" },
+			state: "sealed" as const,
+			commit: async () => value,
+			dispose: () => {},
+		}),
+		dispose,
 	};
 }

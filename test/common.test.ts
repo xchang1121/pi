@@ -10,7 +10,7 @@ import {
 	actionKeyProjectionPartitions,
 	buildActionKey,
 	buildPiActionKey,
-	inferredLocalIsolation,
+	inferredActionEffect,
 } from "../src/action-semantics.ts";
 import {
 	buildSingleToolCallPrompt,
@@ -230,9 +230,9 @@ describe("speculative action common", () => {
 				tools: ["read", "bash", "write"],
 			}),
 		).toEqual(["read", "bash", "write"]);
-		expect(inferredLocalIsolation("read")).toBe("resource_snapshot");
-		expect(inferredLocalIsolation("bash")).toBe("none");
-		expect(inferredLocalIsolation("edit")).toBe("file_mutation");
+		expect(inferredActionEffect("read")).toBe("observation");
+		expect(inferredActionEffect("bash")).toBe("unbounded");
+		expect(inferredActionEffect("edit")).toBe("workspace_mutation");
 		expect(normalizeSpeculativeToolSelection(["bash", "read", "bash", "unknown"])).toEqual(["bash", "read"]);
 		expect(
 			normalizeSpeculativeToolSelection({

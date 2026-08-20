@@ -14,9 +14,10 @@
 - Renamed source request horizons and `requestLifetime: "actor_action"` to decision-batch units; one Actor response may contain several parallel tool actions but advances prediction time only once.
 - Split action identity from execution isolation. `ActionKey` no longer contains an execution class; adapters now resolve a `SpeculativeExecutionRoute` after K(a) materialization.
 - Replaced the three tool groups (`resourceCached`, `sandbox`, and `predictionOnly`) with one prediction-enabled `tools` list. Legacy grouped settings are accepted only at the configuration migration boundary.
-- Replaced the single sandbox option with ordered `executionWorlds`. A world supporting `runtime_sandbox` takes priority for every tool.
+- Replaced the single sandbox option with `executionWorlds`. A runtime-scoped world takes priority for every tool.
 - Renamed prediction-only fallback telemetry to the general execution-blocked terminology.
 - Unified every successful speculative tool exit as a backend-owned `WorldBranch`. Removed the adapter's parallel resource-version callbacks and the redundant `ResourceVersionPolicy`; validation, invalidation, commit, and disposal now follow the branch lifecycle.
+- Replaced tool-to-backend `localIsolation` declarations and opaque route handles with action-effect declarations and one `ExecutionWorldRouter`; runtime worlds cover the full tool surface, unavailable worlds fall through during resolution, and all preparation, fork, and disposal stays behind the router.
 
 ### Added
 
@@ -34,8 +35,8 @@
 - Added probation/protected speculative cache tiers: new results remain eviction-first until a successful actor hit promotes them, with bounded protected occupancy by entries and bytes.
 - Added aggregate, input-free K(a) rejection counts to hit and miss telemetry.
 - Added opt-in, adoption-gated Drafter continuation rounds: every confirmed prefix restores the configured independent-request width, shares the next-action budget with normal turn fanout, and admits fast responses without waiting for the batch; real-task ablation keeps the default depth at zero.
-- Added a uniform route resolver with the priority `runtime_sandbox` → registered local isolation → Actor fallback.
-- Added `resource_snapshot` as the local route for `read`, `grep`, `find`, and `ls`, and `file_mutation` as the Git-worktree route for `write` and `edit`.
+- Added one `ExecutionWorldRouter` with the priority `runtime_sandbox` → registered local fallback → Actor fallback.
+- Added `resource_snapshot` as the local route for `read`, `grep`, `find`, and `ls`, and `workspace_branch` as the Git-worktree route for `write` and `edit`.
 - Added an explicit `execution_blocked` plan state. Blocked predictions remain matchable without being confused with an impossible dependency.
 - Added counterfactual timing for isolation-blocked matches using the same capped lead-time decomposition as adopted speculative work.
 

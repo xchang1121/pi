@@ -16,7 +16,7 @@ import { type SpeculativeExecutionRoute, sameSpeculativeExecutionRoute, type Wor
 import type { PlanUpdate } from "./plan-proposal.ts";
 import { PlanRuntime, type PlanRuntimeNode, type PredictionOpportunity, type RetiredPlanNode } from "./plan-runtime.ts";
 import { PostSettlementQueue } from "./post-settlement.ts";
-import { resourceProfile } from "./resource-budget.ts";
+import { actionResourceProfile, resourceProfile } from "./resource-budget.ts";
 import type {
 	AdoptedAction,
 	CandidatePreflight,
@@ -1085,9 +1085,14 @@ export function makeStructuralSpeculativeActionRuntime<
 				tool: node.action.tool,
 				concrete: executionInput,
 				action: key,
+				signal: context.admissionSignal,
 			});
 		} catch {
 			route = undefined;
+		}
+		if (context.admissionSignal.aborted) {
+			failUnlaunchable(session, node, cause("source", "generation_expired"));
+			return;
 		}
 		if (!route) {
 			const blocked = cause(
@@ -1744,10 +1749,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		return earliestAttempt === undefined ? undefined : Math.max(0, actorArrivedAt - earliestAttempt);
 	};
 
-	const actorResourceProfile = (tool: string) => {
-		const localIsolation = semantics.localIsolation(tool);
-		return resourceProfile(localIsolation === "none" ? "runtime_sandbox" : localIsolation);
-	};
+	const actorResourceProfile = (tool: string) => actionResourceProfile(semantics.effect(tool));
 
 	const actual = async (
 		input: ConsumeInput & { readonly durationMs: number; readonly output?: Output },

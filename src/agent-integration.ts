@@ -11,7 +11,7 @@ import type {
 import { validateToolArguments } from "@earendil-works/pi-ai";
 import type { ActionProjectionRule } from "./action-key-projection.ts";
 import { type ActionKey, type ActionSemanticsRegistry, PI_ACTION_SEMANTICS } from "./action-semantics.ts";
-import { type SpeculativeAgentExecutionWorld, withResourceSnapshotExecutionWorld } from "./agent-execution-world.ts";
+import { createResourceSnapshotExecutionWorld, type SpeculativeAgentExecutionWorld } from "./agent-execution-world.ts";
 import {
 	buildSingleToolCallPrompt,
 	clampCandidateLimit,
@@ -22,11 +22,7 @@ import {
 	type SpeculativeToolSelectionInput,
 	usageTokenCount,
 } from "./common.ts";
-import {
-	type ExecutionWorldMode,
-	resolveSpeculativeExecutionRoute,
-	type SpeculativeExecutionRoute,
-} from "./execution-world.ts";
+import { ExecutionWorldRouter, type SpeculativeExecutionRoute } from "./execution-world.ts";
 import {
 	acquirePatternAwareStore,
 	asPatternAwareRuntimeContext,
@@ -189,9 +185,25 @@ export function createSpeculativeActionHost(
 ): SpeculativeActionHost {
 	const actionSemantics = options.actionSemantics ?? PI_ACTION_SEMANTICS;
 	const projectionRules = (options.projectionRules ?? []).filter((rule) => actionSemantics.supportsProjector(rule.id));
-	const executionWorlds = withResourceSnapshotExecutionWorld(options.executionWorlds ?? [], actionSemantics);
-	const resolveExecutionRoute = (tool: string) =>
-		resolveSpeculativeExecutionRoute(actionSemantics.localIsolation(tool), executionWorlds);
+	const executionWorlds = [...new Set(options.executionWorlds ?? [])];
+	if (
+		!executionWorlds.some(
+			(world) =>
+				world.id === "resource_version" && world.scope === "fallback" && world.isolation === "resource_snapshot",
+		)
+	) {
+		executionWorlds.push(createResourceSnapshotExecutionWorld(actionSemantics));
+	}
+	const executionRouter = new ExecutionWorldRouter(executionWorlds);
+	const resolveExecutionRoute = (tool: string, signal?: AbortSignal, action?: ActionKey) => {
+		const effect = actionSemantics.effect(tool);
+		return effect
+			? executionRouter.resolve(
+					{ tool, effect, ...(action ? { action } : {}) },
+					{ cwd: options.cwd, ...(signal ? { signal } : {}) },
+				)
+			: undefined;
+	};
 	const patternActionSemantics = {
 		namespace: "pi-action-semantics-v1",
 		actionKey: (tool: string, input: Readonly<Record<string, unknown>>, schemaHash?: string) =>
@@ -284,17 +296,7 @@ export function createSpeculativeActionHost(
 		}
 	};
 	const prepareExecutionWorlds = async (tools: readonly string[], signal?: AbortSignal): Promise<void> => {
-		const preparations = new Map<SpeculativeAgentExecutionWorld, Set<ExecutionWorldMode>>();
-		for (const route of await Promise.all([...new Set(tools)].map(resolveExecutionRoute))) {
-			if (!route) continue;
-			const world = routeWorld(route);
-			const modes = preparations.get(world) ?? new Set<ExecutionWorldMode>();
-			modes.add(route.isolation);
-			preparations.set(world, modes);
-		}
-		await Promise.all(
-			[...preparations].map(([world, modes]) => prepareWorld(world, options.cwd, [...modes], signal)),
-		);
+		await Promise.all([...new Set(tools)].map((tool) => resolveExecutionRoute(tool, signal)));
 	};
 	type AgentPlanSource = SpeculativePlanSource<
 		string,
@@ -682,7 +684,7 @@ export function createSpeculativeActionHost(
 					: undefined,
 			);
 		},
-		resolveExecution: ({ tool }) => resolveExecutionRoute(tool),
+		resolveExecution: ({ tool, action, signal }) => resolveExecutionRoute(tool, signal, action),
 		actual: (input) => ({ id: input.id, tool: input.tool, input: input.args }),
 		preflightCandidate: async ({ data, tool: toolName, concrete, action, route, callID, signal }) => {
 			const tool = data.tools.get(toolName);
@@ -719,8 +721,7 @@ export function createSpeculativeActionHost(
 			if (!tool) throw new Error(`Tool ${toolName} not found`);
 			const args = validateCandidateArguments(tool, toolName, concrete, callID);
 			if (args === undefined) throw new Error(`Invalid arguments for tool ${toolName}`);
-			return routeWorld(route).fork({
-				mode: route.isolation,
+			return executionRouter.fork(route, {
 				cwd: options.cwd,
 				tool,
 				toolName,
@@ -734,11 +735,7 @@ export function createSpeculativeActionHost(
 		rejectCandidateOutput: ({ output }) => (output.isError ? "tool_error_result" : undefined),
 		projectionRules,
 		prepareCandidate: async ({ candidate, route, signal }) => {
-			if (!route) {
-				await prepareExecutionWorlds([candidate.tool], signal);
-				return;
-			}
-			await prepareWorld(routeWorld(route), options.cwd, [route.isolation], signal);
+			if (!route) await prepareExecutionWorlds([candidate.tool], signal);
 		},
 		onTurnStarted: async ({ startInput, settings, signal }) => {
 			authoritativeBatches.delete(authoritativeBatchKey(startInput.sessionID, startInput.turnID));
@@ -805,7 +802,7 @@ export function createSpeculativeActionHost(
 						}
 					}
 				} finally {
-					await Promise.allSettled(executionWorlds.map((world) => world.dispose?.()));
+					await executionRouter.dispose();
 				}
 			}
 		},
@@ -883,21 +880,4 @@ function normalizeTimeout(value: unknown): number {
 
 function normalizePositiveInteger(value: unknown, fallback: number): number {
 	return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
-}
-
-function routeWorld(route: SpeculativeExecutionRoute): SpeculativeAgentExecutionWorld {
-	const world = route.context as SpeculativeAgentExecutionWorld | undefined;
-	if (!world || !world.supports(route.isolation as ExecutionWorldMode)) {
-		throw new Error(`Execution world ${route.backend} is unavailable for ${route.isolation}`);
-	}
-	return world;
-}
-
-async function prepareWorld(
-	world: SpeculativeAgentExecutionWorld,
-	cwd: string,
-	modes: readonly ExecutionWorldMode[],
-	signal?: AbortSignal,
-): Promise<void> {
-	await world.prepare?.({ cwd, modes, ...(signal ? { signal } : {}) });
 }

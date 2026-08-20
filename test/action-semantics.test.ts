@@ -7,35 +7,35 @@ import {
 	actionKeyMismatchReason,
 	buildActionKey,
 	buildPiActionKey,
-	FILE_MUTATION_ACTION_TOOLS,
 	KEYABLE_TOOLS,
-	NO_LOCAL_ISOLATION_ACTION_TOOLS,
+	OBSERVATION_ACTION_TOOLS,
 	PI_ACTION_SEMANTICS,
 	READ_RANGE_ACTION_KEY_PROJECTOR,
-	RESOURCE_SNAPSHOT_ACTION_TOOLS,
+	UNBOUNDED_ACTION_TOOLS,
+	WORKSPACE_MUTATION_ACTION_TOOLS,
 } from "../src/action-semantics.ts";
 
 describe("ActionSemanticsRegistry", () => {
-	it("defines K(a) resource evidence and host-local fallback without choosing an execution route", () => {
+	it("defines K(a), resource evidence, and effects without choosing an execution backend", () => {
 		expect(PI_ACTION_SEMANTICS.toolNames()).toEqual(["read", "grep", "find", "ls", "bash", "write", "edit"]);
 		expect(KEYABLE_TOOLS).toEqual(PI_ACTION_SEMANTICS.toolNames());
-		expect(RESOURCE_SNAPSHOT_ACTION_TOOLS).toEqual(["read", "grep", "find", "ls"]);
-		expect(FILE_MUTATION_ACTION_TOOLS).toEqual(["write", "edit"]);
-		expect(NO_LOCAL_ISOLATION_ACTION_TOOLS).toEqual(["bash"]);
+		expect(OBSERVATION_ACTION_TOOLS).toEqual(["read", "grep", "find", "ls"]);
+		expect(WORKSPACE_MUTATION_ACTION_TOOLS).toEqual(["write", "edit"]);
+		expect(UNBOUNDED_ACTION_TOOLS).toEqual(["bash"]);
 
 		expect(PI_ACTION_SEMANTICS.definition("read")).toMatchObject({
-			localIsolation: "resource_snapshot",
+			effect: "observation",
 			resourceScope: "content",
 		});
 		expect(PI_ACTION_SEMANTICS.definition("ls")).toMatchObject({
-			localIsolation: "resource_snapshot",
+			effect: "observation",
 			resourceScope: "tree_entries",
 		});
 		expect(PI_ACTION_SEMANTICS.definition("bash")).toMatchObject({
-			localIsolation: "none",
+			effect: "unbounded",
 		});
 		expect(PI_ACTION_SEMANTICS.definition("write")).toMatchObject({
-			localIsolation: "file_mutation",
+			effect: "workspace_mutation",
 		});
 		expect(PI_ACTION_SEMANTICS.resourceScope("write")).toBeUndefined();
 	});
@@ -184,7 +184,7 @@ describe("ActionSemanticsRegistry", () => {
 		]);
 
 		expect(registry.toolNames()).toEqual(["stat"]);
-		expect(registry.localIsolation("stat")).toBe("resource_snapshot");
+		expect(registry.effect("stat")).toBe("observation");
 		expect(registry.resourceScope("stat")).toBe("content");
 		expect(registry.buildKey("stat", { path: "a.ts" }, "/workspace", "schema")).toMatchObject({
 			tool: "stat",
@@ -217,7 +217,7 @@ describe("ActionSemanticsRegistry", () => {
 		expect(registry.buildKey("malformed", {}, "/workspace")).toBeUndefined();
 	});
 
-	it("rejects duplicate tools and incoherent local fallback policies", () => {
+	it("rejects duplicate tools and incoherent effect evidence", () => {
 		const definition = resourceDefinition("read", "read.v1", () => ({ input: {}, resources: ["."] }));
 		expect(() => new ActionSemanticsRegistry([definition, definition])).toThrow(
 			"duplicate action semantics for read",
@@ -228,10 +228,10 @@ describe("ActionSemanticsRegistry", () => {
 					{
 						...definition,
 						tool: "write",
-						localIsolation: "file_mutation",
+						effect: "workspace_mutation",
 					},
 				]),
-		).toThrow("cannot use resource evidence without a resource snapshot");
+		).toThrow("non-observation action write cannot declare resource evidence");
 		expect(
 			() =>
 				new ActionSemanticsRegistry([
@@ -241,20 +241,20 @@ describe("ActionSemanticsRegistry", () => {
 						resourceScope: undefined,
 					},
 				]),
-		).toThrow("requires resource evidence");
+		).toThrow("observation action missing_scope requires resource evidence");
 		expect(
 			() =>
 				new ActionSemanticsRegistry([
 					{
 						...definition,
 						tool: "bad_observer",
-						localIsolation: "none",
+						effect: "unbounded",
 						resourceScope: undefined,
 					},
 				]),
 		).not.toThrow();
-		expect(() => new ActionSemanticsRegistry([{ ...definition, tool: "bad_none", localIsolation: "none" }])).toThrow(
-			"cannot use resource evidence without a resource snapshot",
+		expect(() => new ActionSemanticsRegistry([{ ...definition, tool: "bad_none", effect: "unbounded" }])).toThrow(
+			"non-observation action bad_none cannot declare resource evidence",
 		);
 	});
 
@@ -308,7 +308,7 @@ function resourceDefinition(
 	return {
 		tool,
 		epoch,
-		localIsolation: "resource_snapshot",
+		effect: "observation",
 		resourceScope: "content",
 		canonicalize,
 	};

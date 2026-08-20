@@ -22,12 +22,12 @@ import {
 	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import {
-	FILE_MUTATION_ACTION_TOOLS,
 	KEYABLE_TOOLS,
-	NO_LOCAL_ISOLATION_ACTION_TOOLS,
-	RESOURCE_SNAPSHOT_ACTION_TOOLS,
+	OBSERVATION_ACTION_TOOLS,
+	UNBOUNDED_ACTION_TOOLS,
+	WORKSPACE_MUTATION_ACTION_TOOLS,
 } from "./action-semantics.ts";
-import { type SpeculativeAgentExecutionWorld, withResourceSnapshotExecutionWorld } from "./agent-execution-world.ts";
+import type { SpeculativeAgentExecutionWorld } from "./agent-execution-world.ts";
 import { createSpeculativeActionHost } from "./agent-integration.ts";
 import {
 	clampCandidateLimit,
@@ -240,9 +240,7 @@ async function installController(
 	await settingsStore.load();
 	let currentSettings = normalizeSpeculativeActionSettings(settingsStore.effective());
 	const settings = () => currentSettings;
-	const executionWorlds = withResourceSnapshotExecutionWorld(
-		dependencies.createExecutionWorlds?.() ?? [createWorkspaceSandbox()],
-	);
+	const executionWorlds = [...new Set(dependencies.createExecutionWorlds?.() ?? [createWorkspaceSandbox()])];
 	const piToolSettings = await loadPiToolSettings(context.cwd);
 	const availableTools = new Map(pi.getAllTools().map((tool) => [tool.name, tool]));
 	const toolConflicts = new Map<string, string>();
@@ -1348,16 +1346,16 @@ function enabledToolCount(settings: EffectiveSpeculativeActionSettings): number 
 }
 
 function toolIsolationLabel(tool: string): string {
-	if ((RESOURCE_SNAPSHOT_ACTION_TOOLS as readonly string[]).includes(tool)) return "resource snapshot fallback";
-	if ((FILE_MUTATION_ACTION_TOOLS as readonly string[]).includes(tool)) return "Git worktree fallback";
-	if ((NO_LOCAL_ISOLATION_ACTION_TOOLS as readonly string[]).includes(tool)) return "requires runtime sandbox";
+	if ((OBSERVATION_ACTION_TOOLS as readonly string[]).includes(tool)) return "resource snapshot fallback";
+	if ((WORKSPACE_MUTATION_ACTION_TOOLS as readonly string[]).includes(tool)) return "Git worktree fallback";
+	if ((UNBOUNDED_ACTION_TOOLS as readonly string[]).includes(tool)) return "requires runtime sandbox";
 	return "unsupported";
 }
 
 function toolCategory(tool: string): number {
-	if ((RESOURCE_SNAPSHOT_ACTION_TOOLS as readonly string[]).includes(tool)) return 0;
-	if ((FILE_MUTATION_ACTION_TOOLS as readonly string[]).includes(tool)) return 1;
-	if ((NO_LOCAL_ISOLATION_ACTION_TOOLS as readonly string[]).includes(tool)) return 2;
+	if ((OBSERVATION_ACTION_TOOLS as readonly string[]).includes(tool)) return 0;
+	if ((WORKSPACE_MUTATION_ACTION_TOOLS as readonly string[]).includes(tool)) return 1;
+	if ((UNBOUNDED_ACTION_TOOLS as readonly string[]).includes(tool)) return 2;
 	return 3;
 }
 
@@ -1366,15 +1364,10 @@ function toolsSummary(tools: readonly string[]): string {
 }
 
 function executionWorldSummary(worlds: readonly SpeculativeAgentExecutionWorld[]): string {
-	const supporting = (mode: "runtime_sandbox" | "resource_snapshot" | "file_mutation") =>
-		worlds.flatMap((world) => {
-			try {
-				return world.supports(mode) ? [world.id] : [];
-			} catch {
-				return [];
-			}
-		});
-	return `Execution capabilities: runtime sandbox ${toolsSummary(supporting("runtime_sandbox"))}; resource snapshot ${toolsSummary(supporting("resource_snapshot"))}; file mutation ${toolsSummary(supporting("file_mutation"))}`;
+	const supporting = (isolation: SpeculativeAgentExecutionWorld["isolation"]) =>
+		worlds.filter((world) => world.isolation === isolation).map((world) => world.id);
+	const snapshots = [...new Set(["resource_version", ...supporting("resource_snapshot")])];
+	return `Execution capabilities: runtime sandbox ${toolsSummary(supporting("runtime_sandbox"))}; resource snapshot ${toolsSummary(snapshots)}; workspace branch ${toolsSummary(supporting("workspace_branch"))}`;
 }
 
 function countSummary(counts: Readonly<Record<string, number>>): string {

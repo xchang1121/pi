@@ -8,7 +8,7 @@ The runtime has four independent layers:
 
 1. **Sources** — Drafter and PatternAware emit source-neutral `PlanAction` values.
 2. **Action identity** — `K(a)` canonicalizes tool semantics, validated schema, arguments, resources, and executor identity. Lossless projection rules may prove that one result covers another action.
-3. **Execution routing** — one resolver selects an isolation capability. The selected route is deliberately not part of `K(a)`.
+3. **Execution routing** — action semantics declare only observable effects; one `ExecutionWorldRouter` selects and prepares an isolation capability. The selected route is deliberately not part of `K(a)`.
 4. **Scheduling and settlement** — the Scheduler controls launch timing and resource pressure; `ExecutionWorld` owns isolated execution and adoption; one settlement lifecycle records match, adoption, fallback, and timing.
 
 Execution routes use this fixed priority:
@@ -17,10 +17,10 @@ Execution routes use this fixed priority:
 |---|---|---|
 | 1 | `runtime_sandbox` | An injected runtime-wide sandbox; preferred for every enabled tool |
 | 2 | `resource_snapshot` | Local fallback for `read`, `grep`, `find`, and `ls` using versioned resource evidence |
-| 2 | `file_mutation` | Local fallback for `write` and `edit` using a private Git worktree and conflict-checked commit |
+| 2 | `workspace_branch` | Local fallback for `write` and `edit` using a private Git worktree and conflict-checked commit |
 | 3 | Actor fallback | If no safe route exists, no speculative tool invocation occurs |
 
-The package does **not** bundle a process sandbox. Consequently, the default Pi extension can predict and match `bash`, but it will not execute Bash speculatively. The Actor executes the command through Pi's normal path. An embedding runtime can enable Bash and all other tools by injecting an `ExecutionWorld` that supports `runtime_sandbox`.
+The package does **not** bundle a process sandbox. Consequently, the default Pi extension can predict and match `bash`, but it will not execute Bash speculatively. The Actor executes the command through Pi's normal path. An embedding runtime can enable Bash and all other tools by injecting one runtime-scoped `ExecutionWorld`.
 
 This arrangement is intentional: a future OS-level agent runtime can provide one isolation world for the whole tool surface instead of requiring Pi to maintain a separate isolation implementation for each tool.
 
@@ -78,7 +78,7 @@ The former `resourceCached` / `sandbox` / `predictionOnly` object is accepted on
 
 ## Runtime sandbox integration
 
-Hosts provide ordered execution worlds through `executionWorlds`. A runtime-wide world advertises `supports("runtime_sandbox")` and forks an isolated branch for any tool. Every successful backend—including the built-in resource snapshot and the Git worktree fallback—returns the same `WorldBranch`; that branch owns compatibility evidence, freshness checks, adoption, and cleanup. The host automatically supplies the resource-snapshot backend when none is registered.
+Hosts provide execution worlds through `executionWorlds`. A runtime-scoped world is necessarily a universal `runtime_sandbox`; only fallback worlds expose tool/effect capability filters. The router confirms backend availability before returning a route, so an unavailable runtime sandbox naturally falls through to a compatible local fallback. Every successful backend—including the built-in resource snapshot and the Git worktree fallback—returns the same `WorldBranch`; that branch owns compatibility evidence, freshness checks, adoption, and cleanup. The host automatically supplies the resource-snapshot backend when none is registered.
 
 ```ts
 createSpeculativeActionHost(sessionID, {
@@ -88,7 +88,7 @@ createSpeculativeActionHost(sessionID, {
 })
 ```
 
-The first runtime-wide world wins for every tool. Without one, the resolver considers the tool's registered local fallback. Absence of both is represented by an undefined route, which the Runtime turns into `execution:isolation_unavailable` and an Actor fallback.
+The first available runtime-wide world wins for every tool. Without one, the router considers fallback worlds compatible with the action's declared effects. Absence of both is represented by an undefined route, which the Runtime turns into `execution:isolation_unavailable` and an Actor fallback. Resolution, preparation, fork, and disposal all pass through the same router; tools cannot retain a direct backend handle.
 
 ## Timing
 

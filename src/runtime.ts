@@ -178,6 +178,7 @@ export interface SpeculativeActionRuntimeAdapter<
 		readonly tool: string;
 		readonly concrete: Record<string, unknown>;
 		readonly action: ActionKey;
+		readonly signal: AbortSignal;
 	}) => MaybePromise<SpeculativeExecutionRoute | undefined>;
 	readonly actual: (input: ConsumeInput) => { readonly id?: string; readonly tool: string; readonly input: unknown };
 	readonly preflightCandidate: (input: {

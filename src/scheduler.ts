@@ -1,5 +1,4 @@
-import type { SpeculativeExecution } from "./action-semantics.ts";
-import type { WorldCompatibilityEvidence } from "./execution-world.ts";
+import type { SpeculativeExecution, WorldCompatibilityEvidence } from "./execution-world.ts";
 import type {
 	SpeculativeResourceBudget,
 	SpeculativeResourceClass,

@@ -1,20 +1,28 @@
-import type { ActionReuseKind, LocalIsolationMechanism, SpeculativeExecution } from "./action-semantics.ts";
+import type { ActionEffect, ActionKey } from "./action-semantics.ts";
 import type { ResourceValidation } from "./settlement.ts";
 
-/** A runtime sandbox can handle every tool; local worlds expose narrower substitutes. */
-export type ExecutionWorldMode = SpeculativeExecution;
+/** Concrete isolation used for one speculative execution. */
+export type SpeculativeExecution = "runtime_sandbox" | "resource_snapshot" | "workspace_branch";
+export type ActionReuseKind = "shared_result" | "exclusive_branch";
+export type ExecutionWorldScope = "runtime" | "fallback";
+
+/** Tool effects are resolved independently from K(a) and prediction source. */
+export interface ExecutionWorldRequest {
+	readonly tool: string;
+	readonly effect: ActionEffect;
+	/** Present for concrete candidates; omitted for best-effort turn warm-up. */
+	readonly action?: ActionKey;
+}
 
 /** One resolved execution capability. Absence of a route means speculation is blocked. */
 export interface SpeculativeExecutionRoute {
 	readonly isolation: SpeculativeExecution;
 	readonly reuse: ActionReuseKind;
+	readonly scope: ExecutionWorldScope;
 	readonly backend: string;
 	readonly fingerprint: string;
-	/** Opaque in-memory backend state; never enters K(a), persistence, or diagnostics. */
-	readonly context?: unknown;
 }
 
-/** Opaque context is intentionally excluded; backend and fingerprint own route identity. */
 export function sameSpeculativeExecutionRoute(
 	left: SpeculativeExecutionRoute,
 	right: SpeculativeExecutionRoute,
@@ -22,6 +30,7 @@ export function sameSpeculativeExecutionRoute(
 	return (
 		left.isolation === right.isolation &&
 		left.reuse === right.reuse &&
+		left.scope === right.scope &&
 		left.backend === right.backend &&
 		left.fingerprint === right.fingerprint
 	);
@@ -95,67 +104,92 @@ export interface WorldBranch<Output> {
 
 export interface ExecutionWorldPreparation {
 	readonly cwd: string;
-	readonly modes: readonly ExecutionWorldMode[];
 	readonly signal?: AbortSignal;
 }
 
-/** Source-independent lifecycle for isolating, sealing, and committing speculative effects. */
-export interface ExecutionWorld<Context extends { readonly mode: ExecutionWorldMode }, Output> {
+interface ExecutionWorldLifecycle<Context, Output> {
 	readonly id: string;
-	readonly supports: (mode: ExecutionWorldMode) => boolean;
 	/** Stable identity of the concrete isolation backend used for route-local reuse. */
-	readonly fingerprint?: (mode: ExecutionWorldMode) => string | Promise<string>;
+	readonly fingerprint?: (request: ExecutionWorldRequest) => string | Promise<string>;
+	/** Idempotent and concurrency-safe; reject while unavailable so resolution can try the next world. */
 	readonly prepare?: (input: ExecutionWorldPreparation) => Promise<void>;
 	readonly fork: (context: Context) => Promise<WorldBranch<Output>>;
 	/** Abort and drain backend-owned forks and branch cleanup before resolving. */
 	readonly dispose?: () => Promise<void>;
 }
 
-/** Resolve one tool through the uniform isolation priority shared by every prediction source. */
-export async function resolveSpeculativeExecutionRoute<Context extends { readonly mode: ExecutionWorldMode }, Output>(
-	localIsolation: LocalIsolationMechanism,
-	worlds: readonly ExecutionWorld<Context, Output>[],
-): Promise<SpeculativeExecutionRoute | undefined> {
-	const runtimeRoute = await firstWorldRoute(
-		worlds,
-		"runtime_sandbox",
-		localIsolation === "resource_snapshot" ? "shared_result" : "exclusive_branch",
+/** Source-independent lifecycle for isolating, sealing, and committing speculative effects. */
+export type ExecutionWorld<Context, Output> = ExecutionWorldLifecycle<Context, Output> &
+	(
+		| {
+				/** A runtime world contains every tool and therefore has no tool-specific capability filter. */
+				readonly scope: "runtime";
+				readonly isolation: "runtime_sandbox";
+		  }
+		| {
+				/** A host-local fallback must prove exactly which action effects it can isolate. */
+				readonly scope: "fallback";
+				readonly isolation: Exclude<SpeculativeExecution, "runtime_sandbox">;
+				readonly supports: (request: ExecutionWorldRequest) => boolean;
+		  }
 	);
-	if (runtimeRoute) return runtimeRoute;
-	if (localIsolation === "none") return undefined;
-	return firstWorldRoute(
-		worlds,
-		localIsolation,
-		localIsolation === "resource_snapshot" ? "shared_result" : "exclusive_branch",
-	);
-}
 
-async function firstWorldRoute<Context extends { readonly mode: ExecutionWorldMode }, Output>(
-	worlds: readonly ExecutionWorld<Context, Output>[],
-	mode: ExecutionWorldMode,
-	reuse: ActionReuseKind,
-): Promise<SpeculativeExecutionRoute | undefined> {
-	for (const world of worlds) {
-		try {
-			if (world.supports(mode)) return await executionWorldRoute(world, mode, reuse);
-		} catch {
-			// A broken capability is unavailable; a later world or local fallback may still be safe.
+/** The only authority allowed to resolve, prepare, fork, and dispose speculative tool execution. */
+export class ExecutionWorldRouter<Context, Output> {
+	private readonly worlds: readonly ExecutionWorld<Context, Output>[];
+	private readonly worldsByID = new Map<string, ExecutionWorld<Context, Output>>();
+
+	constructor(worlds: readonly ExecutionWorld<Context, Output>[]) {
+		this.worlds = [...new Set(worlds)];
+		for (const world of this.worlds) {
+			if (!world.id.trim()) throw new Error("execution world id must not be empty");
+			if (this.worldsByID.has(world.id)) throw new Error(`duplicate execution world ${world.id}`);
+			this.worldsByID.set(world.id, world);
 		}
 	}
-	return undefined;
-}
 
-async function executionWorldRoute<Context extends { readonly mode: ExecutionWorldMode }, Output>(
-	world: ExecutionWorld<Context, Output>,
-	mode: ExecutionWorldMode,
-	reuse: ActionReuseKind,
-): Promise<SpeculativeExecutionRoute> {
-	const fingerprint = (await world.fingerprint?.(mode)) ?? `${world.id}:${mode}`;
-	return Object.freeze({
-		isolation: mode,
-		reuse,
-		backend: world.id,
-		fingerprint,
-		context: world,
-	});
+	/** Runtime sandbox first, then local fallback; unavailable worlds are skipped. */
+	async resolve(
+		request: ExecutionWorldRequest,
+		preparation: ExecutionWorldPreparation,
+	): Promise<SpeculativeExecutionRoute | undefined> {
+		for (const scope of ["runtime", "fallback"] as const) {
+			for (const world of this.worlds) {
+				if (world.scope !== scope) continue;
+				try {
+					if (world.scope === "fallback" && !world.supports(request)) continue;
+					const fingerprint = (await world.fingerprint?.(request)) ?? `${world.id}:${world.isolation}`;
+					await world.prepare?.(preparation);
+					return Object.freeze({
+						isolation: world.isolation,
+						reuse: request.effect === "observation" ? "shared_result" : "exclusive_branch",
+						scope,
+						backend: world.id,
+						fingerprint,
+					});
+				} catch (error) {
+					if (preparation.signal?.aborted) throw error;
+					// Unavailable sandbox or fallback: continue down the explicit capability order.
+				}
+			}
+		}
+		return undefined;
+	}
+
+	fork(route: SpeculativeExecutionRoute, context: Context): Promise<WorldBranch<Output>> {
+		const world = this.world(route);
+		return world.fork(context);
+	}
+
+	async dispose(): Promise<void> {
+		await Promise.allSettled(this.worlds.map((world) => world.dispose?.()));
+	}
+
+	private world(route: SpeculativeExecutionRoute): ExecutionWorld<Context, Output> {
+		const world = this.worldsByID.get(route.backend);
+		if (!world || world.scope !== route.scope || world.isolation !== route.isolation) {
+			throw new Error(`Execution world ${route.backend} is unavailable for ${route.isolation}`);
+		}
+		return world;
+	}
 }

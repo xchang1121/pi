@@ -133,15 +133,15 @@ export function createWorkspaceSandbox(options: WorkspaceSandboxOptions = {}): S
 	const roots = new Set<string>();
 	return {
 		id: "git_worktree",
-		supports: (mode) => mode === "file_mutation",
+		scope: "fallback",
+		isolation: "workspace_branch",
+		supports: ({ tool, effect }) => effect === "workspace_mutation" && (tool === "write" || tool === "edit"),
 		fingerprint: () => "git-worktree:v1",
-		prepare: async ({ cwd, modes, signal }) => {
-			if (!modes.includes("file_mutation")) return;
+		prepare: async ({ cwd, signal }) => {
 			roots.add(path.resolve(cwd));
 			await prepareSandboxWorkspace(cwd, { ...(options.gitBinary ? { gitBinary: options.gitBinary } : {}), signal });
 		},
 		fork: async (context) => {
-			if (context.mode !== "file_mutation") throw new Error(`Execution world does not support mode ${context.mode}`);
 			const sourceRoot = path.resolve(context.cwd);
 			roots.add(sourceRoot);
 			const parent = resolveWorkspaceCheckpoint(context.parentCheckpoint, sourceRoot);

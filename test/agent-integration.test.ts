@@ -223,7 +223,8 @@ describe("speculative action host", () => {
 		};
 		const sandbox: SpeculativeAgentExecutionWorld = {
 			id: "runtime",
-			supports: (mode) => mode === "runtime_sandbox",
+			scope: "runtime",
+			isolation: "runtime_sandbox",
 			fingerprint: () => "runtime:v1",
 			fork: async (context) => {
 				sandboxExecutions++;
@@ -312,7 +313,8 @@ describe("speculative action host", () => {
 		});
 		const runtimeWorld: SpeculativeAgentExecutionWorld = {
 			id: "runtime",
-			supports: (mode) => mode === "runtime_sandbox",
+			scope: "runtime",
+			isolation: "runtime_sandbox",
 			fork,
 		};
 		const tool: AgentTool<typeof readSchema> = {
@@ -350,18 +352,21 @@ describe("speculative action host", () => {
 
 		expect(hit?.result.content).toEqual([{ type: "text", text: "runtime read" }]);
 		expect(fork).toHaveBeenCalledOnce();
-		expect(fork.mock.calls[0]?.[0]).toMatchObject({ mode: "runtime_sandbox" });
+		expect(fork.mock.calls[0]?.[0]).toMatchObject({ toolName: "read" });
 		expect(hostExecutions).toBe(0);
 		await host.dispose();
 	});
 
-	it("prepares the same healthy world selected by route resolution", async () => {
+	it("falls through unavailable runtime worlds to the resource fallback", async () => {
 		const cwd = await temporaryWorkspace();
 		const brokenPrepare = vi.fn();
-		const healthyPrepare = vi.fn();
+		const unavailablePrepare = vi.fn(async () => {
+			throw new Error("runtime failed to start");
+		});
 		const broken: SpeculativeAgentExecutionWorld = {
 			id: "broken",
-			supports: (mode) => mode === "runtime_sandbox",
+			scope: "runtime",
+			isolation: "runtime_sandbox",
 			fingerprint: () => {
 				throw new Error("backend unavailable");
 			},
@@ -370,50 +375,34 @@ describe("speculative action host", () => {
 				throw new Error("must not execute");
 			},
 		};
-		const output = {
-			result: { content: [{ type: "text" as const, text: "sandbox" }], details: {} },
-			isError: false,
+		const unavailable: SpeculativeAgentExecutionWorld = {
+			id: "unavailable",
+			scope: "runtime",
+			isolation: "runtime_sandbox",
+			prepare: unavailablePrepare,
+			fork: async () => {
+				throw new Error("must not execute");
+			},
 		};
-		const healthy: SpeculativeAgentExecutionWorld = {
-			id: "healthy",
-			supports: (mode) => mode === "runtime_sandbox",
-			fingerprint: () => "healthy:v1",
-			prepare: healthyPrepare,
-			fork: async (context) => ({
-				output,
-				backend: "healthy",
-				resources: [],
-				capturedBytes: 0,
-				executionMetrics: {},
-				compatibility: {
-					status: "compatible",
-					backend: "healthy",
-					executionFingerprint: context.action.executionFingerprint,
-				},
-				state: "sealed",
-				commit: async () => output,
-				dispose: () => {},
-			}),
-		};
-		const tool: AgentTool<typeof bashSchema> = {
-			name: "bash",
-			label: "bash",
-			description: "bash",
-			parameters: bashSchema,
-			execute: async () => ({ content: [], details: {} }),
+		let hostExecutions = 0;
+		const tool: AgentTool<typeof readSchema> = {
+			name: "read",
+			label: "read",
+			description: "read",
+			parameters: readSchema,
+			execute: async () => {
+				hostExecutions++;
+				return { content: [{ type: "text", text: "fallback" }], details: {} };
+			},
 		};
 		const events: SpeculativeActionEvent<string>[] = [];
 		const host = createSpeculativeActionHost("session", {
 			cwd,
-			getSettings: () => ({ ...settings(), tools: ["bash"] }),
+			getSettings: settings,
 			draftModel: model("draft"),
-			complete: async () =>
-				assistant(
-					[{ type: "toolCall", id: "draft-bash", name: "bash", arguments: { command: "npm test" } }],
-					"toolUse",
-				),
+			complete: async () => drafterCall({ path: "notes.txt" }),
 			preflight: () => true,
-			executionWorlds: [broken, healthy],
+			executionWorlds: [broken, unavailable],
 			onEvent: (event) => {
 				events.push(event);
 			},
@@ -422,7 +411,11 @@ describe("speculative action host", () => {
 		await host.startTurn(startInput(tool));
 		await waitFor(() => events.some((event) => event.type === "candidate" && event.state.status === "succeeded"));
 		expect(brokenPrepare).not.toHaveBeenCalled();
-		expect(healthyPrepare).toHaveBeenCalledWith(expect.objectContaining({ modes: ["runtime_sandbox"] }));
+		expect(unavailablePrepare).toHaveBeenCalledWith(expect.objectContaining({ cwd }));
+		expect(hostExecutions).toBe(1);
+		expect(events.find((event) => event.type === "candidate")).toMatchObject({
+			candidate: { execution: "resource_snapshot" },
+		});
 		await host.dispose();
 	});
 
@@ -509,7 +502,11 @@ describe("speculative action host", () => {
 		let disposed = 0;
 		const sandbox: SpeculativeAgentExecutionWorld = {
 			id: "unavailable",
-			supports: () => false,
+			scope: "runtime",
+			isolation: "runtime_sandbox",
+			fingerprint: () => {
+				throw new Error("unavailable");
+			},
 			fork: async () => {
 				throw new Error("unused");
 			},

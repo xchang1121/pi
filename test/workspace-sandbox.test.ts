@@ -53,14 +53,18 @@ afterEach(async () => {
 	await closeWorkspaceSandboxPools();
 });
 
-describe("file-mutation ExecutionWorld", () => {
-	it("exposes only file mutation and commits a sealed write exactly once", async () => {
+describe("workspace-branch ExecutionWorld", () => {
+	it("accepts workspace mutations and commits a sealed write exactly once", async () => {
 		const root = await temporaryRoot("write");
 		try {
 			const args = { path: "nested/created.txt", content: "isolated\n" };
 			const world = createWorkspaceSandbox();
-			expect(world.supports("file_mutation")).toBe(true);
-			expect(await world.fingerprint?.("file_mutation")).toBe("git-worktree:v1");
+			expect(world.scope).toBe("fallback");
+			if (world.scope !== "fallback") throw new Error("Expected a fallback world");
+			expect(world.supports({ tool: "write", effect: "workspace_mutation" })).toBe(true);
+			expect(world.supports({ tool: "custom", effect: "workspace_mutation" })).toBe(false);
+			expect(world.supports({ tool: "bash", effect: "unbounded" })).toBe(false);
+			expect(await world.fingerprint?.({ tool: "write", effect: "workspace_mutation" })).toBe("git-worktree:v1");
 			const branch = await world.fork(context(root, "write", writeTool, args));
 
 			expect(branch.state).toBe("sealed");
@@ -264,7 +268,6 @@ function context<Schema extends typeof writeParameters | typeof editParameters>(
 	args: unknown,
 ) {
 	return {
-		mode: "file_mutation" as const,
 		cwd: root,
 		tool,
 		toolName,

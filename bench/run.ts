@@ -566,8 +566,12 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 			patternAware: input.patternAware,
 			patternState: input.patternState ?? "isolated-per-run",
 			executionBoundary: {
-				priority: ["runtime_sandbox", "local_isolation", "actor_fallback"],
-				local: { readOnly: "resource_version", fileMutation: "git_worktree", bash: "unavailable" },
+				priority: ["runtime_sandbox", "local_fallback", "actor_fallback"],
+				local: {
+					observation: "resource_version",
+					workspaceMutation: "git_worktree",
+					unbounded: "unavailable",
+				},
 			},
 			workspace: task.workspace,
 		},

@@ -9,10 +9,10 @@ import {
 	createSpeculativeActionExtension,
 	createSpeculativeActionHost,
 	createWorkspaceSandbox,
+	ExecutionWorldRouter,
 	makeSpeculativeActionRuntime,
 	prepareSandboxWorkspace,
 	releaseResourceVersion,
-	resolveSpeculativeExecutionRoute,
 } from "../src/index.ts";
 
 const packageRoot = fileURLToPath(new URL("..", import.meta.url));
@@ -29,7 +29,7 @@ describe("speculative action package boundary", () => {
 			releaseResourceVersion,
 			createWorkspaceSandbox,
 			prepareSandboxWorkspace,
-			resolveSpeculativeExecutionRoute,
+			ExecutionWorldRouter,
 		]) {
 			expect(exported).toBeTypeOf("function");
 		}

@@ -1,4 +1,5 @@
-import type { SpeculativeExecution } from "./action-semantics.ts";
+import type { ActionEffect } from "./action-semantics.ts";
+import type { SpeculativeExecution } from "./execution-world.ts";
 
 export type SpeculativeResourceClass = "filesystem" | "workspace" | "process" | "global";
 
@@ -22,7 +23,13 @@ export function speculativeResourceBudget(capacity: number): SpeculativeResource
 
 export function resourceProfile(execution: SpeculativeExecution): SpeculativeResourceProfile {
 	if (execution === "resource_snapshot") return { class: "filesystem", units: 1 };
-	if (execution === "file_mutation") return { class: "workspace", units: 1 };
+	if (execution === "workspace_branch") return { class: "workspace", units: 1 };
+	return { class: "global", units: 1 };
+}
+
+export function actionResourceProfile(effect: ActionEffect | undefined): SpeculativeResourceProfile {
+	if (effect === "observation") return { class: "filesystem", units: 1 };
+	if (effect === "workspace_mutation") return { class: "workspace", units: 1 };
 	return { class: "global", units: 1 };
 }
 

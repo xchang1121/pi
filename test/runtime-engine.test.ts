@@ -30,13 +30,15 @@ const settings: SpeculativeActionSettings = {
 const RESOURCE_ROUTE: SpeculativeExecutionRoute = {
 	isolation: "resource_snapshot",
 	reuse: "shared_result",
+	scope: "fallback",
 	backend: "resource_version",
 	fingerprint: "resource-version:v1",
 };
 
 const MUTATION_ROUTE: SpeculativeExecutionRoute = {
-	isolation: "file_mutation",
+	isolation: "workspace_branch",
 	reuse: "exclusive_branch",
+	scope: "fallback",
 	backend: "test_world",
 	fingerprint: "test-world:v1",
 };
