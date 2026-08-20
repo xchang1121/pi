@@ -230,7 +230,7 @@ type PersistedPatternSample = {
 	readonly gap: number;
 };
 
-type PersistedPatternPool = Omit<PatternPool, "samples" | "inferred"> & {
+type PersistedPatternPool = Omit<PatternPool, "samples"> & {
 	readonly samples: ReadonlyArray<PersistedPatternSample>;
 };
 
@@ -255,11 +255,7 @@ type PatternPool = {
 	readonly targetSchemaHash?: string;
 	readonly gap: number;
 	readonly samples: PatternSample[];
-	patternID?: string;
-	inferred?: Record<string, PatternAwareBinding>;
-	observations?: number;
-	nextInferenceAt?: number;
-	inferenceBackoff?: number;
+	patternIDs?: string[];
 };
 
 type PendingValidation = {
@@ -291,10 +287,10 @@ export const PATTERN_AWARE_DEFAULTS: PatternAwareSettings = {
 const MAX_BINDING_VARIANTS = 32;
 const MAX_PATH_SOURCES = 24;
 const PERSIST_DEBOUNCE_MS = 200;
-const PERSISTENCE_VERSION = 16;
+const PERSISTENCE_VERSION = 17;
 const MIN_MIGRATABLE_PERSISTENCE_VERSION = 13;
 const INDEXED_POOL_PERSISTENCE_VERSION = 16;
-const COMPATIBLE_PATTERN_VERSION = 15;
+const COMPATIBLE_PATTERN_VERSION = 17;
 
 class PredictiveContextTrie {
 	private readonly root: TrieNode = { children: new Map(), patterns: new Set() };
@@ -403,13 +399,7 @@ export class PatternAwareStore {
 					...(pool.targetSchemaHash ? { targetSchemaHash: pool.targetSchemaHash } : {}),
 					gap,
 					samples,
-					observations: compatible ? (pool.observations ?? samples.length) : samples.length,
-					...(compatible && pool.patternID ? { patternID: pool.patternID } : {}),
-					...(compatible && pool.inferred ? { inferred: pool.inferred } : {}),
-					...(compatible && pool.nextInferenceAt !== undefined ? { nextInferenceAt: pool.nextInferenceAt } : {}),
-					...(compatible && pool.inferenceBackoff !== undefined
-						? { inferenceBackoff: pool.inferenceBackoff }
-						: {}),
+					...(compatible && pool.patternIDs?.length ? { patternIDs: pool.patternIDs } : {}),
 				});
 			}
 			for (const sample of pool.samples) {
@@ -929,11 +919,18 @@ export class PatternAwareStore {
 	) {
 		if (!this.actionSemantics) return bindings;
 		const minimized = { ...bindings };
+		let covered = samples.filter((sample) =>
+			this.bindingsCoverSample(minimized, targetTool, targetSchemaHash, sample),
+		).length;
 		for (const key of Object.keys(bindings)) {
 			const binding = minimized[key];
 			if (!binding) continue;
 			delete minimized[key];
-			if (samples.every((sample) => this.bindingsCoverSample(minimized, targetTool, targetSchemaHash, sample))) {
+			const next = samples.filter((sample) =>
+				this.bindingsCoverSample(minimized, targetTool, targetSchemaHash, sample),
+			).length;
+			if (next > covered || (covered > 0 && next === covered)) {
+				covered = next;
 				continue;
 			}
 			minimized[key] = binding;
@@ -953,101 +950,103 @@ export class PatternAwareStore {
 			samples: [],
 		};
 		pool.samples.push({ context: [...context], target, gap });
-		pool.observations = (pool.observations ?? pool.samples.length - 1) + 1;
 		const sampleLimit = patternPoolSampleLimit(this.settings);
 		if (pool.samples.length > sampleLimit) pool.samples.splice(0, pool.samples.length - sampleLimit);
 		this.pools.set(poolKey, pool);
 		if (pool.samples.length < this.settings.minOccurrences) {
-			this.retirePoolPattern(pool);
+			this.retirePoolPatterns(pool, new Set());
 			return;
 		}
-		let inferred = pool.inferred;
-		const invalidated =
-			inferred !== undefined &&
-			!this.bindingsCoverSample(inferred, pool.targetTool, pool.targetSchemaHash, pool.samples.at(-1)!);
-		if (!inferred || invalidated || pool.observations >= (pool.nextInferenceAt ?? 0)) {
-			if (!invalidated && pool.observations < (pool.nextInferenceAt ?? this.settings.minOccurrences)) return;
-			inferred = inferBindingsFromSamples(
+		const candidates = new Map<string, Record<string, PatternAwareBinding>>();
+		const remember = (bindings: Record<string, PatternAwareBinding> | undefined) => {
+			if (!bindings) return;
+			candidates.set(stableStringify(bindingMapStructure(bindings)), bindings);
+		};
+		for (const patternID of pool.patternIDs ?? []) remember(this.patterns.get(patternID)?.bindings);
+		remember(inferBindings(context, target.input));
+		remember(
+			inferBindingsFromSamples(
 				pool.samples,
 				bindingEvidenceThreshold(this.settings),
 				this.actionSemantics !== undefined,
+			),
+		);
+
+		const retained = new Set<string>();
+		for (let bindings of candidates.values()) {
+			bindings = this.minimizeProjectedBindings(bindings, pool.targetTool, pool.targetSchemaHash, pool.samples);
+			const support = pool.samples.filter((sample) =>
+				this.bindingsCoverSample(bindings, pool.targetTool, pool.targetSchemaHash, sample),
 			);
-			if (inferred) {
-				inferred = this.minimizeProjectedBindings(inferred, pool.targetTool, pool.targetSchemaHash, pool.samples);
+			if (support.length < this.settings.minOccurrences) continue;
+			const id = hash(
+				stableStringify({
+					context: signatures,
+					targetTool: target.tool,
+					bindings: bindingMapStructure(bindings),
+					targetSchemaHash: target.schemaHash,
+					gap,
+				}),
+			);
+			if (retained.has(id)) continue;
+			retained.add(id);
+			const historicalOpportunities = this.controlOpportunities(pool);
+			const lastSeenSequence = Math.max(...support.map((sample) => sample.target.sequence));
+			const existing = this.patterns.get(id);
+			if (existing) {
+				existing.bindings = bindings;
+				existing.dependencies = bindingDependencies(bindings);
+				existing.occurrences = support.length;
+				existing.replayMatches = support.length;
+				existing.historicalOpportunities = Math.max(existing.historicalOpportunities, historicalOpportunities);
+				existing.historicalMatches = Math.max(existing.historicalMatches, support.length);
+				existing.gapCounts = sampleGapCounts(support);
+				existing.gapLastSeen = sampleGapLastSeen(support);
+				existing.averageDurationMs = averageTargetDuration(support);
+				existing.lastSeenSequence = lastSeenSequence;
+				continue;
 			}
-			pool.inferred = inferred;
-			if (!inferred) {
-				this.retirePoolPattern(pool);
-				pool.inferenceBackoff = Math.min(8, Math.max(2, (pool.inferenceBackoff ?? 1) * 2));
-				pool.nextInferenceAt = pool.observations + pool.inferenceBackoff;
-				return;
-			}
-			pool.inferenceBackoff = 1;
-			pool.nextInferenceAt = pool.observations + 1;
-		}
-		const replayMatches = pool.samples.filter((sample) =>
-			this.bindingsCoverSample(inferred, pool.targetTool, pool.targetSchemaHash, sample),
-		).length;
-		const bindingReplayProbability = replayMatches / pool.samples.length;
-		if (bindingReplayProbability < this.settings.minBindingReplayProbability) {
-			this.retirePoolPattern(pool);
-			return;
-		}
-		const id = hash(
-			stableStringify({
+			this.patterns.set(id, {
+				id,
 				context: signatures,
 				targetTool: target.tool,
-				bindings: bindingMapStructure(inferred),
-				targetSchemaHash: target.schemaHash,
-				gap,
-			}),
-		);
-		if (pool.patternID && pool.patternID !== id) this.retirePoolPattern(pool);
-		pool.patternID = id;
-		const existing = this.patterns.get(id);
-		if (existing) {
-			existing.bindings = inferred;
-			existing.dependencies = bindingDependencies(inferred);
-			existing.occurrences = pool.samples.length;
-			existing.replayMatches = replayMatches;
-			existing.historicalOpportunities = Math.max(existing.historicalOpportunities, pool.samples.length);
-			existing.historicalMatches = Math.max(existing.historicalMatches, replayMatches);
-			existing.gapCounts = sampleGapCounts(pool.samples);
-			existing.gapLastSeen = sampleGapLastSeen(pool.samples);
-			existing.averageDurationMs = averageTargetDuration(pool.samples);
-			existing.lastSeenSequence = target.sequence;
-			return;
+				bindings,
+				dependencies: bindingDependencies(bindings),
+				...(target.schemaHash ? { targetSchemaHash: target.schemaHash } : {}),
+				gapCounts: sampleGapCounts(support),
+				gapLastSeen: sampleGapLastSeen(support),
+				occurrences: support.length,
+				replayMatches: support.length,
+				historicalOpportunities,
+				historicalMatches: support.length,
+				feedback: emptyPatternFeedback(lastSeenSequence),
+				averageDurationMs: averageTargetDuration(support),
+				lastSeenSequence,
+			});
+			this.indexDirty = true;
 		}
-		this.patterns.set(id, {
-			id,
-			context: signatures,
-			targetTool: target.tool,
-			bindings: inferred,
-			dependencies: bindingDependencies(inferred),
-			...(target.schemaHash ? { targetSchemaHash: target.schemaHash } : {}),
-			gapCounts: sampleGapCounts(pool.samples),
-			gapLastSeen: sampleGapLastSeen(pool.samples),
-			occurrences: pool.samples.length,
-			replayMatches,
-			historicalOpportunities: pool.samples.length,
-			historicalMatches: replayMatches,
-			feedback: emptyPatternFeedback(target.sequence),
-			averageDurationMs: averageTargetDuration(pool.samples),
-			lastSeenSequence: target.sequence,
-		});
-		this.indexDirty = true;
+		this.retirePoolPatterns(pool, retained);
 	}
 
-	private retirePoolPattern(pool: PatternPool) {
-		const patternID = pool.patternID;
-		if (!patternID) return;
-		pool.patternID = undefined;
-		if (this.patterns.delete(patternID)) this.indexDirty = true;
-		for (const [sessionID, pending] of this.pending) {
-			const retained = pending.filter((item) => item.patternID !== patternID);
-			if (retained.length) this.pending.set(sessionID, retained);
-			else this.pending.delete(sessionID);
+	private controlOpportunities(pool: PatternPool) {
+		let total = 0;
+		for (const sibling of this.pools.values()) {
+			if (sibling.gap === pool.gap && sameValue(sibling.context, pool.context)) total += sibling.samples.length;
 		}
+		return Math.max(pool.samples.length, total);
+	}
+
+	private retirePoolPatterns(pool: PatternPool, retained: ReadonlySet<string>) {
+		for (const patternID of pool.patternIDs ?? []) {
+			if (retained.has(patternID)) continue;
+			if (this.patterns.delete(patternID)) this.indexDirty = true;
+			for (const [sessionID, pending] of this.pending) {
+				const active = pending.filter((item) => item.patternID !== patternID);
+				if (active.length) this.pending.set(sessionID, active);
+				else this.pending.delete(sessionID);
+			}
+		}
+		pool.patternIDs = [...retained];
 	}
 
 	private resolvePendingBatch(sessionID: string, events: ReadonlyArray<PatternAwareEvent>) {
@@ -1211,7 +1210,7 @@ export class PatternAwareStore {
 			)
 			.slice(0, this.settings.maxPatterns)
 			.map(
-				({ inferred: _, ...pool }): PersistedPatternPool => ({
+				(pool): PersistedPatternPool => ({
 					...pool,
 					samples: pool.samples.slice(-sampleLimit).map((sample) => ({
 						context: sample.context.map(reference),
@@ -2590,9 +2589,11 @@ function mutablePoolRecord(record: Record<string, unknown>, samples: PatternSamp
 		!samples.length
 	)
 		return;
-	const observations = isFiniteNumber(record.observations)
-		? Math.max(samples.length, Math.floor(record.observations))
-		: samples.length;
+	const patternIDs = Array.isArray(record.patternIDs)
+		? record.patternIDs.filter((item): item is string => typeof item === "string")
+		: typeof record.patternID === "string"
+			? [record.patternID]
+			: [];
 	return {
 		key: record.key,
 		context: structuredClone(record.context) as PatternAwareEventSignature[],
@@ -2600,14 +2601,7 @@ function mutablePoolRecord(record: Record<string, unknown>, samples: PatternSamp
 		...(typeof record.targetSchemaHash === "string" ? { targetSchemaHash: record.targetSchemaHash } : {}),
 		gap: isFiniteNumber(record.gap) ? Math.max(0, Math.floor(record.gap)) : samples[0]!.gap,
 		samples,
-		...(typeof record.patternID === "string" ? { patternID: record.patternID } : {}),
-		observations,
-		...(isFiniteNumber(record.nextInferenceAt)
-			? { nextInferenceAt: Math.min(observations + 8, Math.max(0, Math.floor(record.nextInferenceAt))) }
-			: {}),
-		...(isFiniteNumber(record.inferenceBackoff)
-			? { inferenceBackoff: Math.min(8, Math.max(1, Math.floor(record.inferenceBackoff))) }
-			: {}),
+		...(patternIDs.length ? { patternIDs: [...new Set(patternIDs)] } : {}),
 	};
 }
 

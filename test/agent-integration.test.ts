@@ -7,6 +7,7 @@ import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { READ_RANGE_COVERAGE_DETAILS_KEY } from "../src/action-key-projection.ts";
 import { createSpeculativeActionHost, patternPlanActionID } from "../src/agent-integration.ts";
+import { PATTERN_AWARE_DEFAULTS, PatternAwareStore } from "../src/pattern-aware.ts";
 import { PI_READ_RANGE_PROJECTION_RULE } from "../src/pi-read-projection.ts";
 import type { SpeculativeActionEvent } from "../src/runtime.ts";
 import type { SpeculativeAgentSandbox } from "../src/workspace-sandbox.ts";
@@ -188,6 +189,8 @@ describe("speculative action host", () => {
 
 	it("reports authoritative misses and keeps cleanup failures out of actor lifecycle", async () => {
 		const cwd = await temporaryWorkspace();
+		const patternStore = new PatternAwareStore({ ...PATTERN_AWARE_DEFAULTS, minOccurrences: 1 });
+		const observed = vi.spyOn(patternStore, "observeBatch");
 		const actualEvents: SpeculativeActionEvent<string>[] = [];
 		let disposed = 0;
 		const sandbox: SpeculativeAgentSandbox = {
@@ -209,7 +212,12 @@ describe("speculative action host", () => {
 		};
 		const host = createSpeculativeActionHost("session", {
 			cwd,
-			getSettings: settings,
+			getSettings: () => ({
+				...settings(),
+				drafterEnabled: false,
+				patternAware: { ...PATTERN_AWARE_DEFAULTS, minOccurrences: 1 },
+			}),
+			patternStore,
 			draftModel: model("draft"),
 			complete: async () => assistant([{ type: "text", text: "no prediction" }], "stop"),
 			preflight: () => true,
@@ -243,6 +251,7 @@ describe("speculative action host", () => {
 			durationMs: 12,
 			output: { result: await tool.execute("actor", { path: "notes.txt" }), isError: false },
 		});
+		await host.finishTurn("turn-1");
 
 		await waitFor(() =>
 			actualEvents.some(
@@ -252,6 +261,7 @@ describe("speculative action host", () => {
 					event.settlement.provider.durationMs === 12,
 			),
 		);
+		expect(observed.mock.calls[0]?.[0][0]?.input).toEqual({ path: "notes.txt" });
 		await expect(host.dispose()).resolves.toBeUndefined();
 		expect(disposed).toBe(1);
 	});

@@ -540,14 +540,12 @@ export function createSpeculativeActionHost(
 					sessionID: startInput.sessionID,
 					turnID: startInput.turnID,
 					tool: candidate.key.tool,
-					input: structuredClone(candidate.key.input) as Record<string, unknown>,
+					input: structuredClone(candidate.input) as Record<string, unknown>,
 					outcome: output.isError ? "failure" : "success",
 					...observation,
 					durationMs: candidateExecutionMs(candidate),
 					schemaHash: candidate.key.schemaHash,
-					...(typeof candidate.key.input.operation === "string"
-						? { operation: candidate.key.input.operation }
-						: {}),
+					...(typeof candidate.input.operation === "string" ? { operation: candidate.input.operation } : {}),
 					learnTarget: false,
 				},
 				data.schemaHashes,
@@ -566,7 +564,7 @@ export function createSpeculativeActionHost(
 				),
 			};
 		},
-		observe: async ({ startInput, settings, consumeInput, action, tool, concrete, output, durationMs, order }) => {
+		observe: async ({ startInput, settings, consumeInput, tool, concrete, output, durationMs, order }) => {
 			if (!sourcePatternSettings(settings).enabled) return undefined;
 			const definition = startInput.tools.find((item) => item.name === tool);
 			const observation = projectPatternAwareObservation(
@@ -580,7 +578,7 @@ export function createSpeculativeActionHost(
 				sessionID: consumeInput.sessionID,
 				turnID: consumeInput.turnID,
 				tool,
-				input: action ? (structuredClone(action.input) as Record<string, unknown>) : concrete,
+				input: structuredClone(concrete),
 				outcome: output?.isError ? "failure" : "success",
 				...observation,
 				durationMs,

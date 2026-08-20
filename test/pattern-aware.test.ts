@@ -399,7 +399,7 @@ describe("PatternAware", () => {
 		const raw = await fs.readFile(file, "utf8");
 		expect(raw).not.toContain('"history"');
 		const persisted = JSON.parse(raw);
-		expect(persisted.version).toBe(16);
+		expect(persisted.version).toBe(17);
 		expect(persisted.events.length).toBeGreaterThan(0);
 		expect(
 			persisted.pools.every((pool: { samples: Array<{ context: number[]; target: number }> }) =>
@@ -441,7 +441,7 @@ describe("PatternAware", () => {
 		await fs.writeFile(
 			file,
 			JSON.stringify({
-				version: 15,
+				version: 17,
 				patterns: [
 					valid,
 					{ ...valid, id: "bad-context", context: [{ tool: 7, outcome: "success" }] },
@@ -472,7 +472,7 @@ describe("PatternAware", () => {
 		await fs.writeFile(
 			file,
 			JSON.stringify({
-				version: 16,
+				version: 17,
 				patterns: [],
 				events: [event({ sessionID: "one", tool: "grep", input: {} }), { sequence: 2 }],
 				pools: [
@@ -620,7 +620,7 @@ describe("PatternAware", () => {
 		await first.flush();
 
 		const persisted = JSON.parse(await fs.readFile(file, "utf8"));
-		expect(persisted.version).toBe(16);
+		expect(persisted.version).toBe(17);
 		expect(persisted.sequenceCounts.length).toBeGreaterThan(0);
 		const restored = new PatternAwareStore(configured, file);
 		await restored.load();
@@ -631,7 +631,7 @@ describe("PatternAware", () => {
 		]);
 	});
 
-	test("retains inference evidence and retry state across short-lived processes", async () => {
+	test("retains inference evidence across short-lived processes", async () => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "pi-pattern-constant-pool-"));
 		temporary.push(directory);
 		const file = path.join(directory, "patterns.json");
@@ -654,42 +654,6 @@ describe("PatternAware", () => {
 			expect.objectContaining({ tool: "read", input: { filePath: "README.md" } }),
 		);
 		expect(Math.max(...persisted.pools.map((pool: { samples: unknown[] }) => pool.samples.length))).toBe(4);
-		expect(persisted.pools.some((pool: { observations?: number }) => pool.observations === 4)).toBe(true);
-	});
-
-	test("bounds restored inference retry metadata so malformed state cannot starve learning", async () => {
-		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "pi-pattern-retry-bound-"));
-		temporary.push(directory);
-		const file = path.join(directory, "patterns.json");
-		const first = new PatternAwareStore(settings({ minOccurrences: 2 }), file);
-		await first.load();
-		for (const sessionID of ["one", "two"]) {
-			first.observe(input({ sessionID, tool: "inspect", input: {}, output: { kind: "path" } }));
-			first.observe(input({ sessionID, tool: "read", input: { filePath: "README.md" } }));
-			first.finishSession(sessionID);
-		}
-		await first.flush();
-
-		const persisted = JSON.parse(await fs.readFile(file, "utf8"));
-		for (const pool of persisted.pools) {
-			pool.nextInferenceAt = Number.MAX_SAFE_INTEGER;
-			pool.inferenceBackoff = Number.MAX_SAFE_INTEGER;
-		}
-		await fs.writeFile(file, JSON.stringify(persisted));
-
-		const restored = new PatternAwareStore(settings({ minOccurrences: 2 }), file);
-		await restored.load();
-		for (let index = 3; index <= 10; index++) {
-			const sessionID = `session-${index}`;
-			restored.observe(input({ sessionID, tool: "inspect", input: {}, output: { kind: "path" } }));
-			restored.observe(input({ sessionID, tool: "read", input: { filePath: "README.md" } }));
-			restored.finishSession(sessionID);
-		}
-		restored.observe(input({ sessionID: "probe", tool: "inspect", input: {}, output: { kind: "path" } }));
-
-		expect(restored.predict("probe")).toContainEqual(
-			expect.objectContaining({ tool: "read", input: { filePath: "README.md" } }),
-		);
 	});
 
 	test("normalizes partial PatternAware settings", () => {
@@ -750,7 +714,7 @@ describe("PatternAware", () => {
 		).toBe(false);
 	});
 
-	test("keeps the highest-replay mapper instead of requiring perfect history", () => {
+	test("separates mapper support from control-flow confidence", () => {
 		const store = new PatternAwareStore(settings({ minBindingReplayProbability: 0.75 }));
 		trainGrepRead(store, "one", "src/a.ts");
 		trainGrepRead(store, "two", "src/b.ts");
@@ -759,7 +723,12 @@ describe("PatternAware", () => {
 		store.observe(input({ sessionID: "noise", tool: "read", input: { filePath: "manual.ts" } }));
 
 		const pattern = store.snapshot().find((item) => item.targetTool === "read");
-		expect(pattern).toMatchObject({ occurrences: 4, replayMatches: 3 });
+		expect(pattern).toMatchObject({
+			occurrences: 3,
+			replayMatches: 3,
+			historicalOpportunities: 4,
+			historicalMatches: 3,
+		});
 		store.observe(input({ sessionID: "probe", tool: "grep", input: {}, outputPaths: ["src/d.ts"] }));
 		expect(store.predict("probe").find((item) => item.tool === "read")?.input).toEqual({ filePath: "src/d.ts" });
 	});
@@ -803,12 +772,12 @@ describe("PatternAware", () => {
 		expect(candidate?.input).toEqual({ filePath: "src/c.ts" });
 	});
 
-	test("retries negatively cached pools and learns after the recent samples become stable", () => {
+	test("learns a stable mapper branch after unrelated evidence", () => {
 		const store = new PatternAwareStore(settings({ maxContextLength: 1, maxFutureGap: 0 }));
 		for (let index = 0; index < 4; index++) {
 			trainOutputRead(store, `noise-${index}`, { path: `src/source-${index}.ts` }, `src/unrelated-${index}.ts`);
 		}
-		for (let index = 0; index < 32; index++) {
+		for (let index = 0; index < 2; index++) {
 			const file = `src/stable-${index}.ts`;
 			trainOutputRead(store, `stable-${index}`, { path: file }, file);
 		}
@@ -1055,21 +1024,23 @@ describe("PatternAware", () => {
 		expect(ranked[0]?.bindings['["filePath"]']?.variantCounts).toEqual({ "0": 1, "1": 2 });
 	});
 
-	test("retires the old mapper revision when the same control pattern learns a new binding", () => {
+	test("retains multiple replayable mapper branches for one control context", () => {
 		const store = new PatternAwareStore(settings());
-		trainOutputRead(store, "one", { primary: "src/a.ts" }, "src/a.ts");
-		trainOutputRead(store, "two", { primary: "src/b.ts" }, "src/b.ts");
-		const previous = store.snapshot().find((pattern) => pattern.targetTool === "read");
-		expect(previous?.bindings['["filePath"]']).toMatchObject({ type: "event", path: ["primary"] });
+		for (const [sessionID, source, target] of [
+			["same-a", "src/a.ts", "src/a.ts"],
+			["same-b", "src/b.ts", "src/b.ts"],
+			["test-a", "src/c.ts", "src/c.ts.test"],
+			["test-b", "src/d.ts", "src/d.ts.test"],
+		] as const) {
+			store.observe(input({ sessionID, tool: "read", input: { filePath: source } }));
+			store.observe(input({ sessionID, tool: "read", input: { filePath: target } }));
+			store.finishSession(sessionID);
+		}
 
-		trainOutputRead(store, "three", { secondary: "src/c.ts" }, "src/c.ts");
-		const current = store.snapshot().filter((pattern) => pattern.targetTool === "read");
-
-		expect(current).toHaveLength(1);
-		expect(current[0]?.id).not.toBe(previous?.id);
-		expect(current[0]?.bindings['["filePath"]']).toMatchObject({ type: "coalesce" });
-		store.settled(previous!.id, adoptedSettlement());
-		expect(store.snapshot()[0]?.feedback.adopted).toBe(0);
+		store.observe(input({ sessionID: "probe", tool: "read", input: { filePath: "src/e.ts" } }));
+		expect(store.predict("probe").map((candidate) => candidate.input)).toEqual(
+			expect.arrayContaining([{ filePath: "src/e.ts" }, { filePath: "src/e.ts.test" }]),
+		);
 	});
 
 	test("contains non-finite persisted variant counts instead of emitting invalid probabilities", async () => {
@@ -1119,7 +1090,7 @@ describe("PatternAware", () => {
 		expect(probabilities.reduce((sum, value) => sum + value, 0)).toBeLessThanOrEqual(1);
 	});
 
-	test("requires cross-turn evidence before memorizing resource payload constants", () => {
+	test("uses the configured support floor for recurring constant actions", () => {
 		const store = new PatternAwareStore(settings());
 		for (const sessionID of ["one", "two"]) {
 			store.observe(input({ sessionID, tool: "inspect", input: {}, output: { kind: "path" } }));
@@ -1127,18 +1098,8 @@ describe("PatternAware", () => {
 			store.finishSession(sessionID);
 		}
 
-		store.observe(input({ sessionID: "early", tool: "inspect", input: {}, output: { kind: "path" } }));
-		expect(store.predict("early").some((item) => item.tool === "read")).toBe(false);
-		store.finishSession("early");
-
-		for (const sessionID of ["three", "four"]) {
-			store.observe(input({ sessionID, tool: "inspect", input: {}, output: { kind: "path" } }));
-			store.observe(input({ sessionID, tool: "read", input: { filePath: "README.md" } }));
-			store.finishSession(sessionID);
-		}
-
-		store.observe(input({ sessionID: "stable", tool: "inspect", input: {}, output: { kind: "path" } }));
-		expect(store.predict("stable")).toContainEqual(
+		store.observe(input({ sessionID: "probe", tool: "inspect", input: {}, output: { kind: "path" } }));
+		expect(store.predict("probe")).toContainEqual(
 			expect.objectContaining({ tool: "read", input: { filePath: "README.md" } }),
 		);
 	});
