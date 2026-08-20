@@ -354,6 +354,7 @@ describe("speculative action host", () => {
 			expect(request.context.tools?.map((candidate) => candidate.name)).toEqual(["read"]);
 			expect(request.options).toMatchObject({
 				maxTokens: 128,
+				toolChoice: "required",
 				reasoning: undefined,
 				deferred: false,
 				cacheRetention: "short",

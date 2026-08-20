@@ -442,10 +442,11 @@ export function createSpeculativeActionHost(
 				drafterBatches.set(batchKey, batch);
 			}
 			const prepared = await batch;
-			const draftOptions: SimpleStreamOptions = {
+			const draftOptions: SimpleStreamOptions & { readonly toolChoice: "required" } = {
 				...prepared.options,
 				temperature: proposalIndex === 0 ? 0 : 0.7,
 				maxTokens: 128,
+				toolChoice: "required",
 				reasoning: undefined,
 				deferred: false,
 				sessionId: `${sessionID}:draft:${input.turnID}`,
