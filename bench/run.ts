@@ -234,6 +234,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 	const drafterToolCalls: Record<string, number> = {};
 	const drafterNoToolStopReasons: Record<string, number> = {};
 	const drafterPredictionTrace: Array<{
+		readonly requestSessionID?: string;
 		readonly stopReason: string;
 		readonly outputTokens: number;
 		readonly tool?: string;
@@ -264,6 +265,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 			drafterStopReasons[message.stopReason] = (drafterStopReasons[message.stopReason] ?? 0) + 1;
 			const call = message.content.find((item) => item.type === "toolCall");
 			drafterPredictionTrace.push({
+				...(streamOptions?.sessionId ? { requestSessionID: streamOptions.sessionId } : {}),
 				stopReason: message.stopReason,
 				outputTokens: message.usage.output,
 				...(call ? { tool: call.name, input: call.arguments } : {}),
@@ -426,12 +428,14 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 	const speculativeHitProvidersBySource: Record<string, number> = {};
 	const actorActionMatchesByPredictionSource: Record<string, number> = {};
 	const candidateStartTrace: Array<{
+		readonly turnID: string;
 		readonly source: string;
 		readonly tool: string;
 		readonly depth: number;
 		readonly action: string;
 	}> = [];
 	const actorActionTrace: Array<{
+		readonly turnID: string;
 		readonly sequence: number;
 		readonly tool: string;
 		readonly action: string;
@@ -463,6 +467,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 			increment(candidateStartsByTool, event.candidate.tool);
 			increment(candidateStartsByDepth, String(event.candidate.depth));
 			candidateStartTrace.push({
+				turnID: event.turnID,
 				source: event.candidate.source,
 				tool: event.candidate.tool,
 				depth: event.candidate.depth,
@@ -480,6 +485,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 			increment(actorActionMatchesByPredictionSource, source);
 		}
 		actorActionTrace.push({
+			turnID: event.turnID,
 			sequence: event.settlement.actorAction.sequence,
 			tool,
 			action: event.actualAction,
