@@ -779,14 +779,13 @@ export function createSpeculativeActionHost(
 			if (candidate.execution !== "sandbox" && actionSemantics.execution(candidate.tool) !== "sandbox") return;
 			const mode = executionWorldMode(candidate.tool);
 			if (!mode || !options.sandbox?.supports(mode)) throw new Error(`Sandbox unavailable for ${candidate.tool}`);
-			// A concrete candidate's fork owns its setup. Only explicit preparation nodes prewarm.
-			if (action) return;
-			await prepareSandbox([candidate.tool], signal);
+			const invocation = asToolInvocation(action?.executionContext);
+			await prepareSandbox([candidate.tool], signal, invocation ? [invocation] : undefined);
 		},
 		onTurnStarted: async ({ startInput, settings, signal }) => {
 			authoritativeBatches.delete(authoritativeBatchKey(startInput.sessionID, startInput.turnID));
 			void prepareSandbox(settings.tools.sandbox, signal).catch(() => {
-				// Turn warm-up is best-effort; concrete execution remains self-contained.
+				// Turn warm-up is best-effort; concrete candidate preparation retries it.
 			});
 			if (!sourcePatternSettings(settings).enabled) return;
 			const store = await resolvePatternStore(settings);
