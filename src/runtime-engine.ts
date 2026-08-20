@@ -9,7 +9,7 @@ import { actionKeyCovers, actionKeyMatch, PI_ACTION_SEMANTICS } from "./action-s
 import { ActorAction } from "./actor-action.ts";
 import { CandidateExecution, type CandidateReservation, CandidateResources } from "./candidate-execution.ts";
 import { ActionStore, ResultCache, type ResultCacheEvidence, speculativeCacheValue } from "./candidate-stores.ts";
-import { DEFAULTS, type DrafterToolDefinition } from "./common.ts";
+import { clampCandidateLimit, DEFAULTS, type DrafterToolDefinition } from "./common.ts";
 import { diagnosticAction } from "./diagnostics.ts";
 import type { CandidateEventDescriptor, CandidateExecutionProjection } from "./events.ts";
 import type { WorldBranch } from "./execution-world.ts";
@@ -106,10 +106,6 @@ function immediateOnly(update: PlanUpdate): PlanUpdate {
 		};
 	}
 	return { ...update, upsert: [], remove: update.remove };
-}
-
-function requestCount(value: number | undefined): number {
-	return typeof value === "number" && Number.isFinite(value) ? Math.max(1, Math.min(64, Math.floor(value))) : 1;
 }
 
 function concurrentLimit(settings: SpeculativeActionSettings): number {
@@ -881,7 +877,7 @@ export function makeStructuralSpeculativeActionRuntime<
 	const launchSourceRequests = (state: Turn): void => {
 		for (const source of sources) {
 			if (!source.enabled(state.settings)) continue;
-			const count = requestCount(source.proposalCount?.(state.settings));
+			const count = clampCandidateLimit(source.proposalCount?.(state.settings));
 			for (let index = 0; index < count; index++) {
 				const targetDecisionSequence = state.decisionSequence;
 				const slot = claimSourceSlot(
@@ -1874,7 +1870,7 @@ export function makeStructuralSpeculativeActionRuntime<
 				session,
 				source.id,
 				targetDecisionSequence,
-				requestCount(source.proposalCount?.(context.settings)),
+				clampCandidateLimit(source.proposalCount?.(context.settings)),
 			);
 			if (!slot) return;
 			context.continuationSlot = slot;

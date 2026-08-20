@@ -324,7 +324,13 @@ describe("speculative action host", () => {
 		};
 		const host = createSpeculativeActionHost("session", {
 			cwd,
-			getSettings: () => settings(8),
+			getSettings: () => ({
+				...settings(11),
+				drafterMaxTokens: 96,
+				drafterDeterministicCandidates: 2,
+				drafterTemperatureMin: 0.4,
+				drafterTemperatureMax: 1.6,
+			}),
 			draftModel: model("draft"),
 			getDraftOptions,
 			complete,
@@ -342,18 +348,20 @@ describe("speculative action host", () => {
 		releaseSlowRequest?.(assistant([{ type: "text", text: "no tool needed" }], "stop"));
 		await waitFor(() => !host.runtime.inspect("session").pendingPredictions);
 
-		expect(requests).toHaveLength(8);
-		expect(maxActiveRequests).toBe(8);
+		expect(requests).toHaveLength(11);
+		expect(maxActiveRequests).toBe(11);
 		expect(getDraftOptions).toHaveBeenCalledTimes(1);
 		expect(new Set(requests.map((request) => request.options?.sessionId))).toEqual(new Set(["session:draft:turn-1"]));
 		expect(requests.every((request) => request.context === requests[0]!.context)).toBe(true);
-		expect(requests.map((request) => request.options?.temperature)).toEqual([0, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7]);
+		const temperatures = requests.map((request) => request.options?.temperature);
+		expect(temperatures.slice(0, 3)).toEqual([0, 0, 0.4]);
+		expect(temperatures.at(-1)).toBeCloseTo(1.6);
 		for (const request of requests) {
 			expect(request.context.systemPrompt).toContain("Continue the conversation as the assistant");
 			expect(request.context.systemPrompt).not.toMatch(/drafter|predict|speculat|likely next/i);
 			expect(request.context.tools?.map((candidate) => candidate.name)).toEqual(["read"]);
 			expect(request.options).toMatchObject({
-				maxTokens: 128,
+				maxTokens: 96,
 				toolChoice: "required",
 				reasoning: undefined,
 				deferred: false,

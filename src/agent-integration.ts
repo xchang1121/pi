@@ -14,8 +14,9 @@ import { type ActionKey, type ActionSemanticsRegistry, PI_ACTION_SEMANTICS } fro
 import {
 	buildSingleToolCallPrompt,
 	clampCandidateLimit,
-	clampDrafterDepth,
 	DEFAULTS,
+	drafterRequestTemperature,
+	normalizeDrafterRequestSettings,
 	usageTokenCount,
 } from "./common.ts";
 import type { ExecutionWorldMode } from "./execution-world.ts";
@@ -59,6 +60,13 @@ export interface SpeculativeAgentSettingsInput {
 	readonly drafterEnabled?: boolean;
 	/** Number of output-informed tool steps retained after the first Drafter action. */
 	readonly drafterMaxDepth?: number;
+	/** Recommended maximum output budget for each one-action Drafter request. */
+	readonly drafterMaxTokens?: number;
+	/** Number of leading Drafter requests sent at temperature zero. */
+	readonly drafterDeterministicCandidates?: number;
+	/** Inclusive temperature range stratified across the remaining requests. */
+	readonly drafterTemperatureMin?: number;
+	readonly drafterTemperatureMax?: number;
 	readonly candidateLimit?: number;
 	readonly maxConcurrentActions?: number;
 	readonly resourceCacheMaxEntries?: number;
@@ -213,6 +221,7 @@ export function createSpeculativeActionHost(
 	};
 	const resolveSettings = async (): Promise<SpeculativeActionSettings> => {
 		const settings = (await options.getSettings?.()) ?? {};
+		const drafter = normalizeDrafterRequestSettings(settings);
 		return {
 			enabled: typeof settings.enabled === "boolean" ? settings.enabled : DEFAULTS.enabled,
 			drafterEnabled:
@@ -229,7 +238,7 @@ export function createSpeculativeActionHost(
 			),
 			predictionTimeoutMs: normalizeTimeout(settings.predictionTimeoutMs),
 			sourceConfig: {
-				drafterMaxDepth: clampDrafterDepth(settings.drafterMaxDepth),
+				...drafter,
 				patternAware: patternAwareSettings(settings.patternAware ?? PATTERN_AWARE_DEFAULTS),
 			},
 			tools: {
@@ -240,8 +249,10 @@ export function createSpeculativeActionHost(
 	};
 	const sourcePatternSettings = (settings: SpeculativeActionSettings): PatternAwareSettings =>
 		patternAwareSettings(settings.sourceConfig?.patternAware);
+	const sourceDrafterSettings = (settings: SpeculativeActionSettings) =>
+		normalizeDrafterRequestSettings(settings.sourceConfig);
 	const sourceDrafterMaxDepth = (settings: SpeculativeActionSettings): number =>
-		clampDrafterDepth(settings.sourceConfig?.drafterMaxDepth);
+		sourceDrafterSettings(settings).drafterMaxDepth;
 	const resolvePatternStore = async (settings: SpeculativeActionSettings): Promise<PatternAwareStore> => {
 		if (options.patternStore) {
 			return options.patternStore;
@@ -406,7 +417,9 @@ export function createSpeculativeActionHost(
 			startInput: input,
 			candidateNames,
 			proposalIndex,
+			proposalCount,
 			signal,
+			settings,
 		}): Promise<PlanProposal | undefined> => {
 			const proposalID = `drafter:${input.turnID}:${proposalIndex}`;
 			const batchKey = JSON.stringify([input.sessionID, input.turnID]);
@@ -442,10 +455,11 @@ export function createSpeculativeActionHost(
 				drafterBatches.set(batchKey, batch);
 			}
 			const prepared = await batch;
+			const drafter = sourceDrafterSettings(settings);
 			const draftOptions: SimpleStreamOptions & { readonly toolChoice: "required" } = {
 				...prepared.options,
-				temperature: proposalIndex === 0 ? 0 : 0.7,
-				maxTokens: 128,
+				temperature: drafterRequestTemperature(proposalIndex, proposalCount, drafter),
+				maxTokens: drafter.drafterMaxTokens,
 				toolChoice: "required",
 				reasoning: undefined,
 				deferred: false,

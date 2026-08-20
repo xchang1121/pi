@@ -91,6 +91,9 @@ spec: on · Windows AppContainer · 3/4 hits · 1.2s ahead · 5/512 results
 | Pattern prediction depth | 6 | 限制递归多步展开深度，同时允许有界的重复模式 |
 | Drafter requests | 8 | 每轮并行发起的独立单动作请求数；结果由 K(a) 去重 |
 | Drafter rollout depth | 0 | 可选的结果驱动 continuation；正数表示最多继续的动作数 |
+| Drafter 输出 tokens | 128 | 每个请求的推荐输出预算；工具 schema 较大时可以配置 |
+| 确定性 Drafter 请求 | 1 | 前几个请求使用 temperature 0 |
+| Drafter temperature 范围 | 0.7–0.7 | 其余请求针对任意候选数在闭区间内等距分层 |
 | Concurrent actions | 8 | 最大并行投机动作数 |
 | Resource cache | 512 项 / 256 MiB | `read`、`grep`、`find` 结果缓存 |
 | Prediction timeout | 300 秒 | 单轮预测生命周期上限 |
@@ -118,6 +121,10 @@ spec: on · Windows AppContainer · 3/4 hits · 1.2s ahead · 5/512 results
   "draftModel": "provider/model",
   "candidateLimit": 8,
   "drafterMaxDepth": 0,
+  "drafterMaxTokens": 128,
+  "drafterDeterministicCandidates": 1,
+  "drafterTemperatureMin": 0.7,
+  "drafterTemperatureMax": 0.7,
   "maxConcurrentActions": 8,
   "resourceCacheMaxEntries": 512,
   "resourceCacheMaxBytes": 268435456,
@@ -304,6 +311,6 @@ package 只通过 Pi 原生公开 API 接入：生命周期事件提供模型上
 
 ## 实现概览
 
-Actor 与 Drafter 并行运行。每轮 Drafter 会并行发起 `candidateLimit` 个独立请求：每个请求看到 Actor 的对话和可投机工具 schema，以 Assistant 身份只调用一个工具，关闭 reasoning，并使用较小的输出预算；第一个请求使用 temperature 0 保证准确性，其余请求使用 0.7 提供多样性。每个响应只接收第一个工具调用，再由现有 K(a) 关系在执行前合并等价工作。Actor 采纳候选后，可把准确的 Assistant 调用和工具结果回放给同一条有界 Drafter 轨迹，并在 Actor 形成下一次意图期间执行。Runtime 按目标 Actor 序号统一分配请求预算，避免 continuation 与下一 turn 的扇出重复。候选仍经过 schema 校验、preflight、资源版本捕获和执行策略选择。完成结果进入 `ResultCache` 或仅支持精确匹配的 `ActionStore`，隔离副作用由封存的 `WorldBranch` 表示。PatternAware 按 workspace hash 持久化模板和有界 PPM 计数 trie；DAG 执行、新鲜度和调度保持来源无关。
+Actor 与 Drafter 并行运行。每轮 Drafter 会并行发起 `candidateLimit` 个独立请求：每个请求看到 Actor 的对话和可投机工具 schema，以 Assistant 身份只调用一个工具，关闭 reasoning，并使用配置的输出预算。可配置数量的前置请求使用 temperature 0；其余请求针对任意候选数在配置的 temperature 区间中等距分层。每个响应只接收第一个工具调用，再由现有 K(a) 关系在执行前合并等价工作。Actor 采纳候选后，可把准确的 Assistant 调用和工具结果回放给同一条有界 Drafter 轨迹，并在 Actor 形成下一次意图期间执行。Runtime 按目标 Actor 序号统一分配请求预算，避免 continuation 与下一 turn 的扇出重复。候选仍经过 schema 校验、preflight、资源版本捕获和执行策略选择。完成结果进入 `ResultCache` 或仅支持精确匹配的 `ActionStore`，隔离副作用由封存的 `WorldBranch` 表示。PatternAware 按 workspace hash 持久化模板和有界 PPM 计数 trie；DAG 执行、新鲜度和调度保持来源无关。
 
 所有命中、未命中、取消、实际执行、草稿 token、缓存和沙箱阶段耗时均以 typed event 暴露，供实验记录与可视化使用。

@@ -12,7 +12,14 @@ import {
 	buildPiActionKey,
 	inferredExecution,
 } from "../src/action-semantics.ts";
-import { buildSingleToolCallPrompt, clampCandidateLimit, clampDrafterDepth, DEFAULTS } from "../src/common.ts";
+import {
+	buildSingleToolCallPrompt,
+	clampCandidateLimit,
+	clampDrafterDepth,
+	DEFAULTS,
+	drafterRequestTemperature,
+	normalizeDrafterRequestSettings,
+} from "../src/common.ts";
 import { candidateToolNames } from "../src/runtime.ts";
 
 describe("speculative action common", () => {
@@ -27,12 +34,40 @@ describe("speculative action common", () => {
 		expect(DEFAULTS.drafterMaxDepth).toBe(0);
 	});
 
-	it("clamps the per-turn candidate limit to the source range", () => {
+	it("normalizes configured request counts without hidden upper bounds", () => {
 		expect(clampCandidateLimit(0)).toBe(1);
 		expect(clampCandidateLimit(4.9)).toBe(4);
-		expect(clampCandidateLimit(100)).toBe(8);
+		expect(clampCandidateLimit(100)).toBe(100);
 		expect(clampCandidateLimit("4")).toBe(1);
-		expect([clampDrafterDepth(-1), clampDrafterDepth(2.9), clampDrafterDepth(9)]).toEqual([0, 2, 4]);
+		expect([clampDrafterDepth(-1), clampDrafterDepth(2.9), clampDrafterDepth(9)]).toEqual([0, 2, 9]);
+	});
+
+	it("stratifies configurable Drafter sampling for arbitrary candidate counts", () => {
+		const baseline = normalizeDrafterRequestSettings(undefined);
+		expect([0, 1, 2].map((index) => drafterRequestTemperature(index, 3, baseline))).toEqual([0, 0.7, 0.7]);
+		const diverse = normalizeDrafterRequestSettings({
+			drafterDeterministicCandidates: 1,
+			drafterTemperatureMin: 0.4,
+			drafterTemperatureMax: 1.6,
+		});
+		expect(drafterRequestTemperature(0, 1, diverse)).toBe(0);
+		expect([0, 1, 2].map((index) => drafterRequestTemperature(index, 3, diverse))).toEqual([0, 0.4, 1.6]);
+		expect(drafterRequestTemperature(1, 2, diverse)).toBe(1);
+		expect(drafterRequestTemperature(100, 101, diverse)).toBeCloseTo(1.6);
+		expect(
+			normalizeDrafterRequestSettings({
+				drafterMaxTokens: 0,
+				drafterDeterministicCandidates: -1,
+				drafterTemperatureMin: 2,
+				drafterTemperatureMax: 0.5,
+			}),
+		).toEqual({
+			drafterMaxDepth: 0,
+			drafterMaxTokens: DEFAULTS.drafterMaxTokens,
+			drafterDeterministicCandidates: DEFAULTS.drafterDeterministicCandidates,
+			drafterTemperatureMin: 0.5,
+			drafterTemperatureMax: 2,
+		});
 	});
 
 	it("canonicalizes Pi defaults and rejects paths outside the workspace", () => {

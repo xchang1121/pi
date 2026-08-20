@@ -46,6 +46,7 @@
 - Native sandbox protocol v3 now forwards the configured shell and requires an explicit process-isolation attestation; Linux recursively enforces read-only host mounts and readiness probes verify mount isolation.
 - K(a) remains a uniform canonical action key; registered projection rules now require both a potential key relation and validated realized-output coverage before reconstructing an actor result.
 - Drafter rounds now issue `candidateLimit` independent one-action requests concurrently, retain one low-temperature accuracy sample and diverse remaining samples, and rely on the existing K(a) relation to deduplicate execution.
+- Drafter output budgets and arbitrary-count sampling are now configurable recommendations; configured request, rollout, and OCI worker counts no longer have hidden implementation caps.
 
 ### Fixed
 

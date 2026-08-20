@@ -327,7 +327,7 @@ describe("zero-modification Pi extension", () => {
 		expect(discover).toHaveBeenCalledOnce();
 	});
 
-	it("exposes the bounded Drafter rollout in the Drafter submenu", async () => {
+	it("exposes Drafter request policy in the Drafter submenu", async () => {
 		const fixture = await createFixture({ oci: unavailable("docker missing"), native: readyNative() });
 		const menus = new Map<string, string[]>();
 		const visits = new Map<string, number>();
@@ -348,7 +348,14 @@ describe("zero-modification Pi extension", () => {
 		await fixture.emit("session_start", {}, fixture.context);
 		await fixture.commands.get("speculative-action")?.handler("", fixture.context as ExtensionCommandContext);
 
-		expect(menus.get("Drafter")).toEqual(expect.arrayContaining(["Rollout depth: 0"]));
+		expect(menus.get("Drafter")).toEqual(
+			expect.arrayContaining([
+				"Rollout depth: 0",
+				"Output tokens: 128",
+				"Deterministic requests: 1",
+				"Temperature range: 0.7-0.7",
+			]),
+		);
 	});
 });
 
@@ -573,6 +580,10 @@ function effectiveSettings() {
 		enabled: true,
 		drafterEnabled: true,
 		drafterMaxDepth: 2,
+		drafterMaxTokens: 128,
+		drafterDeterministicCandidates: 1,
+		drafterTemperatureMin: 0.7,
+		drafterTemperatureMax: 0.7,
 		candidateLimit: 1,
 		maxConcurrentActions: 1,
 		resourceCacheMaxEntries: 8,

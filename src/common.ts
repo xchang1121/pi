@@ -6,10 +6,26 @@ export interface DrafterToolDefinition {
 	readonly inputSchema?: unknown;
 }
 
+export interface DrafterRequestSettings {
+	readonly drafterMaxDepth: number;
+	readonly drafterMaxTokens: number;
+	readonly drafterDeterministicCandidates: number;
+	readonly drafterTemperatureMin: number;
+	readonly drafterTemperatureMax: number;
+}
+
+const DRAFTER_DEFAULTS: DrafterRequestSettings = {
+	drafterMaxDepth: 0,
+	drafterMaxTokens: 128,
+	drafterDeterministicCandidates: 1,
+	drafterTemperatureMin: 0.7,
+	drafterTemperatureMax: 0.7,
+};
+
 export const DEFAULTS = {
 	enabled: false,
 	drafterEnabled: true,
-	drafterMaxDepth: 0,
+	...DRAFTER_DEFAULTS,
 	candidateLimit: 8,
 	maxConcurrentActions: 8,
 	resourceCacheMaxEntries: 512,
@@ -35,13 +51,48 @@ Rules:
 }
 
 export function clampCandidateLimit(value: unknown): number {
-	return typeof value === "number" && Number.isFinite(value) ? Math.max(1, Math.min(8, Math.floor(value))) : 1;
+	return typeof value === "number" && Number.isFinite(value) ? Math.max(1, Math.floor(value)) : 1;
 }
 
 export function clampDrafterDepth(value: unknown): number {
 	return typeof value === "number" && Number.isFinite(value)
-		? Math.max(0, Math.min(4, Math.floor(value)))
+		? Math.max(0, Math.floor(value))
 		: DEFAULTS.drafterMaxDepth;
+}
+
+export function normalizeDrafterRequestSettings(value: unknown): DrafterRequestSettings {
+	const input = value && typeof value === "object" ? (value as Record<string, unknown>) : {};
+	const lower = nonNegativeNumber(input.drafterTemperatureMin, DEFAULTS.drafterTemperatureMin);
+	const upper = nonNegativeNumber(input.drafterTemperatureMax, DEFAULTS.drafterTemperatureMax);
+	return {
+		drafterMaxDepth: clampDrafterDepth(input.drafterMaxDepth),
+		drafterMaxTokens: positiveInteger(input.drafterMaxTokens, DEFAULTS.drafterMaxTokens),
+		drafterDeterministicCandidates: nonNegativeInteger(
+			input.drafterDeterministicCandidates,
+			DEFAULTS.drafterDeterministicCandidates,
+		),
+		drafterTemperatureMin: Math.min(lower, upper),
+		drafterTemperatureMax: Math.max(lower, upper),
+	};
+}
+
+/** Stratify non-deterministic requests across the configured range for any proposal count. */
+export function drafterRequestTemperature(
+	proposalIndex: number,
+	proposalCount: number,
+	settings: DrafterRequestSettings,
+): number {
+	const count = clampCandidateLimit(proposalCount);
+	const index = Math.max(0, Math.min(count - 1, Math.floor(proposalIndex)));
+	const deterministic = Math.min(count, settings.drafterDeterministicCandidates);
+	if (index < deterministic) return 0;
+	const stochasticCount = count - deterministic;
+	if (stochasticCount === 1) return (settings.drafterTemperatureMin + settings.drafterTemperatureMax) / 2;
+	return (
+		settings.drafterTemperatureMin +
+		((settings.drafterTemperatureMax - settings.drafterTemperatureMin) * (index - deterministic)) /
+			(stochasticCount - 1)
+	);
 }
 
 export function usageTokenCount(
@@ -60,4 +111,16 @@ export function usageTokenCount(
 	return [usage.input, usage.output, usage.cacheRead, usage.cacheWrite]
 		.filter((value): value is number => typeof value === "number" && Number.isFinite(value))
 		.reduce((sum, value) => sum + value, 0);
+}
+
+function positiveInteger(value: unknown, fallback: number): number {
+	return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
+}
+
+function nonNegativeInteger(value: unknown, fallback: number): number {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.floor(value) : fallback;
+}
+
+function nonNegativeNumber(value: unknown, fallback: number): number {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : fallback;
 }

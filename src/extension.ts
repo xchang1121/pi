@@ -22,7 +22,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { IDEMPOTENT_ACTION_TOOLS, KEYABLE_TOOLS, SANDBOX_ACTION_TOOLS } from "./action-semantics.ts";
 import { createSpeculativeActionHost } from "./agent-integration.ts";
-import { clampCandidateLimit, clampDrafterDepth, DEFAULTS } from "./common.ts";
+import { clampCandidateLimit, DEFAULTS, normalizeDrafterRequestSettings } from "./common.ts";
 import { createContainerSandboxProcessBackend, DEFAULT_CONTAINER_SANDBOX_IMAGE } from "./container-sandbox.ts";
 import { createNativeSandboxProcessBackend } from "./native-sandbox.ts";
 import { createOciSetupService, type OciSetupService } from "./oci-setup.ts";
@@ -66,6 +66,10 @@ export interface EffectiveSpeculativeActionSettings {
 	readonly enabled: boolean;
 	readonly drafterEnabled: boolean;
 	readonly drafterMaxDepth: number;
+	readonly drafterMaxTokens: number;
+	readonly drafterDeterministicCandidates: number;
+	readonly drafterTemperatureMin: number;
+	readonly drafterTemperatureMax: number;
 	readonly draftModel?: string;
 	readonly candidateLimit: number;
 	readonly maxConcurrentActions: number;
@@ -139,10 +143,11 @@ export interface SpeculativeActionExtensionDependencies {
 export function normalizeSpeculativeActionSettings(
 	input: SpeculativeActionPackageSettings | undefined,
 ): EffectiveSpeculativeActionSettings {
+	const drafter = normalizeDrafterRequestSettings(input);
 	return {
 		enabled: typeof input?.enabled === "boolean" ? input.enabled : DEFAULTS.enabled,
 		drafterEnabled: typeof input?.drafterEnabled === "boolean" ? input.drafterEnabled : DEFAULTS.drafterEnabled,
-		drafterMaxDepth: clampDrafterDepth(input?.drafterMaxDepth),
+		...drafter,
 		...(typeof input?.draftModel === "string" && input.draftModel.trim()
 			? { draftModel: input.draftModel.trim() }
 			: {}),
@@ -178,6 +183,7 @@ export function formatSpeculativeActionStatus(input: {
 		`Drafter: ${settings.drafterEnabled ? "On" : "Off"}`,
 		`Draft model: ${settings.draftModel ?? "active model"}`,
 		`Drafter requests: ${settings.candidateLimit}`,
+		`Drafter request policy: ${settings.drafterMaxTokens} tokens; ${settings.drafterDeterministicCandidates} deterministic; temperature ${formatNumber(settings.drafterTemperatureMin)}-${formatNumber(settings.drafterTemperatureMax)}`,
 		`Concurrent actions: ${settings.maxConcurrentActions}`,
 		`Resource cache: ${settings.resourceCacheMaxEntries}`,
 		`Resource cache memory: ${formatBytes(settings.resourceCacheMaxBytes)}`,
@@ -903,6 +909,9 @@ async function openDrafterSettings(ctx: ExtensionContext, controller: Speculativ
 			`Enabled: ${settings.drafterEnabled ? "On" : "Off"}`,
 			`Model › ${settings.draftModel ?? activeModelReference(ctx)}`,
 			`Rollout depth: ${settings.drafterMaxDepth}`,
+			`Output tokens: ${settings.drafterMaxTokens}`,
+			`Deterministic requests: ${settings.drafterDeterministicCandidates}`,
+			`Temperature range: ${formatNumber(settings.drafterTemperatureMin)}-${formatNumber(settings.drafterTemperatureMax)}`,
 			`Prediction timeout: ${formatDuration(settings.predictionTimeoutMs)}`,
 			BACK,
 		]);
@@ -912,6 +921,15 @@ async function openDrafterSettings(ctx: ExtensionContext, controller: Speculativ
 		if (choice.startsWith("Model")) await editDraftModel(ctx, controller, settings);
 		if (choice.startsWith("Rollout depth:")) {
 			await editDrafterDepth(ctx, controller, settings);
+		}
+		if (choice.startsWith("Output tokens:")) {
+			await editPositiveInteger(ctx, controller, settings, "drafterMaxTokens", "Drafter output tokens");
+		}
+		if (choice.startsWith("Deterministic requests:")) {
+			await editDrafterDeterministicCandidates(ctx, controller, settings);
+		}
+		if (choice.startsWith("Temperature range:")) {
+			await editDrafterTemperatureRange(ctx, controller, settings);
 		}
 		if (choice.startsWith("Prediction timeout:")) {
 			await editPositiveInteger(ctx, controller, settings, "predictionTimeoutMs", "Prediction timeout (ms)");
@@ -1019,10 +1037,10 @@ async function openSchedulingAndCache(ctx: ExtensionContext, controller: Specula
 		]);
 		if (!choice || choice === BACK) return;
 		if (choice.startsWith("Drafter requests:")) {
-			await editPositiveInteger(ctx, controller, settings, "candidateLimit", "Drafter requests per turn (1-8)");
+			await editPositiveInteger(ctx, controller, settings, "candidateLimit", "Drafter requests per turn");
 		}
 		if (choice.startsWith("Concurrent actions:")) {
-			await editPositiveInteger(ctx, controller, settings, "maxConcurrentActions", "Concurrent actions (1-8)");
+			await editPositiveInteger(ctx, controller, settings, "maxConcurrentActions", "Concurrent actions");
 		}
 		if (choice.startsWith("Resource cache entries:")) {
 			await editPositiveInteger(ctx, controller, settings, "resourceCacheMaxEntries", "Resource cache entries");
@@ -1205,7 +1223,12 @@ async function editPositiveInteger(
 	ctx: ExtensionContext,
 	controller: SpeculativeActionController,
 	settings: EffectiveSpeculativeActionSettings,
-	field: "candidateLimit" | "maxConcurrentActions" | "resourceCacheMaxEntries" | "predictionTimeoutMs",
+	field:
+		| "candidateLimit"
+		| "maxConcurrentActions"
+		| "resourceCacheMaxEntries"
+		| "predictionTimeoutMs"
+		| "drafterMaxTokens",
 	title: string,
 ): Promise<void> {
 	const value = await ctx.ui.input(title, String(settings[field]));
@@ -1226,15 +1249,52 @@ async function editDrafterDepth(
 	controller: SpeculativeActionController,
 	settings: EffectiveSpeculativeActionSettings,
 ): Promise<void> {
-	const title = "Drafter rollout depth (0-4)";
+	const title = "Drafter rollout depth";
 	const value = await ctx.ui.input(title, String(settings.drafterMaxDepth));
 	if (value === undefined) return;
 	const parsed = Number(value.trim());
-	if (!Number.isInteger(parsed) || parsed < 0 || parsed > 4) {
-		ctx.ui.notify(`${title} must be an integer from 0 through 4.`, "warning");
+	if (!Number.isInteger(parsed) || parsed < 0) {
+		ctx.ui.notify(`${title} must be a non-negative integer.`, "warning");
 		return;
 	}
 	controller.setSettings({ ...settings, drafterMaxDepth: parsed });
+}
+
+async function editDrafterDeterministicCandidates(
+	ctx: ExtensionContext,
+	controller: SpeculativeActionController,
+	settings: EffectiveSpeculativeActionSettings,
+): Promise<void> {
+	const title = "Deterministic Drafter requests";
+	const value = await ctx.ui.input(title, String(settings.drafterDeterministicCandidates));
+	if (value === undefined) return;
+	const parsed = Number(value.trim());
+	if (!Number.isInteger(parsed) || parsed < 0) {
+		ctx.ui.notify(`${title} must be a non-negative integer.`, "warning");
+		return;
+	}
+	controller.setSettings({ ...settings, drafterDeterministicCandidates: parsed });
+}
+
+async function editDrafterTemperatureRange(
+	ctx: ExtensionContext,
+	controller: SpeculativeActionController,
+	settings: EffectiveSpeculativeActionSettings,
+): Promise<void> {
+	const value = await ctx.ui.input(
+		"Drafter temperature range",
+		`${formatNumber(settings.drafterTemperatureMin)},${formatNumber(settings.drafterTemperatureMax)}`,
+	);
+	if (value === undefined) return;
+	const [lower, upper, ...extra] = value.split(",").map((item) => Number(item.trim()));
+	if (extra.length > 0 || !Number.isFinite(lower) || !Number.isFinite(upper) || lower < 0 || upper < lower) {
+		ctx.ui.notify(
+			"Drafter temperature range must be two non-negative comma-separated numbers in ascending order.",
+			"warning",
+		);
+		return;
+	}
+	controller.setSettings({ ...settings, drafterTemperatureMin: lower, drafterTemperatureMax: upper });
 }
 
 async function editDraftModel(
@@ -1609,4 +1669,8 @@ function formatBytes(bytes: number): string {
 
 function formatPercent(value: number): string {
 	return `${Math.round(value * 100)}%`;
+}
+
+function formatNumber(value: number): string {
+	return Number.isInteger(value) ? String(value) : String(Number(value.toFixed(3)));
 }

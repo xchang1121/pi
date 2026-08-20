@@ -17,6 +17,7 @@ import {
 	createWriteTool,
 } from "@earendil-works/pi-coding-agent";
 import { createSpeculativeActionHost, type SpeculativeAgentSettingsInput } from "../src/agent-integration.ts";
+import { DEFAULTS } from "../src/common.ts";
 import { createContainerSandboxProcessBackend } from "../src/container-sandbox.ts";
 import { createNativeSandboxProcessBackend } from "../src/native-sandbox.ts";
 import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
@@ -70,9 +71,15 @@ interface BenchmarkOptions {
 	readonly instance: string;
 	readonly label: string;
 	readonly actor: Model<Api>;
+	readonly actorMaxTokens: number;
+	readonly actorTemperature: number;
 	readonly drafter: Model<Api>;
 	readonly candidateLimit: number;
 	readonly drafterMaxDepth: number;
+	readonly drafterMaxTokens: number;
+	readonly drafterDeterministicCandidates: number;
+	readonly drafterTemperatureMin: number;
+	readonly drafterTemperatureMax: number;
 	readonly maxConcurrentActions: number;
 	readonly maxTurns: number;
 	readonly timeoutMs: number;
@@ -96,10 +103,19 @@ const { values } = parseArgs({
 		instance: { type: "string" },
 		label: { type: "string", default: "baseline" },
 		actor: { type: "string", default: "deepseek/deepseek-v4-pro" },
+		"actor-max-tokens": { type: "string", default: "8192" },
+		"actor-temperature": { type: "string", default: "0" },
 		drafter: { type: "string", default: "deepseek/deepseek-v4-flash" },
-		"candidate-limit": { type: "string", default: "8" },
-		"drafter-max-depth": { type: "string", default: "0" },
-		"max-concurrent-actions": { type: "string", default: "8" },
+		"candidate-limit": { type: "string", default: String(DEFAULTS.candidateLimit) },
+		"drafter-max-depth": { type: "string", default: String(DEFAULTS.drafterMaxDepth) },
+		"drafter-max-tokens": { type: "string", default: String(DEFAULTS.drafterMaxTokens) },
+		"drafter-deterministic-candidates": {
+			type: "string",
+			default: String(DEFAULTS.drafterDeterministicCandidates),
+		},
+		"drafter-temperature-min": { type: "string", default: String(DEFAULTS.drafterTemperatureMin) },
+		"drafter-temperature-max": { type: "string", default: String(DEFAULTS.drafterTemperatureMax) },
+		"max-concurrent-actions": { type: "string", default: String(DEFAULTS.maxConcurrentActions) },
 		"max-turns": { type: "string", default: "128" },
 		"timeout-ms": { type: "string", default: "900000" },
 		latency: { type: "string", default: "remote" },
@@ -122,9 +138,18 @@ const options: BenchmarkOptions = {
 	instance,
 	label: values.label ?? "baseline",
 	actor: model(values.actor ?? "deepseek/deepseek-v4-pro"),
+	actorMaxTokens: positiveInteger(values["actor-max-tokens"], "--actor-max-tokens"),
+	actorTemperature: nonNegativeNumber(values["actor-temperature"], "--actor-temperature"),
 	drafter: model(values.drafter ?? "deepseek/deepseek-v4-flash"),
 	candidateLimit: positiveInteger(values["candidate-limit"], "--candidate-limit"),
-	drafterMaxDepth: nonNegativeInteger(values["drafter-max-depth"], "--drafter-max-depth", 4),
+	drafterMaxDepth: nonNegativeInteger(values["drafter-max-depth"], "--drafter-max-depth"),
+	drafterMaxTokens: positiveInteger(values["drafter-max-tokens"], "--drafter-max-tokens"),
+	drafterDeterministicCandidates: nonNegativeInteger(
+		values["drafter-deterministic-candidates"],
+		"--drafter-deterministic-candidates",
+	),
+	drafterTemperatureMin: nonNegativeNumber(values["drafter-temperature-min"], "--drafter-temperature-min"),
+	drafterTemperatureMax: nonNegativeNumber(values["drafter-temperature-max"], "--drafter-temperature-max"),
 	maxConcurrentActions: positiveInteger(values["max-concurrent-actions"], "--max-concurrent-actions"),
 	maxTurns: positiveInteger(values["max-turns"], "--max-turns"),
 	timeoutMs: positiveInteger(values["timeout-ms"], "--timeout-ms"),
@@ -137,6 +162,9 @@ const options: BenchmarkOptions = {
 	patternAware: values["pattern-aware"] ?? false,
 	prepareOnly: values["prepare-only"] ?? false,
 };
+if (options.drafterTemperatureMin > options.drafterTemperatureMax) {
+	throw new Error("--drafter-temperature-min must not exceed --drafter-temperature-max");
+}
 
 const prepared = await prepareTask(options);
 if (options.prepareOnly) {
@@ -230,6 +258,10 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 		enabled: true,
 		drafterEnabled: input.drafterEnabled,
 		drafterMaxDepth: input.drafterMaxDepth,
+		drafterMaxTokens: input.drafterMaxTokens,
+		drafterDeterministicCandidates: input.drafterDeterministicCandidates,
+		drafterTemperatureMin: input.drafterTemperatureMin,
+		drafterTemperatureMax: input.drafterTemperatureMax,
 		candidateLimit: input.candidateLimit,
 		maxConcurrentActions: input.maxConcurrentActions,
 		predictionTimeoutMs: input.timeoutMs,
@@ -329,8 +361,8 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 		streamFn: (actorModel, context, streamOptions) =>
 			streamSimple(actorModel, context, {
 				...streamOptions,
-				temperature: 0,
-				maxTokens: 8_192,
+				temperature: input.actorTemperature,
+				maxTokens: input.actorMaxTokens,
 			}),
 		sessionId: sessionID,
 		shouldStopAfterTurn: () => turnSequence >= input.maxTurns,
@@ -455,9 +487,15 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 			language: task.row.language,
 			sourceDataset: task.row.source_dataset,
 			actor: `${input.actor.provider}/${input.actor.id}`,
+			actorMaxTokens: input.actorMaxTokens,
+			actorTemperature: input.actorTemperature,
 			drafter: `${input.drafter.provider}/${input.drafter.id}`,
 			candidateLimit: input.candidateLimit,
 			drafterMaxDepth: input.drafterMaxDepth,
+			drafterMaxTokens: input.drafterMaxTokens,
+			drafterDeterministicCandidates: input.drafterDeterministicCandidates,
+			drafterTemperatureMin: input.drafterTemperatureMin,
+			drafterTemperatureMax: input.drafterTemperatureMax,
 			drafterEnabled: input.drafterEnabled,
 			maxConcurrentActions: input.maxConcurrentActions,
 			maxTurns: input.maxTurns,
@@ -704,11 +742,15 @@ function positiveInteger(value: string | undefined, option: string): number {
 	return parsed;
 }
 
-function nonNegativeInteger(value: string | undefined, option: string, maximum: number): number {
+function nonNegativeInteger(value: string | undefined, option: string): number {
 	const parsed = Number(value);
-	if (!Number.isInteger(parsed) || parsed < 0 || parsed > maximum) {
-		throw new Error(`${option} must be an integer from 0 through ${maximum}`);
-	}
+	if (!Number.isInteger(parsed) || parsed < 0) throw new Error(`${option} must be a non-negative integer`);
+	return parsed;
+}
+
+function nonNegativeNumber(value: string | undefined, option: string): number {
+	const parsed = Number(value);
+	if (!Number.isFinite(parsed) || parsed < 0) throw new Error(`${option} must be a non-negative number`);
 	return parsed;
 }
 

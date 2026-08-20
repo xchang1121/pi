@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { DEFAULTS } from "./common.ts";
 import type {
 	SandboxProcessBackend,
 	SandboxProcessBackendStatus,
@@ -94,7 +95,7 @@ class ContainerSandboxBackend implements SandboxProcessBackend {
 	constructor(options: ContainerSandboxOptions) {
 		this.options = options;
 		this.invoke = options.invoker ?? invokeContainerRuntime;
-		this.maxWorkers = Math.max(1, Math.min(32, Math.floor(options.maxWorkers ?? 8)));
+		this.maxWorkers = Math.max(1, Math.floor(options.maxWorkers ?? DEFAULTS.maxConcurrentActions));
 	}
 
 	readonly check = async (input: { readonly refresh?: boolean } = {}): Promise<SandboxProcessBackendStatus> => {
