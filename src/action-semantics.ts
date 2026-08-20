@@ -376,6 +376,15 @@ export function actionKeyMatch(
 	projectors: readonly ActionKeyProjector[] = [],
 ): ActionKeyMatch | undefined {
 	if (speculative.key === actor.key) return { kind: "exact", distance: 0 };
+	if (
+		speculative.tool !== actor.tool ||
+		speculative.execution !== actor.execution ||
+		speculative.semanticsEpoch !== actor.semanticsEpoch ||
+		speculative.schemaHash !== actor.schemaHash ||
+		speculative.executionFingerprint !== actor.executionFingerprint
+	) {
+		return undefined;
+	}
 	let best: ActionKeyMatch | undefined;
 	for (const projector of projectors) {
 		let projected: ProjectedActionKey | undefined;

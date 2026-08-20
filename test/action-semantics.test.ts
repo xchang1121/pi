@@ -125,6 +125,52 @@ describe("ActionSemanticsRegistry", () => {
 		expect(actionKeyMismatchReason(first, second)).toBe("different_executor");
 	});
 
+	it("keeps every projection inside the immutable semantic envelope", () => {
+		const permissive: ActionKeyProjector = {
+			id: "permissive",
+			partition: () => "all",
+			project: (_speculative, actor) => ({ action: actor, distance: 1 }),
+		};
+		const base = buildActionKey({
+			tool: "read",
+			execution: "resource_cached",
+			resources: ["a.ts"],
+			input: { path: "a.ts", offset: 1 },
+			semanticsEpoch: "read.v1",
+			schemaHash: "schema.v1",
+			executionFingerprint: "executor.v1",
+		});
+		const sameEnvelope = buildActionKey({
+			...base,
+			resources: ["a.ts"],
+			input: { path: "a.ts", offset: 2 },
+		});
+		expect(actionKeyMatch(base, sameEnvelope, [permissive])).toMatchObject({
+			kind: "projected",
+			projector: "permissive",
+		});
+
+		for (const actor of [
+			buildActionKey({ ...base, tool: "grep", resources: ["a.ts"], input: { path: "a.ts", offset: 2 } }),
+			buildActionKey({ ...base, execution: "sandbox", resources: ["a.ts"], input: { path: "a.ts", offset: 2 } }),
+			buildActionKey({
+				...base,
+				semanticsEpoch: "read.v2",
+				resources: ["a.ts"],
+				input: { path: "a.ts", offset: 2 },
+			}),
+			buildActionKey({ ...base, schemaHash: "schema.v2", resources: ["a.ts"], input: { path: "a.ts", offset: 2 } }),
+			buildActionKey({
+				...base,
+				executionFingerprint: "executor.v2",
+				resources: ["a.ts"],
+				input: { path: "a.ts", offset: 2 },
+			}),
+		]) {
+			expect(actionKeyMatch(base, actor, [permissive])).toBeUndefined();
+		}
+	});
+
 	it("supports a new host tool with one semantics definition", () => {
 		const registry = new ActionSemanticsRegistry([
 			resourceDefinition("stat", "host.stat.v1", (input) => {
