@@ -53,7 +53,10 @@ export type PredictionIdentity = PlanActionIdentity;
 
 export interface ActorActionIdentity {
 	readonly id: string;
+	/** Unique order of this concrete tool call. */
 	readonly sequence: number;
+	/** Actor tool batch used by prediction horizons. Defaults to sequence for external adapters. */
+	readonly decisionSequence?: number;
 	readonly turnID: string;
 }
 

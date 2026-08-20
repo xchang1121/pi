@@ -715,6 +715,50 @@ describe("structural speculative runtime", () => {
 		);
 	});
 
+	it("advances prediction horizons once per Actor tool batch", async () => {
+		const settlements: PredictionSettlement[] = [];
+		const source: Source = {
+			id: "source",
+			enabled: () => true,
+			propose: ({ startInput }) =>
+				startInput.turnID === "turn-1"
+					? {
+							id: "batch",
+							source: "source",
+							revision: 0,
+							actions: [
+								{ id: "same", type: "tool_call", tool: "read", input: { path: "same.ts" }, horizon: 0 },
+								{ id: "next", type: "tool_call", tool: "read", input: { path: "next.ts" }, horizon: 1 },
+							],
+						}
+					: { id: `empty:${startInput.turnID}`, source: "source", revision: 0, actions: [] },
+			onSettled: ({ settlement }) => {
+				settlements.push(settlement);
+			},
+		};
+		const fixture = harness({ source, execute: (_tool, input) => String(input.path) });
+		await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn-1" });
+		await waitFor(() => fixture.executions() >= 1);
+
+		const unrelated = { ...call("turn-1"), id: "unrelated", tool: "find", input: { pattern: "*" } };
+		expect(await fixture.runtime.consume(unrelated)).toBeUndefined();
+		await fixture.runtime.actual({ ...unrelated, durationMs: 1, output: "files" });
+		expect(await fixture.runtime.consume({ ...call("turn-1", { path: "same.ts" }), id: "same" })).toBe("same.ts");
+		await fixture.runtime.finishTurn({ ...call("turn-1"), terminal: false });
+
+		await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn-2" });
+		await waitFor(() => fixture.executions() === 2);
+		expect(await fixture.runtime.consume({ ...call("turn-2", { path: "next.ts" }), id: "next" })).toBe("next.ts");
+		await fixture.runtime.finishTurn({ ...call("turn-2"), terminal: true });
+
+		expect(settlements).toHaveLength(2);
+		expect(
+			settlements.map((settlement) =>
+				settlement.observation === "observed" ? settlement.actorAction.decisionSequence : undefined,
+			),
+		).toEqual([1, 2]);
+	});
+
 	it("recalculates a distant prediction deadline across Actor turns", async () => {
 		let executions = 0;
 		const source: Source = {
@@ -988,6 +1032,16 @@ describe("structural speculative runtime", () => {
 		await waitFor(() => continuationStarted);
 		expect(await fixture.runtime.consume(call("miss", { path: "other.ts" }))).toBeUndefined();
 		await fixture.runtime.actual({ ...call("miss", { path: "other.ts" }), durationMs: 1, output: "actor" });
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		expect(
+			fixture.events.some(
+				(event) =>
+					event.type === "source_request" &&
+					event.request.request.kind === "continuation" &&
+					event.request.settlement.status === "aborted",
+			),
+		).toBe(false);
+		await fixture.runtime.finishTurn({ ...call("miss"), terminal: false });
 		await waitFor(() =>
 			fixture.events.some(
 				(event) =>

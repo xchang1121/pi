@@ -44,9 +44,9 @@ interface PlanRuntimeNodeBase {
 	readonly revision: number;
 	readonly action: PlanAction;
 	readonly actionKey?: ActionKey;
-	readonly anchorActionSeq: number;
-	readonly expectedActionSeq: number;
-	readonly latestActionSeq: number;
+	readonly anchorDecisionSeq: number;
+	readonly expectedDecisionSeq: number;
+	readonly latestDecisionSeq: number;
 	readonly criticalPathMs: number;
 	readonly execution: PlanNodeExecution;
 	readonly readiness: PlanNodeReadiness;
@@ -187,9 +187,9 @@ type MutableNode = {
 	identity: PlanActionIdentity;
 	action: PlanAction;
 	actionKey?: ActionKey;
-	anchorActionSeq: number;
-	expectedActionSeq: number;
-	latestActionSeq: number;
+	anchorDecisionSeq: number;
+	expectedDecisionSeq: number;
+	latestDecisionSeq: number;
 	criticalPathMs: number;
 	execution: MutableNodeExecution;
 	opportunity?: PredictionOpportunity;
@@ -199,10 +199,10 @@ type MutableNode = {
 export class PlanRuntime {
 	private readonly plans = new Map<string, MutablePlan>();
 
-	apply(update: PlanUpdate, anchorActionSeq: number): PlanRuntimeUpdateResult {
+	apply(update: PlanUpdate, anchorDecisionSeq: number): PlanRuntimeUpdateResult {
 		return "actions" in update
-			? this.applyProposal(update, anchorActionSeq)
-			: this.applyDelta(update, anchorActionSeq);
+			? this.applyProposal(update, anchorDecisionSeq)
+			: this.applyDelta(update, anchorDecisionSeq);
 	}
 
 	plan(proposalID: string): MaterializedPlan | undefined {
@@ -219,8 +219,8 @@ export class PlanRuntime {
 	}
 
 	takeReady(
-		settledSequence: number,
-		shouldLaunch: (node: PlanRuntimeNode) => boolean = (node) => node.expectedActionSeq <= settledSequence + 1,
+		settledDecisionSeq: number,
+		shouldLaunch: (node: PlanRuntimeNode) => boolean = (node) => node.expectedDecisionSeq <= settledDecisionSeq + 1,
 	): readonly PlanRuntimeNode[] {
 		const ready = this.mutableValues()
 			.filter(({ plan, node }) => {
@@ -325,8 +325,8 @@ export class PlanRuntime {
 		return this.values().filter(isUnsettledPrediction);
 	}
 
-	due(settledThrough: number): readonly PredictionPlanRuntimeNode[] {
-		return this.pending().filter((node) => node.latestActionSeq <= settledThrough);
+	due(settledDecisionSeq: number): readonly PredictionPlanRuntimeNode[] {
+		return this.pending().filter((node) => node.latestDecisionSeq <= settledDecisionSeq);
 	}
 
 	drainBlocked(): readonly PlanRuntimeNode[] {
@@ -337,7 +337,7 @@ export class PlanRuntime {
 		this.plans.clear();
 	}
 
-	private applyProposal(proposal: PlanProposal, anchorActionSeq: number): PlanRuntimeUpdateResult {
+	private applyProposal(proposal: PlanProposal, anchorDecisionSeq: number): PlanRuntimeUpdateResult {
 		if (!validIdentity(proposal.id, proposal.source)) return { accepted: false, reason: "invalid_identity" };
 		if (!validRevision(proposal.revision)) return { accepted: false, reason: "invalid_revision" };
 		const current = this.plans.get(proposal.id);
@@ -354,11 +354,11 @@ export class PlanRuntime {
 			draftTokens: finiteMetric(proposal.draftTokens),
 			actions,
 			upserted: validated.actions,
-			anchorActionSeq,
+			anchorDecisionSeq,
 		});
 	}
 
-	private applyDelta(delta: PlanDelta, anchorActionSeq: number): PlanRuntimeUpdateResult {
+	private applyDelta(delta: PlanDelta, anchorDecisionSeq: number): PlanRuntimeUpdateResult {
 		if (!validIdentity(delta.proposalID, delta.source)) return { accepted: false, reason: "invalid_identity" };
 		if (!validRevision(delta.revision)) return { accepted: false, reason: "invalid_revision" };
 		const current = this.plans.get(delta.proposalID);
@@ -380,7 +380,7 @@ export class PlanRuntime {
 			draftTokens: current.draftTokens + finiteMetric(delta.draftTokens),
 			actions,
 			upserted: validated.actions,
-			anchorActionSeq,
+			anchorDecisionSeq,
 		});
 	}
 
@@ -391,7 +391,7 @@ export class PlanRuntime {
 		readonly draftTokens: number;
 		readonly actions: ReadonlyMap<string, PlanAction>;
 		readonly upserted: readonly PlanAction[];
-		readonly anchorActionSeq: number;
+		readonly anchorDecisionSeq: number;
 	}): PlanRuntimeUpdateResult {
 		const current = this.plans.get(input.id);
 		const touched = new Set(input.upserted.map((action) => action.id));
@@ -416,13 +416,13 @@ export class PlanRuntime {
 			}
 		}
 
-		const anchor = sequence(input.anchorActionSeq);
+		const anchor = sequence(input.anchorDecisionSeq);
 		const nodes = new Map<string, MutableNode>();
 		for (const [id, action] of input.actions) {
 			const previous = current?.nodes.get(id);
 			if (previous && !replaced.has(id)) {
 				previous.action = action;
-				if (touched.has(id) && previous.execution.status === "deferred") previous.anchorActionSeq = anchor;
+				if (touched.has(id) && previous.execution.status === "deferred") previous.anchorDecisionSeq = anchor;
 				nodes.set(id, previous);
 				continue;
 			}
@@ -469,9 +469,9 @@ export class PlanRuntime {
 			revision: plan.revision,
 			action: node.action,
 			...(node.actionKey ? { actionKey: node.actionKey } : {}),
-			anchorActionSeq: node.anchorActionSeq,
-			expectedActionSeq: node.expectedActionSeq,
-			latestActionSeq: node.latestActionSeq,
+			anchorDecisionSeq: node.anchorDecisionSeq,
+			expectedDecisionSeq: node.expectedDecisionSeq,
+			latestDecisionSeq: node.latestDecisionSeq,
 			criticalPathMs: node.criticalPathMs,
 			execution: executionProjection(node.execution),
 			readiness: this.readiness(plan, node),
@@ -515,12 +515,12 @@ export class PlanRuntime {
 			const calculate = (node: MutableNode): number => {
 				const cached = memo.get(node.action.id);
 				if (cached !== undefined) return cached;
-				if (visiting.has(node.action.id)) return node.anchorActionSeq + relativeHorizon(node.action) + 1;
+				if (visiting.has(node.action.id)) return node.anchorDecisionSeq + relativeHorizon(node.action) + 1;
 				visiting.add(node.action.id);
 				const settlement = node.opportunity?.settlement;
 				let value = predictionMatched(settlement)
-					? settlement.actorAction.sequence
-					: node.anchorActionSeq + relativeHorizon(node.action) + 1;
+					? actorDecisionSequence(settlement.actorAction)
+					: node.anchorDecisionSeq + relativeHorizon(node.action) + 1;
 				for (const dependency of node.action.dependsOn ?? []) {
 					const parent = plan.nodes.get(dependency.actionID);
 					if (parent) value = Math.max(value, calculate(parent) + 1);
@@ -552,8 +552,8 @@ export class PlanRuntime {
 			return value;
 		};
 		for (const node of plan.nodes.values()) {
-			node.expectedActionSeq = expected(node);
-			node.latestActionSeq = latest(node);
+			node.expectedDecisionSeq = expected(node);
+			node.latestDecisionSeq = latest(node);
 			node.criticalPathMs = criticalPath(node);
 		}
 	}
@@ -564,7 +564,7 @@ function newNode(
 	source: string,
 	revision: number,
 	action: PlanAction,
-	anchorActionSeq: number,
+	anchorDecisionSeq: number,
 ): MutableNode {
 	const identity: PlanActionIdentity = Object.freeze({
 		id: planNodeID(source, proposalID, action.id, revision),
@@ -576,9 +576,9 @@ function newNode(
 		identity,
 		action,
 		actionKey: undefined,
-		anchorActionSeq,
-		expectedActionSeq: anchorActionSeq + horizon(action) + 1,
-		latestActionSeq: anchorActionSeq + latestHorizon(action) + 1,
+		anchorDecisionSeq,
+		expectedDecisionSeq: anchorDecisionSeq + horizon(action) + 1,
+		latestDecisionSeq: anchorDecisionSeq + latestHorizon(action) + 1,
 		criticalPathMs: Math.max(1, finiteMetric(action.expectedDurationMs)),
 		execution: { status: "deferred" },
 		...(action.type === "tool_call" ? { opportunity: new PredictionOpportunity(identity) } : {}),
@@ -680,7 +680,7 @@ function compareMutableNodes(
 	right: { readonly plan: MutablePlan; readonly node: MutableNode },
 ): number {
 	return (
-		left.node.expectedActionSeq - right.node.expectedActionSeq ||
+		left.node.expectedDecisionSeq - right.node.expectedDecisionSeq ||
 		right.node.criticalPathMs - left.node.criticalPathMs ||
 		left.plan.id.localeCompare(right.plan.id) ||
 		left.node.action.id.localeCompare(right.node.action.id)
@@ -810,6 +810,10 @@ function horizon(action: PlanAction): number {
 
 function latestHorizon(action: PlanAction): number {
 	return Math.max(horizon(action), sequence(action.latestHorizon ?? action.horizon ?? 0));
+}
+
+function actorDecisionSequence(action: ActorActionIdentity): number {
+	return sequence(action.decisionSequence ?? action.sequence);
 }
 
 function validIdentity(proposalID: string, source: string): boolean {

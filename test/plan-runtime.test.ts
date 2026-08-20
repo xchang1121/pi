@@ -53,8 +53,8 @@ describe("PlanRuntime", () => {
 		execution.cancel(cause("admission", "scheduler_preempted"), 1, 0);
 
 		expect(plan.get("plan", "future")).toMatchObject({
-			expectedActionSeq: 5,
-			latestActionSeq: 7,
+			expectedDecisionSeq: 5,
+			latestDecisionSeq: 7,
 			execution: { status: "cancelled" },
 			predictionState: { status: "pending" },
 		});
@@ -72,7 +72,7 @@ describe("PlanRuntime", () => {
 
 		const clamped = new PlanRuntime();
 		clamped.apply(proposal([action("clamped", { horizon: 2, latestHorizon: 0 })]), 4);
-		expect(clamped.get("plan", "clamped")).toMatchObject({ expectedActionSeq: 7, latestActionSeq: 7 });
+		expect(clamped.get("plan", "clamped")).toMatchObject({ expectedDecisionSeq: 7, latestDecisionSeq: 7 });
 	});
 
 	it("binds one canonical action identity to an opportunity", () => {
@@ -148,10 +148,15 @@ describe("PlanRuntime", () => {
 			4,
 		);
 
-		expect(plan.get("plan", "short")).toMatchObject({ expectedActionSeq: 5, criticalPathMs: 10 });
-		expect(plan.get("plan", "critical")).toMatchObject({ expectedActionSeq: 5, criticalPathMs: 100 });
-		expect(plan.get("plan", "child")).toMatchObject({ expectedActionSeq: 6, criticalPathMs: 80 });
+		expect(plan.get("plan", "short")).toMatchObject({ expectedDecisionSeq: 5, criticalPathMs: 10 });
+		expect(plan.get("plan", "critical")).toMatchObject({ expectedDecisionSeq: 5, criticalPathMs: 100 });
+		expect(plan.get("plan", "child")).toMatchObject({ expectedDecisionSeq: 6, criticalPathMs: 80 });
 		expect(plan.takeReady(4).map((node) => node.action.id)).toEqual(["critical", "short"]);
+
+		const actor = { id: "actor", sequence: 99, decisionSequence: 7, turnID: "turn" } as const;
+		const opportunity = plan.claimMatch("plan", "critical", actor, { kind: "exact", distance: 0 })!;
+		plan.confirm(opportunity, actor, { status: "adopted", candidateID: "candidate" });
+		expect(plan.get("plan", "child")).toMatchObject({ expectedDecisionSeq: 8, latestDecisionSeq: 8 });
 	});
 
 	it("keeps preparation work outside Actor prediction settlement", () => {
