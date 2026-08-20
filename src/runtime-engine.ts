@@ -566,6 +566,9 @@ interface CandidateRecord<Output, StartInput, StateData> {
 	readonly id: string;
 	readonly key: ActionKey;
 	readonly work: CandidateExecution<Output>;
+	readonly worldParent?: CandidateRecord<Output, StartInput, StateData>;
+	actorAdopted: boolean;
+	versionWorld?: CandidateRecord<Output, StartInput, StateData>;
 	readonly owner: {
 		readonly startInput: StartInput;
 		readonly data: StateData;
@@ -1210,7 +1213,16 @@ export function makeStructuralSpeculativeActionRuntime<
 			failUnlaunchable(session, node, cause("plan", "context_missing"));
 			return;
 		}
-		const reusable = await reusableForPrediction(session, node.actionKey);
+		const parent = dependencyWorld(session, node);
+		if (parent === null) {
+			failUnlaunchable(session, node, cause("plan", "incompatible_parent_worlds"));
+			return;
+		}
+		if (parent && (node.actionKey.execution === "resource_cached" || !parent.world?.checkpoint)) {
+			session.plan.defer(node.proposalID, node.action.id);
+			return;
+		}
+		const reusable = await reusableForPrediction(session, node.actionKey, parent);
 		if (reusable) {
 			attachNode(session, node, reusable);
 			return;
@@ -1231,6 +1243,8 @@ export function makeStructuralSpeculativeActionRuntime<
 			id: candidateID,
 			key: node.actionKey,
 			work,
+			...(parent ? { worldParent: parent } : {}),
+			actorAdopted: false,
 			owner: {
 				startInput: context.startInput,
 				data: context.data,
@@ -1258,8 +1272,9 @@ export function makeStructuralSpeculativeActionRuntime<
 		const insertion = jobs.insertOrGetCompatible(
 			session.id,
 			candidate,
-			(existing, match) => canShareInFlight(existing, node.actionKey!, match, projectionRules),
-			(existing) => activeExecution(existing),
+			(existing, match) =>
+				candidateWorld(existing) === parent && canShareInFlight(existing, node.actionKey!, match, projectionRules),
+			(existing) => candidateWorld(existing) === parent && activeExecution(existing),
 		);
 		if (!insertion.inserted) {
 			attachNode(session, node, insertion.entry);
@@ -1328,21 +1343,12 @@ export function makeStructuralSpeculativeActionRuntime<
 					signal: candidate.work.controller.signal,
 				});
 			}
+			const parent = candidateWorld(candidate);
 			if (semantics.requiresRuntimeResourceVersion(candidate.key.tool) && adapter.captureResourceVersion) {
-				const version = await adapter.captureResourceVersion({
-					startInput: candidate.owner.startInput,
-					data: candidate.owner.data,
-					settings: candidate.owner.settings,
-					candidate: candidate.owner.draft,
-					tool: candidate.key.tool,
-					concrete: candidate.key.input as Record<string, unknown>,
-					action: candidate.key,
-					callID: candidate.id,
-					index: candidate.owner.index,
-				});
+				candidate.versionWorld = parent;
+				const version = await captureCandidateVersion(candidate);
 				candidate.resources.setVersion(version, adapter.releaseResourceVersion);
 			}
-			const parentWorld = parentWorldFor(session, candidate);
 			const executed = await adapter.executeCandidate({
 				startInput: candidate.owner.startInput,
 				data: candidate.owner.data,
@@ -1353,7 +1359,7 @@ export function makeStructuralSpeculativeActionRuntime<
 				callID: candidate.id,
 				index: candidate.owner.index,
 				signal: candidate.work.controller.signal,
-				...(parentWorld ? { parentWorld } : {}),
+				...(parent?.world ? { parentWorld: parent.world } : {}),
 			});
 			const branch = asWorldBranch(executed);
 			const output = branch?.output ?? (executed as Output);
@@ -1457,7 +1463,9 @@ export function makeStructuralSpeculativeActionRuntime<
 				return [{ node, opportunity }];
 			});
 			await Promise.all(matchingPredictions.map(({ node }) => promoteForActor(state.session, node)));
-			const candidates = uniqueCandidates([...candidatesAtArrival, ...allCandidates(state.sessionID)]);
+			const candidates = uniqueCandidates([...candidatesAtArrival, ...allCandidates(state.sessionID)]).filter(
+				(candidate) => candidateWorld(candidate) === undefined,
+			);
 			const ranked = rankCandidates(actualKey, candidates);
 			let selected:
 				| {
@@ -1637,11 +1645,10 @@ export function makeStructuralSpeculativeActionRuntime<
 					status: "adopted",
 					candidateID: selected.candidate.id,
 				};
-				for (const { node } of matchingPredictions) {
+				reconcileAdoptedCandidate(state.session, actualKey, selected.candidate);
+				for (const { node } of matchingPredictions)
 					queueContinuation(state.session, node, selected.candidate, selected.output, "actor_adopted");
-				}
 				confirmPredictions(state.session, matchingPredictions, identity, adoption);
-				invalidateChangedResources(state.session, actualKey, selected.candidate);
 				queueActorSettlement(state, input, actualCall, actorAction, selected.output, selected.candidate);
 				state.session.effects.enqueue(() => dispatchReady(state.session));
 				return selected.output;
@@ -1950,14 +1957,18 @@ export function makeStructuralSpeculativeActionRuntime<
 		else releaseActionContext(session, retired.node.identity.id);
 	};
 
-	const reusableForPrediction = async (session: Session, key: ActionKey): Promise<Candidate | undefined> => {
+	const reusableForPrediction = async (
+		session: Session,
+		key: ActionKey,
+		parent: Candidate | undefined,
+	): Promise<Candidate | undefined> => {
 		for (const lookup of [
 			...jobs.lookup(session.id, key),
 			...results.lookup(session.id, key),
 			...branches.lookup(session.id, key),
 		]) {
 			const candidate = lookup.entry;
-			if (!activeExecution(candidate)) continue;
+			if (!activeExecution(candidate) || candidateWorld(candidate) !== parent) continue;
 			if (lookup.match.kind === "projected" && candidate.work.execution.status !== "succeeded") {
 				if (!canShareInFlight(candidate, key, lookup.match, projectionRules)) continue;
 			}
@@ -1979,6 +1990,41 @@ export function makeStructuralSpeculativeActionRuntime<
 			.values()
 			.filter((node) => "candidateID" in node.execution && node.execution.candidateID === candidateID);
 
+	const descendsFrom = (candidate: Candidate, ancestor: Candidate): boolean => {
+		for (let parent = candidate.worldParent; parent; parent = parent.worldParent) {
+			if (parent === ancestor) return true;
+		}
+		return false;
+	};
+
+	const unresolvedWorld = (candidate: Candidate): Candidate | undefined => {
+		for (let current: Candidate | undefined = candidate; current; current = current.worldParent) {
+			if (current.world && !current.actorAdopted) return current;
+		}
+		return undefined;
+	};
+
+	const candidateWorld = (candidate: Candidate): Candidate | undefined =>
+		candidate.worldParent ? unresolvedWorld(candidate.worldParent) : undefined;
+
+	const dependencyWorld = (session: Session, node: PlanRuntimeNode): Candidate | null | undefined => {
+		const parents = new Set<Candidate>();
+		for (const dependency of node.action.dependsOn ?? []) {
+			const parentNode = session.plan.get(node.proposalID, dependency.actionID);
+			if (!parentNode || !("candidateID" in parentNode.execution) || !parentNode.execution.candidateID) continue;
+			const candidate = candidateByID(session.id, parentNode.execution.candidateID);
+			if (!candidate) continue;
+			const parent = unresolvedWorld(candidate);
+			if (parent) parents.add(parent);
+		}
+		if (!parents.size) return undefined;
+		return (
+			[...parents].find((candidate) =>
+				[...parents].every((parent) => parent === candidate || descendsFrom(candidate, parent)),
+			) ?? null
+		);
+	};
+
 	const forecastsForCandidate = (
 		session: Session,
 		candidate: Candidate,
@@ -1999,21 +2045,6 @@ export function makeStructuralSpeculativeActionRuntime<
 		);
 	};
 
-	const parentWorldFor = (session: Session, candidate: Candidate): WorldBranch<Output> | undefined => {
-		const nodes = nodesForCandidate(session, candidate.id);
-		for (const node of nodes) {
-			for (const dependency of node.action.dependsOn ?? []) {
-				const parent = session.plan.get(node.proposalID, dependency.actionID);
-				if (!parent || !("candidateID" in parent.execution) || !parent.execution.candidateID) continue;
-				const parentCandidate = candidateByID(session.id, parent.execution.candidateID);
-				if (parentCandidate?.world) {
-					return parentCandidate.world;
-				}
-			}
-		}
-		return undefined;
-	};
-
 	const installWatcher = (session: Session, candidate: Candidate): void => {
 		if (!adapter.watchResourceVersion || !semantics.watchesResourceVersion(candidate.key.tool)) return;
 		void Promise.resolve(
@@ -2031,43 +2062,34 @@ export function makeStructuralSpeculativeActionRuntime<
 		);
 	};
 
-	const validateCandidate = async (
+	const validateCandidate = (
 		state: Turn,
 		input: ConsumeInput,
 		action: ActionKey,
 		candidate: Candidate,
-	): Promise<ResourceValidation> => {
-		if (!adapter.validateResourceVersion || !semantics.requiresRuntimeResourceVersion(candidate.key.tool)) {
-			return { status: "valid", metrics: zeroValidationMetrics() };
-		}
-		try {
-			const validation = await adapter.validateResourceVersion({
-				stateData: state.data,
-				consumeInput: input,
-				action,
-				candidate: publicCandidate(candidate),
-			});
-			recordValidation(candidate, validation);
-			return validation;
-		} catch (error) {
-			return {
-				status: "indeterminate",
-				cause: cause("freshness", "validation_failed", errorDetail(error)),
-				metrics: zeroValidationMetrics(),
-			};
-		}
-	};
+	): Promise<ResourceValidation> => validateCandidateVersion(state.data, action, candidate, input);
 
-	const validateCandidateWithoutTurn = async (
+	const validateCandidateWithoutTurn = (action: ActionKey, candidate: Candidate): Promise<ResourceValidation> =>
+		validateCandidateVersion(candidate.owner.data, action, candidate);
+
+	const validateCandidateVersion = async (
+		stateData: StateData,
 		action: ActionKey,
 		candidate: Candidate,
+		consumeInput?: ConsumeInput,
 	): Promise<ResourceValidation> => {
 		if (!adapter.validateResourceVersion || !semantics.requiresRuntimeResourceVersion(candidate.key.tool)) {
 			return { status: "valid", metrics: zeroValidationMetrics() };
 		}
 		try {
+			if (candidate.versionWorld?.actorAdopted && adapter.captureResourceVersion) {
+				const version = await captureCandidateVersion(candidate);
+				candidate.resources.replaceVersion(version, adapter.releaseResourceVersion);
+				candidate.versionWorld = candidateWorld(candidate);
+			}
 			const validation = await adapter.validateResourceVersion({
-				stateData: candidate.owner.data,
+				stateData,
+				...(consumeInput ? { consumeInput } : {}),
 				action,
 				candidate: publicCandidate(candidate),
 			});
@@ -2244,13 +2266,20 @@ export function makeStructuralSpeculativeActionRuntime<
 		trimResults(session, settings);
 	};
 
+	const reconcileAdoptedCandidate = (session: Session, action: ActionKey, adopted: Candidate): void => {
+		invalidateChangedResources(session, action, adopted);
+		adopted.actorAdopted = true;
+	};
+
 	const invalidateChangedResources = (session: Session, action: ActionKey, adopted?: Candidate): void => {
 		const invalidateWorkspace = adopted && semantics.resourceVersionPolicy(adopted.key.tool) === "workspace";
 		const changed =
 			adopted && !invalidateWorkspace ? (adopted.world?.resources ?? action.resources) : action.resources;
 		if ((!changed.length && !invalidateWorkspace) || (adopted && adopted.work.reservation.kind === "shared")) return;
-		for (const candidate of allCandidates(session.id)) {
-			if (candidate === adopted) continue;
+		const candidates = allCandidates(session.id);
+		const invalid = new Set<Candidate>();
+		for (const candidate of candidates) {
+			if (candidate === adopted || (adopted && descendsFrom(candidate, adopted))) continue;
 			// Once an Actor reserves a candidate, its freshness and compatibility checks
 			// are authoritative. Cache invalidation may only retire unclaimed work.
 			if (!reservationAvailable(candidate.work.reservation)) continue;
@@ -2258,10 +2287,31 @@ export function makeStructuralSpeculativeActionRuntime<
 				invalidateWorkspace ||
 				candidate.key.resources.some((resource) => changed.some((path) => resourcePathsOverlap(resource, path)))
 			) {
-				discardCandidate(session, candidate, cause("freshness", "authoritative_resource_changed"));
+				for (const descendant of candidates) {
+					if (descendant === candidate || descendsFrom(descendant, candidate)) invalid.add(descendant);
+				}
 			}
 		}
+		for (const candidate of invalid) {
+			if (reservationAvailable(candidate.work.reservation))
+				discardCandidate(session, candidate, cause("freshness", "authoritative_resource_changed"));
+		}
 	};
+
+	const captureCandidateVersion = (candidate: Candidate): Promise<unknown> =>
+		Promise.resolve(
+			adapter.captureResourceVersion!({
+				startInput: candidate.owner.startInput,
+				data: candidate.owner.data,
+				settings: candidate.owner.settings,
+				candidate: candidate.owner.draft,
+				tool: candidate.key.tool,
+				concrete: candidate.key.input as Record<string, unknown>,
+				action: candidate.key,
+				callID: candidate.id,
+				index: candidate.owner.index,
+			}),
+		);
 
 	const pruneActionContexts = (session: Session): void => {
 		for (const [id, context] of session.actionContexts) {

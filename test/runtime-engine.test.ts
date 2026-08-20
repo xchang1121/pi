@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { type ActionProjectionRule, READ_RANGE_ACTION_KEY_PROJECTOR } from "../src/action-key-projection.ts";
 import { buildPiActionKey } from "../src/action-semantics.ts";
+import type { WorldBranch, WorldCheckpoint } from "../src/execution-world.ts";
 import type { SpeculativeActionEvent, SpeculativeActionSettings, SpeculativePlanSource } from "../src/runtime.ts";
 import { makeStructuralSpeculativeActionRuntime } from "../src/runtime-engine.ts";
 import { cause, type PredictionSettlement, type ResourceValidation, zeroValidationMetrics } from "../src/settlement.ts";
@@ -44,6 +45,7 @@ function harness(input: {
 		tool: string,
 		input: Readonly<Record<string, unknown>>,
 		signal: AbortSignal,
+		parentWorld?: WorldBranch<string>,
 	) => unknown | Promise<unknown>;
 	readonly expired?: () => boolean | Promise<boolean>;
 	readonly capture?: () => unknown | Promise<unknown>;
@@ -63,9 +65,9 @@ function harness(input: {
 		actionKey: input.actionKey ?? ((tool, args) => buildPiActionKey(tool, args, "/workspace")),
 		actual: (call) => ({ id: call.id, tool: call.tool, input: call.input }),
 		preflightCandidate: () => ({ ok: true }),
-		executeCandidate: async ({ tool, concrete, signal }) => {
+		executeCandidate: async ({ tool, concrete, signal, parentWorld }) => {
 			executions++;
-			return ((await input.execute?.(tool, concrete, signal)) as string) ?? "speculative";
+			return ((await input.execute?.(tool, concrete, signal, parentWorld)) as string) ?? "speculative";
 		},
 		captureResourceVersion: input.capture ?? (() => ({ version: 1 })),
 		validateResourceVersion: async ({ candidate }) =>
@@ -943,67 +945,6 @@ describe("structural speculative runtime", () => {
 		});
 	});
 
-	it("revises a speculative continuation after confirmation before launching its child", async () => {
-		const continuations: string[] = [];
-		const executed: string[] = [];
-		const source: Source = {
-			id: "source",
-			enabled: () => true,
-			propose: () => ({
-				id: "chain",
-				source: "source",
-				revision: 0,
-				actions: [
-					{ id: "parent", type: "tool_call", tool: "read", input: { path: "parent.ts" }, feedback: "parent" },
-				],
-			}),
-			continue: ({ candidate, proposalID, actionID, revision, trigger }) => {
-				const path = String(candidate.input.path);
-				continuations.push(`${path}:${trigger}:${candidate.empiricalProbability ?? "none"}`);
-				if (path !== "parent.ts") return undefined;
-				return {
-					proposalID,
-					source: "source",
-					revision,
-					upsert: [
-						{
-							id: "child",
-							type: "tool_call",
-							tool: "read",
-							input: { path: "child.ts" },
-							empiricalProbability: trigger === "actor_adopted" ? 0.9 : 0.2,
-							feedback: trigger === "actor_adopted" ? "confirmed-child" : "speculative-child",
-							dependsOn: [{ actionID, condition: "execution_succeeded" }],
-						},
-					],
-				};
-			},
-		};
-		const fixture = harness({
-			source,
-			execute: (_tool, input) => {
-				executed.push(String(input.path));
-				return `${String(input.path)}:output`;
-			},
-		});
-		await fixture.runtime.startTurn({ sessionID: "session", turnID: "chain" });
-		await waitFor(() => continuations.includes("parent.ts:execution_succeeded:none"));
-		expect(executed).toEqual(["parent.ts"]);
-		expect(await fixture.runtime.consume(call("chain", { path: "parent.ts" }))).toBe("parent.ts:output");
-		await waitFor(() => executed.includes("child.ts"));
-		expect(continuations).toContain("parent.ts:actor_adopted:none");
-		expect(executed).toEqual(["parent.ts", "child.ts"]);
-		expect(
-			await fixture.runtime.consume({
-				sessionID: "session",
-				turnID: "chain",
-				id: "child-call",
-				tool: "read",
-				input: { path: "child.ts" },
-			}),
-		).toBe("child.ts:output");
-	});
-
 	it("retains a queued confirmation continuation after an empty speculative continuation", async () => {
 		let release!: () => void;
 		const gate = new Promise<void>((resolve) => {
@@ -1270,14 +1211,126 @@ describe("structural speculative runtime", () => {
 		expect(fixture.runtime.inspect().deferredPlanActions).toBe(0);
 		await fixture.runtime.finishTurn({ ...call("miss"), terminal: true });
 	});
+
+	it("keeps equal child actions isolated by parent world and rebases the adopted lineage", async () => {
+		let enabled = true;
+		let workspaceVersion = 0;
+		const captured: number[] = [];
+		const executed: string[] = [];
+		const childParents: string[] = [];
+		const source: Source = {
+			id: "source",
+			enabled: () => enabled,
+			proposalCount: () => 2,
+			continueOn: ["execution_succeeded"],
+			propose: ({ proposalIndex }) => ({
+				id: `chain:${proposalIndex}`,
+				source: "source",
+				revision: 0,
+				actions: [
+					{
+						id: "parent",
+						type: "tool_call",
+						tool: "bash",
+						input: { command: `parent-${proposalIndex}` },
+					},
+				],
+			}),
+			continue: ({ proposalID, actionID, revision, candidate }) => {
+				if (String(candidate.input.command).startsWith("child")) return undefined;
+				return {
+					proposalID,
+					source: "source",
+					revision,
+					upsert: [
+						{
+							id: "child",
+							type: "tool_call",
+							tool: "bash",
+							input: { command: "child" },
+							dependsOn: [{ actionID, condition: "execution_succeeded" }],
+						},
+					],
+				};
+			},
+		};
+		const fixture = harness({
+			source,
+			capture: () => {
+				captured.push(workspaceVersion);
+				return workspaceVersion;
+			},
+			validate: (version) =>
+				version === workspaceVersion
+					? { status: "valid", metrics: zeroValidationMetrics() }
+					: {
+							status: "stale",
+							cause: cause("freshness", "resource_changed"),
+							metrics: zeroValidationMetrics(),
+						},
+			execute: (_tool, input, _signal, parentWorld) => {
+				const command = String(input.command);
+				executed.push(command);
+				if (command === "child") childParents.push(String(parentWorld?.output));
+				const output = command === "child" ? `child:${parentWorld?.output}` : command;
+				const parentCheckpoint = parentWorld?.checkpoint;
+				return world(output, {
+					checkpoint: {
+						backend: "test",
+						id: output,
+						lineage: parentCheckpoint?.lineage ?? output,
+						depth: (parentCheckpoint?.depth ?? -1) + 1,
+					},
+					resources: ["."],
+					onCommit: () => workspaceVersion++,
+				});
+			},
+		});
+
+		await fixture.runtime.startTurn({ sessionID: "session", turnID: "parent" });
+		await waitFor(() => childParents.length === 2);
+		expect(executed.sort()).toEqual(["child", "child", "parent-0", "parent-1"]);
+		expect(childParents.sort()).toEqual(["parent-0", "parent-1"]);
+
+		const parentCall: Call = {
+			sessionID: "session",
+			turnID: "parent",
+			id: "actor-parent",
+			tool: "bash",
+			input: { command: "parent-0" },
+		};
+		expect(await fixture.runtime.consume(parentCall)).toBe("parent-0");
+		enabled = false;
+		await fixture.runtime.finishTurn({ ...parentCall, terminal: false });
+
+		await fixture.runtime.startTurn({ sessionID: "session", turnID: "child" });
+		const childCall: Call = {
+			sessionID: "session",
+			turnID: "child",
+			id: "actor-child",
+			tool: "bash",
+			input: { command: "child" },
+		};
+		expect(await fixture.runtime.consume(childCall)).toBe("child:parent-0");
+		expect(captured).toContain(1);
+		await fixture.runtime.finishTurn({ ...childCall, terminal: true });
+	});
 });
 
-function world(output: string) {
+function world(
+	output: string,
+	options: {
+		readonly checkpoint?: WorldCheckpoint;
+		readonly resources?: readonly string[];
+		readonly onCommit?: () => void;
+	} = {},
+): WorldBranch<string> {
 	let state = "sealed" as "sealed" | "committing" | "committed" | "failed";
 	return {
 		output,
 		backend: "test",
-		resources: [],
+		...(options.checkpoint ? { checkpoint: options.checkpoint } : {}),
+		resources: options.resources ?? [],
 		capturedBytes: 0,
 		executionMetrics: {},
 		compatibility: { status: "compatible" as const, backend: "test", executionFingerprint: "" },
@@ -1286,6 +1339,7 @@ function world(output: string) {
 		},
 		commit: async () => {
 			state = "committing";
+			options.onCommit?.();
 			state = "committed";
 			return output;
 		},

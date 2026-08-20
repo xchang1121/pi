@@ -75,12 +75,16 @@ describe("CandidateExecution", () => {
 		const released: string[] = [];
 		const resources = new CandidateResources<string>();
 		expect(resources.setVersion("v1", (version) => released.push(`version:${version}`))).toBe(true);
+		expect(resources.setWatcher(() => released.push("watcher:v1"))).toBe(true);
+		expect(resources.replaceVersion("v2", (version) => released.push(`version:${version}`))).toBe(true);
+		expect(resources.version).toBe("v2");
+		expect(released).toEqual(["watcher:v1", "version:v1"]);
 		expect(resources.dispose()).toBe(true);
 		expect(resources.dispose()).toBe(false);
 		expect(resources.version).toBeUndefined();
 
 		expect(resources.setWatcher(() => released.push("late-watcher"))).toBe(false);
 		expect(resources.setVersion("late", (version) => released.push(`late-version:${version}`))).toBe(false);
-		expect(released).toEqual(["version:v1", "late-watcher", "late-version:late"]);
+		expect(released).toEqual(["watcher:v1", "version:v1", "version:v2", "late-watcher", "late-version:late"]);
 	});
 });

@@ -184,6 +184,23 @@ export class CandidateResources<Version = unknown> {
 		return true;
 	}
 
+	replaceVersion(version: Version, release?: (version: Version) => void): boolean {
+		if (this.stateValue === "disposed") {
+			safely(() => release?.(version));
+			return false;
+		}
+		const previousVersion = this.versionValue;
+		const previousRelease = this.releaseVersion;
+		const stop = this.stopWatcher;
+		this.hasVersion = true;
+		this.versionValue = version;
+		this.releaseVersion = release;
+		this.stopWatcher = undefined;
+		safely(stop);
+		if (previousRelease) safely(() => previousRelease(previousVersion as Version));
+		return true;
+	}
+
 	setWatcher(stop: (() => void) | undefined): boolean {
 		if (!stop) return false;
 		if (this.stateValue === "disposed" || this.stopWatcher) {
