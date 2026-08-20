@@ -387,7 +387,7 @@ export function createSpeculativeActionHost(
 				toolChoice: "required",
 				reasoning: undefined,
 				deferred: false,
-				sessionId: `${sessionID}:draft:${input.turnID}`,
+				sessionId: `${sessionID}:draft`,
 				cacheRetention: prepared.options.cacheRetention ?? "short",
 			};
 			const message = await options.complete(prepared.model, prepared.context, { ...draftOptions, signal });
