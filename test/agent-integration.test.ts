@@ -70,9 +70,9 @@ function settings(candidateLimit = 1) {
 	};
 }
 
-function startInput(tool: AgentTool) {
+function startInput(tool: AgentTool, turnID = "turn-1") {
 	return {
-		turnID: "turn-1",
+		turnID,
 		actorModel: model("actor"),
 		context: { systemPrompt: "system", messages: [], tools: [tool] },
 		actorOptions: undefined,
@@ -408,9 +408,10 @@ describe("speculative action host", () => {
 				return { content: [{ type: "text", text: `${args.path}:result` }], details: { path: args.path } };
 			},
 		};
+		let currentSettings = { ...settings(1), drafterMaxDepth: 2 };
 		const host = createSpeculativeActionHost("session", {
 			cwd,
-			getSettings: () => ({ ...settings(1), drafterMaxDepth: 2 }),
+			getSettings: () => currentSettings,
 			draftModel: model("draft"),
 			complete,
 			preflight: () => true,
@@ -419,16 +420,22 @@ describe("speculative action host", () => {
 		await host.startTurn(startInput(tool));
 		await waitFor(() => executed.length === 1);
 		for (const [index, file] of ["notes.txt", "other.txt", "third.txt"].entries()) {
+			const turnID = `turn-${index + 1}`;
+			if (index > 0) await host.startTurn(startInput(tool, turnID));
 			expect(
 				await host.consume({
-					turnID: "turn-1",
+					turnID,
 					id: `actor-${index}`,
 					tool: "read",
 					args: { path: file },
 					tools: [tool],
 				}),
 			).toMatchObject({ result: { content: [{ type: "text", text: `${file}:result` }] } });
-			if (index < 2) await waitFor(() => executed.length === index + 2);
+			if (index < 2) {
+				await waitFor(() => executed.length === index + 2);
+				await host.finishTurn(turnID);
+				currentSettings = { ...currentSettings, drafterEnabled: false };
+			}
 		}
 		expect(executed).toEqual(["notes.txt", "other.txt", "third.txt"]);
 		expect(requests).toHaveLength(3);

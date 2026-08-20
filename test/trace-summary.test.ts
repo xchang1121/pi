@@ -82,7 +82,7 @@ function authoritativeEvents(): SpeculativeActionEvent<string>[] {
 					turnID: "turn",
 					index: 0,
 					kind: "proposal",
-					targetActionSequence: 1,
+					targetDecisionSequence: 1,
 				},
 				startedAt: 0,
 				durationMs: 5,

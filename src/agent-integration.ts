@@ -398,7 +398,7 @@ export function createSpeculativeActionHost(
 		id: "drafter",
 		enabled: (settings) => settings.drafterEnabled ?? DEFAULTS.drafterEnabled,
 		timeoutMs: (settings) => settings.predictionTimeoutMs,
-		requestLifetime: "actor_action",
+		requestLifetime: "actor_decision",
 		multiStepEnabled: (settings) => sourceDrafterMaxDepth(settings) > 0,
 		continueOn: ["actor_adopted"],
 		proposalCount: (settings) => clampCandidateLimit(settings.candidateLimit ?? DEFAULTS.candidateLimit),

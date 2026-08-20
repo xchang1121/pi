@@ -546,10 +546,10 @@ interface PlanActionContext<StartInput, StateData> {
 	continuationTail: Promise<void>;
 }
 
-/** One producer request from the bounded budget for a future Actor action. */
+/** One producer request from the bounded budget for a future Actor decision. */
 interface SourceRequestSlot {
 	readonly source: string;
-	readonly targetActionSequence: number;
+	readonly targetDecisionSequence: number;
 	readonly expiresAtTarget: boolean;
 	readonly generations: Set<SourceGeneration>;
 	readonly owners: Set<string>;
@@ -810,17 +810,17 @@ export function makeStructuralSpeculativeActionRuntime<
 	const claimSourceSlot = (
 		session: Session,
 		source: string,
-		targetActionSequence: number,
+		targetDecisionSequence: number,
 		limit: number,
 		expiresAtTarget = true,
 	): SourceRequestSlot | undefined => {
 		const used = [...session.sourceSlots].filter(
-			(slot) => slot.active && slot.source === source && slot.targetActionSequence === targetActionSequence,
+			(slot) => slot.active && slot.source === source && slot.targetDecisionSequence === targetDecisionSequence,
 		).length;
 		if (used >= limit) return undefined;
 		const slot: SourceRequestSlot = {
 			source,
-			targetActionSequence,
+			targetDecisionSequence,
 			expiresAtTarget,
 			generations: new Set(),
 			owners: new Set(),
@@ -846,9 +846,10 @@ export function makeStructuralSpeculativeActionRuntime<
 		}
 	};
 
-	const expireSourceHorizon = (session: Session, sequence: number, failure: ResolutionCause): void => {
+	const expireSourceHorizon = (session: Session, decisionSequence: number, failure: ResolutionCause): void => {
 		for (const slot of [...session.sourceSlots]) {
-			if (slot.expiresAtTarget && slot.targetActionSequence <= sequence) releaseSourceSlot(session, slot, failure);
+			if (slot.expiresAtTarget && slot.targetDecisionSequence <= decisionSequence)
+				releaseSourceSlot(session, slot, failure);
 		}
 	};
 
@@ -875,13 +876,13 @@ export function makeStructuralSpeculativeActionRuntime<
 			if (!source.enabled(state.settings)) continue;
 			const count = requestCount(source.proposalCount?.(state.settings));
 			for (let index = 0; index < count; index++) {
-				const targetActionSequence = state.session.sequence + 1;
+				const targetDecisionSequence = state.decisionSequence;
 				const slot = claimSourceSlot(
 					state.session,
 					source.id,
-					targetActionSequence,
+					targetDecisionSequence,
 					count,
-					source.requestLifetime === "actor_action",
+					source.requestLifetime === "actor_decision",
 				);
 				if (!slot) break;
 				const generation = new SourceGeneration(state.generation.signal);
@@ -893,7 +894,7 @@ export function makeStructuralSpeculativeActionRuntime<
 						turnID: state.turnID,
 						index: state.session.sourceRequestSequence++,
 						kind: "proposal",
-						targetActionSequence,
+						targetDecisionSequence,
 					},
 					generation,
 					timeoutMs: source.timeoutMs?.(state.settings),
@@ -1400,7 +1401,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		const actorArrivedAt = performance.now();
 		const state = turns.get(turnKey(input.sessionID, input.turnID));
 		if (!state || state.lifecycle !== "active" || signal?.aborted || masterEnabled === false) return undefined;
-		expireSourceHorizon(state.session, state.session.sequence + 1, cause("control", "actor_action_arrived"));
+		expireSourceHorizon(state.session, state.decisionSequence, cause("control", "actor_action_arrived"));
 		closeActorPhase(state, actorArrivedAt);
 		if (state.actorArrivedAt === undefined) {
 			state.actorArrivedAt = actorArrivedAt;
@@ -1845,7 +1846,8 @@ export function makeStructuralSpeculativeActionRuntime<
 		trigger: "execution_succeeded" | "actor_adopted",
 	): void => {
 		if (!node.prediction) return;
-		if (session.plan.get(node.proposalID, node.action.id)?.identity.id !== node.identity.id) return;
+		const current = session.plan.get(node.proposalID, node.action.id);
+		if (current?.identity.id !== node.identity.id || !current.prediction) return;
 		const context = session.actionContexts.get(node.identity.id);
 		const source = context ? sourcesByID.get(context.identity.source) : undefined;
 		if (!context || !source?.continue) return;
@@ -1853,16 +1855,17 @@ export function makeStructuralSpeculativeActionRuntime<
 		if (source.continueOn && !source.continueOn.includes(trigger)) return;
 		if (context.continuationTriggers.has(trigger)) return;
 		context.continuationTriggers.add(trigger);
-		const targetActionSequence = Math.max(
-			session.sequence + 1,
-			(context.sourceSlot?.targetActionSequence ?? session.sequence) + 1,
-		);
+		const parentDecisionSequence =
+			current.predictionState.status === "matching"
+				? (current.predictionState.actorAction.decisionSequence ?? current.expectedDecisionSeq)
+				: current.expectedDecisionSeq;
+		const targetDecisionSequence = parentDecisionSequence + 1;
 		let slot = context.continuationSlot;
 		if (!slot?.active) {
 			slot = claimSourceSlot(
 				session,
 				source.id,
-				targetActionSequence,
+				targetDecisionSequence,
 				requestCount(source.proposalCount?.(context.settings)),
 			);
 			if (!slot) return;
@@ -1884,7 +1887,7 @@ export function makeStructuralSpeculativeActionRuntime<
 						turnID: context.startInput.turnID,
 						index: session.sourceRequestSequence++,
 						kind: "continuation",
-						targetActionSequence: continuationSlot.targetActionSequence,
+						targetDecisionSequence: continuationSlot.targetDecisionSequence,
 					},
 					generation,
 					timeoutMs: source.timeoutMs?.(context.settings),

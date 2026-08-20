@@ -96,8 +96,8 @@ export interface SpeculativePlanSource<
 	readonly id: string;
 	readonly enabled: (settings: SpeculativeActionSettings) => boolean;
 	readonly timeoutMs?: (settings: SpeculativeActionSettings) => number | undefined;
-	/** Stop requests that can only predict the next Actor action once that intent arrives. */
-	readonly requestLifetime?: "actor_action" | "turn";
+	/** Stop requests that can only predict the next Actor decision once that decision arrives. */
+	readonly requestLifetime?: "actor_decision" | "turn";
 	readonly multiStepEnabled?: (settings: SpeculativeActionSettings) => boolean;
 	readonly proposalCount?: (settings: SpeculativeActionSettings) => number;
 	readonly propose: (input: {

@@ -11,6 +11,7 @@
 - Replaced copied plan/candidate statuses and split feedback callbacks with authoritative execution, prediction, and Actor-action settlements. Preparation hints no longer emit Actor prediction outcomes.
 - Renamed ambiguous summary and inspection fields to `predictionRejectedAfterMatch`, `actorCandidateRejections`, `candidateTerminalCauses`, and `exclusiveCandidates`/`sharedCandidates`.
 - Renamed the plan dependency and continuation signal from `actor_confirmed` to `actor_adopted`; a key match without a usable result no longer satisfies downstream work.
+- Renamed source request horizons and `requestLifetime: "actor_action"` to decision-batch units; one Actor response may contain several parallel tool actions but advances prediction time only once.
 
 ### Added
 
@@ -48,6 +49,7 @@
 
 ### Fixed
 
+- A continuation targeting the next Actor decision is no longer cancelled by a sibling tool call from the same parallel Actor response.
 - Probation cache aging now advances after each Actor decision batch, after matching, so a completed multi-step prediction remains adoptable through its declared deadline even when a batch contains multiple tool calls.
 - Query K(a) now preserves `read`'s omitted-limit semantics and rejects numeric views that Pi tools do not interpret as stable integer ranges.
 - Tool error settlements are discarded before they can become reusable speculative cache entries.

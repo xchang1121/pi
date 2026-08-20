@@ -385,7 +385,7 @@ describe("structural speculative runtime", () => {
 		const source: Source = {
 			id: "source",
 			enabled: () => true,
-			requestLifetime: "actor_action",
+			requestLifetime: "actor_decision",
 			proposalCount: () => 8,
 			propose: ({ proposalIndex, signal }) => {
 				entered++;
@@ -959,6 +959,76 @@ describe("structural speculative runtime", () => {
 				input: { path: "child.ts" },
 			}),
 		).toBe("child.ts:output");
+	});
+
+	it("keeps a next-decision continuation alive across parallel tools in one Actor decision", async () => {
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let continuationStarted = false;
+		const executed: string[] = [];
+		const source: Source = {
+			id: "source",
+			enabled: () => true,
+			requestLifetime: "actor_decision",
+			continueOn: ["actor_adopted"],
+			propose: () => plan("source", "parallel-continuation", { path: "parent.ts" }),
+			continue: async ({ proposalID, actionID, revision, trigger }) => {
+				if (trigger !== "actor_adopted") return undefined;
+				continuationStarted = true;
+				await gate;
+				return {
+					proposalID,
+					source: "source",
+					revision,
+					upsert: [
+						{
+							id: "child",
+							type: "tool_call",
+							tool: "read",
+							input: { path: "child.ts" },
+							dependsOn: [{ actionID, condition: "actor_adopted" }],
+						},
+					],
+				};
+			},
+		};
+		const fixture = harness({
+			source,
+			execute: (_tool, input) => {
+				executed.push(String(input.path));
+				return `${String(input.path)}:output`;
+			},
+		});
+		await fixture.runtime.startTurn({ sessionID: "session", turnID: "parallel-continuation" });
+		await waitFor(() => executed.includes("parent.ts"));
+
+		const parent = {
+			sessionID: "session",
+			turnID: "parallel-continuation",
+			id: "parent-call",
+			tool: "read",
+			input: { path: "parent.ts" },
+		};
+		expect(await fixture.runtime.consume(parent)).toBe("parent.ts:output");
+		await waitFor(() => continuationStarted);
+
+		const sibling = { ...parent, id: "sibling-call", input: { path: "sibling.ts" } };
+		expect(await fixture.runtime.consume(sibling)).toBeUndefined();
+		await fixture.runtime.actual({ ...sibling, durationMs: 1, output: "actor" });
+		expect(
+			fixture.events.some(
+				(event) =>
+					event.type === "source_request" &&
+					event.request.request.kind === "continuation" &&
+					event.request.settlement.status === "aborted",
+			),
+		).toBe(false);
+
+		release();
+		await waitFor(() => executed.includes("child.ts"));
+		await fixture.runtime.finishTurn({ ...parent, terminal: true });
 	});
 
 	it("keeps a bounded continuation alive across turns without extending turn completion", async () => {

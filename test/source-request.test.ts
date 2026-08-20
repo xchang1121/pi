@@ -7,7 +7,7 @@ const request = {
 	turnID: "turn",
 	index: 0,
 	kind: "proposal",
-	targetActionSequence: 1,
+	targetDecisionSequence: 1,
 } as const;
 
 describe("source request ownership", () => {

@@ -108,8 +108,8 @@ export interface SourceRequestIdentity {
 	readonly turnID: string;
 	readonly index: number;
 	readonly kind: SourceRequestKind;
-	/** Actor action sequence this request is trying to cover. */
-	readonly targetActionSequence: number;
+	/** Actor decision batch this request is trying to cover. */
+	readonly targetDecisionSequence: number;
 }
 
 export interface SettledSourceRequest {
