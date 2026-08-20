@@ -622,19 +622,22 @@ export function createSpeculativeActionHost(
 		prepareCandidate: async ({ candidate, route, signal }) => {
 			if (!route) await prepareExecutionWorlds([candidate.tool], signal);
 		},
-		onTurnStarted: async ({ startInput, settings, signal }) => {
+		onTurnStarted: ({ startInput, settings, signal }) => {
 			authoritativeBatches.delete(authoritativeBatchKey(startInput.sessionID, startInput.turnID));
 			void prepareExecutionWorlds(settings.tools, signal).catch(() => {
 				// Turn warm-up is best-effort; concrete candidate preparation retries it.
 			});
 			if (!sourcePatternSettings(settings).enabled) return;
-			const store = await resolvePatternStore(settings);
-			store.observeTurn({
-				sessionID: startInput.sessionID,
-				turnID: startInput.turnID,
-				phase: "start",
-				model: `${startInput.actorModel.provider}/${startInput.actorModel.id}`,
-			});
+			void resolvePatternStore(settings)
+				.then((store) =>
+					store.observeTurn({
+						sessionID: startInput.sessionID,
+						turnID: startInput.turnID,
+						phase: "start",
+						model: `${startInput.actorModel.provider}/${startInput.actorModel.id}`,
+					}),
+				)
+				.catch(() => undefined);
 		},
 		onTurnFinished: async ({ startInput, settings, terminal, durationMs }) => {
 			drafterBatches.delete(JSON.stringify([startInput.sessionID, startInput.turnID]));

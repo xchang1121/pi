@@ -416,10 +416,14 @@ describe("speculative action host", () => {
 		await host.dispose();
 	});
 
-	it("reports authoritative misses and keeps cleanup failures out of actor lifecycle", async () => {
+	it("keeps optional analysis and cleanup out of the actor lifecycle", async () => {
 		const cwd = await temporaryWorkspace();
 		const patternStore = new PatternAwareStore({ ...PATTERN_AWARE_DEFAULTS, minOccurrences: 1 });
 		const observed = vi.spyOn(patternStore, "observeBatch");
+		let resolveStore!: (store: PatternAwareStore) => void;
+		const pendingStore = new Promise<PatternAwareStore>((resolve) => {
+			resolveStore = resolve;
+		});
 		const actualEvents: SpeculativeActionEvent<string>[] = [];
 		let disposed = 0;
 		const sandbox: SpeculativeAgentExecutionWorld = {
@@ -451,7 +455,7 @@ describe("speculative action host", () => {
 				drafterEnabled: false,
 				patternAware: { ...PATTERN_AWARE_DEFAULTS, minOccurrences: 1 },
 			}),
-			patternStore,
+			patternStore: pendingStore,
 			draftModel: model("draft"),
 			complete: async () => assistant([{ type: "text", text: "no prediction" }], "stop"),
 			preflight: () => true,
@@ -460,7 +464,14 @@ describe("speculative action host", () => {
 				actualEvents.push(event);
 			},
 		});
-		await host.startTurn(startInput(tool));
+		let started = false;
+		const start = host.startTurn(startInput(tool)).then(() => {
+			started = true;
+		});
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(started).toBe(true);
+		resolveStore(patternStore);
+		await start;
 		await waitFor(() => actualEvents.filter((event) => event.type === "source_request").length === 1);
 		expect(
 			actualEvents
