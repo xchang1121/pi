@@ -2215,10 +2215,17 @@ export function makeStructuralSpeculativeActionRuntime<
 	};
 
 	const advanceColdCache = (session: Session, settings: SpeculativeActionSettings): void => {
-		for (const candidate of results.advanceDecisionBatch(session.id, {
-			maxAgeMs: CACHE_COLD_MAX_AGE_MS,
-			maxDecisionBatches: CACHE_COLD_MAX_DECISION_BATCHES,
-		})) {
+		for (const candidate of results.advanceDecisionBatch(
+			session.id,
+			{
+				maxAgeMs: CACHE_COLD_MAX_AGE_MS,
+				maxDecisionBatches: CACHE_COLD_MAX_DECISION_BATCHES,
+			},
+			(candidate) =>
+				!nodesForCandidate(session, candidate.id).some(
+					(node) => node.predictionState && node.predictionState.status !== "settled",
+				),
+		)) {
 			removeCandidate(session, candidate);
 		}
 		trimResults(session, settings);

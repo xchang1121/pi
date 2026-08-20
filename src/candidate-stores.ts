@@ -279,7 +279,11 @@ export class ResultCache<Scope, Entry extends SizedActionStoreEntry> {
 		return limits ? this.rebalanceHot(scope, limits) : [];
 	}
 
-	advanceDecisionBatch(scope: Scope, policy: ResultCacheColdPolicy): readonly Entry[] {
+	advanceDecisionBatch(
+		scope: Scope,
+		policy: ResultCacheColdPolicy,
+		canEvict: (entry: Entry) => boolean = () => true,
+	): readonly Entry[] {
 		const now = this.now();
 		const maxAgeMs = expirationLimit(policy.maxAgeMs);
 		const maxDecisionBatches = expirationLimit(policy.maxDecisionBatches);
@@ -288,7 +292,7 @@ export class ResultCache<Scope, Entry extends SizedActionStoreEntry> {
 			const current = this.metadata.get(scope)?.get(entry);
 			if (!current || current.segment !== "cold") continue;
 			const decisionBatches = current.decisionBatches + 1;
-			if (now - current.segmentEnteredAt >= maxAgeMs || decisionBatches > maxDecisionBatches) {
+			if ((now - current.segmentEnteredAt >= maxAgeMs || decisionBatches > maxDecisionBatches) && canEvict(entry)) {
 				this.delete(scope, entry);
 				expired.push(entry);
 				continue;
