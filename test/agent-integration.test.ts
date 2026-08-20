@@ -16,6 +16,7 @@ const readSchema = Type.Object({
 	offset: Type.Optional(Type.Number()),
 	limit: Type.Optional(Type.Number()),
 });
+const grepSchema = Type.Object({ pattern: Type.String(), path: Type.Optional(Type.String()) });
 const bashSchema = Type.Object({ command: Type.String(), timeout: Type.Optional(Type.Number()) });
 
 function model(id = "actor"): Model<"openai-responses"> {
@@ -441,18 +442,19 @@ describe("speculative action host", () => {
 				throw new Error("cleanup failed");
 			},
 		};
-		const tool: AgentTool<typeof readSchema> = {
-			name: "read",
-			label: "read",
-			description: "read",
-			parameters: readSchema,
-			execute: async () => ({ content: [{ type: "text", text: "actor" }], details: {} }),
+		const tool: AgentTool<typeof grepSchema> = {
+			name: "grep",
+			label: "grep",
+			description: "grep",
+			parameters: grepSchema,
+			execute: async () => ({ content: [{ type: "text", text: "nested/notes.txt:1:one" }], details: {} }),
 		};
 		const host = createSpeculativeActionHost("session", {
 			cwd,
 			getSettings: () => ({
 				...settings(),
 				drafterEnabled: false,
+				tools: ["grep"],
 				patternAware: { ...PATTERN_AWARE_DEFAULTS, minOccurrences: 1 },
 			}),
 			patternStore: pendingStore,
@@ -482,19 +484,19 @@ describe("speculative action host", () => {
 			await host.consume({
 				turnID: "turn-1",
 				id: "actor",
-				tool: "read",
-				args: { path: "notes.txt" },
+				tool: "grep",
+				args: { pattern: "one", path: "src" },
 				tools: [tool],
 			}),
 		).toBeUndefined();
 		await host.actual({
 			turnID: "turn-1",
 			id: "actor",
-			tool: "read",
-			args: { path: "notes.txt" },
+			tool: "grep",
+			args: { pattern: "one", path: "src" },
 			tools: [tool],
 			durationMs: 12,
-			output: { result: await tool.execute("actor", { path: "notes.txt" }), isError: false },
+			output: { result: await tool.execute("actor", { pattern: "one", path: "src" }), isError: false },
 		});
 		await host.finishTurn("turn-1");
 
@@ -506,7 +508,10 @@ describe("speculative action host", () => {
 					event.settlement.provider.durationMs === 12,
 			),
 		);
-		expect(observed.mock.calls[0]?.[0][0]?.input).toEqual({ path: "notes.txt" });
+		expect(observed.mock.calls[0]?.[0][0]).toMatchObject({
+			input: { pattern: "one", path: "src" },
+			outputPaths: ["src/nested/notes.txt"],
+		});
 		await expect(host.dispose()).resolves.toBeUndefined();
 		expect(disposed).toBe(1);
 	});

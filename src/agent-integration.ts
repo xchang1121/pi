@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import path from "node:path";
 import type { AgentTool, AgentToolCall, AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { Api, AssistantMessage, Context, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
 import { validateToolArguments } from "@earendil-works/pi-ai";
@@ -444,7 +445,7 @@ export function createSpeculativeActionHost(
 			const action = adoptedAction ?? candidate;
 			const observation = projectPatternAwareObservation(
 				output.result,
-				extractOutputPaths(action.key.tool, output.result),
+				extractOutputPaths(action.key.tool, action.input, output.result),
 				options.cwd,
 			);
 			const next = context.store.continue(
@@ -482,7 +483,7 @@ export function createSpeculativeActionHost(
 			const definition = startInput.tools.find((item) => item.name === tool);
 			const observation = projectPatternAwareObservation(
 				output?.result,
-				extractOutputPaths(tool, output?.result),
+				extractOutputPaths(tool, concrete, output?.result),
 				options.cwd,
 			);
 			const key = authoritativeBatchKey(consumeInput.sessionID, consumeInput.turnID);
@@ -742,8 +743,13 @@ function stableValue(value: unknown): unknown {
 	);
 }
 
-function extractOutputPaths(tool: string, result: AgentToolResult<unknown> | undefined): readonly string[] | undefined {
+function extractOutputPaths(
+	tool: string,
+	input: Readonly<Record<string, unknown>>,
+	result: AgentToolResult<unknown> | undefined,
+): readonly string[] | undefined {
 	if ((tool !== "find" && tool !== "grep") || !result) return undefined;
+	const searchRoot = typeof input.path === "string" && input.path ? input.path : ".";
 	const text = result.content
 		.filter((item): item is Extract<(typeof result.content)[number], { type: "text" }> => item.type === "text")
 		.map((item) => item.text)
@@ -756,7 +762,12 @@ function extractOutputPaths(tool: string, result: AgentToolResult<unknown> | und
 			if (tool === "find") return trimmed;
 			return /^(.*?):\d+(?::\d+)?:/.exec(trimmed)?.[1];
 		})
-		.filter((item): item is string => typeof item === "string" && item.length > 0);
+		.filter((item): item is string => typeof item === "string" && item.length > 0)
+		.map((item) => {
+			if (path.isAbsolute(item)) return item;
+			if (tool === "grep" && path.basename(searchRoot) === item) return searchRoot;
+			return path.join(searchRoot, item);
+		});
 	return paths.length ? [...new Set(paths)] : undefined;
 }
 
