@@ -57,6 +57,23 @@ describe("SandboxBackendRouter", () => {
 		await expect(router.fingerprint()).resolves.toBe("container:v2");
 	});
 
+	it("rejects a route switch between K(a) fingerprinting and process open", async () => {
+		let containerStatus = unavailable("starting");
+		const container = backend(() => containerStatus, "container");
+		const native = backend(ready("native", "native:v1"), "native");
+		const router = createSandboxBackendRouter("auto", [
+			{ id: "container", backend: container.value },
+			{ id: "native", backend: native.value },
+		]);
+		const expectedFingerprint = await router.fingerprint();
+		containerStatus = ready("container", "container:v2");
+
+		await expect(
+			router.open({ parent: "root", signal: new AbortController().signal, expectedFingerprint }),
+		).rejects.toThrow("changed after K(a) construction");
+		expect(container.calls).not.toContain("open");
+	});
+
 	it("selects a backend for each concrete process invocation", async () => {
 		const native = backend(ready("native", "native:v1"), "native", (invocation) =>
 			invocation.shell.toLowerCase().endsWith("cmd.exe"),

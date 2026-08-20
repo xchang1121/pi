@@ -107,6 +107,7 @@ export interface SandboxProcessBackend {
 		readonly parent: string;
 		readonly signal: AbortSignal;
 		readonly invocation?: ToolProcessInvocation;
+		readonly expectedFingerprint?: string;
 	}) => Promise<SandboxProcessSession>;
 	readonly dispose: () => Promise<void>;
 }
@@ -198,7 +199,14 @@ export function createSandboxBackendRouter(
 		},
 		open: async (input) => {
 			if (disposed) throw new Error("Speculative process backend is disposed.");
-			return (await select(input.invocation)).open(input);
+			const backend = await select(input.invocation);
+			if (
+				input.expectedFingerprint !== undefined &&
+				(await backend.fingerprint(input.invocation)) !== input.expectedFingerprint
+			) {
+				throw new Error("Speculative process backend changed after K(a) construction.");
+			}
+			return backend.open(input);
 		},
 		dispose: async () => {
 			if (disposed) return;
@@ -635,6 +643,7 @@ async function executeWorkspaceSnapshot(
 		context.signal,
 		parent,
 		invocation,
+		actualFingerprint,
 	);
 }
 
@@ -644,6 +653,7 @@ async function createPrivateGitWorkspace(
 	processBackend?: SandboxProcessBackend,
 	signal?: AbortSignal,
 	invocation?: ToolProcessInvocation,
+	expectedFingerprint?: string,
 ): Promise<PrivateGitWorkspace> {
 	const sourceRoot = path.resolve(cwd);
 	await assertNoSymlinkPath(sourceRoot, sourceRoot);
@@ -656,6 +666,7 @@ async function createPrivateGitWorkspace(
 					parent: pool.parent,
 					signal: signal ?? new AbortController().signal,
 					...(invocation ? { invocation } : {}),
+					...(expectedFingerprint !== undefined ? { expectedFingerprint } : {}),
 				})
 			: undefined;
 		const workspace = processSession
@@ -1125,8 +1136,16 @@ async function withPrivateGitWorkspace<T>(
 	signal?: AbortSignal,
 	checkpoint?: GitWorldCheckpoint,
 	invocation?: ToolProcessInvocation,
+	expectedFingerprint?: string,
 ): Promise<T> {
-	const workspace = await createPrivateGitWorkspace(cwd, gitBinary, processBackend, signal, invocation);
+	const workspace = await createPrivateGitWorkspace(
+		cwd,
+		gitBinary,
+		processBackend,
+		signal,
+		invocation,
+		expectedFingerprint,
+	);
 	try {
 		if (checkpoint) await materializeCheckpoint(workspace, checkpoint);
 		return await run(workspace);
