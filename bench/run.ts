@@ -398,32 +398,59 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 		await host.dispose();
 	}
 	const summary = summarizeSpeculativeTrace(events);
-	const sourceRequestKinds = events.reduce<Record<string, number>>((counts, event) => {
-		if (event.type === "source_request") {
-			counts[event.request.request.kind] = (counts[event.request.request.kind] ?? 0) + 1;
-		}
-		return counts;
-	}, {});
-	const speculativeHitsByDepth = events.reduce<Record<string, number>>((counts, event) => {
-		if (event.type === "actor_action" && event.settlement.provider.kind === "speculative") {
-			const depth = String(event.candidate?.depth ?? 0);
-			counts[depth] = (counts[depth] ?? 0) + 1;
-		}
-		return counts;
-	}, {});
+	const sourceRequestKinds: Record<string, number> = {};
+	const sourceRequestsBySource: Record<string, number> = {};
+	const predictionsBySource: Record<
+		string,
+		{ settled: number; observed: number; matched: number; adopted: number }
+	> = {};
+	const candidateStartsBySource: Record<string, number> = {};
+	const candidateStartsByTool: Record<string, number> = {};
+	const candidateStartsByDepth: Record<string, number> = {};
+	const speculativeHitsByDepth: Record<string, number> = {};
 	const actorActionsByTool: Record<string, number> = {};
 	const speculativeHitsByTool: Record<string, number> = {};
 	const actorFallbacksByTool: Record<string, number> = {};
 	const speculativeHitsByRelation: Record<string, number> = {};
+	const speculativeHitProvidersBySource: Record<string, number> = {};
+	const actorActionMatchesByPredictionSource: Record<string, number> = {};
 	for (const event of events) {
+		if (event.type === "source_request") {
+			increment(sourceRequestKinds, event.request.request.kind);
+			increment(sourceRequestsBySource, event.request.request.source);
+			continue;
+		}
+		if (event.type === "prediction") {
+			const source = event.settlement.prediction.source;
+			const counters = (predictionsBySource[source] ??= { settled: 0, observed: 0, matched: 0, adopted: 0 });
+			counters.settled++;
+			if (event.settlement.observation === "unobserved") continue;
+			counters.observed++;
+			if (!event.settlement.match.matched) continue;
+			counters.matched++;
+			if (event.settlement.match.adoption.status === "adopted") counters.adopted++;
+			continue;
+		}
+		if (event.type === "candidate") {
+			if (event.state.status !== "running") continue;
+			increment(candidateStartsBySource, event.candidate.source);
+			increment(candidateStartsByTool, event.candidate.tool);
+			increment(candidateStartsByDepth, String(event.candidate.depth));
+			continue;
+		}
 		if (event.type !== "actor_action") continue;
 		const { provider, tool } = event.settlement;
 		actorActionsByTool[tool] = (actorActionsByTool[tool] ?? 0) + 1;
+		for (const source of new Set(event.settlement.matchedPredictions.map((prediction) => prediction.source))) {
+			increment(actorActionMatchesByPredictionSource, source);
+		}
 		if (provider.kind === "actor") {
 			actorFallbacksByTool[tool] = (actorFallbacksByTool[tool] ?? 0) + 1;
 			continue;
 		}
+		increment(speculativeHitProvidersBySource, event.candidate?.source ?? "cache");
 		speculativeHitsByTool[tool] = (speculativeHitsByTool[tool] ?? 0) + 1;
+		increment(speculativeHitsByDepth, String(event.candidate?.depth ?? 0));
 		const relation = provider.match.kind === "exact" ? "exact" : `projected:${provider.match.projector}`;
 		speculativeHitsByRelation[relation] = (speculativeHitsByRelation[relation] ?? 0) + 1;
 	}
@@ -511,6 +538,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 			hitRate: summary.hitRate,
 			sourceRequests: summary.sourceRequests,
 			sourceRequestKinds,
+			sourceRequestsBySource,
 			sourceOutcomes: summary.sourceOutcomes,
 			predictionsSettled: summary.predictionsSettled,
 			predictionsObserved: summary.predictionsObserved,
@@ -518,6 +546,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 			predictionsAdopted: summary.predictionsAdopted,
 			predictionPrecision: summary.predictionPrecision,
 			adoptionYield: summary.adoptionYield,
+			predictionsBySource,
 			predictionUnobserved: summary.predictionUnobserved,
 			predictionRejectedAfterMatch: summary.predictionRejectedAfterMatch,
 			executionAheadMs: summary.executionAheadMs,
@@ -538,11 +567,16 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 			speculativeExecutionMs: summary.speculativeExecutionMs,
 			actorExecutionMs: summary.actorExecutionMs,
 			candidateStarted: summary.candidateStarted,
+			candidateStartsBySource,
+			candidateStartsByTool,
+			candidateStartsByDepth,
 			candidateSucceeded: summary.candidateSucceeded,
 			candidateFailed: summary.candidateFailed,
 			candidateCancelled: summary.candidateCancelled,
 			candidateTerminalCauses: summary.candidateTerminalCauses,
 			actorCandidateRejections: summary.actorCandidateRejections,
+			speculativeHitProvidersBySource,
+			actorActionMatchesByPredictionSource,
 			actorCost: actorUsage.cost,
 			drafterCost,
 			actorTokens: actorUsage.tokens,
@@ -684,6 +718,10 @@ function lines(value: string): string[] {
 		.split(/\r?\n/)
 		.map((line) => line.trim())
 		.filter(Boolean);
+}
+
+function increment(counts: Record<string, number>, key: string): void {
+	counts[key] = (counts[key] ?? 0) + 1;
 }
 
 function latencyProfile(value: string | undefined): LatencyProfile {
