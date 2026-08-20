@@ -122,7 +122,7 @@ describe("PlanRuntime", () => {
 		]);
 	});
 
-	it("uses execution predicates for launch without exposing an unadopted Actor prefix", () => {
+	it("keeps execution dependencies independent from Actor adoption", () => {
 		const plan = new PlanRuntime();
 		plan.apply(
 			proposal([
@@ -145,7 +145,7 @@ describe("PlanRuntime", () => {
 				.matchable(2)
 				.map((node) => node.action.id)
 				.sort(),
-		).toEqual(["parent"]);
+		).toEqual(["parent", "settled", "succeeded"]);
 		expect(
 			plan
 				.launchable()
@@ -156,13 +156,13 @@ describe("PlanRuntime", () => {
 		const opportunity = plan.claimMatch("plan", "parent", actor, { kind: "exact", distance: 0 })!;
 
 		plan.confirm(opportunity, actor, { status: "rejected", cause: cause("execution", "failed") });
-		expect(plan.launchable().map((node) => node.action.id)).toEqual(["settled"]);
 		expect(
 			plan
-				.drainBlocked()
+				.launchable()
 				.map((node) => node.action.id)
 				.sort(),
-		).toEqual(["confirmed", "succeeded"]);
+		).toEqual(["settled", "succeeded"]);
+		expect(plan.drainBlocked().map((node) => node.action.id)).toEqual(["confirmed"]);
 	});
 
 	it("derives source-neutral deadlines and critical paths from the dependency graph", () => {

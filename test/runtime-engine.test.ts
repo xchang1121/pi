@@ -1194,21 +1194,15 @@ describe("structural speculative runtime", () => {
 		await fixture.runtime.finishTurn({ ...call("child-turn"), terminal: true });
 	});
 
-	it("cancels a conditional continuation and rejects its late child when the parent misses", async () => {
-		let release!: () => void;
-		const gate = new Promise<void>((resolve) => {
-			release = resolve;
-		});
-		let continuationStarted = false;
+	it("adopts a target-state-valid child after its parent prediction misses", async () => {
+		let enabled = true;
 		const executed: string[] = [];
 		const source: Source = {
 			id: "source",
-			enabled: () => true,
+			enabled: () => enabled,
 			propose: () => plan("source", "conditional", { path: "parent.ts" }),
 			continue: async ({ proposalID, actionID, revision, trigger }) => {
 				if (trigger !== "execution_succeeded") return undefined;
-				continuationStarted = true;
-				await gate;
 				return {
 					proposalID,
 					source: "source",
@@ -1229,37 +1223,26 @@ describe("structural speculative runtime", () => {
 			source,
 			execute: (_tool, input) => {
 				executed.push(String(input.path));
-				return "output";
+				return `${String(input.path)}:output`;
 			},
 		});
 
 		await fixture.runtime.startTurn({ sessionID: "session", turnID: "miss" });
-		await waitFor(() => continuationStarted);
+		await waitFor(() => executed.includes("late.ts"));
 		expect(await fixture.runtime.consume(call("miss", { path: "other.ts" }))).toBeUndefined();
 		await fixture.runtime.actual({ ...call("miss", { path: "other.ts" }), durationMs: 1, output: "actor" });
-		await new Promise((resolve) => setTimeout(resolve, 10));
-		expect(
-			fixture.events.some(
-				(event) =>
-					event.type === "source_request" &&
-					event.request.request.kind === "continuation" &&
-					event.request.settlement.status === "aborted",
-			),
-		).toBe(false);
 		await fixture.runtime.finishTurn({ ...call("miss"), terminal: false });
-		await waitFor(() =>
-			fixture.events.some(
-				(event) =>
-					event.type === "source_request" &&
-					event.request.request.kind === "continuation" &&
-					event.request.settlement.status === "aborted",
-			),
-		);
-		release();
-		await new Promise((resolve) => setTimeout(resolve, 10));
-		expect(executed).toEqual(["parent.ts"]);
-		expect(fixture.runtime.inspect().deferredPlanActions).toBe(0);
-		await fixture.runtime.finishTurn({ ...call("miss"), terminal: true });
+
+		enabled = false;
+		await fixture.runtime.startTurn({ sessionID: "session", turnID: "target" });
+		expect(await fixture.runtime.consume(call("target", { path: "late.ts" }))).toBe("late.ts:output");
+		await fixture.runtime.finishTurn({ ...call("target"), terminal: true });
+		expect(executed).toEqual(["parent.ts", "late.ts"]);
+		expect(
+			fixture.events
+				.filter((event) => event.type === "prediction")
+				.map((event) => (event.settlement.observation === "observed" ? event.settlement.match.matched : undefined)),
+		).toEqual([false, true]);
 	});
 
 	it("keeps equal child actions isolated by parent world and rebases the adopted lineage", async () => {

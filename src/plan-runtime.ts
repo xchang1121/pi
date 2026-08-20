@@ -530,21 +530,11 @@ export class PlanRuntime {
 		});
 	}
 
-	private actorPrefixSatisfied(plan: MutablePlan, node: MutableNode): boolean {
-		return (node.action.dependsOn ?? []).every((dependency) => {
-			const parent = plan.nodes.get(dependency.actionID);
-			if (!parent) return false;
-			return parent.action.type === "preparation_hint"
-				? dependencySatisfied(parent, dependency.condition)
-				: predictionAdopted(parent.opportunity?.settlement);
-		});
-	}
-
 	private isMatchable(plan: MutablePlan, node: MutableNode, decisionSequence: number): boolean {
 		return (
 			node.opportunity?.state.status === "pending" &&
 			node.earliestDecisionSeq <= decisionSequence &&
-			this.actorPrefixSatisfied(plan, node)
+			this.dependenciesSatisfied(plan, node)
 		);
 	}
 
@@ -651,11 +641,7 @@ function dependencyImpossible(node: MutableNode, condition: PlanActionDependency
 				? true
 				: node.opportunity?.settlement !== undefined && !predictionAdopted(node.opportunity.settlement);
 		case "execution_succeeded":
-			return (
-				execution.status === "failed" ||
-				execution.status === "cancelled" ||
-				(node.opportunity?.settlement !== undefined && !predictionAdopted(node.opportunity.settlement))
-			);
+			return execution.status === "failed" || execution.status === "cancelled";
 		case "execution_settled":
 			return false;
 	}
