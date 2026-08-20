@@ -1958,6 +1958,10 @@ export function makeStructuralSpeculativeActionRuntime<
 		if (!context || !source?.continue) return;
 		if (source.multiStepEnabled?.(context.settings) === false) return;
 		if (source.continueOn && !source.continueOn.includes(trigger)) return;
+		if (source.continuationMode === "candidate_round") {
+			if (context.continuationTriggers.size > 0) return;
+			if (trigger === "execution_succeeded" && candidate.route.reuse !== "shared_result") return;
+		}
 		if (context.continuationTriggers.has(trigger)) return;
 		context.continuationTriggers.add(trigger);
 		const parentDecisionSequence =

@@ -397,7 +397,7 @@ export function createSpeculativeActionHost(
 		requestLifetime: "actor_decision",
 		multiStepEnabled: (settings) => sourceDrafterMaxDepth(settings) > 0,
 		continuationMode: "candidate_round",
-		continueOn: ["actor_adopted"],
+		continueOn: ["execution_succeeded", "actor_adopted"],
 		proposalCount: (settings) => clampCandidateLimit(settings.candidateLimit ?? DEFAULTS.candidateLimit),
 		propose: async ({
 			startInput: input,
@@ -470,6 +470,7 @@ export function createSpeculativeActionHost(
 		continue: async ({
 			proposalID,
 			actionID,
+			candidate,
 			feedback,
 			output,
 			adoptedAction,
@@ -482,9 +483,12 @@ export function createSpeculativeActionHost(
 			if (!previous || previous.depth >= sourceDrafterMaxDepth(settings) || signal.aborted) return undefined;
 			const previousCall = previous.message.content.find((item): item is AgentToolCall => item.type === "toolCall");
 			if (!previousCall) return undefined;
-			const replayedCall = adoptedAction
-				? { ...previousCall, name: adoptedAction.key.tool, arguments: structuredClone(adoptedAction.input) }
-				: previousCall;
+			const replayedAction = adoptedAction ?? candidate;
+			const replayedCall = {
+				...previousCall,
+				name: replayedAction.key.tool,
+				arguments: structuredClone(replayedAction.input),
+			};
 			const replayedMessage: AssistantMessage = {
 				...previous.message,
 				content: previous.message.content.map((item) => (item === previousCall ? replayedCall : item)),

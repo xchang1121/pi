@@ -426,7 +426,7 @@ describe("speculative action host", () => {
 		await host.dispose();
 	});
 
-	it("projects proven read coverage and replays the adopted Actor call to the next Drafter round", async () => {
+	it("continues from the expanded read view while projecting a narrower Actor result", async () => {
 		const cwd = await temporaryWorkspace();
 		let executedInput: { path: string; offset?: number; limit?: number } | undefined;
 		const contexts: Parameters<CreateComplete>[1][] = [];
@@ -469,6 +469,22 @@ describe("speculative action host", () => {
 
 		await host.startTurn(startInput(tool));
 		await waitFor(() => host.runtime.inspect("session").sharedCandidates === 1);
+		await waitFor(() => contexts.length === 2);
+		expect(contexts[1]?.messages).toEqual([
+			expect.objectContaining({
+				role: "assistant",
+				content: [
+					expect.objectContaining({
+						type: "toolCall",
+						arguments: { path: "notes.txt", offset: 1, limit: 2000 },
+					}),
+				],
+			}),
+			expect.objectContaining({
+				role: "toolResult",
+				content: [{ type: "text", text: "one\ntwo\nthree\nfour" }],
+			}),
+		]);
 		const hit = await host.consume({
 			turnID: "turn-1",
 			tool: "read",
@@ -481,19 +497,7 @@ describe("speculative action host", () => {
 			text: "two\nthree\n\n[1 more lines in file. Use offset=4 to continue.]",
 		});
 		expect(executedInput).toMatchObject({ offset: 1, limit: 2000 });
-		await waitFor(() => contexts.length === 2);
-		expect(contexts[1]?.messages).toEqual([
-			expect.objectContaining({
-				role: "assistant",
-				content: [
-					expect.objectContaining({
-						type: "toolCall",
-						arguments: { path: "notes.txt", offset: 2, limit: 2 },
-					}),
-				],
-			}),
-			expect.objectContaining({ role: "toolResult" }),
-		]);
+		expect(contexts).toHaveLength(2);
 		await host.dispose();
 	});
 
@@ -686,7 +690,7 @@ describe("speculative action host", () => {
 		await host.dispose();
 	});
 
-	it("resets arbitrary Drafter width after adoption without batch blocking", async () => {
+	it("recycles a deduplicated read result into the next Drafter round without waiting for adoption", async () => {
 		const cwd = await temporaryWorkspace();
 		await Promise.all([
 			writeFile(path.join(cwd, "other.txt"), "other", "utf8"),
@@ -736,8 +740,9 @@ describe("speculative action host", () => {
 		});
 
 		await host.startTurn(startInput(tool));
-		await waitFor(() => requestCounts[0] === 4 && executed.length === 1);
-		expect(executed).toEqual(["notes.txt"]);
+		await waitFor(() => requestCounts[0] === 4 && requestCounts[1] === 4 && executed.includes("ignored.txt"));
+		expect(executed).toContain("notes.txt");
+		expect(executed).not.toContain("other.txt");
 		expect(
 			await host.consume({
 				turnID: "turn-1",
@@ -747,8 +752,6 @@ describe("speculative action host", () => {
 				tools: [tool],
 			}),
 		).toMatchObject({ result: { content: [{ type: "text", text: "notes.txt:result" }] } });
-		await waitFor(() => requestCounts[1] === 4 && executed.includes("ignored.txt"));
-		expect(executed).not.toContain("other.txt");
 		releaseSlow();
 		await waitFor(() => executed.includes("other.txt"));
 		expect(requests).toHaveLength(8);
