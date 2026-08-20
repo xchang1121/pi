@@ -134,6 +134,16 @@ export interface ActorHitTiming {
 	readonly hitLatencyMs: number;
 }
 
+/** Latency an isolation-blocked match could hide if a safe execution route were available. */
+export interface ExecutionBlockedTiming {
+	/** Earliest matching prediction intent to Actor interception. */
+	readonly attemptLeadMs: number;
+	/** Actor execution time covered by that lead, capped by the authoritative duration. */
+	readonly executionAheadMs: number;
+	/** Authoritative execution time that would remain on the Actor critical path. */
+	readonly hitLatencyMs: number;
+}
+
 export type ActorActionProvider =
 	| {
 			readonly kind: "speculative";
@@ -147,6 +157,7 @@ export type ActorActionProvider =
 			readonly durationMs: number;
 			readonly isError: boolean;
 			readonly toolExecution: TimelineInterval;
+			readonly executionBlockedTiming?: ExecutionBlockedTiming;
 	  };
 
 export interface ActorActionSettlement {

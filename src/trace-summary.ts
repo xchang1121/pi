@@ -35,6 +35,14 @@ export interface SpeculativeTraceSummary {
 	readonly executionAheadMs: number;
 	readonly attemptLeadMs: number;
 	readonly hitLatencyMs: number;
+	/** Actor actions whose matched prediction was deliberately not executed. */
+	readonly executionBlockedActorActions: number;
+	/** Earliest matching prediction intent to Actor interception. */
+	readonly executionBlockedAttemptLeadMs: number;
+	/** Actor execution time that a safe speculative backend could have hidden. */
+	readonly executionBlockedPotentialHiddenLatencyMs: number;
+	/** Actor execution time that would still have remained after that overlap. */
+	readonly executionBlockedPotentialHitLatencyMs: number;
 	readonly totalDraftTokens: number;
 	readonly cache: SpeculativeCacheSnapshot;
 }
@@ -90,6 +98,10 @@ export function emptySpeculativeTraceSummary(cache: SpeculativeCacheSnapshot = E
 		executionAheadMs: 0,
 		attemptLeadMs: 0,
 		hitLatencyMs: 0,
+		executionBlockedActorActions: 0,
+		executionBlockedAttemptLeadMs: 0,
+		executionBlockedPotentialHiddenLatencyMs: 0,
+		executionBlockedPotentialHitLatencyMs: 0,
 		totalDraftTokens: 0,
 		cache: cloneCache(cache),
 	};
@@ -157,6 +169,13 @@ export function reduceSpeculativeTrace<SessionID>(
 			} else {
 				next.actorFallbacks++;
 				next.actorExecutionMs += metric(event.settlement.provider.durationMs);
+				const timing = event.settlement.provider.executionBlockedTiming;
+				if (timing) {
+					next.executionBlockedActorActions++;
+					next.executionBlockedAttemptLeadMs += metric(timing.attemptLeadMs);
+					next.executionBlockedPotentialHiddenLatencyMs += metric(timing.executionAheadMs);
+					next.executionBlockedPotentialHitLatencyMs += metric(timing.hitLatencyMs);
+				}
 			}
 			break;
 	}

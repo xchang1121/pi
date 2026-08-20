@@ -87,7 +87,6 @@ describe("PlanRuntime", () => {
 			tool: "read",
 			input: { path: "keyed.ts" },
 			resources: ["keyed.ts"],
-			execution: "resource_cached" as const,
 			semanticsEpoch: "1",
 			schemaHash: "schema",
 			executionFingerprint: "executor",
@@ -97,6 +96,30 @@ describe("PlanRuntime", () => {
 		expect(plan.get("plan", "keyed")?.actionKey).toBe(key);
 		expect(plan.get("plan", "keyed")?.action.input).toEqual({ path: "keyed.ts" });
 		expect(Object.isFrozen(plan.get("plan", "keyed")?.action.input)).toBe(true);
+	});
+
+	it("keeps an execution-blocked node matchable without making it launchable", () => {
+		const plan = new PlanRuntime();
+		plan.apply(proposal([action("bash")]), 0);
+		const key = {
+			key: "key",
+			hash: "hash",
+			tool: "bash",
+			input: { command: "npm test" },
+			resources: ["."],
+			semanticsEpoch: "pi.bash.v2",
+			schemaHash: "schema",
+			executionFingerprint: "pi.bash.local.v2",
+		};
+
+		expect(plan.bindActionKey("plan", "bash", key)).toBe(true);
+		const blocked = cause("execution", "isolation_unavailable");
+		expect(plan.markExecutionBlocked("plan", "bash", blocked)).toBe(true);
+		expect(plan.markExecutionBlocked("plan", "bash", blocked)).toBe(false);
+		expect(plan.launchable()).toEqual([]);
+		expect(plan.matchable(1)).toMatchObject([
+			{ actionKey: key, execution: { status: "execution_blocked", cause: blocked } },
+		]);
 	});
 
 	it("uses execution predicates for launch without exposing an unadopted Actor prefix", () => {

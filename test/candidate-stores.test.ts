@@ -181,7 +181,7 @@ function entry(id: string, path: string, offset = 1, limit = 20, estimatedBytes 
 }
 
 function key(path: string, offset = 1, limit = 20) {
-	const action = buildPiActionKey("read", { path, offset, limit }, "", "resource_cached");
+	const action = buildPiActionKey("read", { path, offset, limit }, "", "schema");
 	if (!action) throw new Error("read action key should be supported");
 	return action satisfies ActionKey;
 }

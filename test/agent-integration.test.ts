@@ -18,6 +18,7 @@ const readSchema = Type.Object({
 	offset: Type.Optional(Type.Number()),
 	limit: Type.Optional(Type.Number()),
 });
+const bashSchema = Type.Object({ command: Type.String(), timeout: Type.Optional(Type.Number()) });
 
 function model(id = "actor"): Model<"openai-responses"> {
 	return {
@@ -65,7 +66,7 @@ function settings(candidateLimit = 1) {
 		candidateLimit,
 		drafterMaxDepth: 0,
 		maxConcurrentActions: candidateLimit,
-		tools: { resourceCached: ["read"], sandbox: [] },
+		tools: ["read"],
 		patternAware: { enabled: false },
 	};
 }
@@ -129,9 +130,296 @@ describe("speculative action host", () => {
 
 		expect(hit?.result.content).toEqual([{ type: "text", text: "one\ntwo\nthree\nfour" }]);
 		expect(executions).toBe(1);
+		expect(events.find((event) => event.type === "candidate")).toMatchObject({
+			candidate: { execution: "resource_snapshot" },
+		});
 		await waitFor(() =>
 			events.some((event) => event.type === "actor_action" && event.settlement.provider.kind === "speculative"),
 		);
+		await host.dispose();
+	});
+
+	it("matches Bash intent but leaves the only process execution to the Actor", async () => {
+		const cwd = await temporaryWorkspace();
+		let executions = 0;
+		let preflights = 0;
+		const events: SpeculativeActionEvent<string>[] = [];
+		const tool: AgentTool<typeof bashSchema> = {
+			name: "bash",
+			label: "bash",
+			description: "bash",
+			parameters: bashSchema,
+			execute: async () => {
+				executions++;
+				return { content: [{ type: "text", text: "built" }], details: {} };
+			},
+		};
+		const host = createSpeculativeActionHost("session", {
+			cwd,
+			getSettings: () => ({
+				...settings(),
+				tools: ["bash"],
+			}),
+			draftModel: model("draft"),
+			complete: async () =>
+				assistant(
+					[{ type: "toolCall", id: "draft-bash", name: "bash", arguments: { command: "npm test" } }],
+					"toolUse",
+				),
+			preflight: () => {
+				preflights++;
+				return true;
+			},
+			onEvent: (event) => {
+				events.push(event);
+			},
+		});
+
+		await host.startTurn(startInput(tool));
+		await waitFor(() => host.runtime.inspect("session").executionBlockedPlanActions === 1);
+		expect(host.runtime.inspect("session")).toMatchObject({
+			exclusiveCandidates: 0,
+			sharedCandidates: 0,
+		});
+		expect(executions).toBe(0);
+		expect(preflights).toBe(0);
+		expect(events.some((event) => event.type === "candidate")).toBe(false);
+
+		const call = { turnID: "turn-1", id: "actor-bash", tool: "bash", args: { command: "npm test" }, tools: [tool] };
+		expect(await host.consume(call)).toBeUndefined();
+		expect(executions).toBe(0);
+		const result = await tool.execute("actor-bash", { command: "npm test" });
+		await host.actual({ ...call, durationMs: 5, output: { result, isError: false } });
+		await host.finishTurn("turn-1", true);
+
+		await waitFor(() => events.some((event) => event.type === "prediction"));
+		expect(executions).toBe(1);
+		expect(events.find((event) => event.type === "prediction")).toMatchObject({
+			settlement: {
+				observation: "observed",
+				match: {
+					matched: true,
+					adoption: { status: "rejected", cause: { stage: "execution", code: "isolation_unavailable" } },
+				},
+			},
+		});
+		await host.dispose();
+	});
+
+	it("routes Bash through a runtime-wide sandbox before considering local fallbacks", async () => {
+		const cwd = await temporaryWorkspace();
+		let actorExecutions = 0;
+		let sandboxExecutions = 0;
+		const dispose = vi.fn();
+		const tool: AgentTool<typeof bashSchema> = {
+			name: "bash",
+			label: "bash",
+			description: "bash",
+			parameters: bashSchema,
+			execute: async () => {
+				actorExecutions++;
+				return { content: [{ type: "text", text: "actor" }], details: {} };
+			},
+		};
+		const sandbox: SpeculativeAgentSandbox = {
+			id: "runtime",
+			supports: (mode) => mode === "runtime_sandbox",
+			fingerprint: () => "runtime:v1",
+			fork: async (context) => {
+				sandboxExecutions++;
+				const output = {
+					result: { content: [{ type: "text" as const, text: "sandbox" }], details: {} },
+					isError: false,
+				};
+				return {
+					output,
+					backend: "runtime",
+					resources: [],
+					capturedBytes: 0,
+					executionMetrics: {},
+					compatibility: {
+						status: "compatible",
+						backend: "runtime",
+						executionFingerprint: context.action.executionFingerprint,
+					},
+					state: "sealed",
+					commit: async () => output,
+				};
+			},
+			dispose,
+		};
+		const events: SpeculativeActionEvent<string>[] = [];
+		const host = createSpeculativeActionHost("session", {
+			cwd,
+			getSettings: () => ({ ...settings(), tools: ["bash"] }),
+			draftModel: model("draft"),
+			complete: async () =>
+				assistant(
+					[{ type: "toolCall", id: "draft-bash", name: "bash", arguments: { command: "npm test" } }],
+					"toolUse",
+				),
+			preflight: () => true,
+			executionWorlds: [sandbox, sandbox],
+			onEvent: (event) => {
+				events.push(event);
+			},
+		});
+
+		await host.startTurn(startInput(tool));
+		await waitFor(() => events.some((event) => event.type === "candidate" && event.state.status === "succeeded"));
+		const hit = await host.consume({
+			turnID: "turn-1",
+			id: "actor-bash",
+			tool: "bash",
+			args: { command: "npm test" },
+			tools: [tool],
+		});
+
+		expect(hit?.result.content).toEqual([{ type: "text", text: "sandbox" }]);
+		expect(sandboxExecutions).toBe(1);
+		expect(actorExecutions).toBe(0);
+		expect(events.find((event) => event.type === "candidate")).toMatchObject({
+			candidate: { execution: "runtime_sandbox" },
+		});
+		await host.dispose();
+		expect(dispose).toHaveBeenCalledOnce();
+	});
+
+	it("prefers a runtime-wide sandbox over a read tool's resource-snapshot fallback", async () => {
+		const cwd = await temporaryWorkspace();
+		let hostExecutions = 0;
+		const fork = vi.fn(async (context: Parameters<SpeculativeAgentSandbox["fork"]>[0]) => {
+			const output = {
+				result: { content: [{ type: "text" as const, text: "runtime read" }], details: {} },
+				isError: false,
+			};
+			return {
+				output,
+				backend: "runtime",
+				resources: [],
+				capturedBytes: 0,
+				executionMetrics: {},
+				compatibility: {
+					status: "compatible" as const,
+					backend: "runtime",
+					executionFingerprint: context.action.executionFingerprint,
+				},
+				state: "sealed" as const,
+				commit: async () => output,
+			};
+		});
+		const runtimeWorld: SpeculativeAgentSandbox = {
+			id: "runtime",
+			supports: (mode) => mode === "runtime_sandbox",
+			fork,
+		};
+		const tool: AgentTool<typeof readSchema> = {
+			name: "read",
+			label: "read",
+			description: "read",
+			parameters: readSchema,
+			execute: async () => {
+				hostExecutions++;
+				return { content: [{ type: "text", text: "host read" }], details: {} };
+			},
+		};
+		const events: SpeculativeActionEvent<string>[] = [];
+		const host = createSpeculativeActionHost("session", {
+			cwd,
+			getSettings: settings,
+			draftModel: model("draft"),
+			complete: async () => drafterCall({ path: "notes.txt" }),
+			preflight: () => true,
+			executionWorlds: [runtimeWorld],
+			onEvent: (event) => {
+				events.push(event);
+			},
+		});
+
+		await host.startTurn(startInput(tool));
+		await waitFor(() => events.some((event) => event.type === "candidate" && event.state.status === "succeeded"));
+		const hit = await host.consume({
+			turnID: "turn-1",
+			id: "actor-read",
+			tool: "read",
+			args: { path: "notes.txt" },
+			tools: [tool],
+		});
+
+		expect(hit?.result.content).toEqual([{ type: "text", text: "runtime read" }]);
+		expect(fork).toHaveBeenCalledOnce();
+		expect(fork.mock.calls[0]?.[0]).toMatchObject({ mode: "runtime_sandbox" });
+		expect(hostExecutions).toBe(0);
+		await host.dispose();
+	});
+
+	it("prepares the same healthy world selected by route resolution", async () => {
+		const cwd = await temporaryWorkspace();
+		const brokenPrepare = vi.fn();
+		const healthyPrepare = vi.fn();
+		const broken: SpeculativeAgentSandbox = {
+			id: "broken",
+			supports: (mode) => mode === "runtime_sandbox",
+			fingerprint: () => {
+				throw new Error("backend unavailable");
+			},
+			prepare: brokenPrepare,
+			fork: async () => {
+				throw new Error("must not execute");
+			},
+		};
+		const output = {
+			result: { content: [{ type: "text" as const, text: "sandbox" }], details: {} },
+			isError: false,
+		};
+		const healthy: SpeculativeAgentSandbox = {
+			id: "healthy",
+			supports: (mode) => mode === "runtime_sandbox",
+			fingerprint: () => "healthy:v1",
+			prepare: healthyPrepare,
+			fork: async (context) => ({
+				output,
+				backend: "healthy",
+				resources: [],
+				capturedBytes: 0,
+				executionMetrics: {},
+				compatibility: {
+					status: "compatible",
+					backend: "healthy",
+					executionFingerprint: context.action.executionFingerprint,
+				},
+				state: "sealed",
+				commit: async () => output,
+			}),
+		};
+		const tool: AgentTool<typeof bashSchema> = {
+			name: "bash",
+			label: "bash",
+			description: "bash",
+			parameters: bashSchema,
+			execute: async () => ({ content: [], details: {} }),
+		};
+		const events: SpeculativeActionEvent<string>[] = [];
+		const host = createSpeculativeActionHost("session", {
+			cwd,
+			getSettings: () => ({ ...settings(), tools: ["bash"] }),
+			draftModel: model("draft"),
+			complete: async () =>
+				assistant(
+					[{ type: "toolCall", id: "draft-bash", name: "bash", arguments: { command: "npm test" } }],
+					"toolUse",
+				),
+			preflight: () => true,
+			executionWorlds: [broken, healthy],
+			onEvent: (event) => {
+				events.push(event);
+			},
+		});
+
+		await host.startTurn(startInput(tool));
+		await waitFor(() => events.some((event) => event.type === "candidate" && event.state.status === "succeeded"));
+		expect(brokenPrepare).not.toHaveBeenCalled();
+		expect(healthyPrepare).toHaveBeenCalledWith(expect.objectContaining({ modes: ["runtime_sandbox"] }));
 		await host.dispose();
 	});
 
@@ -213,6 +501,7 @@ describe("speculative action host", () => {
 		const actualEvents: SpeculativeActionEvent<string>[] = [];
 		let disposed = 0;
 		const sandbox: SpeculativeAgentSandbox = {
+			id: "unavailable",
 			supports: () => false,
 			fork: async () => {
 				throw new Error("unused");
@@ -240,7 +529,7 @@ describe("speculative action host", () => {
 			draftModel: model("draft"),
 			complete: async () => assistant([{ type: "text", text: "no prediction" }], "stop"),
 			preflight: () => true,
-			sandbox,
+			executionWorlds: [sandbox],
 			onEvent: (event) => {
 				actualEvents.push(event);
 			},

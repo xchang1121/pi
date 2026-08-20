@@ -21,6 +21,7 @@ import type {
 
 export type PlanNodeExecution =
 	| { readonly status: "deferred" }
+	| { readonly status: "execution_blocked"; readonly cause: ResolutionCause }
 	| { readonly status: "scheduled" }
 	| { readonly status: "running"; readonly candidateID: string }
 	| { readonly status: "succeeded"; readonly candidateID: string }
@@ -177,6 +178,7 @@ interface PlanExecutionOwner {
 
 type MutableNodeExecution =
 	| { readonly status: "deferred" }
+	| { readonly status: "execution_blocked"; readonly cause: ResolutionCause }
 	| { readonly status: "scheduled" }
 	| {
 			readonly status: "attached";
@@ -263,6 +265,13 @@ export class PlanRuntime {
 		const node = this.mutable(proposalID, actionID)?.node;
 		if (!node || node.actionKey) return false;
 		node.actionKey = actionKey;
+		return true;
+	}
+
+	markExecutionBlocked(proposalID: string, actionID: string, cause: ResolutionCause): boolean {
+		const node = this.mutable(proposalID, actionID)?.node;
+		if (node?.execution.status !== "deferred" || !node.actionKey) return false;
+		node.execution = { status: "execution_blocked", cause: Object.freeze({ ...cause }) };
 		return true;
 	}
 
@@ -816,7 +825,6 @@ function samePlanActionExecution(left: PlanAction, right: PlanAction): boolean {
 	return (
 		left.type === right.type &&
 		left.tool === right.tool &&
-		left.execution === right.execution &&
 		isDeepStrictEqual(left.input, right.input) &&
 		isDeepStrictEqual(left.missing ?? [], right.missing ?? []) &&
 		isDeepStrictEqual(normalizedDependencies(left), normalizedDependencies(right))

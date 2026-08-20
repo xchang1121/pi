@@ -10,7 +10,6 @@ import { resourceProfile, speculativeResourceBudget } from "./resource-budget.ts
 export interface PredictionForecast {
 	readonly tool: string;
 	readonly execution: SpeculativeExecution;
-	readonly sandboxMode: "none" | "workspace_snapshot" | "file_mutation";
 	readonly expectedDurationMs?: number;
 	readonly resourceDemand?: number;
 	readonly decisionBatchesUntilCall?: number;
@@ -174,7 +173,7 @@ export class SpeculationScheduler<Job extends object> {
 
 	private evaluateOne(forecast: PredictionForecast): ScheduledWork {
 		const expectedDurationMs = this.duration(forecast);
-		const baseResource = resourceProfile(forecast.execution, forecast.sandboxMode);
+		const baseResource = resourceProfile(forecast.execution);
 		const resource = {
 			class: baseResource.class,
 			units: Math.max(baseResource.units, units(forecast.resourceDemand)),

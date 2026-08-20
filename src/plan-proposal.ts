@@ -1,5 +1,3 @@
-import type { SpeculativeExecution } from "./action-semantics.ts";
-
 export type PlanActionDependencyCondition = "execution_settled" | "execution_succeeded" | "actor_adopted";
 
 /** A scheduler-visible edge. The producer may add actions in later deltas. */
@@ -15,7 +13,6 @@ export interface PlanAction {
 	readonly tool: string;
 	readonly input: unknown;
 	readonly missing?: readonly (readonly (string | number)[])[];
-	readonly execution?: SpeculativeExecution;
 	readonly diagnostic?: string;
 	/** Expected Actor tool batches before this action; used to schedule execution. */
 	readonly horizon?: number;

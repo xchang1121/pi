@@ -17,9 +17,15 @@ import {
 	DEFAULTS,
 	drafterRequestTemperature,
 	normalizeDrafterRequestSettings,
+	normalizeSpeculativeToolSelection,
+	type SpeculativeToolSelectionInput,
 	usageTokenCount,
 } from "./common.ts";
-import type { ExecutionWorldMode } from "./execution-world.ts";
+import {
+	type ExecutionWorldMode,
+	resolveSpeculativeExecutionRoute,
+	type SpeculativeExecutionRoute,
+} from "./execution-world.ts";
 import {
 	acquirePatternAwareStore,
 	asPatternAwareRuntimeContext,
@@ -73,10 +79,8 @@ export interface SpeculativeAgentSettingsInput {
 	readonly resourceCacheMaxBytes?: number;
 	readonly predictionTimeoutMs?: number;
 	readonly patternAware?: Partial<PatternAwareSettings>;
-	readonly tools?: {
-		readonly resourceCached?: readonly string[];
-		readonly sandbox?: readonly string[];
-	};
+	/** Legacy grouped input is accepted only for configuration migration. */
+	readonly tools?: SpeculativeToolSelectionInput;
 }
 
 export interface SpeculativeAgentPreflightContext {
@@ -84,6 +88,7 @@ export interface SpeculativeAgentPreflightContext {
 	readonly toolName: string;
 	readonly args: unknown;
 	readonly action: ActionKey;
+	readonly route: SpeculativeExecutionRoute;
 	readonly signal: AbortSignal;
 }
 
@@ -119,12 +124,12 @@ export interface CreateSpeculativeActionHostOptions {
 	readonly preflight?: (
 		context: SpeculativeAgentPreflightContext,
 	) => boolean | CandidatePreflight | Promise<boolean | CandidatePreflight>;
-	/** Canonical K(a), reuse, projection, versioning, and sandbox policy for this host. */
+	/** Canonical K(a), projection, and resource-version semantics for this host. */
 	readonly actionSemantics?: ActionSemanticsRegistry;
 	/** Lossless Π rules; each rule owns key relation, realized coverage, and output reconstruction. */
 	readonly projectionRules?: readonly ActionProjectionRule<ToolSettlement>[];
-	/** Required capability for every tool configured under tools.sandbox. */
-	readonly sandbox?: SpeculativeAgentSandbox;
+	/** Ordered execution capabilities. A runtime-wide sandbox takes precedence over local fallbacks. */
+	readonly executionWorlds?: readonly SpeculativeAgentSandbox[];
 	/** Optional persistence root for workspace-hashed PatternAware state. */
 	readonly patternStateDirectory?: string;
 	/** Stable logical workspace identity when physical checkout paths are ephemeral. */
@@ -192,10 +197,9 @@ export function createSpeculativeActionHost(
 ): SpeculativeActionHost {
 	const actionSemantics = options.actionSemantics ?? PI_ACTION_SEMANTICS;
 	const projectionRules = (options.projectionRules ?? []).filter((rule) => actionSemantics.supportsProjector(rule.id));
-	const executionWorldMode = (tool: string): ExecutionWorldMode | undefined => {
-		const mode = actionSemantics.sandboxMode(tool);
-		return mode === "file_mutation" || mode === "workspace_snapshot" ? mode : undefined;
-	};
+	const executionWorlds = [...new Set(options.executionWorlds ?? [])];
+	const resolveExecutionRoute = (tool: string) =>
+		resolveSpeculativeExecutionRoute(actionSemantics.localIsolation(tool), executionWorlds);
 	const patternActionSemantics = {
 		namespace: "pi-action-semantics-v1",
 		actionKey: (tool: string, input: Readonly<Record<string, unknown>>, schemaHash?: string) =>
@@ -241,10 +245,7 @@ export function createSpeculativeActionHost(
 				...drafter,
 				patternAware: patternAwareSettings(settings.patternAware ?? PATTERN_AWARE_DEFAULTS),
 			},
-			tools: {
-				resourceCached: normalizeStringArray(settings.tools?.resourceCached, DEFAULTS.tools.resourceCached),
-				sandbox: normalizeStringArray(settings.tools?.sandbox, DEFAULTS.tools.sandbox),
-			},
+			tools: normalizeSpeculativeToolSelection(settings.tools, actionSemantics.toolNames()),
 		};
 	};
 	const sourcePatternSettings = (settings: SpeculativeActionSettings): PatternAwareSettings =>
@@ -290,26 +291,18 @@ export function createSpeculativeActionHost(
 			// Persistence failure must not change Agent lifecycle semantics.
 		}
 	};
-	const prepareSandbox = async (
-		tools: readonly string[],
-		signal?: AbortSignal,
-		routeContexts?: readonly ToolInvocation[],
-	): Promise<void> => {
-		const modes = [
-			...new Set(
-				tools.flatMap((tool) => {
-					const mode = executionWorldMode(tool);
-					return mode && options.sandbox?.supports(mode) ? [mode] : [];
-				}),
-			),
-		];
-		if (!modes.length) return;
-		await options.sandbox?.prepare?.({
-			cwd: options.cwd,
-			modes,
-			...(routeContexts?.length ? { routeContexts } : {}),
-			...(signal ? { signal } : {}),
-		});
+	const prepareExecutionWorlds = async (tools: readonly string[], signal?: AbortSignal): Promise<void> => {
+		const preparations = new Map<SpeculativeAgentSandbox, Set<ExecutionWorldMode>>();
+		for (const route of await Promise.all([...new Set(tools)].map(resolveExecutionRoute))) {
+			if (!route || route.isolation === "resource_snapshot") continue;
+			const world = routeWorld(route);
+			const modes = preparations.get(world) ?? new Set<ExecutionWorldMode>();
+			modes.add(route.isolation);
+			preparations.set(world, modes);
+		}
+		await Promise.all(
+			[...preparations].map(([world, modes]) => prepareWorld(world, options.cwd, [...modes], signal)),
+		);
 	};
 	type AgentPlanSource = SpeculativePlanSource<
 		string,
@@ -673,22 +666,11 @@ export function createSpeculativeActionHost(
 			}
 			if (!tool) return undefined;
 			let invocation: ToolInvocation | undefined;
-			let worldFingerprint: string | undefined;
 			try {
 				invocation = await options.resolveInvocation?.(toolName, validated);
 			} catch {
 				return undefined;
 			}
-			const mode = actionSemantics.sandboxMode(toolName);
-			if (mode && mode !== "none" && options.sandbox?.fingerprint) {
-				try {
-					worldFingerprint = await options.sandbox.fingerprint(mode, invocation);
-				} catch {
-					worldFingerprint = undefined;
-				}
-			}
-			const routedInvocation =
-				invocation && worldFingerprint ? { ...invocation, isolationFingerprint: worldFingerprint } : invocation;
 			const schemaHash =
 				context.type === "consume" ? stableHash(tool.parameters ?? null) : context.data.schemaHashes[toolName];
 			return actionSemantics.buildKey(
@@ -696,54 +678,29 @@ export function createSpeculativeActionHost(
 				validated,
 				options.cwd,
 				schemaHash,
-				routedInvocation || worldFingerprint
+				invocation
 					? {
-							fingerprint: stableHash({ invocation: routedInvocation ?? null, world: worldFingerprint ?? null }),
-							...(routedInvocation ? { context: routedInvocation } : {}),
+							fingerprint: stableHash(invocation),
+							context: invocation,
 						}
 					: undefined,
 			);
 		},
+		resolveExecution: ({ tool }) => resolveExecutionRoute(tool),
 		actual: (input) => ({ id: input.id, tool: input.tool, input: input.args }),
-		preflightCandidate: async ({ data, tool: toolName, concrete, action, callID, signal }) => {
+		preflightCandidate: async ({ data, tool: toolName, concrete, action, route, callID, signal }) => {
 			const tool = data.tools.get(toolName);
 			if (!tool || !options.preflight) return { ok: false, reason: "permission_or_policy" };
 			const args = validateCandidateArguments(tool, toolName, concrete, callID);
 			if (args === undefined) return { ok: false, reason: "invalid_tool_call_input" };
-			const mode = executionWorldMode(toolName);
-			if (action.execution === "sandbox" && (!mode || !options.sandbox?.supports(mode))) {
-				return { ok: false, reason: "sandbox_unavailable" };
-			}
-			const processInvocation = asToolInvocation(action.executionContext);
-			if (mode === "workspace_snapshot" && !processInvocation?.process) {
-				return { ok: false, reason: "execution_context_unavailable" };
-			}
-			if (mode === "workspace_snapshot" && !processInvocation?.isolationFingerprint) {
-				return { ok: false, reason: "sandbox_unavailable" };
-			}
-			if (action.execution === "sandbox" && mode && options.sandbox?.fingerprint) {
-				try {
-					const invocation = asToolInvocation(action.executionContext);
-					const actualFingerprint = await options.sandbox.fingerprint(mode, invocation);
-					if (invocation?.isolationFingerprint && invocation.isolationFingerprint !== actualFingerprint) {
-						return { ok: false, reason: "sandbox_backend_changed" };
-					}
-				} catch (error) {
-					return {
-						ok: false,
-						reason: "sandbox_unavailable",
-						detail: error instanceof Error ? error.message : String(error),
-					};
-				}
-			}
-			const result = await options.preflight({ tool, toolName, args, action, signal });
+			const result = await options.preflight({ tool, toolName, args, action, route, signal });
 			return typeof result === "boolean"
 				? result
 					? { ok: true }
 					: { ok: false, reason: "permission_or_policy" }
 				: result;
 		},
-		authorizeCandidate: async ({ stateData, tool: toolName, concrete, action, signal }) => {
+		authorizeCandidate: async ({ stateData, tool: toolName, concrete, action, route, signal }) => {
 			const tool = stateData.tools.get(toolName);
 			if (!tool || !options.preflight) return { ok: false, reason: "permission_or_policy_changed" };
 			const args = validateCandidateArguments(tool, toolName, concrete, "spec_authorize");
@@ -753,6 +710,7 @@ export function createSpeculativeActionHost(
 				toolName,
 				args,
 				action,
+				route,
 				signal: signal ?? new AbortController().signal,
 			});
 			if (typeof result === "boolean") {
@@ -760,22 +718,20 @@ export function createSpeculativeActionHost(
 			}
 			return result.ok ? result : { ...result, reason: "permission_or_policy_changed" };
 		},
-		executeCandidate: async ({ data, tool: toolName, concrete, action, callID, signal, parentWorld }) => {
+		executeCandidate: async ({ data, tool: toolName, concrete, action, route, callID, signal, parentWorld }) => {
 			const tool = data.tools.get(toolName);
 			if (!tool) return errorSettlement(`Tool ${toolName} not found`);
 			const args = validateCandidateArguments(tool, toolName, concrete, callID);
 			if (args === undefined) return errorSettlement(`Invalid arguments for tool ${toolName}`);
-			if (action.execution === "sandbox") {
-				const mode = executionWorldMode(toolName);
-				if (!mode || !options.sandbox?.supports(mode)) throw new Error(`Sandbox unavailable for tool ${toolName}`);
-				const branch = await options.sandbox.fork({
-					mode,
+			if (route.isolation !== "resource_snapshot") {
+				const world = routeWorld(route);
+				const branch = await world.fork({
+					mode: route.isolation,
 					cwd: options.cwd,
 					tool,
 					toolName,
 					args,
 					action,
-					invocation: asToolInvocation(action.executionContext),
 					callID,
 					signal,
 					...(parentWorld?.checkpoint ? { parentCheckpoint: parentWorld.checkpoint } : {}),
@@ -796,16 +752,17 @@ export function createSpeculativeActionHost(
 		watchResourceVersion: ({ candidate, onInvalidated }) =>
 			watchResourceVersion(candidate.resourceVersion, onInvalidated),
 		projectionRules,
-		prepareCandidate: async ({ candidate, action, signal }) => {
-			if (candidate.execution !== "sandbox" && actionSemantics.execution(candidate.tool) !== "sandbox") return;
-			const mode = executionWorldMode(candidate.tool);
-			if (!mode || !options.sandbox?.supports(mode)) throw new Error(`Sandbox unavailable for ${candidate.tool}`);
-			const invocation = asToolInvocation(action?.executionContext);
-			await prepareSandbox([candidate.tool], signal, invocation ? [invocation] : undefined);
+		prepareCandidate: async ({ candidate, route, signal }) => {
+			if (!route) {
+				await prepareExecutionWorlds([candidate.tool], signal);
+				return;
+			}
+			if (route.isolation === "resource_snapshot") return;
+			await prepareWorld(routeWorld(route), options.cwd, [route.isolation], signal);
 		},
 		onTurnStarted: async ({ startInput, settings, signal }) => {
 			authoritativeBatches.delete(authoritativeBatchKey(startInput.sessionID, startInput.turnID));
-			void prepareSandbox(settings.tools.sandbox, signal).catch(() => {
+			void prepareExecutionWorlds(settings.tools, signal).catch(() => {
 				// Turn warm-up is best-effort; concrete candidate preparation retries it.
 			});
 			if (!sourcePatternSettings(settings).enabled) return;
@@ -868,20 +825,11 @@ export function createSpeculativeActionHost(
 						}
 					}
 				} finally {
-					try {
-						await options.sandbox?.dispose?.();
-					} catch {
-						// Sandbox resource cleanup must not change Agent uninstall semantics.
-					}
+					await Promise.allSettled(executionWorlds.map((world) => world.dispose?.()));
 				}
 			}
 		},
 	};
-}
-
-function asToolInvocation(value: unknown): ToolInvocation | undefined {
-	if (!value || typeof value !== "object" || typeof (value as { executor?: unknown }).executor !== "string") return;
-	return value as ToolInvocation;
 }
 
 function validateCandidateArguments(
@@ -981,6 +929,19 @@ function normalizePositiveInteger(value: unknown, fallback: number): number {
 	return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
 }
 
-function normalizeStringArray(value: unknown, fallback: readonly string[]): readonly string[] {
-	return Array.isArray(value) && value.every((item): item is string => typeof item === "string") ? value : fallback;
+function routeWorld(route: SpeculativeExecutionRoute): SpeculativeAgentSandbox {
+	const world = route.context as SpeculativeAgentSandbox | undefined;
+	if (!world || !world.supports(route.isolation as ExecutionWorldMode)) {
+		throw new Error(`Execution world ${route.backend} is unavailable for ${route.isolation}`);
+	}
+	return world;
+}
+
+async function prepareWorld(
+	world: SpeculativeAgentSandbox,
+	cwd: string,
+	modes: readonly ExecutionWorldMode[],
+	signal?: AbortSignal,
+): Promise<void> {
+	await world.prepare?.({ cwd, modes, ...(signal ? { signal } : {}) });
 }

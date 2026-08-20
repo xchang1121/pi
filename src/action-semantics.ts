@@ -1,10 +1,11 @@
 import path from "node:path";
 
-export type SpeculativeExecution = "resource_cached" | "sandbox";
+/** Isolation selected for one speculative attempt, independent of action identity. */
+export type SpeculativeExecution = "runtime_sandbox" | "resource_snapshot" | "file_mutation";
 export type ActionReuseKind = "shared_result" | "exclusive_branch";
-export type ResourceVersionPolicy = "resources" | "workspace" | "actor_time";
+export type ResourceVersionPolicy = "resources" | "actor_time" | "none";
 export type ResourceDependencyScope = "content" | "tree_entries" | "tree_query" | "tree_content";
-export type SandboxActionMode = "none" | "workspace_snapshot" | "file_mutation";
+export type LocalIsolationMechanism = Exclude<SpeculativeExecution, "runtime_sandbox"> | "none";
 
 export interface ReadActionRange {
 	readonly path: string;
@@ -19,7 +20,6 @@ export interface ActionKey {
 	readonly tool: string;
 	readonly input: Readonly<Record<string, unknown>>;
 	readonly resources: readonly string[];
-	readonly execution: SpeculativeExecution;
 	/** Version of the canonicalization and execution contract, independent of the input schema. */
 	readonly semanticsEpoch: string;
 	/** Stable hash of the validated input schema used by both producer and consumer. */
@@ -61,7 +61,6 @@ export type ActionKeyMatch = ExactActionKeyMatch | ProjectedActionKeyMatch;
 
 export type ActionKeyMismatchReason =
 	| "different_tool"
-	| "different_execution"
 	| "different_semantics"
 	| "different_schema"
 	| "different_executor"
@@ -76,17 +75,16 @@ export interface CanonicalAction {
 export interface ActionSemanticsDefinition {
 	readonly tool: string;
 	readonly epoch: string;
-	readonly execution: SpeculativeExecution;
-	readonly reuse: ActionReuseKind;
+	/** Safe host-local fallback when no runtime-wide sandbox is available. */
+	readonly localIsolation: LocalIsolationMechanism;
 	readonly resourceVersion: ResourceVersionPolicy;
 	/** Filesystem evidence required to prove that a completed action is still current. */
 	readonly resourceScope?: ResourceDependencyScope;
-	readonly sandboxMode: SandboxActionMode;
 	readonly canonicalize: (input: unknown, cwd: string) => CanonicalAction | undefined;
 	readonly projectors?: readonly ActionKeyProjector[];
 }
 
-/** Immutable source of truth for K(a), reuse, projection, versioning, and sandbox policy. */
+/** Immutable source of truth for K(a), projection, resource evidence, and safe local fallback capability. */
 export class ActionSemanticsRegistry {
 	private readonly definitionsByTool = new Map<string, ActionSemanticsDefinition>();
 	private readonly projectorsByID = new Map<string, ActionKeyProjector>();
@@ -120,18 +118,14 @@ export class ActionSemanticsRegistry {
 		return this.definitionsByTool.get(tool);
 	}
 
-	toolNames(execution?: SpeculativeExecution): readonly string[] {
+	toolNames(localIsolation?: LocalIsolationMechanism): readonly string[] {
 		return [...this.definitionsByTool.values()]
-			.filter((definition) => execution === undefined || definition.execution === execution)
+			.filter((definition) => localIsolation === undefined || definition.localIsolation === localIsolation)
 			.map((definition) => definition.tool);
 	}
 
-	execution(tool: string): SpeculativeExecution | undefined {
-		return this.definition(tool)?.execution;
-	}
-
-	reuse(tool: string): ActionReuseKind | undefined {
-		return this.definition(tool)?.reuse;
+	localIsolation(tool: string): LocalIsolationMechanism {
+		return this.definition(tool)?.localIsolation ?? "none";
 	}
 
 	resourceVersionPolicy(tool: string): ResourceVersionPolicy | undefined {
@@ -142,13 +136,8 @@ export class ActionSemanticsRegistry {
 		return this.definition(tool)?.resourceScope;
 	}
 
-	sandboxMode(tool: string): SandboxActionMode | undefined {
-		return this.definition(tool)?.sandboxMode;
-	}
-
 	requiresRuntimeResourceVersion(tool: string): boolean {
-		const policy = this.resourceVersionPolicy(tool);
-		return policy === "resources" || policy === "workspace";
+		return this.resourceVersionPolicy(tool) === "resources";
 	}
 
 	watchesResourceVersion(tool: string): boolean {
@@ -181,7 +170,6 @@ export class ActionSemanticsRegistry {
 		if (!canonical || !canonical.resources.every((resource) => typeof resource === "string")) return undefined;
 		return buildActionKey({
 			tool,
-			execution: definition.execution,
 			resources: canonical.resources,
 			input: canonical.input,
 			schemaHash,
@@ -225,71 +213,58 @@ export const PI_ACTION_SEMANTICS = new ActionSemanticsRegistry([
 	{
 		tool: "read",
 		epoch: "pi.read.v2",
-		execution: "resource_cached",
-		reuse: "shared_result",
+		localIsolation: "resource_snapshot",
 		resourceVersion: "resources",
 		resourceScope: "content",
-		sandboxMode: "none",
 		canonicalize: canonicalRead,
 		projectors: [READ_RANGE_ACTION_KEY_PROJECTOR],
 	},
 	{
 		tool: "grep",
 		epoch: "pi.grep.v2",
-		execution: "resource_cached",
-		reuse: "shared_result",
+		localIsolation: "resource_snapshot",
 		resourceVersion: "resources",
 		resourceScope: "tree_content",
-		sandboxMode: "none",
 		canonicalize: canonicalGrep,
 	},
 	{
 		tool: "find",
 		epoch: "pi.find.v2",
-		execution: "resource_cached",
-		reuse: "shared_result",
+		localIsolation: "resource_snapshot",
 		resourceVersion: "resources",
 		resourceScope: "tree_query",
-		sandboxMode: "none",
 		canonicalize: canonicalFind,
 	},
 	{
 		tool: "bash",
-		epoch: "pi.bash.v1",
-		execution: "sandbox",
-		reuse: "exclusive_branch",
-		resourceVersion: "workspace",
-		resourceScope: "tree_content",
-		sandboxMode: "workspace_snapshot",
+		epoch: "pi.bash.v2",
+		localIsolation: "none",
+		resourceVersion: "none",
 		canonicalize: canonicalBash,
 	},
 	{
 		tool: "write",
 		epoch: "pi.write.v1",
-		execution: "sandbox",
-		reuse: "exclusive_branch",
+		localIsolation: "file_mutation",
 		resourceVersion: "actor_time",
-		sandboxMode: "file_mutation",
 		canonicalize: canonicalWrite,
 	},
 	{
 		tool: "edit",
 		epoch: "pi.edit.v1",
-		execution: "sandbox",
-		reuse: "exclusive_branch",
+		localIsolation: "file_mutation",
 		resourceVersion: "actor_time",
-		sandboxMode: "file_mutation",
 		canonicalize: canonicalEdit,
 	},
 ]);
 
-export const IDEMPOTENT_ACTION_TOOLS = Object.freeze(PI_ACTION_SEMANTICS.toolNames("resource_cached"));
-export const SANDBOX_ACTION_TOOLS = Object.freeze(PI_ACTION_SEMANTICS.toolNames("sandbox"));
+export const RESOURCE_SNAPSHOT_ACTION_TOOLS = Object.freeze(PI_ACTION_SEMANTICS.toolNames("resource_snapshot"));
+export const FILE_MUTATION_ACTION_TOOLS = Object.freeze(PI_ACTION_SEMANTICS.toolNames("file_mutation"));
+export const NO_LOCAL_ISOLATION_ACTION_TOOLS = Object.freeze(PI_ACTION_SEMANTICS.toolNames("none"));
 export const KEYABLE_TOOLS = Object.freeze(PI_ACTION_SEMANTICS.toolNames());
 
 export function buildActionKey(input: {
 	readonly tool: string;
-	readonly execution: SpeculativeExecution;
 	readonly resources: readonly string[];
 	readonly input: Readonly<Record<string, unknown>>;
 	readonly schemaHash?: string;
@@ -303,7 +278,6 @@ export function buildActionKey(input: {
 	const canonicalInput = freezeCanonicalValue(structuredClone(input.input));
 	const key = stableStringify({
 		tool: input.tool,
-		execution: input.execution,
 		semanticsEpoch,
 		schemaHash,
 		executionFingerprint,
@@ -315,7 +289,6 @@ export function buildActionKey(input: {
 		tool: input.tool,
 		input: canonicalInput,
 		resources: Object.freeze([...input.resources]),
-		execution: input.execution,
 		semanticsEpoch,
 		schemaHash,
 		executionFingerprint,
@@ -378,7 +351,6 @@ export function actionKeyMatch(
 	if (speculative.key === actor.key) return { kind: "exact", distance: 0 };
 	if (
 		speculative.tool !== actor.tool ||
-		speculative.execution !== actor.execution ||
 		speculative.semanticsEpoch !== actor.semanticsEpoch ||
 		speculative.schemaHash !== actor.schemaHash ||
 		speculative.executionFingerprint !== actor.executionFingerprint
@@ -409,7 +381,6 @@ export function actionKeyMismatchReason(
 ): ActionKeyMismatchReason | undefined {
 	if (actionKeyMatch(speculative, actor, projectors)) return undefined;
 	if (speculative.tool !== actor.tool) return "different_tool";
-	if (speculative.execution !== actor.execution) return "different_execution";
 	if (speculative.semanticsEpoch !== actor.semanticsEpoch) return "different_semantics";
 	if (speculative.schemaHash !== actor.schemaHash) return "different_schema";
 	if (speculative.executionFingerprint !== actor.executionFingerprint) return "different_executor";
@@ -466,20 +437,8 @@ export function normalizeRelativeRoot(value: unknown, cwd: string): string | und
 	return normalizeWorkspacePath(value ?? ".", cwd);
 }
 
-export function inferredExecution(tool: string): SpeculativeExecution | undefined {
-	return PI_ACTION_SEMANTICS.execution(tool);
-}
-
-export function isIdempotentAction(tool: string): boolean {
-	return PI_ACTION_SEMANTICS.reuse(tool) === "shared_result";
-}
-
-export function isAdoptableSandboxAction(tool: string): boolean {
-	return PI_ACTION_SEMANTICS.sandboxMode(tool) === "file_mutation";
-}
-
-export function isObservableSandboxAction(tool: string): boolean {
-	return PI_ACTION_SEMANTICS.sandboxMode(tool) === "workspace_snapshot";
+export function inferredLocalIsolation(tool: string): LocalIsolationMechanism {
+	return PI_ACTION_SEMANTICS.localIsolation(tool);
 }
 
 export function normalizeReadOffset(value: unknown): number {
@@ -605,7 +564,6 @@ function readProjectionPartition(action: ActionKey): string | undefined {
 	const range = readActionRange(action);
 	if (!range) return undefined;
 	return JSON.stringify([
-		action.execution,
 		action.semanticsEpoch,
 		action.schemaHash,
 		action.executionFingerprint,
@@ -615,30 +573,20 @@ function readProjectionPartition(action: ActionKey): string | undefined {
 }
 
 function assertDefinitionCoherence(definition: ActionSemanticsDefinition): void {
-	if (definition.execution === "resource_cached") {
-		if (definition.reuse !== "shared_result") {
-			throw new Error(`resource-cached action ${definition.tool} must use shared_result reuse`);
-		}
-		if (
-			definition.resourceVersion !== "resources" ||
-			definition.resourceScope === undefined ||
-			definition.sandboxMode !== "none"
-		) {
-			throw new Error(`resource-cached action ${definition.tool} has incoherent version or sandbox policy`);
+	if (definition.localIsolation === "none") {
+		if (definition.resourceVersion !== "none" || definition.resourceScope !== undefined) {
+			throw new Error(`action ${definition.tool} without local isolation has local version state`);
 		}
 		return;
 	}
-	if (definition.reuse !== "exclusive_branch") {
-		throw new Error(`sandbox action ${definition.tool} must use exclusive_branch reuse`);
+	if (definition.localIsolation === "resource_snapshot") {
+		if (definition.resourceVersion !== "resources" || definition.resourceScope === undefined) {
+			throw new Error(`resource-snapshot action ${definition.tool} requires resource evidence`);
+		}
+		return;
 	}
-	if (
-		(definition.resourceVersion === "workspace" &&
-			(definition.resourceScope !== "tree_content" || definition.sandboxMode !== "workspace_snapshot")) ||
-		(definition.resourceVersion === "actor_time" &&
-			(definition.resourceScope !== undefined || definition.sandboxMode !== "file_mutation")) ||
-		definition.resourceVersion === "resources"
-	) {
-		throw new Error(`sandbox action ${definition.tool} has incoherent version or sandbox policy`);
+	if (definition.resourceVersion !== "actor_time" || definition.resourceScope !== undefined) {
+		throw new Error(`file-mutation action ${definition.tool} must validate at commit time`);
 	}
 }
 

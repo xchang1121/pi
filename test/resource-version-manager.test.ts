@@ -130,14 +130,14 @@ describe("speculative action resource versions", () => {
 
 	test("derives custom-tool resource evidence from action semantics rather than tool names", async () => {
 		const root = await workspace();
-		const bash = PI_ACTION_SEMANTICS.definition("bash");
+		const grep = PI_ACTION_SEMANTICS.definition("grep");
 		const write = PI_ACTION_SEMANTICS.definition("write");
-		if (!bash || !write) throw new Error("Pi sandbox semantics unavailable");
+		if (!grep || !write) throw new Error("Pi resource semantics unavailable");
 		const semantics = new ActionSemanticsRegistry([
-			{ ...bash, tool: "custom_process", epoch: "test.custom-process.v1" },
+			{ ...grep, tool: "custom_query", epoch: "test.custom-query.v1" },
 			{ ...write, tool: "custom_write", epoch: "test.custom-write.v1" },
 		]);
-		const processAction = semantics.buildKey("custom_process", { command: "echo ok" }, root);
+		const processAction = semantics.buildKey("custom_query", { pattern: "ok", path: "." }, root);
 		const writeAction = semantics.buildKey("custom_write", { path: "out.txt", content: "ok" }, root);
 		if (!processAction || !writeAction) throw new Error("custom action key unavailable");
 
@@ -198,12 +198,11 @@ describe("speculative action resource versions", () => {
 		expect(path.resolve(await invalidated)).toBe(path.resolve(file));
 	});
 
-	test("releases an unwatched sandbox token and retires its workspace manager", async () => {
+	test("releases an unwatched token and retires its workspace manager", async () => {
 		const root = await workspace();
 		await fs.writeFile(path.join(root, "value.txt"), "one\n");
 		const key = buildActionKey({
 			tool: "bash",
-			execution: "sandbox",
 			resources: ["."],
 			input: { command: "cat value.txt" },
 		});
@@ -216,11 +215,10 @@ describe("speculative action resource versions", () => {
 		releaseResourceVersion(second);
 	});
 
-	test("keeps a shared manager alive until every unwatched sandbox token is released", async () => {
+	test("keeps a shared manager alive until every unwatched token is released", async () => {
 		const root = await workspace();
 		const key = buildActionKey({
 			tool: "bash",
-			execution: "sandbox",
 			resources: ["."],
 			input: { command: "echo test" },
 		});
@@ -239,7 +237,6 @@ describe("speculative action resource versions", () => {
 function action(tool: "read" | "grep" | "find", resources: ReadonlyArray<string>) {
 	return buildActionKey({
 		tool,
-		execution: "resource_cached",
 		resources,
 		input: tool === "read" ? { path: resources[0] } : { path: resources[0], pattern: "*" },
 	});

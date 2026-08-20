@@ -29,17 +29,10 @@ import {
 	formatSpeculativeActionStatus,
 	resolveSpeculativeDraftModel,
 	type SpeculativeActionMetrics,
-	type SpeculativeSandboxHealth,
 	type SpeculativeSettingsStore,
 } from "../src/extension.ts";
-import type { OciSetupService } from "../src/oci-setup.ts";
 import type { SpeculativeActionPackageSettings } from "../src/settings-store.ts";
 import { emptySpeculativeTraceSummary } from "../src/trace-summary.ts";
-import {
-	createSandboxBackendRouter,
-	type SandboxProcessBackend,
-	type SandboxProcessBackendStatus,
-} from "../src/workspace-sandbox.ts";
 
 const roots: string[] = [];
 
@@ -136,7 +129,6 @@ describe("zero-modification Pi extension", () => {
 			const agentDir = path.join(cwd, "agent");
 			await mkdir(agentDir, { recursive: true });
 			const host = mockHost();
-			const native = fakeBackend(readyNative());
 			const customExecute = vi.fn(async () => ({
 				content: [{ type: "text" as const, text: "custom read" }],
 				details: undefined,
@@ -146,8 +138,7 @@ describe("zero-modification Pi extension", () => {
 			const speculativeExtension = createSpeculativeActionExtension({
 				createHost: () => host,
 				createSettingsStore: () => memorySettingsStore(),
-				createBackendRouter: () => backendRouter(native, native),
-				createSandbox: () => ({ supports: () => false, fork: vi.fn(), dispose: vi.fn() }),
+				createExecutionWorlds: () => [],
 			});
 			const extensionFactories =
 				position === "before" ? [customExtension, speculativeExtension] : [speculativeExtension, customExtension];
@@ -230,67 +221,22 @@ describe("zero-modification Pi extension", () => {
 		expect(result?.content).toEqual([{ type: "text", text: "authoritative" }]);
 	});
 
-	it("shows configured, active, OCI, and native state separately", () => {
-		const health = sandboxHealth(unavailable("docker missing"), readyNative());
+	it("states the unified execution boundary without claiming a bundled process sandbox", () => {
 		const status = formatSpeculativeActionStatus({
 			settings: effectiveSettings(),
 			metrics: emptyMetrics(),
-			health,
 		});
-		const nativeLabel =
-			process.platform === "win32"
-				? "Windows AppContainer"
-				: process.platform === "darwin"
-					? "macOS native sandbox"
-					: "Linux native sandbox";
 
-		expect(status).toContain("Configured isolation: auto");
-		expect(status).toContain(`Session isolation: auto; active: ${nativeLabel} ready`);
-		expect(status).toContain("OCI worker: unavailable (none): docker missing");
-		expect(status).toContain(`Native sandbox: ${nativeLabel} ready`);
+		expect(status).toContain("Prediction tools: read write edit bash");
+		expect(status).toContain(
+			"Execution boundary: runtime sandbox first; resource snapshots or Git worktrees second; otherwise Actor fallback",
+		);
+		expect(status).not.toMatch(/OCI|AppContainer|Docker|Podman/);
 		expect(status).toContain("Execution ahead: 0ms; hit latency: 0ms; attempt lead: 0ms; Actor execution: 0ms");
-		expect(status).not.toContain("Saved:");
-		expect(status).not.toContain("End-to-end speedup");
 	});
 
-	it("does not offer OCI installation while the native fallback is ready", async () => {
-		const discover = vi.fn(async () => []);
-		const fixture = await createFixture({
-			oci: unavailable("docker missing"),
-			native: readyNative(),
-			ociSetup: { discover, setup: vi.fn() },
-		});
-		await fixture.emit("session_start", {}, fixture.context);
-
-		await fixture.commands.get("speculative-action")?.handler("on", fixture.context as ExtensionCommandContext);
-
-		expect(discover).not.toHaveBeenCalled();
-		expect(fixture.ui.notify).toHaveBeenLastCalledWith("Speculative action enabled.", "info");
-	});
-
-	it("does not offer OCI installation for an unavailable explicitly configured native session", async () => {
-		const discover = vi.fn(async () => []);
-		const fixture = await createFixture({
-			oci: { ...readyNative(), backend: "container", detail: "container ready" },
-			native: unavailable("native broker missing"),
-			ociSetup: { discover, setup: vi.fn() },
-		});
-		fixture.store.setEffective({ enabled: false, isolation: { backend: "native" } });
-		await fixture.emit("session_start", {}, fixture.context);
-
-		await fixture.commands.get("speculative-action")?.handler("on", fixture.context as ExtensionCommandContext);
-
-		expect(discover).not.toHaveBeenCalled();
-		expect(fixture.ui.notify).toHaveBeenCalledWith("Native sandbox is unavailable: native broker missing", "warning");
-	});
-
-	it("keeps the TUI hierarchical and offers OCI repair even when native fallback is ready", async () => {
-		const discover = vi.fn(async () => []);
-		const fixture = await createFixture({
-			oci: unavailable("docker missing"),
-			native: readyNative(),
-			ociSetup: { discover, setup: vi.fn() },
-		});
+	it("keeps tool execution policy hierarchical and explains the fallback boundary", async () => {
+		const fixture = await createFixture();
 		const menus = new Map<string, string[]>();
 		const visits = new Map<string, number>();
 		fixture.ui.select = async (title, options) => {
@@ -298,12 +244,12 @@ describe("zero-modification Pi extension", () => {
 			const visit = visits.get(title) ?? 0;
 			visits.set(title, visit + 1);
 			if (title === "Speculative action" && visit === 0) {
-				return options.find((option) => option.startsWith("Tools & sandbox"));
+				return options.find((option) => option.startsWith("Tools & execution"));
 			}
-			if (title === "Tools & sandbox" && visit === 0) return "Install or repair OCI dependencies";
-			if (title === "Tools & sandbox") return "Back";
+			if (title === "Tools & execution" && visit === 0) return "Execution guarantees";
+			if (title === "Tools & execution") return "Back";
 			if (title === "Speculative action") return "Close";
-			return "Skip for now";
+			return undefined;
 		};
 		await fixture.emit("session_start", {}, fixture.context);
 		const command = fixture.commands.get("speculative-action");
@@ -313,22 +259,17 @@ describe("zero-modification Pi extension", () => {
 			expect.arrayContaining([
 				expect.stringMatching(/^Prediction sources/),
 				expect.stringMatching(/^Scheduling & cache/),
-				expect.stringMatching(/^Tools & sandbox/),
+				expect.stringMatching(/^Tools & execution/),
 			]),
 		);
-		expect(menus.get("Tools & sandbox")).toEqual(
-			expect.arrayContaining([
-				expect.stringMatching(/^Active backend:/),
-				expect.stringMatching(/^OCI worker:/),
-				expect.stringMatching(/^Native sandbox:/),
-				"Install or repair OCI dependencies",
-			]),
+		expect(menus.get("Tools & execution")).toEqual(
+			expect.arrayContaining([expect.stringMatching(/^Tool policy/), "Execution guarantees"]),
 		);
-		expect(discover).toHaveBeenCalledOnce();
+		expect(fixture.ui.notify).toHaveBeenCalledWith(expect.stringContaining("runtime-wide sandbox"), "info");
 	});
 
 	it("exposes Drafter request policy in the Drafter submenu", async () => {
-		const fixture = await createFixture({ oci: unavailable("docker missing"), native: readyNative() });
+		const fixture = await createFixture();
 		const menus = new Map<string, string[]>();
 		const visits = new Map<string, number>();
 		fixture.ui.select = async (title, options) => {
@@ -361,9 +302,6 @@ describe("zero-modification Pi extension", () => {
 
 interface FixtureOptions {
 	readonly consume?: SpeculativeActionHost["consume"];
-	readonly oci?: SandboxProcessBackendStatus;
-	readonly native?: SandboxProcessBackendStatus;
-	readonly ociSetup?: OciSetupService;
 	readonly overriddenTools?: readonly string[];
 }
 
@@ -428,10 +366,6 @@ async function createFixture(options: FixtureOptions = {}) {
 		thinkingLevel: "off",
 	} as unknown as ExtensionContext;
 	const store = memorySettingsStore();
-	const ociStatus = options.oci ?? unavailable("not installed");
-	const nativeStatus = options.native ?? readyNative();
-	const oci = fakeBackend(ociStatus);
-	const native = fakeBackend(nativeStatus);
 	const pi = {
 		on: (event: string, handler: (event: never, context: ExtensionContext) => unknown) => {
 			handlers.set(event, [...(handlers.get(event) ?? []), handler]);
@@ -453,9 +387,7 @@ async function createFixture(options: FixtureOptions = {}) {
 	const factory = createSpeculativeActionExtension({
 		createHost: () => host,
 		createSettingsStore: () => store,
-		createBackendRouter: (settings) => backendRouter(oci, native, settings.isolation.backend),
-		createSandbox: () => ({ supports: () => false, fork: vi.fn(), dispose: vi.fn() }),
-		ociSetup: options.ociSetup,
+		createExecutionWorlds: () => [],
 	});
 	await factory(pi);
 	const emit = async (event: string, payload: object, eventContext: ExtensionContext) => {
@@ -480,6 +412,7 @@ function mockHost(consume: SpeculativeActionHost["consume"] = async () => undefi
 				pendingPredictions: 0,
 				deferredPlanActions: 0,
 				activePlanActions: 0,
+				executionBlockedPlanActions: 0,
 				blockedPlanActions: 0,
 			}),
 		} as unknown as SpeculativeActionHost["runtime"],
@@ -512,48 +445,6 @@ function memorySettingsStore(): SpeculativeSettingsStore {
 		},
 		flush: async () => undefined,
 	};
-}
-
-function fakeBackend(status: SandboxProcessBackendStatus): SandboxProcessBackend {
-	return {
-		check: vi.fn(async () => status),
-		fingerprint: vi.fn(async () => status.fingerprint ?? status.detail),
-		prepare: vi.fn(),
-		open: vi.fn(),
-		dispose: vi.fn(),
-	};
-}
-
-function unavailable(detail: string): SandboxProcessBackendStatus {
-	return { backend: "workspace", state: "unavailable", source: "none", detail };
-}
-
-function readyNative(): SandboxProcessBackendStatus {
-	return {
-		backend: "native",
-		state: "ready",
-		source: "prebuilt",
-		detail: "Windows AppContainer is ready",
-		fingerprint: "native:test",
-	};
-}
-
-function sandboxHealth(
-	oci: SandboxProcessBackendStatus,
-	native: SandboxProcessBackendStatus,
-): SpeculativeSandboxHealth {
-	return { configured: "auto", active: native, candidates: { container: oci, native } };
-}
-
-function backendRouter(
-	oci: SandboxProcessBackend,
-	native: SandboxProcessBackend,
-	configured: "auto" | "container" | "native" = "auto",
-) {
-	return createSandboxBackendRouter(configured, [
-		{ id: "container", backend: oci },
-		{ id: "native", backend: native },
-	]);
 }
 
 function textResult(text: string): AgentToolResult<unknown> {
@@ -589,7 +480,6 @@ function effectiveSettings() {
 		resourceCacheMaxEntries: 8,
 		resourceCacheMaxBytes: 1024,
 		predictionTimeoutMs: 1000,
-		isolation: { backend: "auto" as const, runtime: "auto" as const, image: "worker" },
 		patternAware: {
 			enabled: false,
 			multiStepEnabled: true,
@@ -603,7 +493,7 @@ function effectiveSettings() {
 			maxPatterns: 100,
 			minBindingReplayProbability: 0.8,
 		},
-		tools: { resourceCached: ["read"], sandbox: ["bash"] },
+		tools: ["read", "write", "edit", "bash"],
 	};
 }
 

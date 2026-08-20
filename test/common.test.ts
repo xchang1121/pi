@@ -10,7 +10,7 @@ import {
 	actionKeyProjectionPartitions,
 	buildActionKey,
 	buildPiActionKey,
-	inferredExecution,
+	inferredLocalIsolation,
 } from "../src/action-semantics.ts";
 import {
 	buildSingleToolCallPrompt,
@@ -19,6 +19,7 @@ import {
 	DEFAULTS,
 	drafterRequestTemperature,
 	normalizeDrafterRequestSettings,
+	normalizeSpeculativeToolSelection,
 } from "../src/common.ts";
 import { candidateToolNames } from "../src/runtime.ts";
 
@@ -86,7 +87,7 @@ describe("speculative action common", () => {
 		expect(buildPiActionKey("find", { pattern: "**/*.ts", path: "/outside" }, "/workspace")).toBeUndefined();
 	});
 
-	it("builds stable, conflict-sensitive keys for Pi sandbox tools", () => {
+	it("builds stable, conflict-sensitive keys independently of isolation routing", () => {
 		const bash = buildPiActionKey("bash", { command: "npm test", timeout: 30 }, "/workspace/a");
 		const otherCwd = buildPiActionKey("bash", { command: "npm test", timeout: 30 }, "/workspace/b");
 		const write = buildPiActionKey("write", { path: "src/out.ts", content: "one\n" }, "/workspace");
@@ -104,62 +105,56 @@ describe("speculative action common", () => {
 
 		expect(bash).toMatchObject({
 			tool: "bash",
-			execution: "sandbox",
 			resources: [path.resolve("/workspace/a").replaceAll("\\", "/")],
 		});
 		expect(bash?.key).not.toBe(otherCwd?.key);
-		expect(write).toMatchObject({ tool: "write", execution: "sandbox", resources: ["src/out.ts"] });
+		expect(write).toMatchObject({ tool: "write", resources: ["src/out.ts"] });
 		expect(write?.key).not.toBe(otherWrite?.key);
 		expect(edit?.key).toBe(sameEdit?.key);
 		expect(buildPiActionKey("write", { path: "../outside", content: "no" }, "/workspace")).toBeUndefined();
 		expect(buildPiActionKey("edit", { path: "file", edits: [] }, "/workspace")).toBeUndefined();
 	});
 
-	it("namespaces K(a) by execution class and validated schema", () => {
+	it("namespaces K(a) by semantics, executor identity, and validated schema", () => {
 		const base = buildActionKey({
 			tool: "custom",
-			execution: "resource_cached",
 			resources: ["resource"],
 			input: { alpha: 1, beta: 2 },
 			schemaHash: "schema-a",
 		});
 		const reordered = buildActionKey({
 			tool: "custom",
-			execution: "resource_cached",
 			resources: ["resource"],
 			input: { beta: 2, alpha: 1 },
 			schemaHash: "schema-a",
 		});
-		const sandbox = buildActionKey({
+		const nextSemantics = buildActionKey({
 			tool: "custom",
-			execution: "sandbox",
 			resources: ["resource"],
 			input: { alpha: 1, beta: 2 },
 			schemaHash: "schema-a",
+			semanticsEpoch: "custom.v2",
 		});
 		const nextSchema = buildActionKey({
 			tool: "custom",
-			execution: "resource_cached",
 			resources: ["resource"],
 			input: { alpha: 1, beta: 2 },
 			schemaHash: "schema-b",
 		});
 		const implicitSchema = buildActionKey({
 			tool: "custom",
-			execution: "resource_cached",
 			resources: ["resource"],
 			input: { value: 1 },
 		});
 		const explicitEmptySchema = buildActionKey({
 			tool: "custom",
-			execution: "resource_cached",
 			resources: ["resource"],
 			input: { value: 1 },
 			schemaHash: "",
 		});
 
 		expect(reordered.key).toBe(base.key);
-		expect(new Set([base.key, sandbox.key, nextSchema.key]).size).toBe(3);
+		expect(new Set([base.key, nextSemantics.key, nextSchema.key]).size).toBe(3);
 		expect(implicitSchema.key).toBe(explicitEmptySchema.key);
 		expect(base.schemaHash).toBe("schema-a");
 	});
@@ -195,12 +190,13 @@ describe("speculative action common", () => {
 		);
 		const otherSchema = buildPiActionKey("read", { path: "a.ts", offset: 20, limit: 10 }, "/workspace", "schema-b");
 		const otherTool = buildPiActionKey("grep", { pattern: "private-pattern" }, "/workspace", "schema-a");
-		const sandbox = buildActionKey({
+		const otherExecutor = buildActionKey({
 			tool: "read",
-			execution: "sandbox",
 			resources: narrow?.resources ?? [],
 			input: { ...(narrow?.input ?? {}) },
 			schemaHash: "schema-a",
+			semanticsEpoch: broad?.semanticsEpoch,
+			executionFingerprint: "other-executor",
 		});
 
 		expect(broad && narrow ? actionKeyMismatchReason(broad, narrow, projectors) : "missing").toBeUndefined();
@@ -215,15 +211,15 @@ describe("speculative action common", () => {
 		expect(broad && otherSchema ? actionKeyMismatchReason(broad, otherSchema, projectors) : "missing").toBe(
 			"different_schema",
 		);
-		expect(broad ? actionKeyMismatchReason(sandbox, broad, projectors) : "missing").toBe("different_execution");
+		expect(broad ? actionKeyMismatchReason(otherExecutor, broad, projectors) : "missing").toBe("different_executor");
 		expect(broad && otherTool ? actionKeyMismatchReason(otherTool, broad, projectors) : "missing").toBe(
 			"different_tool",
 		);
 		expect(JSON.stringify(actionKeyMismatchReason(broad!, otherPath!, projectors))).not.toContain("secret-name");
 	});
 
-	it("selects configured readonly and sandbox candidates independently", () => {
-		expect(DEFAULTS.tools.sandbox).toEqual(["bash", "write", "edit"]);
+	it("selects prediction tools independently from their execution route", () => {
+		expect(DEFAULTS.tools).toEqual(["read", "grep", "find", "bash", "write", "edit"]);
 		expect(
 			candidateToolNames({
 				enabled: true,
@@ -231,11 +227,20 @@ describe("speculative action common", () => {
 				maxConcurrentActions: 4,
 				resourceCacheMaxEntries: 8,
 				predictionTimeoutMs: 100,
-				tools: { resourceCached: ["read"], sandbox: ["bash", "write"] },
+				tools: ["read", "bash", "write"],
 			}),
 		).toEqual(["read", "bash", "write"]);
-		expect(inferredExecution("read")).toBe("resource_cached");
-		expect(inferredExecution("edit")).toBe("sandbox");
+		expect(inferredLocalIsolation("read")).toBe("resource_snapshot");
+		expect(inferredLocalIsolation("bash")).toBe("none");
+		expect(inferredLocalIsolation("edit")).toBe("file_mutation");
+		expect(normalizeSpeculativeToolSelection(["bash", "read", "bash", "unknown"])).toEqual(["bash", "read"]);
+		expect(
+			normalizeSpeculativeToolSelection({
+				resourceCached: ["read"],
+				sandbox: ["write"],
+				predictionOnly: ["bash"],
+			}),
+		).toEqual(["read", "write", "bash"]);
 	});
 
 	it("defines equivalence through an injected projection without changing K(a)", () => {
@@ -243,7 +248,7 @@ describe("speculative action common", () => {
 			id: "custom.subset",
 			partition: (action) =>
 				action.tool === "custom"
-					? JSON.stringify([action.execution, action.schemaHash, action.resources, action.input.namespace])
+					? JSON.stringify([action.schemaHash, action.resources, action.input.namespace])
 					: undefined,
 			project: (speculative, actor) => {
 				const speculativeValues = Array.isArray(speculative.input.values) ? speculative.input.values : undefined;
@@ -253,7 +258,6 @@ describe("speculative action common", () => {
 				return {
 					action: buildActionKey({
 						tool: speculative.tool,
-						execution: speculative.execution,
 						resources: speculative.resources,
 						schemaHash: speculative.schemaHash,
 						input: { ...speculative.input, values: actorValues },
@@ -271,13 +275,11 @@ describe("speculative action common", () => {
 		};
 		const speculative = buildActionKey({
 			tool: "custom",
-			execution: "resource_cached",
 			resources: ["set"],
 			input: { namespace: "items", values: ["a", "b", "c"] },
 		});
 		const actor = buildActionKey({
 			tool: "custom",
-			execution: "resource_cached",
 			resources: ["set"],
 			input: { namespace: "items", values: ["b", "c"] },
 		});

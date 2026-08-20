@@ -5,12 +5,6 @@ import type { SpeculativeAgentSettingsInput } from "./agent-integration.ts";
 
 export interface SpeculativeActionPackageSettings extends SpeculativeAgentSettingsInput {
 	readonly draftModel?: string;
-	readonly isolation?: {
-		readonly backend?: "auto" | "container" | "native";
-		readonly runtime?: "auto" | "docker" | "podman";
-		readonly image?: string;
-		readonly guestShell?: string;
-	};
 }
 
 export type SpeculativeSettingsScope = "global" | "project";

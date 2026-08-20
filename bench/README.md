@@ -36,12 +36,10 @@ Remove-Item Env:DEEPSEEK_API_KEY
 
 Latency profiles add the same deterministic delay to Actor and speculative
 executions. `native` adds nothing; `remote`, `sandbox`, and `heavy` model
-increasingly remote or isolated tools. The runner uses the package's production
-OCI/native backend router and exact stock-Pi Bash invocation descriptor. The
-result records backend health, invocation-specific Bash availability, the
-profile, and raw tool execution counts. If no compatible isolated process
-backend is ready, Bash candidates fail closed and the run must not be used to
-draw conclusions about Bash hit rate.
+increasingly remote or isolated tools. The runner uses resource-version routes
+for read-only tools and the production Git-worktree world for file mutations.
+No process sandbox is bundled, so Bash predictions are matched but execute only
+through the Actor path unless the embedding host injects a runtime-wide world.
 
 Set `--drafter-max-depth 0` for the one-step Drafter ablation. Positive values
 bound output-informed continuation steps after the first action.
@@ -69,6 +67,12 @@ teardown after the Agent has completed is excluded.
 include native parallel Actor tool calls. `executionAheadMs` is the narrower,
 directly observed execution head start of adopted speculative work. The two are
 reported separately and are not subtracted into an invented causal estimate.
+
+For a matched action whose execution was blocked by missing isolation,
+`executionBlockedPotentialHiddenLatencyMs` reports the capped portion of the
+authoritative Actor duration that the observed prediction lead could have
+covered. It is a counterfactual and is never added to actual hits or
+`hiddenLatencyMs`.
 
 Required ablation discipline:
 

@@ -17,7 +17,7 @@ import type {
 	WorldExecutionMetrics,
 } from "./execution-world.ts";
 import { ResourceVersionManager, type ResourceVersionToken } from "./resource-version.ts";
-import type { ToolInvocation, ToolProcessInvocation, ToolSettlement } from "./tool-settlement.ts";
+import type { ToolSettlement } from "./tool-settlement.ts";
 
 export interface SandboxFileChange {
 	readonly root: string;
@@ -50,185 +50,16 @@ export interface SpeculativeSandboxExecuteContext {
 	readonly toolName: string;
 	readonly args: unknown;
 	readonly action: ActionKey;
-	readonly invocation?: ToolInvocation;
 	readonly callID: string;
 	readonly signal: AbortSignal;
 	/** Optional immutable parent state for source-neutral multi-step execution. */
 	readonly parentCheckpoint?: WorldCheckpoint;
 }
 
-export type SpeculativeAgentSandbox = ExecutionWorld<SpeculativeSandboxExecuteContext, ToolSettlement, ToolInvocation>;
-
-export interface SandboxProcessRunnerInput {
-	readonly command: string;
-	readonly shell: string;
-	readonly cwd: string;
-	/** Private parent mounted by native isolation. */
-	readonly processRoot: string;
-	/** Private workspace exposed to the command at sourceRoot; cwd must remain inside it. */
-	readonly workspaceRoot: string;
-	readonly sourceRoot: string;
-	readonly timeout?: number;
-	readonly environment: Readonly<Record<string, string>>;
-	readonly shellArgs: readonly string[];
-	readonly commandTransport: "argv" | "stdin";
-	readonly signal: AbortSignal;
-}
-
-export type SandboxProcessRunner = (input: SandboxProcessRunnerInput) => Promise<ToolSettlement>;
-
-export interface SandboxProcessBackendStatus {
-	readonly backend: string;
-	readonly state: "ready" | "unavailable";
-	readonly source: string;
-	readonly detail: string;
-	readonly fingerprint?: string;
-	readonly path?: string;
-}
-
-export interface SandboxProcessSession {
-	/** Empty private root owned by this session. */
-	readonly processRoot: string;
-	readonly execute: SandboxProcessRunner;
-	/** Ends every descendant and releases the private root. Idempotent. */
-	readonly close: () => Promise<void>;
-}
-
-/** Process isolation lifecycle. A session owns one branch and cannot be shared concurrently. */
-export interface SandboxProcessBackend {
-	readonly check: (options?: { readonly refresh?: boolean }) => Promise<SandboxProcessBackendStatus>;
-	readonly supports?: (invocation: ToolProcessInvocation) => boolean;
-	readonly fingerprint: (invocation?: ToolProcessInvocation) => Promise<string>;
-	readonly prepare: (input: {
-		readonly signal?: AbortSignal;
-		readonly invocation?: ToolProcessInvocation;
-	}) => Promise<void>;
-	readonly open: (input: {
-		readonly parent: string;
-		readonly signal: AbortSignal;
-		readonly invocation?: ToolProcessInvocation;
-		readonly expectedFingerprint?: string;
-	}) => Promise<SandboxProcessSession>;
-	readonly dispose: () => Promise<void>;
-}
-
-export interface SandboxBackendRoute {
-	readonly id: string;
-	readonly backend: SandboxProcessBackend;
-}
-
-export interface SandboxBackendRouterStatus {
-	readonly configured: string;
-	readonly active: SandboxProcessBackendStatus;
-	readonly candidates: Readonly<Record<string, SandboxProcessBackendStatus>>;
-}
-
-export interface SandboxBackendRouter extends SandboxProcessBackend {
-	readonly configured: string;
-	readonly inspect: (options?: { readonly refresh?: boolean }) => Promise<SandboxBackendRouterStatus>;
-}
+export type SpeculativeAgentSandbox = ExecutionWorld<SpeculativeSandboxExecuteContext, ToolSettlement>;
 
 export interface WorkspaceSandboxOptions {
-	/** Required process boundary for workspace-snapshot actions such as bash. */
-	readonly processBackend?: SandboxProcessBackend;
 	readonly gitBinary?: string;
-}
-
-/** One route owns health, fingerprint, preparation, and execution backend identity. */
-export function createSandboxBackendRouter(
-	configured: string,
-	routes: readonly SandboxBackendRoute[],
-): SandboxBackendRouter {
-	if (configured !== "auto" && !routes.some((route) => route.id === configured)) {
-		throw new Error(`Unknown speculative process backend: ${configured}`);
-	}
-	if (new Set(routes.map((route) => route.id)).size !== routes.length || routes.some((route) => !route.id.trim())) {
-		throw new Error("Speculative process backend route IDs must be unique and non-empty.");
-	}
-	let disposed = false;
-	const inspect = async ({ refresh = false }: { readonly refresh?: boolean } = {}) => {
-		const checked = await Promise.all(
-			routes.map(async (route) => [route, await safeBackendCheck(route.backend, refresh)] as const),
-		);
-		const candidates = Object.freeze(
-			Object.fromEntries(checked.map(([route, status]) => [route.id, status])),
-		) as Readonly<Record<string, SandboxProcessBackendStatus>>;
-		const eligible = configured === "auto" ? checked : checked.filter(([route]) => route.id === configured);
-		const selected = eligible.find(([, status]) => status.state === "ready")?.[0];
-		const active = selected
-			? candidates[selected.id]
-			: unavailableBackendStatus(
-					(configured === "auto" ? checked : checked.filter(([route]) => route.id === configured))
-						.map(([, status]) => status.detail)
-						.join("; ") || "No speculative process backend is configured.",
-				);
-		return Object.freeze({ configured, active, candidates });
-	};
-	const select = async (invocation?: ToolProcessInvocation) => {
-		if (disposed) throw new Error("Speculative process backend is disposed.");
-		const checked = await Promise.all(
-			routes.map(async (route) => [route, await safeBackendCheck(route.backend, false)] as const),
-		);
-		const eligible = (configured === "auto" ? checked : checked.filter(([route]) => route.id === configured)).filter(
-			([route, status]) =>
-				status.state === "ready" && (!invocation || route.backend.supports?.(invocation) !== false),
-		);
-		const selected = eligible[0]?.[0];
-		if (selected) return selected.backend;
-		const detail = (configured === "auto" ? checked : checked.filter(([route]) => route.id === configured))
-			.map(([route, status]) =>
-				status.state === "ready" && invocation && route.backend.supports?.(invocation) === false
-					? `${route.id}: incompatible with ${invocation.shell}`
-					: status.detail,
-			)
-			.join("; ");
-		throw new Error(detail || "No speculative process backend is configured.");
-	};
-	return {
-		configured,
-		inspect,
-		check: async (options) => (await inspect(options)).active,
-		supports: (invocation) =>
-			(configured === "auto" ? routes : routes.filter((route) => route.id === configured)).some(
-				(route) => route.backend.supports?.(invocation) !== false,
-			),
-		fingerprint: async (invocation) => (await select(invocation)).fingerprint(invocation),
-		prepare: async (input) => {
-			if (disposed) throw new Error("Speculative process backend is disposed.");
-			await (await select(input.invocation)).prepare(input);
-		},
-		open: async (input) => {
-			if (disposed) throw new Error("Speculative process backend is disposed.");
-			const backend = await select(input.invocation);
-			if (
-				input.expectedFingerprint !== undefined &&
-				(await backend.fingerprint(input.invocation)) !== input.expectedFingerprint
-			) {
-				throw new Error("Speculative process backend changed after K(a) construction.");
-			}
-			return backend.open(input);
-		},
-		dispose: async () => {
-			if (disposed) return;
-			disposed = true;
-			await Promise.all(routes.map((route) => route.backend.dispose()));
-		},
-	};
-}
-
-async function safeBackendCheck(
-	backend: SandboxProcessBackend,
-	refresh: boolean,
-): Promise<SandboxProcessBackendStatus> {
-	try {
-		return await backend.check({ refresh });
-	} catch (error) {
-		return unavailableBackendStatus(error instanceof Error ? error.message : String(error));
-	}
-}
-
-function unavailableBackendStatus(detail: string): SandboxProcessBackendStatus {
-	return { backend: "workspace", state: "unavailable", source: "none", detail };
 }
 
 export interface SandboxWorkspaceContext {
@@ -246,7 +77,6 @@ interface PrivateGitWorkspace extends SandboxWorkspaceContext {
 	readonly repository: string;
 	readonly gitBinary: string;
 	readonly pool: PooledGitRepository;
-	readonly processSession?: SandboxProcessSession;
 }
 
 interface PooledGitRepository {
@@ -318,60 +148,29 @@ function resolveWorkspaceCheckpoint(
 /** Create a copy-on-write execution world with transactional multi-file commit. */
 export function createWorkspaceSandbox(options: WorkspaceSandboxOptions = {}): SpeculativeAgentSandbox {
 	const roots = new Set<string>();
-	const supports = (mode: ExecutionWorldMode) =>
-		mode === "file_mutation" || (mode === "workspace_snapshot" && !!options.processBackend);
 	return {
-		supports,
-		fingerprint: (mode, invocation) =>
-			mode === "file_mutation" ? "git-worktree:v1" : requireProcessBackend(options).fingerprint(invocation?.process),
-		prepare: async ({ cwd, modes, routeContexts, signal }) => {
-			const supported = modes.filter(supports);
-			if (supported.length === 0) return;
+		id: "git_worktree",
+		supports: (mode) => mode === "file_mutation",
+		fingerprint: () => "git-worktree:v1",
+		prepare: async ({ cwd, modes, signal }) => {
+			if (!modes.includes("file_mutation")) return;
 			roots.add(path.resolve(cwd));
 			await prepareSandboxWorkspace(cwd, { ...(options.gitBinary ? { gitBinary: options.gitBinary } : {}), signal });
-			if (supported.includes("workspace_snapshot")) {
-				const invocations = routeContexts?.flatMap((context) => (context.process ? [context] : [])) ?? [];
-				if (invocations.length) {
-					await Promise.all(
-						invocations.map(async (invocation) => {
-							const actual = await requireProcessBackend(options).fingerprint(invocation.process);
-							if (invocation.isolationFingerprint && invocation.isolationFingerprint !== actual) {
-								throw new Error("Speculative process backend changed after K(a) construction.");
-							}
-							await requireProcessBackend(options).prepare({ signal, invocation: invocation.process });
-						}),
-					);
-				} else {
-					await requireProcessBackend(options).prepare({ signal });
-				}
-			}
 		},
 		fork: async (context) => {
-			if (!supports(context.mode)) throw new Error(`Execution world does not support mode ${context.mode}`);
+			if (context.mode !== "file_mutation") throw new Error(`Execution world does not support mode ${context.mode}`);
 			const sourceRoot = path.resolve(context.cwd);
 			roots.add(sourceRoot);
 			const parent = resolveWorkspaceCheckpoint(context.parentCheckpoint, sourceRoot);
-			let snapshot: WorkspaceExecutionSnapshot;
-			if (context.mode === "file_mutation") {
-				snapshot = await executeMutation(context, parent, options.gitBinary);
-			} else if (context.mode === "workspace_snapshot" && options.processBackend) {
-				snapshot = await executeWorkspaceSnapshot(context, parent, options.processBackend, options.gitBinary);
-			} else {
-				throw new Error(`Execution world does not support mode ${context.mode}`);
-			}
+			const snapshot = await executeMutation(context, parent, options.gitBinary);
 			return new GitWorldBranch(snapshot, sourceRoot, context.action.executionFingerprint, parent);
 		},
 		dispose: async () => {
 			const ownedRoots = [...roots];
 			roots.clear();
-			await Promise.all([closeWorkspaceSandboxPools(ownedRoots), options.processBackend?.dispose()]);
+			await closeWorkspaceSandboxPools(ownedRoots);
 		},
 	};
-}
-
-function requireProcessBackend(options: WorkspaceSandboxOptions): SandboxProcessBackend {
-	if (!options.processBackend) throw new Error("workspace-snapshot process backend is unavailable");
-	return options.processBackend;
 }
 
 class GitWorldBranch implements WorldBranch<ToolSettlement> {
@@ -588,90 +387,17 @@ async function executeMutation(
 				executionMetrics: { setupMs, captureMs: changeCollectionMs },
 			};
 		},
-		undefined,
-		undefined,
 		parent,
 	);
 }
 
-async function executeWorkspaceSnapshot(
-	context: SpeculativeSandboxExecuteContext,
-	parent: GitWorldCheckpoint | undefined,
-	backend: SandboxProcessBackend,
-	gitBinary?: string,
-): Promise<WorkspaceExecutionSnapshot> {
-	const invocation = context.invocation?.process;
-	if (!invocation) throw new Error(`${context.toolName} has no isolated process invocation`);
-	const actualFingerprint = await backend.fingerprint(invocation);
-	if (context.invocation?.isolationFingerprint && context.invocation.isolationFingerprint !== actualFingerprint) {
-		throw new Error("Speculative process backend changed after K(a) construction.");
-	}
-	const sourceRoot = path.resolve(context.cwd);
-	const invocationCwd = path.resolve(invocation.cwd);
-	if (!contains(sourceRoot, invocationCwd)) throw new Error(`${context.toolName}.cwd escapes workspace`);
-	const setupStarted = performance.now();
-	return withPrivateGitWorkspace(
-		sourceRoot,
-		gitBinary ?? "git",
-		async (workspace) => {
-			const setupMs = Math.max(0, performance.now() - setupStarted);
-			const output = await workspace.processSession!.execute({
-				command: invocation.command,
-				shell: invocation.shell,
-				shellArgs: invocation.shellArgs,
-				commandTransport: invocation.commandTransport,
-				environment: invocation.environment,
-				cwd: path.join(workspace.sandboxRoot, path.relative(sourceRoot, invocationCwd)),
-				processRoot: workspace.processRoot,
-				workspaceRoot: workspace.sandboxRoot,
-				sourceRoot,
-				...(invocation.timeout !== undefined ? { timeout: invocation.timeout } : {}),
-				signal: context.signal,
-			});
-			const collectionStarted = performance.now();
-			const changes = await collectSandboxChanges(workspace);
-			return {
-				output: replacePaths(output, [[workspace.sandboxRoot, sourceRoot]]),
-				changes,
-				executionMetrics: {
-					setupMs,
-					captureMs: Math.max(0, performance.now() - collectionStarted),
-				},
-			};
-		},
-		backend,
-		context.signal,
-		parent,
-		invocation,
-		actualFingerprint,
-	);
-}
-
-async function createPrivateGitWorkspace(
-	cwd: string,
-	gitBinary: string,
-	processBackend?: SandboxProcessBackend,
-	signal?: AbortSignal,
-	invocation?: ToolProcessInvocation,
-	expectedFingerprint?: string,
-): Promise<PrivateGitWorkspace> {
+async function createPrivateGitWorkspace(cwd: string, gitBinary: string): Promise<PrivateGitWorkspace> {
 	const sourceRoot = path.resolve(cwd);
 	await assertNoSymlinkPath(sourceRoot, sourceRoot);
 	const pool = await acquireSandboxRepository(sourceRoot, gitBinary);
-	let processSession: SandboxProcessSession | undefined;
 	try {
 		const commit = await acquireSandboxBaseline(pool, SANDBOX_AUTHOR_ENVIRONMENT);
-		processSession = processBackend
-			? await processBackend.open({
-					parent: pool.parent,
-					signal: signal ?? new AbortController().signal,
-					...(invocation ? { invocation } : {}),
-					...(expectedFingerprint !== undefined ? { expectedFingerprint } : {}),
-				})
-			: undefined;
-		const workspace = processSession
-			? await attachSandboxWorkspace(pool, commit, processSession.processRoot)
-			: ((await takePreparedSandbox(pool, commit)) ?? (await attachSandboxWorkspace(pool, commit)));
+		const workspace = (await takePreparedSandbox(pool, commit)) ?? (await attachSandboxWorkspace(pool, commit));
 		return {
 			sourceRoot,
 			sandboxRoot: workspace.sandboxRoot,
@@ -679,10 +405,8 @@ async function createPrivateGitWorkspace(
 			repository: pool.repository,
 			gitBinary,
 			pool,
-			...(processSession ? { processSession } : {}),
 		};
 	} catch (error) {
-		await processSession?.close().catch(() => undefined);
 		releaseSandboxRepository(pool);
 		throw error;
 	}
@@ -1132,20 +856,9 @@ async function withPrivateGitWorkspace<T>(
 	cwd: string,
 	gitBinary: string,
 	run: (workspace: PrivateGitWorkspace) => Promise<T>,
-	processBackend?: SandboxProcessBackend,
-	signal?: AbortSignal,
 	checkpoint?: GitWorldCheckpoint,
-	invocation?: ToolProcessInvocation,
-	expectedFingerprint?: string,
 ): Promise<T> {
-	const workspace = await createPrivateGitWorkspace(
-		cwd,
-		gitBinary,
-		processBackend,
-		signal,
-		invocation,
-		expectedFingerprint,
-	);
+	const workspace = await createPrivateGitWorkspace(cwd, gitBinary);
 	try {
 		if (checkpoint) await materializeCheckpoint(workspace, checkpoint);
 		return await run(workspace);
@@ -1191,8 +904,7 @@ async function cleanupPrivateGitWorkspace(workspace: PrivateGitWorkspace): Promi
 		// The private parent removal below is the final cleanup boundary.
 	}
 	try {
-		if (workspace.processSession) await workspace.processSession.close();
-		else await rm(workspace.processRoot, { recursive: true, force: true });
+		await rm(workspace.processRoot, { recursive: true, force: true });
 	} finally {
 		releaseSandboxRepository(workspace.pool);
 	}

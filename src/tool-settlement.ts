@@ -6,7 +6,7 @@ export interface ToolSettlement<TDetails = unknown> {
 	readonly isError: boolean;
 }
 
-/** Exact process invocation required to replay a tool inside an isolated execution world. */
+/** Exact process invocation accepted by an optional isolated-process backend. */
 export interface ToolProcessInvocation {
 	readonly command: string;
 	readonly cwd: string;
@@ -21,6 +21,4 @@ export interface ToolProcessInvocation {
 export interface ToolInvocation {
 	readonly executor: string;
 	readonly process?: ToolProcessInvocation;
-	/** Concrete isolation route selected while constructing K(a). */
-	readonly isolationFingerprint?: string;
 }

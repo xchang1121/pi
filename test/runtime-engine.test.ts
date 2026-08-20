@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { type ActionProjectionRule, READ_RANGE_ACTION_KEY_PROJECTOR } from "../src/action-key-projection.ts";
 import { buildPiActionKey } from "../src/action-semantics.ts";
-import type { WorldBranch, WorldCheckpoint } from "../src/execution-world.ts";
+import type { SpeculativeExecutionRoute, WorldBranch, WorldCheckpoint } from "../src/execution-world.ts";
 import type { SpeculativeActionEvent, SpeculativeActionSettings, SpeculativePlanSource } from "../src/runtime.ts";
 import { makeStructuralSpeculativeActionRuntime } from "../src/runtime-engine.ts";
 import { cause, type PredictionSettlement, type ResourceValidation, zeroValidationMetrics } from "../src/settlement.ts";
@@ -24,7 +24,21 @@ const settings: SpeculativeActionSettings = {
 	resourceCacheMaxBytes: 1024 * 1024,
 	predictionTimeoutMs: 100,
 	maxConcurrentActions: 8,
-	tools: { resourceCached: ["read"], sandbox: ["bash"] },
+	tools: ["read", "write", "bash"],
+};
+
+const RESOURCE_ROUTE: SpeculativeExecutionRoute = {
+	isolation: "resource_snapshot",
+	reuse: "shared_result",
+	backend: "resource_version",
+	fingerprint: "resource-version:v1",
+};
+
+const MUTATION_ROUTE: SpeculativeExecutionRoute = {
+	isolation: "file_mutation",
+	reuse: "exclusive_branch",
+	backend: "test_world",
+	fingerprint: "test-world:v1",
 };
 
 type Source = SpeculativePlanSource<string, string, Start, Call, { readonly cwd: string }>;
@@ -54,15 +68,24 @@ function harness(input: {
 	readonly coveringAction?: ActionProjectionRule<string>["coveringAction"];
 	readonly onEvent?: (event: SpeculativeActionEvent<string>) => void | Promise<void>;
 	readonly actionKey?: (tool: string, args: unknown) => ReturnType<typeof buildPiActionKey>;
+	readonly resolveExecution?: (tool: string) => SpeculativeExecutionRoute | undefined;
 }) {
 	const events: SpeculativeActionEvent<string>[] = [];
 	let executions = 0;
 	const runtime = makeStructuralSpeculativeActionRuntime<string, string, Start, Call, Call, { readonly cwd: string }>({
 		sources: [input.source],
 		settings: input.settings ?? (() => settings),
-		definitions: () => [{ name: "read" }, { name: "bash" }],
+		definitions: () => [{ name: "read" }, { name: "bash" }, { name: "write" }],
 		stateData: () => ({ cwd: "/workspace" }),
 		actionKey: input.actionKey ?? ((tool, args) => buildPiActionKey(tool, args, "/workspace")),
+		resolveExecution: ({ tool }) =>
+			input.resolveExecution
+				? input.resolveExecution(tool)
+				: tool === "read"
+					? RESOURCE_ROUTE
+					: tool === "write"
+						? MUTATION_ROUTE
+						: undefined,
 		actual: (call) => ({ id: call.id, tool: call.tool, input: call.input }),
 		preflightCandidate: () => ({ ok: true }),
 		executeCandidate: async ({ tool, concrete, signal, parentWorld }) => {
@@ -367,6 +390,31 @@ describe("structural speculative runtime", () => {
 		expect(new Set(settlements.map((item) => item.observation === "observed" && item.actorAction.id))).toEqual(
 			new Set(["call:turn"]),
 		);
+	});
+
+	it("does not deduplicate equal K(a) work across different execution routes", async () => {
+		const source: Source = {
+			id: "source",
+			enabled: () => true,
+			propose: () => [
+				plan("source", "route-a", { path: "README.md" }),
+				plan("source", "route-b", { path: "README.md" }),
+			],
+		};
+		let routeSequence = 0;
+		const fixture = harness({
+			source,
+			resolveExecution: () => {
+				const id = `route-${++routeSequence}`;
+				return { ...RESOURCE_ROUTE, backend: id, fingerprint: id };
+			},
+		});
+
+		await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn" });
+		await waitFor(() => fixture.runtime.inspect().sharedCandidates === 2);
+		await waitFor(() => fixture.executions() === 2);
+		expect(routeSequence).toBe(2);
+		await fixture.runtime.finishTurn({ ...call("turn"), terminal: true });
 	});
 
 	it("counts one shared execution once when it serves multiple Actor actions", async () => {
@@ -677,7 +725,7 @@ describe("structural speculative runtime", () => {
 		await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn-1" });
 		await waitFor(() => fixture.runtime.inspect().sharedCandidates === 1);
 
-		configured = { ...settings, tools: { ...settings.tools, resourceCached: [] } };
+		configured = { ...settings, tools: settings.tools.filter((tool) => tool !== "read") };
 		await fixture.runtime.settingsChanged(configured);
 		expect(await fixture.runtime.consume(call("turn-1"))).toBe("speculative");
 		await fixture.runtime.finishTurn({ ...call("turn-1"), terminal: false });
@@ -895,11 +943,7 @@ describe("structural speculative runtime", () => {
 		await fixture.runtime.finishTurn({ ...call("turn-2"), terminal: true });
 	});
 
-	it("serializes one exclusive result across parallel Actor calls", async () => {
-		let release!: () => void;
-		const gate = new Promise<void>((resolve) => {
-			release = resolve;
-		});
+	it("records an exact match when isolation is unavailable without starting speculative execution", async () => {
 		const settlements: PredictionSettlement[] = [];
 		const source: Source = {
 			id: "source",
@@ -916,13 +960,11 @@ describe("structural speculative runtime", () => {
 		};
 		const fixture = harness({
 			source,
-			execute: async () => {
-				await gate;
-				return world("built");
-			},
 		});
 		await fixture.runtime.startTurn({ sessionID: "session", turnID: "parallel" });
-		await waitFor(() => fixture.runtime.inspect().exclusiveCandidates === 1);
+		await waitFor(() => fixture.events.some((event) => event.type === "source_request"));
+		expect(fixture.runtime.inspect()).toMatchObject({ exclusiveCandidates: 0, sharedCandidates: 0 });
+		expect(fixture.executions()).toBe(0);
 		const firstCall: Call = {
 			sessionID: "session",
 			turnID: "parallel",
@@ -930,19 +972,27 @@ describe("structural speculative runtime", () => {
 			tool: "bash",
 			input: { command: "build" },
 		};
-		const secondCall = { ...firstCall, id: "second" };
-		const first = fixture.runtime.consume(firstCall);
-		await Promise.resolve();
-		expect(await fixture.runtime.consume(secondCall)).toBeUndefined();
-		await fixture.runtime.actual({ ...secondCall, durationMs: 2, output: "actor-second" });
-		release();
-		expect(await first).toBe("built");
+		expect(await fixture.runtime.consume(firstCall)).toBeUndefined();
+		expect(fixture.executions()).toBe(0);
+		await fixture.runtime.actual({ ...firstCall, durationMs: 2, output: "actor-built" });
 		await fixture.runtime.finishTurn({ ...firstCall, terminal: true });
 		expect(settlements).toHaveLength(1);
 		expect(settlements[0]).toMatchObject({
 			actorAction: { id: "first" },
-			match: { matched: true, adoption: { status: "adopted" } },
+			match: {
+				matched: true,
+				adoption: { status: "rejected", cause: { stage: "execution", code: "isolation_unavailable" } },
+			},
 		});
+		expect(fixture.events.some((event) => event.type === "candidate" && event.candidate.tool === "bash")).toBe(false);
+		const actorEvent = fixture.events.find((event) => event.type === "actor_action");
+		expect(actorEvent?.type === "actor_action" && actorEvent.settlement.provider.kind === "actor").toBe(true);
+		if (actorEvent?.type === "actor_action" && actorEvent.settlement.provider.kind === "actor") {
+			const timing = actorEvent.settlement.provider.executionBlockedTiming;
+			expect(timing).toBeDefined();
+			expect(timing?.executionAheadMs).toBeLessThanOrEqual(2);
+			expect((timing?.executionAheadMs ?? 0) + (timing?.hitLatencyMs ?? 0)).toBe(2);
+		}
 	});
 
 	it("retains a queued confirmation continuation after an empty speculative continuation", async () => {
@@ -1215,7 +1265,6 @@ describe("structural speculative runtime", () => {
 	it("keeps equal child actions isolated by parent world and rebases the adopted lineage", async () => {
 		let enabled = true;
 		let workspaceVersion = 0;
-		const captured: number[] = [];
 		const executed: string[] = [];
 		const childParents: string[] = [];
 		const source: Source = {
@@ -1231,13 +1280,13 @@ describe("structural speculative runtime", () => {
 					{
 						id: "parent",
 						type: "tool_call",
-						tool: "bash",
-						input: { command: `parent-${proposalIndex}` },
+						tool: "write",
+						input: { path: `parent-${proposalIndex}.txt`, content: `parent-${proposalIndex}` },
 					},
 				],
 			}),
 			continue: ({ proposalID, actionID, revision, candidate }) => {
-				if (String(candidate.input.command).startsWith("child")) return undefined;
+				if (String(candidate.input.content).startsWith("child")) return undefined;
 				return {
 					proposalID,
 					source: "source",
@@ -1246,8 +1295,8 @@ describe("structural speculative runtime", () => {
 						{
 							id: "child",
 							type: "tool_call",
-							tool: "bash",
-							input: { command: "child" },
+							tool: "write",
+							input: { path: "child.txt", content: "child" },
 							dependsOn: [{ actionID, condition: "execution_succeeded" }],
 						},
 					],
@@ -1256,23 +1305,11 @@ describe("structural speculative runtime", () => {
 		};
 		const fixture = harness({
 			source,
-			capture: () => {
-				captured.push(workspaceVersion);
-				return workspaceVersion;
-			},
-			validate: (version) =>
-				version === workspaceVersion
-					? { status: "valid", metrics: zeroValidationMetrics() }
-					: {
-							status: "stale",
-							cause: cause("freshness", "resource_changed"),
-							metrics: zeroValidationMetrics(),
-						},
 			execute: (_tool, input, _signal, parentWorld) => {
-				const command = String(input.command);
-				executed.push(command);
-				if (command === "child") childParents.push(String(parentWorld?.output));
-				const output = command === "child" ? `child:${parentWorld?.output}` : command;
+				const content = String(input.content);
+				executed.push(content);
+				if (content === "child") childParents.push(String(parentWorld?.output));
+				const output = content === "child" ? `child:${parentWorld?.output}` : content;
 				const parentCheckpoint = parentWorld?.checkpoint;
 				return world(output, {
 					checkpoint: {
@@ -1296,8 +1333,8 @@ describe("structural speculative runtime", () => {
 			sessionID: "session",
 			turnID: "parent",
 			id: "actor-parent",
-			tool: "bash",
-			input: { command: "parent-0" },
+			tool: "write",
+			input: { path: "parent-0.txt", content: "parent-0" },
 		};
 		expect(await fixture.runtime.consume(parentCall)).toBe("parent-0");
 		enabled = false;
@@ -1308,11 +1345,11 @@ describe("structural speculative runtime", () => {
 			sessionID: "session",
 			turnID: "child",
 			id: "actor-child",
-			tool: "bash",
-			input: { command: "child" },
+			tool: "write",
+			input: { path: "child.txt", content: "child" },
 		};
 		expect(await fixture.runtime.consume(childCall)).toBe("child:parent-0");
-		expect(captured).toContain(1);
+		expect(workspaceVersion).toBe(2);
 		await fixture.runtime.finishTurn({ ...childCall, terminal: true });
 	});
 });

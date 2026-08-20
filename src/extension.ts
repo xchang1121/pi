@@ -20,12 +20,19 @@ import {
 	type SourceInfo,
 	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
-import { IDEMPOTENT_ACTION_TOOLS, KEYABLE_TOOLS, SANDBOX_ACTION_TOOLS } from "./action-semantics.ts";
+import {
+	FILE_MUTATION_ACTION_TOOLS,
+	KEYABLE_TOOLS,
+	NO_LOCAL_ISOLATION_ACTION_TOOLS,
+	RESOURCE_SNAPSHOT_ACTION_TOOLS,
+} from "./action-semantics.ts";
 import { createSpeculativeActionHost } from "./agent-integration.ts";
-import { clampCandidateLimit, DEFAULTS, normalizeDrafterRequestSettings } from "./common.ts";
-import { createContainerSandboxProcessBackend, DEFAULT_CONTAINER_SANDBOX_IMAGE } from "./container-sandbox.ts";
-import { createNativeSandboxProcessBackend } from "./native-sandbox.ts";
-import { createOciSetupService, type OciSetupService } from "./oci-setup.ts";
+import {
+	clampCandidateLimit,
+	DEFAULTS,
+	normalizeDrafterRequestSettings,
+	normalizeSpeculativeToolSelection,
+} from "./common.ts";
 import { PATTERN_AWARE_DEFAULTS, type PatternAwareSettings, patternAwareSettings } from "./pattern-aware.ts";
 import { PI_READ_RANGE_PROJECTION_RULE, withPiProjectionCoverage } from "./pi-read-projection.ts";
 import { resolvePiToolInvocation } from "./pi-tool-invocation.ts";
@@ -37,17 +44,9 @@ import {
 } from "./settings-store.ts";
 import type { ToolSettlement } from "./tool-settlement.ts";
 import { emptySpeculativeTraceSummary, reduceSpeculativeTrace, type SpeculativeTraceSummary } from "./trace-summary.ts";
-import {
-	createSandboxBackendRouter,
-	createWorkspaceSandbox,
-	type SandboxBackendRouter,
-	type SandboxBackendRouterStatus,
-	type SandboxProcessBackendStatus,
-	type SpeculativeAgentSandbox,
-} from "./workspace-sandbox.ts";
+import { createWorkspaceSandbox, type SpeculativeAgentSandbox } from "./workspace-sandbox.ts";
 
 const STATUS_KEY = "speculative-action";
-const SETUP_STATUS_KEY = "speculative-action-setup";
 const CLOSE = "Close";
 const BACK = "Back";
 const USE_ACTIVE_MODEL = "Use active model";
@@ -76,22 +75,11 @@ export interface EffectiveSpeculativeActionSettings {
 	readonly resourceCacheMaxEntries: number;
 	readonly resourceCacheMaxBytes: number;
 	readonly predictionTimeoutMs: number;
-	readonly isolation: {
-		readonly backend: "auto" | "container" | "native";
-		readonly runtime: "auto" | "docker" | "podman";
-		readonly image: string;
-		readonly guestShell?: string;
-	};
 	readonly patternAware: PatternAwareSettings;
-	readonly tools: {
-		readonly resourceCached: readonly string[];
-		readonly sandbox: readonly string[];
-	};
+	readonly tools: readonly string[];
 }
 
 export type SpeculativeActionMetrics = SpeculativeTraceSummary;
-
-export type SpeculativeSandboxHealth = SandboxBackendRouterStatus;
 
 export interface SpeculativeSettingsStore {
 	readonly scope: SpeculativeSettingsScope;
@@ -106,18 +94,16 @@ export interface SpeculativeSettingsStore {
 
 interface SpeculativeActionController {
 	readonly settings: () => EffectiveSpeculativeActionSettings;
-	readonly sessionIsolation: () => EffectiveSpeculativeActionSettings["isolation"];
 	readonly settingsScope: () => SpeculativeSettingsScope;
 	readonly setSettingsScope: (scope: SpeculativeSettingsScope) => void;
-	readonly health: () => SpeculativeSandboxHealth | undefined;
 	readonly metrics: () => SpeculativeActionMetrics;
 	readonly registeredTools: () => ReadonlySet<string>;
 	readonly toolConflicts: () => ReadonlyMap<string, string>;
 	readonly recentEvents: () => readonly string[];
+	readonly executionSummary: () => string;
 	readonly setSettings: (settings: SpeculativeActionPackageSettings | undefined) => void;
 	readonly attachUI: (ui: ExtensionUIContext) => void;
 	readonly detachUI: () => void;
-	readonly refreshHealth: (refresh?: boolean) => Promise<SpeculativeSandboxHealth>;
 	readonly startTurn: (messages: AgentMessage[], context: ExtensionContext) => Promise<void>;
 	readonly finishTurn: (terminal?: boolean) => Promise<void>;
 	readonly execute: (
@@ -133,11 +119,9 @@ interface SpeculativeActionController {
 }
 
 export interface SpeculativeActionExtensionDependencies {
-	readonly createBackendRouter?: (settings: EffectiveSpeculativeActionSettings) => SandboxBackendRouter;
-	readonly createSandbox?: () => SpeculativeAgentSandbox;
+	readonly createExecutionWorlds?: () => readonly SpeculativeAgentSandbox[];
 	readonly createHost?: typeof createSpeculativeActionHost;
 	readonly createSettingsStore?: (cwd: string) => SpeculativeSettingsStore;
-	readonly ociSetup?: OciSetupService;
 }
 
 export function normalizeSpeculativeActionSettings(
@@ -156,27 +140,17 @@ export function normalizeSpeculativeActionSettings(
 		resourceCacheMaxEntries: positiveInteger(input?.resourceCacheMaxEntries, DEFAULTS.resourceCacheMaxEntries),
 		resourceCacheMaxBytes: positiveInteger(input?.resourceCacheMaxBytes, DEFAULTS.resourceCacheMaxBytes),
 		predictionTimeoutMs: positiveInteger(input?.predictionTimeoutMs, DEFAULTS.predictionTimeoutMs),
-		isolation: normalizeIsolation(input?.isolation),
 		patternAware: patternAwareSettings(input?.patternAware ?? PATTERN_AWARE_DEFAULTS),
-		tools: {
-			resourceCached: supportedTools(
-				input?.tools?.resourceCached,
-				DEFAULTS.tools.resourceCached,
-				IDEMPOTENT_ACTION_TOOLS,
-			),
-			sandbox: supportedTools(input?.tools?.sandbox, DEFAULTS.tools.sandbox, SANDBOX_ACTION_TOOLS),
-		},
+		tools: normalizeSpeculativeToolSelection(input?.tools, KEYABLE_TOOLS),
 	};
 }
 
 export function formatSpeculativeActionStatus(input: {
 	readonly settings: EffectiveSpeculativeActionSettings;
 	readonly metrics: SpeculativeActionMetrics;
-	readonly health?: SpeculativeSandboxHealth;
 }): string {
-	const { settings, metrics, health } = input;
+	const { settings, metrics } = input;
 	const hitRate = Math.round(metrics.hitRate * 100);
-	const activeSandbox = health ? statusSummary(health.active) : "not checked";
 	const cache = metrics.cache;
 	return [
 		`Enabled: ${settings.enabled ? "On" : "Off"}`,
@@ -189,12 +163,8 @@ export function formatSpeculativeActionStatus(input: {
 		`Resource cache memory: ${formatBytes(settings.resourceCacheMaxBytes)}`,
 		`Prediction timeout: ${formatDuration(settings.predictionTimeoutMs)}`,
 		`PatternAware: ${settings.patternAware.enabled ? "On" : "Off"}; multi-step: ${settings.patternAware.multiStepEnabled ? "On" : "Off"} (beam ${settings.patternAware.beamWidth}, depth ${settings.patternAware.maxPredictionDepth}, support ${settings.patternAware.minOccurrences}, binding≥${settings.patternAware.minBindingReplayProbability}, gap ${settings.patternAware.maxFutureGap}, coverage ${formatPercent(settings.patternAware.futureGapCoverage)}, half-life ${settings.patternAware.decayHalfLifeEvents})`,
-		`Resource-cached tools: ${toolsSummary(settings.tools.resourceCached)}`,
-		`Sandbox-staged tools: ${toolsSummary(settings.tools.sandbox)}`,
-		`Configured isolation: ${settings.isolation.backend}; runtime: ${settings.isolation.runtime}; image: ${settings.isolation.image}; shell: ${settings.isolation.guestShell ?? "image default"}`,
-		`Session isolation: ${health?.configured ?? "not started"}; active: ${activeSandbox}`,
-		`OCI worker: ${health ? statusSummary(health.candidates.container) : "not checked"}`,
-		`Native sandbox: ${health ? statusSummary(health.candidates.native) : "not checked"}`,
+		`Prediction tools: ${toolsSummary(settings.tools)}`,
+		"Execution boundary: runtime sandbox first; resource snapshots or Git worktrees second; otherwise Actor fallback",
 		`Actor actions: ${metrics.speculativeHits}/${metrics.actorActions} speculative hits (${hitRate}%); fallbacks: ${metrics.actorFallbacks}`,
 		`Predictions: ${metrics.predictionsMatched}/${metrics.predictionsObserved} matched (${formatPercent(metrics.predictionPrecision)}); ${metrics.predictionsAdopted}/${metrics.predictionsMatched} adopted (${formatPercent(metrics.adoptionYield)}); unobserved: ${metrics.predictionsSettled - metrics.predictionsObserved}`,
 		`Prediction rejections after match: ${countSummary(metrics.predictionRejectedAfterMatch)}`,
@@ -202,9 +172,9 @@ export function formatSpeculativeActionStatus(input: {
 		`Candidates: ${metrics.candidateStarted} started; ${metrics.candidateSucceeded} succeeded; ${metrics.candidateFailed} failed; ${metrics.candidateCancelled} cancelled`,
 		`Task timing: ${formatDuration(metrics.endToEndMs)} actual; ${formatDuration(metrics.serializedMs)} serialized; ${formatDuration(metrics.hiddenLatencyMs)} serialized overlap; ${formatDuration(metrics.nonToolMs)} non-tool; ${formatDuration(metrics.toolExecutionMs)} tools`,
 		`Execution ahead: ${formatDuration(metrics.executionAheadMs)}; hit latency: ${formatDuration(metrics.hitLatencyMs)}; attempt lead: ${formatDuration(metrics.attemptLeadMs)}; Actor execution: ${formatDuration(metrics.actorExecutionMs)}`,
+		`Isolation-blocked potential: ${metrics.executionBlockedActorActions} Actor actions; ${formatDuration(metrics.executionBlockedPotentialHiddenLatencyMs)} could be hidden; ${formatDuration(metrics.executionBlockedPotentialHitLatencyMs)} would remain; ${formatDuration(metrics.executionBlockedAttemptLeadMs)} attempt lead`,
 		`Draft tokens: ${metrics.totalDraftTokens}`,
 		`Results: ${cache.resultEntries}/${cache.cacheCapacity}, ${formatBytes(cache.resultBytes)}/${formatBytes(cache.cacheByteCapacity ?? 0)}; cold: ${cache.cacheCold}; hot: ${cache.cacheHot}; jobs: ${cache.inFlightJobs}; branches: ${cache.branchEntries} (${formatBytes(cache.branchBytes)})`,
-		...(health?.active.path ? [`Sandbox path: ${health.active.path}`] : []),
 	].join("\n");
 }
 
@@ -214,15 +184,11 @@ export function createSpeculativeActionExtension(
 	return (pi) => {
 		let controller: SpeculativeActionController | undefined;
 		const wrapperSources = new Map<string, string>();
-		const ociSetup = dependencies.ociSetup ?? createOciSetupService();
 
 		pi.on("session_start", async (_event, ctx) => {
 			await controller?.dispose();
 			controller = await installController(ctx, pi, dependencies, wrapperSources);
 			controller.attachUI(ctx.ui);
-			if (ctx.mode === "tui" && controller?.settings().enabled) {
-				void controller.refreshHealth().catch(() => undefined);
-			}
 		});
 		pi.on("context", async (event, ctx) => {
 			await controller?.startTurn(event.messages, ctx);
@@ -243,7 +209,7 @@ export function createSpeculativeActionExtension(
 
 		const command = {
 			description: "Configure speculative action pre-execution",
-			handler: (args: string, ctx: ExtensionCommandContext) => runCommand(args, ctx, controller, ociSetup),
+			handler: (args: string, ctx: ExtensionCommandContext) => runCommand(args, ctx, controller),
 		};
 		pi.registerCommand("speculative-action", command);
 	};
@@ -259,7 +225,6 @@ async function installController(
 	wrapperSources: Map<string, string>,
 ): Promise<SpeculativeActionController> {
 	let currentMetrics = emptyMetrics();
-	let health: SpeculativeSandboxHealth | undefined;
 	let ui: ExtensionUIContext | undefined;
 	let latestContext = context;
 	let currentTurnID: string | undefined;
@@ -272,14 +237,7 @@ async function installController(
 	await settingsStore.load();
 	let currentSettings = normalizeSpeculativeActionSettings(settingsStore.effective());
 	const settings = () => currentSettings;
-	const sessionSettings = currentSettings;
-	const backendRouter =
-		dependencies.createBackendRouter?.(sessionSettings) ?? createConfiguredBackendRouter(sessionSettings);
-	const sandbox =
-		dependencies.createSandbox?.() ??
-		createWorkspaceSandbox({
-			processBackend: backendRouter,
-		});
+	const executionWorlds = dependencies.createExecutionWorlds?.() ?? [createWorkspaceSandbox()];
 	const piToolSettings = await loadPiToolSettings(context.cwd);
 	const availableTools = new Map(pi.getAllTools().map((tool) => [tool.name, tool]));
 	const toolConflicts = new Map<string, string>();
@@ -307,14 +265,9 @@ async function installController(
 		}
 		const conflictText =
 			toolConflicts.size > 0 ? ` · ${toolConflicts.size} tool conflict${toolConflicts.size === 1 ? "" : "s"}` : "";
-		const healthText = health
-			? health.active.state === "ready"
-				? backendDisplayName(health.active)
-				: "bash sandbox unavailable"
-			: "unchecked";
 		ui.setStatus(
 			STATUS_KEY,
-			`spec: on · ${healthText}${conflictText} · ${currentMetrics.speculativeHits}/${currentMetrics.actorActions} hits · ${formatDuration(currentMetrics.hiddenLatencyMs)} serialized overlap (${formatDuration(currentMetrics.endToEndMs)}/${formatDuration(currentMetrics.serializedMs)}) · ${currentMetrics.cache.resultEntries}/${currentMetrics.cache.cacheCapacity} results (${formatBytes(currentMetrics.cache.resultBytes)}) · ${currentMetrics.cache.inFlightJobs} jobs · ${currentMetrics.cache.branchEntries} branches`,
+			`spec: on · unsafe routes fall back${conflictText} · ${currentMetrics.speculativeHits}/${currentMetrics.actorActions} adopted · ${currentMetrics.predictionsMatched}/${currentMetrics.predictionsObserved} predictions matched · ${formatDuration(currentMetrics.hiddenLatencyMs)} serialized overlap (${formatDuration(currentMetrics.endToEndMs)}/${formatDuration(currentMetrics.serializedMs)}) · ${currentMetrics.cache.resultEntries}/${currentMetrics.cache.cacheCapacity} results (${formatBytes(currentMetrics.cache.resultBytes)}) · ${currentMetrics.cache.inFlightJobs} jobs · ${currentMetrics.cache.branchEntries} branches`,
 		);
 	}
 	const host = (dependencies.createHost ?? createSpeculativeActionHost)(context.sessionManager.getSessionId(), {
@@ -340,7 +293,7 @@ async function installController(
 				...(piToolSettings.shellCommandPrefix ? { shellCommandPrefix: piToolSettings.shellCommandPrefix } : {}),
 			}),
 		projectionRules: [PI_READ_RANGE_PROJECTION_RULE],
-		sandbox,
+		executionWorlds,
 		patternStateDirectory: getAgentDir(),
 		onEvent: (event) => {
 			currentMetrics = reduceSpeculativeTrace(currentMetrics, event);
@@ -352,14 +305,13 @@ async function installController(
 
 	const controller: SpeculativeActionController = {
 		settings,
-		sessionIsolation: () => sessionSettings.isolation,
 		settingsScope: () => settingsStore.scope,
 		setSettingsScope: (scope) => settingsStore.setScope(scope),
-		health: () => health,
 		metrics: () => currentMetrics,
 		registeredTools: () => new Set(baseDefinitions.keys()),
 		toolConflicts: () => new Map(toolConflicts),
 		recentEvents: () => [...recentEvents],
+		executionSummary: () => executionWorldSummary(executionWorlds),
 		setSettings: (value) => {
 			if (value) settingsStore.setEffective(value);
 			else settingsStore.clear();
@@ -374,11 +326,6 @@ async function installController(
 		detachUI: () => {
 			ui?.setStatus(STATUS_KEY, undefined);
 			ui = undefined;
-		},
-		refreshHealth: async (refresh = false) => {
-			health = await backendRouter.inspect({ refresh });
-			renderFooter();
-			return health;
 		},
 		startTurn: async (messages, nextContext) => {
 			latestContext = nextContext;
@@ -469,7 +416,7 @@ async function installController(
 			}
 		},
 		statusText: () =>
-			`${formatSpeculativeActionStatus({ settings: settings(), metrics: currentMetrics, health })}\nCustom tool conflicts: ${toolConflictSummary(toolConflicts)}`,
+			`${formatSpeculativeActionStatus({ settings: settings(), metrics: currentMetrics })}\n${executionWorldSummary(executionWorlds)}\nCustom tool conflicts: ${toolConflictSummary(toolConflicts)}`,
 		dispose: async () => {
 			ui?.setStatus(STATUS_KEY, undefined);
 			ui = undefined;
@@ -493,20 +440,6 @@ async function recoverSpeculation<T>(operation: () => Promise<T>): Promise<T | u
 	} catch {
 		return undefined;
 	}
-}
-
-function createConfiguredBackendRouter(settings: EffectiveSpeculativeActionSettings): SandboxBackendRouter {
-	const container = createContainerSandboxProcessBackend({
-		runtime: settings.isolation.runtime,
-		image: settings.isolation.image,
-		maxWorkers: settings.maxConcurrentActions,
-		...(settings.isolation.guestShell ? { guestShell: settings.isolation.guestShell } : {}),
-	});
-	const native = createNativeSandboxProcessBackend();
-	return createSandboxBackendRouter(settings.isolation.backend, [
-		{ id: "container", backend: container },
-		{ id: "native", backend: native },
-	]);
 }
 
 interface PiToolSettings {
@@ -655,27 +588,10 @@ function expandHome(value: string): string {
 	return home ? path.join(home, value.slice(2)) : value;
 }
 
-function backendDisplayName(status: SandboxProcessBackendStatus): string {
-	if (status.backend === "container") return "OCI worker";
-	if (status.backend === "native") {
-		if (process.platform === "win32") return "Windows AppContainer";
-		if (process.platform === "darwin") return "macOS native sandbox";
-		return "Linux native sandbox";
-	}
-	return status.backend;
-}
-
-function statusSummary(status: SandboxProcessBackendStatus): string {
-	return status.state === "ready"
-		? `${backendDisplayName(status)} ready (${status.source})`
-		: `unavailable (${status.source}): ${status.detail}`;
-}
-
 async function runCommand(
 	args: string,
 	ctx: ExtensionCommandContext,
 	controller: SpeculativeActionController | undefined,
-	ociSetup: OciSetupService,
 ): Promise<void> {
 	if (!controller) {
 		ctx.ui.notify("Speculative action runtime is unavailable.", "error");
@@ -684,13 +600,7 @@ async function runCommand(
 	const command = args.trim().toLowerCase();
 	if (command === "on" || command === "off") {
 		controller.setSettings({ ...controller.settings(), enabled: command === "on" });
-		const health = command === "on" ? await prepareSandboxOnEnable(ctx, controller, ociSetup) : undefined;
-		ctx.ui.notify(
-			command === "on" && health?.active.state !== "ready"
-				? `Speculative action enabled; Bash speculation is unavailable: ${health?.active.detail ?? "process sandbox not ready"}`
-				: `Speculative action ${command === "on" ? "enabled" : "disabled"}.`,
-			command === "on" && health?.active.state !== "ready" ? "warning" : "info",
-		);
+		ctx.ui.notify(`Speculative action ${command === "on" ? "enabled" : "disabled"}.`, "info");
 		return;
 	}
 	if (command === "reset") {
@@ -702,74 +612,18 @@ async function runCommand(
 		showRecentEvents(ctx, controller);
 		return;
 	}
-	if (command === "status" || command === "refresh" || (command === "" && ctx.mode !== "tui")) {
-		await controller.refreshHealth(command === "refresh");
+	if (command === "status" || (command === "" && ctx.mode !== "tui")) {
 		ctx.ui.notify(controller.statusText(), controller.settings().enabled ? "info" : "warning");
 		return;
 	}
 	if (command) {
-		ctx.ui.notify("Usage: /speculative-action [on|off|status|events|refresh|reset]", "warning");
+		ctx.ui.notify("Usage: /speculative-action [on|off|status|events|reset]", "warning");
 		return;
 	}
-	await openSettings(ctx, controller, ociSetup);
+	await openSettings(ctx, controller);
 }
 
-async function prepareSandboxOnEnable(
-	ctx: ExtensionContext,
-	controller: SpeculativeActionController,
-	ociSetup: OciSetupService,
-	forceOciSetup = false,
-): Promise<SpeculativeSandboxHealth> {
-	let health = await controller.refreshHealth(true);
-	const isolation = controller.sessionIsolation();
-	if ((!forceOciSetup && health.active.state === "ready") || ctx.mode !== "tui") return health;
-	if (!forceOciSetup && health.configured === "native") {
-		ctx.ui.notify(`Native sandbox is unavailable: ${health.candidates.native.detail}`, "warning");
-		return health;
-	}
-	const options = await ociSetup.discover(isolation.runtime);
-	if (options.length === 0) {
-		ctx.ui.notify(
-			"No supported automatic OCI installer was found. Install Docker or Podman manually, then refresh.",
-			"warning",
-		);
-		return health;
-	}
-	const labels = new Map(options.map((option) => [`${option.label} — ${option.detail}`, option]));
-	const choice = await ctx.ui.select("Sandbox dependency setup", [...labels.keys(), "Skip for now"]);
-	const selected = choice ? labels.get(choice) : undefined;
-	if (!selected) return health;
-	const confirmed = await ctx.ui.confirm(
-		selected.label,
-		`Pi will use the operating system package manager to prepare ${selected.runtime}, then build the bundled worker image. Administrator approval and network downloads may be required. Continue?`,
-	);
-	if (!confirmed) return health;
-	try {
-		await ociSetup.setup({
-			runtime: selected.runtime,
-			image: isolation.image,
-			onProgress: (message) => ctx.ui.setStatus(SETUP_STATUS_KEY, `sandbox setup: ${message}`),
-		});
-		health = await controller.refreshHealth(true);
-		ctx.ui.notify(
-			health.candidates.container.state === "ready"
-				? `OCI worker is ready. Active backend: ${backendDisplayName(health.active)}.`
-				: `OCI setup completed, but the worker is not ready: ${health.candidates.container.detail}`,
-			health.candidates.container.state === "ready" ? "info" : "warning",
-		);
-	} catch (error) {
-		ctx.ui.notify(`Sandbox setup failed: ${error instanceof Error ? error.message : String(error)}`, "error");
-	} finally {
-		ctx.ui.setStatus(SETUP_STATUS_KEY, undefined);
-	}
-	return health;
-}
-
-async function openSettings(
-	ctx: ExtensionContext,
-	controller: SpeculativeActionController,
-	ociSetup: OciSetupService,
-): Promise<void> {
+async function openSettings(ctx: ExtensionContext, controller: SpeculativeActionController): Promise<void> {
 	let applied = cloneSettings(controller.settings());
 	let draft = cloneSettings(applied);
 	const editor: SpeculativeActionController = {
@@ -790,7 +644,7 @@ async function openSettings(
 			`Configuration scope: ${controller.settingsScope()}`,
 			`Prediction sources › ${sourceSummary(draft)}`,
 			`Scheduling & cache › ${draft.candidateLimit} draft requests, ${draft.maxConcurrentActions} concurrent, ${draft.resourceCacheMaxEntries} entries`,
-			`Tools & sandbox › ${enabledToolCount(draft)} tools, ${activeBackendSummary(controller.health())}`,
+			`Tools & execution › ${enabledToolCount(draft)} tools`,
 			`Apply changes${dirty ? " (pending)" : ""}`,
 			...(dirty ? ["Discard changes"] : []),
 			"Status",
@@ -811,14 +665,6 @@ async function openSettings(
 			controller.setSettings({ ...applied, enabled });
 			applied = cloneSettings(controller.settings());
 			draft = { ...draft, enabled };
-			if (enabled) {
-				const health = await prepareSandboxOnEnable(ctx, controller, ociSetup);
-				if (health.active.state !== "ready")
-					ctx.ui.notify(
-						`Bash speculation unavailable; other configured tools remain active: ${health.active.detail}`,
-						"warning",
-					);
-			}
 			continue;
 		}
 		if (choice.startsWith("Configuration scope:")) {
@@ -834,8 +680,8 @@ async function openSettings(
 			await openSchedulingAndCache(ctx, editor);
 			continue;
 		}
-		if (choice.startsWith("Tools & sandbox")) {
-			await openToolsAndSandbox(ctx, editor, controller, ociSetup);
+		if (choice.startsWith("Tools & execution")) {
+			await openToolsAndExecution(ctx, editor, controller);
 			continue;
 		}
 		if (choice.startsWith("Apply changes")) {
@@ -843,15 +689,9 @@ async function openSettings(
 				ctx.ui.notify("No pending speculative-action changes.", "info");
 				continue;
 			}
-			const isolationChanged = JSON.stringify(draft.isolation) !== JSON.stringify(applied.isolation);
 			controller.setSettings(draft);
 			reload();
-			ctx.ui.notify(
-				isolationChanged
-					? "Speculative-action settings applied. Isolation backend changes take effect in the next Pi session."
-					: "Speculative-action settings applied.",
-				"info",
-			);
+			ctx.ui.notify("Speculative-action settings applied.", "info");
 			continue;
 		}
 		if (choice === "Discard changes") {
@@ -859,7 +699,6 @@ async function openSettings(
 			continue;
 		}
 		if (choice === "Status") {
-			await controller.refreshHealth();
 			ctx.ui.notify(controller.statusText(), "info");
 			continue;
 		}
@@ -1049,85 +888,26 @@ async function openSchedulingAndCache(ctx: ExtensionContext, controller: Specula
 	}
 }
 
-async function openToolsAndSandbox(
+async function openToolsAndExecution(
 	ctx: ExtensionContext,
 	editor: SpeculativeActionController,
 	controller: SpeculativeActionController,
-	ociSetup: OciSetupService,
 ): Promise<void> {
 	while (true) {
 		const settings = editor.settings();
-		const choice = await ctx.ui.select("Tools & sandbox", [
+		const choice = await ctx.ui.select("Tools & execution", [
 			`Tool policy › ${enabledToolCount(settings)} enabled`,
-			`Isolation › ${settings.isolation.backend}, ${settings.isolation.runtime}`,
-			`Active backend: ${activeBackendSummary(controller.health())}`,
-			`OCI worker: ${componentHealthSummary(controller.health()?.candidates.container)}`,
-			`Native sandbox: ${componentHealthSummary(controller.health()?.candidates.native)}`,
-			"Install or repair OCI dependencies",
-			"Isolation guarantees",
+			"Execution guarantees",
 			BACK,
 		]);
 		if (!choice || choice === BACK) return;
 		if (choice.startsWith("Tool policy"))
 			await editToolPolicy(ctx, editor, controller.registeredTools(), controller.toolConflicts());
-		if (choice.startsWith("Isolation ›")) await openIsolationSettings(ctx, editor);
-		if (
-			choice.startsWith("Active backend:") ||
-			choice.startsWith("OCI worker:") ||
-			choice.startsWith("Native sandbox:")
-		) {
-			const health = await controller.refreshHealth(true);
+		if (choice === "Execution guarantees") {
 			ctx.ui.notify(
-				[
-					`Configured: ${health.configured}`,
-					`Active: ${statusSummary(health.active)}`,
-					`OCI worker: ${statusSummary(health.candidates.container)}`,
-					`Native sandbox: ${statusSummary(health.candidates.native)}`,
-				].join("\n"),
-				health.active.state === "ready" ? "info" : "warning",
-			);
-		}
-		if (choice === "Install or repair OCI dependencies") {
-			if (JSON.stringify(settings.isolation) !== JSON.stringify(controller.settings().isolation)) {
-				ctx.ui.notify("Apply the pending isolation settings before preparing their dependencies.", "warning");
-				continue;
-			}
-			const before = controller.health()?.candidates.container;
-			const health = await prepareSandboxOnEnable(ctx, controller, ociSetup, true);
-			if (health.candidates.container.state === "ready" && before?.state === "ready")
-				ctx.ui.notify(`OCI worker ready: ${health.candidates.container.detail}`, "info");
-		}
-		if (choice === "Isolation guarantees") {
-			ctx.ui.notify(
-				"Speculative file edits run in private Git worktrees. Bash additionally runs in the selected process boundary: an OCI worker, or the native OS sandbox. Only conflict-checked file changes are committed; failed candidates are discarded and the actor executes normally.",
+				`Every speculative tool first uses a runtime-wide sandbox when one is available. Otherwise read-only tools use resource snapshots, write/edit use private Git worktrees, and tools without a safe isolation route are matched but executed only by the Actor.\n${controller.executionSummary()}`,
 				"info",
 			);
-		}
-	}
-}
-
-async function openIsolationSettings(ctx: ExtensionContext, controller: SpeculativeActionController): Promise<void> {
-	while (true) {
-		const settings = controller.settings();
-		const choice = await ctx.ui.select("Isolation", [
-			`Backend: ${settings.isolation.backend}`,
-			`OCI runtime: ${settings.isolation.runtime}`,
-			`Worker image: ${settings.isolation.image}`,
-			`Worker shell: ${settings.isolation.guestShell ?? "image default"}`,
-			BACK,
-		]);
-		if (!choice || choice === BACK) return;
-		if (choice.startsWith("Backend:")) {
-			await editIsolationChoice(ctx, controller, settings, "backend", ["auto", "container", "native"]);
-		}
-		if (choice.startsWith("OCI runtime:")) {
-			await editIsolationChoice(ctx, controller, settings, "runtime", ["auto", "docker", "podman"]);
-		}
-		if (choice.startsWith("Worker image:")) {
-			await editIsolationText(ctx, controller, settings, "image", "OCI worker image", false);
-		}
-		if (choice.startsWith("Worker shell:")) {
-			await editIsolationText(ctx, controller, settings, "guestShell", "Worker shell (blank = image default)", true);
 		}
 	}
 }
@@ -1140,29 +920,25 @@ async function editToolPolicy(
 ): Promise<void> {
 	while (true) {
 		const settings = controller.settings();
-		const tools = [
-			...new Set([...KEYABLE_TOOLS, ...settings.tools.resourceCached, ...settings.tools.sandbox, ...registered]),
-		].sort((left, right) => toolCategory(left) - toolCategory(right) || left.localeCompare(right));
+		const tools = [...new Set([...KEYABLE_TOOLS, ...settings.tools, ...registered])].sort(
+			(left, right) => toolCategory(left) - toolCategory(right) || left.localeCompare(right),
+		);
 		const labels = new Map<string, string>();
 		for (const tool of tools) {
-			const group = toolGroup(tool);
-			const selected = group ? settings.tools[group].includes(tool) : false;
+			const supported = (KEYABLE_TOOLS as readonly string[]).includes(tool);
+			const selected = supported && settings.tools.includes(tool);
 			const availability = conflicts.has(tool) ? " · custom override" : registered.has(tool) ? "" : " · unavailable";
-			labels.set(
-				`${selected ? "[x]" : "[ ]"} ${tool} · ${group === "resourceCached" ? "cached" : group === "sandbox" ? "sandbox" : "unsupported"}${availability}`,
-				tool,
-			);
+			labels.set(`${selected ? "[x]" : "[ ]"} ${tool} · ${toolIsolationLabel(tool)}${availability}`, tool);
 		}
 		const choice = await ctx.ui.select("Tool policy", [...labels.keys(), BACK]);
 		if (!choice || choice === BACK) return;
 		const tool = labels.get(choice);
 		if (!tool) continue;
-		const group = toolGroup(tool);
-		if (!group) {
+		if (!(KEYABLE_TOOLS as readonly string[]).includes(tool)) {
 			ctx.ui.notify(`${tool} has no speculative action semantics.`, "warning");
 			continue;
 		}
-		const selected = settings.tools[group].includes(tool);
+		const selected = settings.tools.includes(tool);
 		if (!selected && !registered.has(tool)) {
 			const conflict = conflicts.get(tool);
 			ctx.ui.notify(
@@ -1173,50 +949,9 @@ async function editToolPolicy(
 			);
 			continue;
 		}
-		const next = selected ? settings.tools[group].filter((item) => item !== tool) : [...settings.tools[group], tool];
-		controller.setSettings({ ...settings, tools: { ...settings.tools, [group]: next } });
+		const next = selected ? settings.tools.filter((item) => item !== tool) : [...settings.tools, tool];
+		controller.setSettings({ ...settings, tools: next });
 	}
-}
-
-async function editIsolationChoice(
-	ctx: ExtensionContext,
-	controller: SpeculativeActionController,
-	settings: EffectiveSpeculativeActionSettings,
-	field: "backend" | "runtime",
-	values: readonly string[],
-): Promise<void> {
-	const choice = await ctx.ui.select(field === "backend" ? "Isolation backend" : "Worker runtime", [...values, BACK]);
-	if (!choice || choice === BACK || !values.includes(choice)) return;
-	const isolation =
-		field === "backend"
-			? { ...settings.isolation, backend: choice as EffectiveSpeculativeActionSettings["isolation"]["backend"] }
-			: { ...settings.isolation, runtime: choice as EffectiveSpeculativeActionSettings["isolation"]["runtime"] };
-	controller.setSettings({ ...settings, isolation });
-}
-
-async function editIsolationText(
-	ctx: ExtensionContext,
-	controller: SpeculativeActionController,
-	settings: EffectiveSpeculativeActionSettings,
-	field: "image" | "guestShell",
-	title: string,
-	allowEmpty: boolean,
-): Promise<void> {
-	const value = await ctx.ui.input(title, settings.isolation[field] ?? "");
-	if (value === undefined) return;
-	const normalized = value.trim();
-	if (!normalized && !allowEmpty) {
-		ctx.ui.notify(`${title} must not be empty.`, "warning");
-		return;
-	}
-	let isolation: EffectiveSpeculativeActionSettings["isolation"];
-	if (field === "image") {
-		isolation = { ...settings.isolation, image: normalized };
-	} else {
-		const { guestShell: _previous, ...base } = settings.isolation;
-		isolation = normalized ? { ...base, guestShell: normalized } : base;
-	}
-	controller.setSettings({ ...settings, isolation });
 }
 
 async function editPositiveInteger(
@@ -1493,6 +1228,14 @@ export function formatSpeculativeActionEvent(event: SpeculativeActionEvent<strin
 				);
 			} else {
 				parts.push(`${formatDuration(event.settlement.provider.durationMs)} Actor execution`);
+				const timing = event.settlement.provider.executionBlockedTiming;
+				if (timing) {
+					parts.push(
+						`${formatDuration(timing.executionAheadMs)} potentially hidden`,
+						`${formatDuration(timing.hitLatencyMs)} would remain`,
+						`${formatDuration(timing.attemptLeadMs)} prediction lead`,
+					);
+				}
 			}
 			parts.push(compactEventText(event.actualAction));
 			break;
@@ -1563,38 +1306,15 @@ function emptyMetrics(): SpeculativeActionMetrics {
 	});
 }
 
-function supportedTools(value: unknown, fallback: readonly string[], allowed: readonly string[]): readonly string[] {
-	if (!Array.isArray(value) || !value.every((item): item is string => typeof item === "string")) return fallback;
-	const supported = new Set(allowed);
-	return [...new Set(value.filter((item) => supported.has(item)))];
-}
-
 function positiveInteger(value: unknown, fallback: number): number {
 	return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
-}
-
-function normalizeIsolation(
-	input: SpeculativeActionPackageSettings["isolation"],
-): EffectiveSpeculativeActionSettings["isolation"] {
-	const guestShell = nonEmpty(input?.guestShell);
-	return {
-		backend: input?.backend === "container" || input?.backend === "native" ? input.backend : "auto",
-		runtime: input?.runtime === "docker" || input?.runtime === "podman" ? input.runtime : "auto",
-		image: nonEmpty(input?.image) ?? DEFAULT_CONTAINER_SANDBOX_IMAGE,
-		...(guestShell ? { guestShell } : {}),
-	};
-}
-
-function nonEmpty(value: unknown): string | undefined {
-	return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
 function cloneSettings(settings: EffectiveSpeculativeActionSettings): EffectiveSpeculativeActionSettings {
 	return {
 		...settings,
-		isolation: { ...settings.isolation },
 		patternAware: { ...settings.patternAware },
-		tools: { resourceCached: [...settings.tools.resourceCached], sandbox: [...settings.tools.sandbox] },
+		tools: [...settings.tools],
 	};
 }
 
@@ -1618,32 +1338,37 @@ function activeModelReference(ctx: ExtensionContext): string {
 }
 
 function enabledToolCount(settings: EffectiveSpeculativeActionSettings): number {
-	return new Set([...settings.tools.resourceCached, ...settings.tools.sandbox]).size;
+	return new Set(settings.tools).size;
 }
 
-function activeBackendSummary(health: SpeculativeSandboxHealth | undefined): string {
-	if (!health) return "not checked";
-	return health.active.state === "ready" ? `${backendDisplayName(health.active)} ready` : "unavailable";
-}
-
-function componentHealthSummary(status: SandboxProcessBackendStatus | undefined): string {
-	if (!status) return "not checked";
-	return status.state === "ready" ? "ready" : "unavailable";
-}
-
-function toolGroup(tool: string): "resourceCached" | "sandbox" | undefined {
-	if ((IDEMPOTENT_ACTION_TOOLS as readonly string[]).includes(tool)) return "resourceCached";
-	if ((SANDBOX_ACTION_TOOLS as readonly string[]).includes(tool)) return "sandbox";
-	return undefined;
+function toolIsolationLabel(tool: string): string {
+	if ((RESOURCE_SNAPSHOT_ACTION_TOOLS as readonly string[]).includes(tool)) return "resource snapshot fallback";
+	if ((FILE_MUTATION_ACTION_TOOLS as readonly string[]).includes(tool)) return "Git worktree fallback";
+	if ((NO_LOCAL_ISOLATION_ACTION_TOOLS as readonly string[]).includes(tool)) return "requires runtime sandbox";
+	return "unsupported";
 }
 
 function toolCategory(tool: string): number {
-	const group = toolGroup(tool);
-	return group === "resourceCached" ? 0 : group === "sandbox" ? 1 : 2;
+	if ((RESOURCE_SNAPSHOT_ACTION_TOOLS as readonly string[]).includes(tool)) return 0;
+	if ((FILE_MUTATION_ACTION_TOOLS as readonly string[]).includes(tool)) return 1;
+	if ((NO_LOCAL_ISOLATION_ACTION_TOOLS as readonly string[]).includes(tool)) return 2;
+	return 3;
 }
 
 function toolsSummary(tools: readonly string[]): string {
 	return tools.length > 0 ? tools.join(" ") : "none";
+}
+
+function executionWorldSummary(worlds: readonly SpeculativeAgentSandbox[]): string {
+	const supporting = (mode: "runtime_sandbox" | "file_mutation") =>
+		worlds.flatMap((world) => {
+			try {
+				return world.supports(mode) ? [world.id] : [];
+			} catch {
+				return [];
+			}
+		});
+	return `Execution capabilities: runtime sandbox ${toolsSummary(supporting("runtime_sandbox"))}; file mutation ${toolsSummary(supporting("file_mutation"))}; resource snapshots built in`;
 }
 
 function countSummary(counts: Readonly<Record<string, number>>): string {

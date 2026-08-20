@@ -24,7 +24,6 @@ export const PI_READ_RANGE_PROJECTION_RULE: ActionProjectionRule<ToolSettlement>
 		if (!range || range.limit === 0 || range.limit >= READ_DEFAULT_LIMIT) return undefined;
 		return buildActionKey({
 			tool: action.tool,
-			execution: action.execution,
 			resources: action.resources,
 			input: { ...action.input, limit: READ_DEFAULT_LIMIT },
 			schemaHash: action.schemaHash,

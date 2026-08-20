@@ -12,7 +12,7 @@ import { ActionStore, ResultCache, type ResultCacheEvidence, speculativeCacheVal
 import { clampCandidateLimit, DEFAULTS, type DrafterToolDefinition } from "./common.ts";
 import { diagnosticAction } from "./diagnostics.ts";
 import type { CandidateEventDescriptor, CandidateExecutionProjection } from "./events.ts";
-import type { WorldBranch } from "./execution-world.ts";
+import { type SpeculativeExecutionRoute, sameSpeculativeExecutionRoute, type WorldBranch } from "./execution-world.ts";
 import type { PlanUpdate } from "./plan-proposal.ts";
 import { PlanRuntime, type PlanRuntimeNode, type PredictionOpportunity, type RetiredPlanNode } from "./plan-runtime.ts";
 import { PostSettlementQueue } from "./post-settlement.ts";
@@ -132,15 +132,13 @@ function cacheLimits(settings: SpeculativeActionSettings) {
 
 function forecastFor(
 	node: PlanRuntimeNode,
-	semantics: ActionSemanticsRegistry,
+	route: SpeculativeExecutionRoute,
 	decisionSequence: number,
 	sourceLatencyMs = 0,
 ): PredictionForecast {
-	const execution = node.actionKey?.execution ?? semantics.execution(node.action.tool) ?? "resource_cached";
 	return {
 		tool: node.action.tool,
-		execution,
-		sandboxMode: semantics.sandboxMode(node.action.tool) ?? "none",
+		execution: route.isolation,
 		...(node.action.expectedDurationMs !== undefined ? { expectedDurationMs: node.action.expectedDurationMs } : {}),
 		...(node.action.resourceDemand !== undefined ? { resourceDemand: node.action.resourceDemand } : {}),
 		decisionBatchesUntilCall: Math.max(0, node.expectedDecisionSeq - decisionSequence),
@@ -158,7 +156,6 @@ function planActionDraft(node: PlanRuntimeNode): SpeculativeDraftCandidate {
 		tool: node.action.tool,
 		input: node.action.input,
 		...(node.action.missing ? { missing: node.action.missing } : {}),
-		...(node.action.execution ? { execution: node.action.execution } : {}),
 		...(node.action.diagnostic ? { diagnostic: node.action.diagnostic } : {}),
 		source: node.source,
 		proposalID: node.proposalID,
@@ -416,7 +413,7 @@ function candidateEventDescriptor<Output, StartInput, StateData>(
 		id: candidate.id,
 		tool: candidate.key.tool,
 		actionKeyHash: candidate.key.hash,
-		execution: candidate.key.execution,
+		execution: candidate.route.isolation,
 		predictedAction: diagnosticAction(candidate.key.tool, candidate.key.input, candidate.key),
 		predictionLatencyMs: candidate.predictionLatencyMs,
 		draftTokens: candidate.draftTokens,
@@ -541,6 +538,7 @@ interface PlanActionContext<StartInput, StateData> {
 	readonly continuationSlots: Set<SourceRequestSlot>;
 	readonly continuationTriggers: Set<"execution_succeeded" | "actor_adopted">;
 	continuationTail: Promise<void>;
+	executionRoute?: SpeculativeExecutionRoute;
 }
 
 /** One producer request from the bounded budget for a future Actor decision. */
@@ -566,6 +564,7 @@ interface PlanAdmissionScope<SessionID, Output, StartInput, StateData> {
 interface CandidateRecord<Output, StartInput, StateData> {
 	readonly id: string;
 	readonly key: ActionKey;
+	readonly route: SpeculativeExecutionRoute;
 	readonly work: CandidateExecution<Output>;
 	readonly worldParent?: CandidateRecord<Output, StartInput, StateData>;
 	actorAdopted: boolean;
@@ -741,11 +740,8 @@ export function makeStructuralSpeculativeActionRuntime<
 	};
 
 	const candidateNames = (settings: SpeculativeActionSettings): readonly string[] => {
-		const resource = new Set(settings.tools.resourceCached);
-		const sandbox = new Set(settings.tools.sandbox);
-		return semantics
-			.toolNames()
-			.filter((tool) => (semantics.execution(tool) === "resource_cached" ? resource.has(tool) : sandbox.has(tool)));
+		const known = new Set(semantics.toolNames());
+		return [...new Set(settings.tools)].filter((tool) => known.has(tool));
 	};
 
 	const startTurn = async (input: StartInput, signal?: AbortSignal): Promise<void> => {
@@ -1074,6 +1070,33 @@ export function makeStructuralSpeculativeActionRuntime<
 			failUnlaunchable(session, node, cause("matching", "action_not_keyable"));
 			return;
 		}
+		let route: SpeculativeExecutionRoute | undefined;
+		try {
+			route = await adapter.resolveExecution({
+				startInput: context.startInput,
+				data: context.data,
+				settings: context.settings,
+				candidate: context.draft,
+				tool: node.action.tool,
+				concrete: executionInput,
+				action: key,
+			});
+		} catch {
+			route = undefined;
+		}
+		if (!route) {
+			const blocked = cause(
+				"execution",
+				"isolation_unavailable",
+				"No safe speculative execution route is available.",
+			);
+			session.plan.bindActionKey(node.proposalID, node.action.id, key);
+			if (!session.plan.markExecutionBlocked(node.proposalID, node.action.id, blocked)) {
+				failUnlaunchable(session, node, cause("plan", "execution_route_state_invalid"));
+			}
+			return;
+		}
+		context.executionRoute = route;
 		const callID = `spec_${session.candidateSequence + 1}`;
 		let preflight: CandidatePreflight;
 		try {
@@ -1085,6 +1108,7 @@ export function makeStructuralSpeculativeActionRuntime<
 				tool: node.action.tool,
 				concrete: executionInput,
 				action: key,
+				route,
 				callID,
 				index: session.candidateSequence,
 				signal: context.admissionSignal,
@@ -1188,7 +1212,13 @@ export function makeStructuralSpeculativeActionRuntime<
 			if (existingTimer) clearTimeout(existingTimer);
 			session.launchTimers.delete(node.prediction.id);
 			const context = session.actionContexts.get(node.identity.id);
-			const forecast = forecastFor(node, semantics, session.decisionSequence, context?.predictionLatencyMs);
+			if (!context?.executionRoute) continue;
+			const forecast = forecastFor(
+				node,
+				context.executionRoute,
+				session.decisionSequence,
+				context.predictionLatencyMs,
+			);
 			const delay = node.prediction.id === immediatePredictionID ? 0 : session.scheduler.launchDelay(forecast);
 			if (delay <= 0) {
 				const promoted = session.plan.promote(node.proposalID, node.action.id);
@@ -1215,16 +1245,26 @@ export function makeStructuralSpeculativeActionRuntime<
 			failUnlaunchable(session, node, cause("plan", "context_missing"));
 			return;
 		}
+		const route = context.executionRoute;
+		if (!route) {
+			failUnlaunchable(session, node, cause("plan", "execution_route_missing"));
+			return;
+		}
 		const parent = dependencyWorld(session, node);
 		if (parent === null) {
 			failUnlaunchable(session, node, cause("plan", "incompatible_parent_worlds"));
 			return;
 		}
-		if (parent && (node.actionKey.execution === "resource_cached" || !parent.world?.checkpoint)) {
+		if (
+			parent &&
+			(route.reuse === "shared_result" ||
+				!parent.world?.checkpoint ||
+				!sameSpeculativeExecutionRoute(parent.route, route))
+		) {
 			session.plan.defer(node.proposalID, node.action.id);
 			return;
 		}
-		const reusable = await reusableForPrediction(session, node.actionKey, parent);
+		const reusable = await reusableForPrediction(session, node.actionKey, route, parent);
 		if (reusable) {
 			attachNode(session, node, reusable);
 			return;
@@ -1236,14 +1276,15 @@ export function makeStructuralSpeculativeActionRuntime<
 		}
 		const sequence = ++session.candidateSequence;
 		const candidateID = `spec_${sequence}_${node.actionKey.hash.slice(0, 12)}`;
-		const reuse = semantics.reuse(node.action.tool) === "exclusive_branch" ? "exclusive" : "shared";
+		const reuse = route.reuse === "exclusive_branch" ? "exclusive" : "shared";
 		const work = new CandidateExecution<Output>(reuse);
 		const scheduled = session.scheduler.evaluate([
-			forecastFor(node, semantics, session.decisionSequence, context.predictionLatencyMs),
+			forecastFor(node, route, session.decisionSequence, context.predictionLatencyMs),
 		]);
 		const candidate: Candidate = {
 			id: candidateID,
 			key: node.actionKey,
+			route,
 			work,
 			...(parent ? { worldParent: parent } : {}),
 			actorAdopted: false,
@@ -1275,8 +1316,13 @@ export function makeStructuralSpeculativeActionRuntime<
 			session.id,
 			candidate,
 			(existing, match) =>
-				candidateWorld(existing) === parent && canShareInFlight(existing, node.actionKey!, match, projectionRules),
-			(existing) => candidateWorld(existing) === parent && activeExecution(existing),
+				sameSpeculativeExecutionRoute(existing.route, route) &&
+				candidateWorld(existing) === parent &&
+				canShareInFlight(existing, node.actionKey!, match, projectionRules),
+			(existing) =>
+				sameSpeculativeExecutionRoute(existing.route, route) &&
+				candidateWorld(existing) === parent &&
+				activeExecution(existing),
 		);
 		if (!insertion.inserted) {
 			attachNode(session, node, insertion.entry);
@@ -1342,6 +1388,7 @@ export function makeStructuralSpeculativeActionRuntime<
 					settings: candidate.owner.settings,
 					candidate: candidate.owner.draft,
 					action: candidate.key,
+					route: candidate.route,
 					signal: candidate.work.controller.signal,
 				});
 			}
@@ -1358,6 +1405,7 @@ export function makeStructuralSpeculativeActionRuntime<
 				tool: candidate.key.tool,
 				concrete: candidate.key.input as Record<string, unknown>,
 				action: candidate.key,
+				route: candidate.route,
 				callID: candidate.id,
 				index: candidate.owner.index,
 				signal: candidate.work.controller.signal,
@@ -1482,7 +1530,13 @@ export function makeStructuralSpeculativeActionRuntime<
 						readonly toolExecution: TimelineInterval;
 				  }
 				| undefined;
-			let rejection: ResolutionCause = cause("matching", ranked.length ? "candidate_unavailable" : "no_candidate");
+			const blockedPrediction = matchingPredictions.find(
+				({ node }) => node.execution.status === "execution_blocked",
+			)?.node;
+			let rejection: ResolutionCause =
+				blockedPrediction?.execution.status === "execution_blocked"
+					? blockedPrediction.execution.cause
+					: cause("matching", ranked.length ? "candidate_unavailable" : "no_candidate");
 			let rejectedCandidateID: string | undefined;
 			const stopCandidate = (candidate: Candidate, reservationOwner: string): boolean => {
 				const failure = signal?.aborted
@@ -1508,12 +1562,7 @@ export function makeStructuralSpeculativeActionRuntime<
 					continue;
 				}
 				if (candidate.work.execution.status === "queued") {
-					preemptForActor(
-						state.session,
-						resourceProfile(candidate.key.execution, semantics.sandboxMode(candidate.key.tool)),
-						state.settings,
-						candidate,
-					);
+					preemptForActor(state.session, resourceProfile(candidate.route.isolation), state.settings, candidate);
 					startQueuedCandidates(state.session, candidate, true);
 				}
 				admission.release();
@@ -1669,23 +1718,42 @@ export function makeStructuralSpeculativeActionRuntime<
 				return selected.output;
 			}
 
-			actorAction.deferToFallback(matchingPredictions.map(({ opportunity }) => opportunity.identity));
+			actorAction.deferToFallback(
+				matchingPredictions.map(({ opportunity }) => opportunity.identity),
+				executionBlockedAttemptLead(state.session, matchingPredictions, actorArrivedAt),
+			);
 			const adoption: PredictionAdoption = {
 				status: "rejected",
 				...(rejectedCandidateID ? { candidateID: rejectedCandidateID } : {}),
 				cause: rejection,
 			};
 			confirmPredictions(state.session, matchingPredictions, identity, adoption);
-			preemptForActor(
-				state.session,
-				resourceProfile(actualKey.execution, semantics.sandboxMode(actualKey.tool)),
-				state.settings,
-			);
+			preemptForActor(state.session, actorResourceProfile(actualKey.tool), state.settings);
 			state.session.effects.enqueue(() => dispatchReady(state.session));
 			return undefined;
 		} finally {
 			admission.release();
 		}
+	};
+
+	const executionBlockedAttemptLead = (
+		session: Session,
+		matches: readonly ClaimedPrediction[],
+		actorArrivedAt: number,
+	): number | undefined => {
+		let earliestAttempt: number | undefined;
+		for (const { node } of matches) {
+			if (node.execution.status !== "execution_blocked") continue;
+			const startedAt = session.actionContexts.get(node.identity.id)?.attemptStartedAt;
+			if (startedAt === undefined || !Number.isFinite(startedAt)) continue;
+			earliestAttempt = earliestAttempt === undefined ? startedAt : Math.min(earliestAttempt, startedAt);
+		}
+		return earliestAttempt === undefined ? undefined : Math.max(0, actorArrivedAt - earliestAttempt);
+	};
+
+	const actorResourceProfile = (tool: string) => {
+		const localIsolation = semantics.localIsolation(tool);
+		return resourceProfile(localIsolation === "none" ? "runtime_sandbox" : localIsolation);
 	};
 
 	const actual = async (
@@ -1737,7 +1805,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			cache: cacheSnapshot(state.session, state.settings),
 			settlement,
 			actualAction: diagnosticAction(actorAction.tool, actualCall.input, key),
-			...(key ? { execution: key.execution } : {}),
+			...(settledCandidate ? { execution: settledCandidate.route.isolation } : {}),
 			...(settledCandidate ? { candidate: candidateEventDescriptor(settledCandidate) } : {}),
 		};
 		state.session.effects.enqueue(async () => {
@@ -1997,6 +2065,7 @@ export function makeStructuralSpeculativeActionRuntime<
 	const reusableForPrediction = async (
 		session: Session,
 		key: ActionKey,
+		route: SpeculativeExecutionRoute,
 		parent: Candidate | undefined,
 	): Promise<Candidate | undefined> => {
 		for (const lookup of [
@@ -2005,7 +2074,12 @@ export function makeStructuralSpeculativeActionRuntime<
 			...branches.lookup(session.id, key),
 		]) {
 			const candidate = lookup.entry;
-			if (!activeExecution(candidate) || candidateWorld(candidate) !== parent) continue;
+			if (
+				!activeExecution(candidate) ||
+				!sameSpeculativeExecutionRoute(candidate.route, route) ||
+				candidateWorld(candidate) !== parent
+			)
+				continue;
 			if (lookup.match.kind === "projected" && candidate.work.execution.status !== "succeeded") {
 				if (!canShareInFlight(candidate, key, lookup.match, projectionRules)) continue;
 			}
@@ -2075,7 +2149,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		return unique.map((node) =>
 			forecastFor(
 				node,
-				semantics,
+				candidate.route,
 				session.decisionSequence,
 				session.actionContexts.get(node.identity.id)?.predictionLatencyMs,
 			),
@@ -2158,6 +2232,7 @@ export function makeStructuralSpeculativeActionRuntime<
 				consumeInput: input,
 				settings: state.settings,
 				action,
+				route: candidate.route,
 				candidate: publicCandidate(candidate),
 				tool: actualCall.tool,
 				concrete,
@@ -2309,10 +2384,8 @@ export function makeStructuralSpeculativeActionRuntime<
 	};
 
 	const invalidateChangedResources = (session: Session, action: ActionKey, adopted?: Candidate): void => {
-		const invalidateWorkspace = adopted && semantics.resourceVersionPolicy(adopted.key.tool) === "workspace";
-		const changed =
-			adopted && !invalidateWorkspace ? (adopted.world?.resources ?? action.resources) : action.resources;
-		if ((!changed.length && !invalidateWorkspace) || (adopted && adopted.work.reservation.kind === "shared")) return;
+		const changed = adopted ? (adopted.world?.resources ?? action.resources) : action.resources;
+		if (!changed.length || (adopted && adopted.work.reservation.kind === "shared")) return;
 		const candidates = allCandidates(session.id);
 		const invalid = new Set<Candidate>();
 		for (const candidate of candidates) {
@@ -2320,10 +2393,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			// Once an Actor reserves a candidate, its freshness and compatibility checks
 			// are authoritative. Cache invalidation may only retire unclaimed work.
 			if (!reservationAvailable(candidate.work.reservation)) continue;
-			if (
-				invalidateWorkspace ||
-				candidate.key.resources.some((resource) => changed.some((path) => resourcePathsOverlap(resource, path)))
-			) {
+			if (candidate.key.resources.some((resource) => changed.some((path) => resourcePathsOverlap(resource, path)))) {
 				for (const descendant of candidates) {
 					if (descendant === candidate || descendsFrom(descendant, candidate)) invalid.add(descendant);
 				}
@@ -2511,6 +2581,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			activePlanActions: planNodes.filter(
 				(node) => node.execution.status === "scheduled" || node.execution.status === "running",
 			).length,
+			executionBlockedPlanActions: planNodes.filter((node) => node.execution.status === "execution_blocked").length,
 			blockedPlanActions: planNodes.filter((node) => node.readiness === "blocked").length,
 		};
 	};
@@ -2537,7 +2608,7 @@ export function makeStructuralSpeculativeActionRuntime<
 				.length,
 			cacheTools: [...new Set([...inFlight, ...cached, ...staged].map((candidate) => candidate.key.tool))].sort(),
 			cacheExecutions: [
-				...new Set([...inFlight, ...cached, ...staged].map((candidate) => candidate.key.execution)),
+				...new Set([...inFlight, ...cached, ...staged].map((candidate) => candidate.route.isolation)),
 			].sort(),
 		};
 	};

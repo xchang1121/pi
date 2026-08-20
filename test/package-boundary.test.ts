@@ -6,21 +6,20 @@ import * as packageApi from "../src/index.ts";
 import {
 	acquirePatternAwareStore,
 	captureResourceVersion,
-	createContainerSandboxProcessBackend,
-	createSandboxBackendRouter,
 	createSpeculativeActionExtension,
 	createSpeculativeActionHost,
 	createWorkspaceSandbox,
 	makeSpeculativeActionRuntime,
 	prepareSandboxWorkspace,
 	releaseResourceVersion,
+	resolveSpeculativeExecutionRoute,
 } from "../src/index.ts";
 
 const packageRoot = fileURLToPath(new URL("..", import.meta.url));
 const workspaceRoot = path.resolve(packageRoot, "../..");
 
 describe("speculative action package boundary", () => {
-	test("exports the runtime, integration, learning, resource, and sandbox entry points", () => {
+	test("exports runtime, learning, resource, and file-mutation entry points", () => {
 		for (const exported of [
 			makeSpeculativeActionRuntime,
 			createSpeculativeActionHost,
@@ -28,10 +27,9 @@ describe("speculative action package boundary", () => {
 			acquirePatternAwareStore,
 			captureResourceVersion,
 			releaseResourceVersion,
-			createContainerSandboxProcessBackend,
-			createSandboxBackendRouter,
 			createWorkspaceSandbox,
 			prepareSandboxWorkspace,
+			resolveSpeculativeExecutionRoute,
 		]) {
 			expect(exported).toBeTypeOf("function");
 		}
@@ -66,8 +64,16 @@ describe("speculative action package boundary", () => {
 			peerDependencies?: Record<string, string>;
 		};
 		expect(Object.keys(manifest.exports).sort()).toEqual([".", "./extension", "./package.json"]);
-		expect(manifest.files).toEqual(expect.arrayContaining(["dist", "native/sandbox", "native/worker"]));
+		expect(manifest.files).toEqual(["dist", "README.md", "README-CN.md", "CHANGELOG.md"]);
 		expect(manifest.scripts?.build).toMatch(/^shx rm -rf dist && /);
+		expect(Object.keys(manifest.scripts ?? {})).not.toEqual(
+			expect.arrayContaining(["build:native", "build:worker", "generate:native-manifest", "smoke:native"]),
+		);
+		await expect(fs.stat(path.join(packageRoot, "native", "sandbox"))).rejects.toThrow();
+		await expect(fs.stat(path.join(packageRoot, "native", "worker"))).rejects.toThrow();
+		for (const removed of ["container-sandbox.ts", "native-sandbox.ts", "oci-setup.ts"]) {
+			await expect(fs.stat(path.join(packageRoot, "src", removed))).rejects.toThrow();
+		}
 		expect(manifest.pi?.extensions).toEqual(["./dist/extension.js"]);
 		expect(manifest.peerDependencies).toMatchObject({
 			"@earendil-works/pi-agent-core": "*",

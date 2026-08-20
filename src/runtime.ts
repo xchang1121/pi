@@ -1,13 +1,8 @@
 import type { ActionProjectionRule } from "./action-key-projection.ts";
-import {
-	type ActionKey,
-	type ActionSemanticsRegistry,
-	PI_ACTION_SEMANTICS,
-	type SpeculativeExecution,
-} from "./action-semantics.ts";
+import { type ActionKey, type ActionSemanticsRegistry, PI_ACTION_SEMANTICS } from "./action-semantics.ts";
 import type { DrafterToolDefinition } from "./common.ts";
 import type { SpeculativeActionEvent } from "./events.ts";
-import type { WorldBranch } from "./execution-world.ts";
+import type { SpeculativeExecutionRoute, WorldBranch } from "./execution-world.ts";
 import type { PlanAction, PlanProposal, PlanUpdate } from "./plan-proposal.ts";
 import { makeStructuralSpeculativeActionRuntime } from "./runtime-engine.ts";
 import type { PredictionSettlement, ResourceValidation } from "./settlement.ts";
@@ -31,10 +26,8 @@ export interface SpeculativeActionSettings {
 	readonly predictionTimeoutMs: number;
 	/** Source-owned configuration. The runtime treats every value as opaque. */
 	readonly sourceConfig?: Readonly<Record<string, unknown>>;
-	readonly tools: {
-		readonly resourceCached: readonly string[];
-		readonly sandbox: readonly string[];
-	};
+	/** Tools eligible for prediction; execution isolation is resolved independently. */
+	readonly tools: readonly string[];
 }
 
 export interface SpeculativeDraftCandidate {
@@ -42,7 +35,6 @@ export interface SpeculativeDraftCandidate {
 	readonly tool: string;
 	readonly input: unknown;
 	readonly missing?: readonly (readonly (string | number)[])[];
-	readonly execution?: SpeculativeExecution;
 	readonly diagnostic?: string;
 	readonly source?: string;
 	readonly proposalID?: string;
@@ -178,6 +170,16 @@ export interface SpeculativeActionRuntimeAdapter<
 			| { readonly type: "start"; readonly startInput: StartInput; readonly data: StateData }
 			| { readonly type: "consume"; readonly consumeInput: ConsumeInput },
 	) => MaybePromise<ActionKey | undefined>;
+	/** Resolve the highest-priority safe execution capability for this attempt. */
+	readonly resolveExecution: (input: {
+		readonly startInput: StartInput;
+		readonly data: StateData;
+		readonly settings: SpeculativeActionSettings;
+		readonly candidate: SpeculativeDraftCandidate;
+		readonly tool: string;
+		readonly concrete: Record<string, unknown>;
+		readonly action: ActionKey;
+	}) => MaybePromise<SpeculativeExecutionRoute | undefined>;
 	readonly actual: (input: ConsumeInput) => { readonly id?: string; readonly tool: string; readonly input: unknown };
 	readonly preflightCandidate: (input: {
 		readonly startInput: StartInput;
@@ -187,6 +189,7 @@ export interface SpeculativeActionRuntimeAdapter<
 		readonly tool: string;
 		readonly concrete: Record<string, unknown>;
 		readonly action: ActionKey;
+		readonly route: SpeculativeExecutionRoute;
 		readonly callID: string;
 		readonly index: number;
 		readonly signal: AbortSignal;
@@ -196,6 +199,7 @@ export interface SpeculativeActionRuntimeAdapter<
 		readonly consumeInput: ConsumeInput;
 		readonly settings: SpeculativeActionSettings;
 		readonly action: ActionKey;
+		readonly route: SpeculativeExecutionRoute;
 		readonly candidate: SpeculativeCandidate;
 		readonly tool: string;
 		readonly concrete: Record<string, unknown>;
@@ -208,6 +212,7 @@ export interface SpeculativeActionRuntimeAdapter<
 		readonly tool: string;
 		readonly concrete: Record<string, unknown>;
 		readonly action: ActionKey;
+		readonly route: SpeculativeExecutionRoute;
 		readonly callID: string;
 		readonly index: number;
 		readonly signal: AbortSignal;
@@ -219,6 +224,7 @@ export interface SpeculativeActionRuntimeAdapter<
 		readonly settings: SpeculativeActionSettings;
 		readonly candidate: SpeculativeDraftCandidate;
 		readonly action?: ActionKey;
+		readonly route?: SpeculativeExecutionRoute;
 		readonly signal: AbortSignal;
 	}) => MaybePromise<void>;
 	readonly captureResourceVersion?: (input: {
@@ -273,6 +279,7 @@ export interface SpeculativeRuntimeInspection {
 	readonly pendingPredictions: number;
 	readonly deferredPlanActions: number;
 	readonly activePlanActions: number;
+	readonly executionBlockedPlanActions: number;
 	readonly blockedPlanActions: number;
 }
 
@@ -294,11 +301,8 @@ export function candidateToolNames(
 	settings: SpeculativeActionSettings,
 	semantics: ActionSemanticsRegistry = PI_ACTION_SEMANTICS,
 ): readonly string[] {
-	const resourceCached = new Set(settings.tools.resourceCached);
-	const sandbox = new Set(settings.tools.sandbox);
-	return semantics
-		.toolNames()
-		.filter((tool) => (semantics.execution(tool) === "sandbox" ? sandbox.has(tool) : resourceCached.has(tool)));
+	const known = new Set(semantics.toolNames());
+	return [...new Set(settings.tools)].filter((tool) => known.has(tool));
 }
 
 export function candidateExecutionMs(candidate: SpeculativeCandidate): number {

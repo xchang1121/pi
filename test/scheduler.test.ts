@@ -102,8 +102,7 @@ describe("SpeculationScheduler", () => {
 function forecast(overrides: Partial<PredictionForecast> = {}): PredictionForecast {
 	return {
 		tool: "read",
-		execution: "resource_cached",
-		sandboxMode: "none",
+		execution: "resource_snapshot",
 		expectedDurationMs: 50,
 		decisionBatchesUntilCall: 1,
 		...overrides,

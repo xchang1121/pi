@@ -4,6 +4,7 @@ import type {
 	ActorActionSettlement,
 	ActorHitTiming,
 	CandidateRejection,
+	ExecutionBlockedTiming,
 	PredictionIdentity,
 	ResolutionCause,
 } from "./settlement.ts";
@@ -11,7 +12,11 @@ import type { TimelineInterval } from "./task-timing.ts";
 
 export type ActorActionState =
 	| { readonly status: "matching" }
-	| { readonly status: "awaiting_fallback"; readonly matchedPredictions: readonly PredictionIdentity[] }
+	| {
+			readonly status: "awaiting_fallback";
+			readonly matchedPredictions: readonly PredictionIdentity[];
+			readonly executionBlockedAttemptLeadMs?: number;
+	  }
 	| { readonly status: "settled"; readonly value: ActorActionSettlement };
 
 /** Exactly-once owner spanning Actor interception and the optional fallback execution. */
@@ -86,11 +91,17 @@ export class ActorAction {
 		});
 	}
 
-	deferToFallback(matchedPredictions: readonly PredictionIdentity[] = []): boolean {
+	deferToFallback(
+		matchedPredictions: readonly PredictionIdentity[] = [],
+		executionBlockedAttemptLeadMs?: number,
+	): boolean {
 		if (this.stateValue.status !== "matching") return false;
 		this.stateValue = Object.freeze({
 			status: "awaiting_fallback",
 			matchedPredictions: freezePredictions(matchedPredictions),
+			...(executionBlockedAttemptLeadMs !== undefined
+				? { executionBlockedAttemptLeadMs: finite(executionBlockedAttemptLeadMs) }
+				: {}),
 		});
 		return true;
 	}
@@ -103,6 +114,10 @@ export class ActorAction {
 		if (this.stateValue.status !== "awaiting_fallback") return undefined;
 		const duration = finite(durationMs);
 		const completed = finite(completedAt);
+		const executionBlockedTiming =
+			this.stateValue.executionBlockedAttemptLeadMs === undefined
+				? undefined
+				: normalizeExecutionBlockedTiming(this.stateValue.executionBlockedAttemptLeadMs, duration);
 		return this.finish({
 			actorAction: this.identity,
 			tool: this.tool,
@@ -114,6 +129,7 @@ export class ActorAction {
 				durationMs: duration,
 				isError,
 				toolExecution: Object.freeze({ startedAt: Math.max(0, completed - duration), completedAt: completed }),
+				...(executionBlockedTiming ? { executionBlockedTiming } : {}),
 			}),
 		});
 	}
@@ -135,6 +151,17 @@ function normalizeTiming(timing: ActorHitTiming): ActorHitTiming {
 		executionAheadMs: finite(timing.executionAheadMs),
 		attemptLeadMs: finite(timing.attemptLeadMs),
 		hitLatencyMs: finite(timing.hitLatencyMs),
+	});
+}
+
+function normalizeExecutionBlockedTiming(attemptLeadMs: number, durationMs: number): ExecutionBlockedTiming {
+	const attemptLead = finite(attemptLeadMs);
+	const duration = finite(durationMs);
+	const executionAheadMs = Math.min(duration, attemptLead);
+	return Object.freeze({
+		attemptLeadMs: attemptLead,
+		executionAheadMs,
+		hitLatencyMs: Math.max(0, duration - executionAheadMs),
 	});
 }
 

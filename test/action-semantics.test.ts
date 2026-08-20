@@ -7,46 +7,36 @@ import {
 	actionKeyMismatchReason,
 	buildActionKey,
 	buildPiActionKey,
-	IDEMPOTENT_ACTION_TOOLS,
-	isAdoptableSandboxAction,
-	isObservableSandboxAction,
+	FILE_MUTATION_ACTION_TOOLS,
 	KEYABLE_TOOLS,
+	NO_LOCAL_ISOLATION_ACTION_TOOLS,
 	PI_ACTION_SEMANTICS,
 	READ_RANGE_ACTION_KEY_PROJECTOR,
-	SANDBOX_ACTION_TOOLS,
+	RESOURCE_SNAPSHOT_ACTION_TOOLS,
 } from "../src/action-semantics.ts";
 
 describe("ActionSemanticsRegistry", () => {
-	it("defines every Pi tool's execution, reuse, versioning, and sandbox policy in one place", () => {
+	it("defines K(a) resource evidence and host-local fallback without choosing an execution route", () => {
 		expect(PI_ACTION_SEMANTICS.toolNames()).toEqual(["read", "grep", "find", "bash", "write", "edit"]);
 		expect(KEYABLE_TOOLS).toEqual(PI_ACTION_SEMANTICS.toolNames());
-		expect(IDEMPOTENT_ACTION_TOOLS).toEqual(["read", "grep", "find"]);
-		expect(SANDBOX_ACTION_TOOLS).toEqual(["bash", "write", "edit"]);
+		expect(RESOURCE_SNAPSHOT_ACTION_TOOLS).toEqual(["read", "grep", "find"]);
+		expect(FILE_MUTATION_ACTION_TOOLS).toEqual(["write", "edit"]);
+		expect(NO_LOCAL_ISOLATION_ACTION_TOOLS).toEqual(["bash"]);
 
 		expect(PI_ACTION_SEMANTICS.definition("read")).toMatchObject({
-			execution: "resource_cached",
-			reuse: "shared_result",
+			localIsolation: "resource_snapshot",
 			resourceVersion: "resources",
 			resourceScope: "content",
-			sandboxMode: "none",
 		});
 		expect(PI_ACTION_SEMANTICS.definition("bash")).toMatchObject({
-			execution: "sandbox",
-			reuse: "exclusive_branch",
-			resourceVersion: "workspace",
-			resourceScope: "tree_content",
-			sandboxMode: "workspace_snapshot",
+			localIsolation: "none",
+			resourceVersion: "none",
 		});
 		expect(PI_ACTION_SEMANTICS.definition("write")).toMatchObject({
-			execution: "sandbox",
-			reuse: "exclusive_branch",
+			localIsolation: "file_mutation",
 			resourceVersion: "actor_time",
-			sandboxMode: "file_mutation",
 		});
 		expect(PI_ACTION_SEMANTICS.resourceScope("write")).toBeUndefined();
-		expect(isObservableSandboxAction("bash")).toBe(true);
-		expect(isAdoptableSandboxAction("write")).toBe(true);
-		expect(isAdoptableSandboxAction("edit")).toBe(true);
 	});
 
 	it("keeps read's omitted-limit view distinct inside its versioned K(a)", () => {
@@ -64,7 +54,6 @@ describe("ActionSemanticsRegistry", () => {
 		).toMatchObject({ kind: "projected", projector: "read.range" });
 		expect(implicit).toMatchObject({
 			tool: "read",
-			execution: "resource_cached",
 			semanticsEpoch: "pi.read.v2",
 			schemaHash: "schema-v1",
 			resources: ["src/a.ts"],
@@ -89,7 +78,6 @@ describe("ActionSemanticsRegistry", () => {
 	it("never equates identical inputs across different tool-semantics epochs", () => {
 		const oldAction = buildActionKey({
 			tool: "read",
-			execution: "resource_cached",
 			resources: ["a.ts"],
 			input: { path: "a.ts", offset: 1, limit: 20 },
 			schemaHash: "schema",
@@ -97,7 +85,6 @@ describe("ActionSemanticsRegistry", () => {
 		});
 		const newAction = buildActionKey({
 			tool: "read",
-			execution: "resource_cached",
 			resources: ["a.ts"],
 			input: { path: "a.ts", offset: 1, limit: 20 },
 			schemaHash: "schema",
@@ -133,7 +120,6 @@ describe("ActionSemanticsRegistry", () => {
 		};
 		const base = buildActionKey({
 			tool: "read",
-			execution: "resource_cached",
 			resources: ["a.ts"],
 			input: { path: "a.ts", offset: 1 },
 			semanticsEpoch: "read.v1",
@@ -152,7 +138,6 @@ describe("ActionSemanticsRegistry", () => {
 
 		for (const actor of [
 			buildActionKey({ ...base, tool: "grep", resources: ["a.ts"], input: { path: "a.ts", offset: 2 } }),
-			buildActionKey({ ...base, execution: "sandbox", resources: ["a.ts"], input: { path: "a.ts", offset: 2 } }),
 			buildActionKey({
 				...base,
 				semanticsEpoch: "read.v2",
@@ -182,8 +167,7 @@ describe("ActionSemanticsRegistry", () => {
 		]);
 
 		expect(registry.toolNames()).toEqual(["stat"]);
-		expect(registry.execution("stat")).toBe("resource_cached");
-		expect(registry.reuse("stat")).toBe("shared_result");
+		expect(registry.localIsolation("stat")).toBe("resource_snapshot");
 		expect(registry.requiresRuntimeResourceVersion("stat")).toBe(true);
 		expect(registry.watchesResourceVersion("stat")).toBe(true);
 		expect(registry.resourceScope("stat")).toBe("content");
@@ -218,13 +202,10 @@ describe("ActionSemanticsRegistry", () => {
 		expect(registry.buildKey("malformed", {}, "/workspace")).toBeUndefined();
 	});
 
-	it("rejects duplicate tools and incoherent execution policies", () => {
+	it("rejects duplicate tools and incoherent local fallback policies", () => {
 		const definition = resourceDefinition("read", "read.v1", () => ({ input: {}, resources: ["."] }));
 		expect(() => new ActionSemanticsRegistry([definition, definition])).toThrow(
 			"duplicate action semantics for read",
-		);
-		expect(() => new ActionSemanticsRegistry([{ ...definition, reuse: "exclusive_branch" }])).toThrow(
-			"must use shared_result reuse",
 		);
 		expect(
 			() =>
@@ -232,13 +213,12 @@ describe("ActionSemanticsRegistry", () => {
 					{
 						...definition,
 						tool: "write",
-						execution: "sandbox",
-						reuse: "exclusive_branch",
+						localIsolation: "file_mutation",
 						resourceVersion: "resources",
-						sandboxMode: "file_mutation",
+						resourceScope: undefined,
 					},
 				]),
-		).toThrow("incoherent version or sandbox policy");
+		).toThrow("must validate at commit time");
 		expect(
 			() =>
 				new ActionSemanticsRegistry([
@@ -248,21 +228,22 @@ describe("ActionSemanticsRegistry", () => {
 						resourceScope: undefined,
 					},
 				]),
-		).toThrow("incoherent version or sandbox policy");
+		).toThrow("requires resource evidence");
 		expect(
 			() =>
 				new ActionSemanticsRegistry([
 					{
 						...definition,
-						tool: "bad_process",
-						execution: "sandbox",
-						reuse: "exclusive_branch",
-						resourceVersion: "workspace",
-						resourceScope: "content",
-						sandboxMode: "workspace_snapshot",
+						tool: "bad_observer",
+						localIsolation: "none",
+						resourceVersion: "none",
+						resourceScope: undefined,
 					},
 				]),
-		).toThrow("incoherent version or sandbox policy");
+		).not.toThrow();
+		expect(() => new ActionSemanticsRegistry([{ ...definition, tool: "bad_none", localIsolation: "none" }])).toThrow(
+			"without local isolation has local version state",
+		);
 	});
 
 	it("rejects conflicting projector implementations with one identifier", () => {
@@ -306,10 +287,10 @@ describe("ActionSemanticsRegistry", () => {
 		).toThrow();
 	});
 
-	it("distinguishes runtime-watched resources, workspace snapshots, and Actor-time validation", () => {
+	it("distinguishes runtime-watched resources, unisolated actions, and Actor-time validation", () => {
 		expect(PI_ACTION_SEMANTICS.requiresRuntimeResourceVersion("read")).toBe(true);
 		expect(PI_ACTION_SEMANTICS.watchesResourceVersion("read")).toBe(true);
-		expect(PI_ACTION_SEMANTICS.requiresRuntimeResourceVersion("bash")).toBe(true);
+		expect(PI_ACTION_SEMANTICS.requiresRuntimeResourceVersion("bash")).toBe(false);
 		expect(PI_ACTION_SEMANTICS.watchesResourceVersion("bash")).toBe(false);
 		expect(PI_ACTION_SEMANTICS.requiresRuntimeResourceVersion("write")).toBe(false);
 		expect(PI_ACTION_SEMANTICS.watchesResourceVersion("write")).toBe(false);
@@ -324,11 +305,9 @@ function resourceDefinition(
 	return {
 		tool,
 		epoch,
-		execution: "resource_cached",
-		reuse: "shared_result",
+		localIsolation: "resource_snapshot",
 		resourceVersion: "resources",
 		resourceScope: "content",
-		sandboxMode: "none",
 		canonicalize,
 	};
 }

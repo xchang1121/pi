@@ -1,4 +1,17 @@
-import { IDEMPOTENT_ACTION_TOOLS, SANDBOX_ACTION_TOOLS } from "./action-semantics.ts";
+import {
+	FILE_MUTATION_ACTION_TOOLS,
+	KEYABLE_TOOLS,
+	NO_LOCAL_ISOLATION_ACTION_TOOLS,
+	RESOURCE_SNAPSHOT_ACTION_TOOLS,
+} from "./action-semantics.ts";
+
+export interface LegacySpeculativeToolGroups {
+	readonly resourceCached?: readonly string[];
+	readonly sandbox?: readonly string[];
+	readonly predictionOnly?: readonly string[];
+}
+
+export type SpeculativeToolSelectionInput = readonly string[] | LegacySpeculativeToolGroups;
 
 export interface DrafterToolDefinition {
 	readonly name: string;
@@ -31,10 +44,7 @@ export const DEFAULTS = {
 	resourceCacheMaxEntries: 512,
 	resourceCacheMaxBytes: 256 * 1024 * 1024,
 	predictionTimeoutMs: 300_000,
-	tools: {
-		resourceCached: IDEMPOTENT_ACTION_TOOLS,
-		sandbox: SANDBOX_ACTION_TOOLS,
-	},
+	tools: KEYABLE_TOOLS,
 };
 
 export function buildSingleToolCallPrompt(): string {
@@ -52,6 +62,25 @@ Rules:
 
 export function clampCandidateLimit(value: unknown): number {
 	return typeof value === "number" && Number.isFinite(value) ? Math.max(1, Math.floor(value)) : 1;
+}
+
+/** Normalize the current tool list and migrate the former three-group configuration at one boundary. */
+export function normalizeSpeculativeToolSelection(
+	value: unknown,
+	allowed: readonly string[] = KEYABLE_TOOLS,
+): readonly string[] {
+	const allowedSet = new Set(allowed);
+	const select = (items: readonly string[]) => [...new Set(items.filter((item) => allowedSet.has(item)))];
+	if (Array.isArray(value)) {
+		return value.every((item): item is string => typeof item === "string") ? select(value) : select(allowed);
+	}
+	if (!value || typeof value !== "object") return select(allowed);
+	const legacy = value as Record<string, unknown>;
+	return select([
+		...stringArrayOr(legacy.resourceCached, RESOURCE_SNAPSHOT_ACTION_TOOLS),
+		...stringArrayOr(legacy.sandbox, FILE_MUTATION_ACTION_TOOLS),
+		...stringArrayOr(legacy.predictionOnly, NO_LOCAL_ISOLATION_ACTION_TOOLS),
+	]);
 }
 
 export function clampDrafterDepth(value: unknown): number {
@@ -123,4 +152,8 @@ function nonNegativeInteger(value: unknown, fallback: number): number {
 
 function nonNegativeNumber(value: unknown, fallback: number): number {
 	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : fallback;
+}
+
+function stringArrayOr(value: unknown, fallback: readonly string[]): readonly string[] {
+	return Array.isArray(value) && value.every((item): item is string => typeof item === "string") ? value : fallback;
 }

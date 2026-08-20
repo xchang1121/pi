@@ -12,6 +12,10 @@
 - Renamed ambiguous summary and inspection fields to `predictionRejectedAfterMatch`, `actorCandidateRejections`, `candidateTerminalCauses`, and `exclusiveCandidates`/`sharedCandidates`.
 - Renamed the plan dependency and continuation signal from `actor_confirmed` to `actor_adopted`; a key match without a usable result no longer satisfies downstream work.
 - Renamed source request horizons and `requestLifetime: "actor_action"` to decision-batch units; one Actor response may contain several parallel tool actions but advances prediction time only once.
+- Split action identity from execution isolation. `ActionKey` no longer contains an execution class; adapters now resolve a `SpeculativeExecutionRoute` after K(a) materialization.
+- Replaced the three tool groups (`resourceCached`, `sandbox`, and `predictionOnly`) with one prediction-enabled `tools` list. Legacy grouped settings are accepted only at the configuration migration boundary.
+- Replaced the single sandbox option with ordered `executionWorlds`. A world supporting `runtime_sandbox` takes priority for every tool.
+- Renamed prediction-only fallback telemetry to the general execution-blocked terminology.
 
 ### Added
 
@@ -29,6 +33,10 @@
 - Added probation/protected speculative cache tiers: new results remain eviction-first until a successful actor hit promotes them, with bounded protected occupancy by entries and bytes.
 - Added aggregate, input-free K(a) rejection counts to hit and miss telemetry.
 - Added opt-in, adoption-gated Drafter continuation rounds: every confirmed prefix restores the configured independent-request width, shares the next-action budget with normal turn fanout, and admits fast responses without waiting for the batch; real-task ablation keeps the default depth at zero.
+- Added a uniform route resolver with the priority `runtime_sandbox` → registered local isolation → Actor fallback.
+- Added `resource_snapshot` as the local route for `read`, `grep`, and `find`, and `file_mutation` as the Git-worktree route for `write` and `edit`.
+- Added an explicit `execution_blocked` plan state. Blocked predictions remain matchable without being confused with an impossible dependency.
+- Added counterfactual timing for isolation-blocked matches using the same capped lead-time decomposition as adopted speculative work.
 
 ### Changed
 
@@ -47,6 +55,11 @@
 - K(a) remains a uniform canonical action key; registered projection rules now require both a potential key relation and validated realized-output coverage before reconstructing an actor result.
 - Drafter rounds now issue `candidateLimit` independent one-action requests concurrently, retain one low-temperature accuracy sample and diverse remaining samples, and rely on the existing K(a) relation to deduplicate execution.
 - Drafter output budgets and arbitrary-count sampling are now configurable recommendations; configured request, rollout, and OCI worker counts no longer have hidden implementation caps.
+- Drafter and PatternAware now emit only source-neutral actions; neither source can select an execution mechanism.
+- Scheduler forecasts, resource arbitration, events, and cache snapshots derive isolation from the resolved route instead of K(a).
+- In-flight and retained candidates are reused only when both K(a) compatibility and execution-route identity hold.
+- The Pi TUI now exposes one tool policy and explains the runtime-sandbox, resource-snapshot, Git-worktree, and Actor-fallback boundary.
+- Documentation and benchmark output now distinguish actual hidden latency from execution-blocked counterfactual potential.
 
 ### Fixed
 
@@ -62,3 +75,10 @@
 - Missing Docker or Podman no longer produces a global sandbox warning when the native fallback is ready.
 - Cache lookup, telemetry, and speculative cleanup failures can no longer replace an authoritative stock Pi tool result.
 - Same-name tools registered during normal extension initialization now remain authoritative and are excluded from speculation regardless of load order; stock tool renderers are preserved for both TUI and HTML output.
+- Execution-blocked predictions remain K(a)-matchable and no longer enter the dependency-impossible settlement path.
+- Execution-world warm-up now prepares the same healthy backend selected by route resolution when an earlier registered capability is unavailable.
+
+### Removed
+
+- Removed the bundled OCI, native process, and Windows AppContainer backends and their setup paths. The package no longer installs or launches Docker/Podman and no longer mutates OS sandbox state.
+- Removed process-backend routing and installation settings from the Pi extension; embedding runtimes can inject a runtime-wide `ExecutionWorld` instead.

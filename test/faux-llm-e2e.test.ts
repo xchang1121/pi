@@ -16,15 +16,8 @@ import { afterEach, describe, expect, it } from "vitest";
 import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { createSpeculativeActionHost, type SpeculativeAgentSettingsInput } from "../src/agent-integration.ts";
 import { PATTERN_AWARE_DEFAULTS, type PatternAwareSettings, PatternAwareStore } from "../src/pattern-aware.ts";
-import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import type { SpeculativeActionEvent } from "../src/runtime.ts";
-import type { ToolInvocation } from "../src/tool-settlement.ts";
 import { summarizeSpeculativeTrace } from "../src/trace-summary.ts";
-import {
-	createWorkspaceSandbox,
-	type SandboxProcessBackend,
-	type SpeculativeAgentSandbox,
-} from "../src/workspace-sandbox.ts";
 
 const roots: string[] = [];
 const readSchema = Type.Object({ path: Type.String() });
@@ -135,10 +128,8 @@ describe("faux LLM speculative action end to end", () => {
 		expect(result.summary.attemptLeadMs).toBeGreaterThan(result.summary.executionAheadMs);
 	});
 
-	it("adopts one isolated Bash branch across fragmented model streams", async () => {
+	it("matches Bash across fragmented model streams but executes only through the Actor", async () => {
 		const cwd = await workspace();
-		const backendExecutions = { value: 0 };
-		const sandbox = createWorkspaceSandbox({ processBackend: mockProcessBackend(backendExecutions, 120) });
 		const result = await runAgent({
 			cwd,
 			sessionID: "bash-branch-hit",
@@ -155,23 +146,33 @@ describe("faux LLM speculative action end to end", () => {
 			draftTokensPerSecond: 2_000,
 			settings: {
 				...drafterSettings(),
-				tools: { resourceCached: [], sandbox: ["bash"] },
+				tools: ["bash"],
 			},
-			sandbox,
-			resolveInvocation: (tool, args) =>
-				resolvePiToolInvocation(tool, args, {
-					cwd,
-					environment: { PATH: "mock" },
-					shellPath: process.execPath,
-				}),
 		});
 
 		expect(result.streamEvents).toEqual(expect.arrayContaining(["thinking_delta", "toolcall_delta"]));
-		expect(result.summary).toMatchObject({ actorActions: 1, speculativeHits: 1, actorFallbacks: 0 });
-		expect(result.summary.hiddenLatencyMs).toBeGreaterThanOrEqual(100);
-		expect(backendExecutions.value).toBe(1);
-		expect(result.executions.bash ?? 0).toBe(0);
-		expect(await readFile(path.join(cwd, "generated.txt"), "utf8")).toBe("speculative");
+		expect(result.summary).toMatchObject({
+			actorActions: 1,
+			speculativeHits: 0,
+			actorFallbacks: 1,
+			predictionsMatched: 1,
+			predictionsAdopted: 0,
+			executionBlockedActorActions: 1,
+		});
+		expect(result.summary.executionBlockedPotentialHiddenLatencyMs).toBeGreaterThan(0);
+		expect(
+			result.summary.executionBlockedPotentialHiddenLatencyMs + result.summary.executionBlockedPotentialHitLatencyMs,
+		).toBe(result.summary.actorExecutionMs);
+		expect(result.executions.bash).toBe(1);
+		expect(await readFile(path.join(cwd, "generated.txt"), "utf8")).toBe("actor");
+		expect(result.events.find((event) => event.type === "prediction")).toMatchObject({
+			settlement: {
+				match: {
+					matched: true,
+					adoption: { status: "rejected", cause: { stage: "execution", code: "isolation_unavailable" } },
+				},
+			},
+		});
 	});
 
 	it("falls back once when Drafter delivery is late or terminates with an error", async () => {
@@ -283,8 +284,6 @@ type RunAgentInput = {
 	readonly draftTokensPerSecond?: number;
 	readonly settings: SpeculativeAgentSettingsInput;
 	readonly patternStore?: PatternAwareStore;
-	readonly sandbox?: SpeculativeAgentSandbox;
-	readonly resolveInvocation?: (tool: string, input: unknown) => ToolInvocation | undefined;
 };
 
 function turn(content: ScriptedTurn["content"], delayMs = 0): ScriptedTurn {
@@ -344,8 +343,6 @@ async function runAgent(input: RunAgentInput) {
 		complete: (model, context, options) => drafter.streamSimple(model, context, options).result(),
 		preflight: () => true,
 		...(input.patternStore ? { patternStore: input.patternStore } : {}),
-		...(input.sandbox ? { sandbox: input.sandbox } : {}),
-		...(input.resolveInvocation ? { resolveInvocation: input.resolveInvocation } : {}),
 		onEvent: (event) => {
 			events.push(event);
 		},
@@ -444,7 +441,10 @@ async function runAgent(input: RunAgentInput) {
 	try {
 		await agent.prompt("Fix the reported issue by inspecting the relevant files.");
 		if (input.settings.enabled !== false) {
-			await waitFor(() => events.filter((event) => event.type === "actor_action").length === toolLatencyMs.length);
+			await waitFor(
+				() => events.filter((event) => event.type === "actor_action").length === toolLatencyMs.length,
+				5_000,
+			);
 		}
 		return {
 			events,
@@ -491,35 +491,6 @@ function fallbackBash(cwd: string): AgentTool<typeof bashSchema> {
 	};
 }
 
-function mockProcessBackend(executions: { value: number }, durationMs: number): SandboxProcessBackend {
-	return {
-		check: async () => ({
-			backend: "native",
-			state: "ready",
-			source: "test",
-			detail: "mock process boundary ready",
-			fingerprint: "mock-process:v1",
-		}),
-		supports: () => true,
-		fingerprint: async () => "mock-process:v1",
-		prepare: async () => {},
-		open: async ({ parent }) => {
-			const processRoot = await mkdtemp(path.join(parent, "mock-process-"));
-			return {
-				processRoot,
-				execute: async (input) => {
-					executions.value++;
-					await delay(durationMs, input.signal);
-					await writeFile(path.join(input.cwd, "generated.txt"), "speculative", "utf8");
-					return { result: textResult("speculative"), isError: false };
-				},
-				close: async () => rm(processRoot, { recursive: true, force: true }),
-			};
-		},
-		dispose: async () => {},
-	};
-}
-
 function patternTools(cwd: string, durationMs: number, matchFile: string): AgentTool[] {
 	const read = delayedRead(cwd, durationMs);
 	const grep: AgentTool<typeof grepSchema> = {
@@ -558,7 +529,7 @@ function drafterSettings(): SpeculativeAgentSettingsInput {
 		maxConcurrentActions: 1,
 		predictionTimeoutMs: 1_000,
 		patternAware: { enabled: false },
-		tools: { resourceCached: ["read"], sandbox: [] },
+		tools: ["read"],
 	};
 }
 
@@ -570,7 +541,7 @@ function patternAwareSettings(patternAware: PatternAwareSettings): SpeculativeAg
 		maxConcurrentActions: 4,
 		predictionTimeoutMs: 1_000,
 		patternAware,
-		tools: { resourceCached: ["grep", "read"], sandbox: [] },
+		tools: ["grep", "read"],
 	};
 }
 
