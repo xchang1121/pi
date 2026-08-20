@@ -5,11 +5,9 @@ import type { AgentTool } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, Model } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { READ_RANGE_COVERAGE_DETAILS_KEY } from "../src/action-key-projection.ts";
 import type { SpeculativeAgentExecutionWorld } from "../src/agent-execution-world.ts";
 import { createSpeculativeActionHost, patternPlanActionID } from "../src/agent-integration.ts";
 import { PATTERN_AWARE_DEFAULTS, PatternAwareStore } from "../src/pattern-aware.ts";
-import { PI_READ_RANGE_PROJECTION_RULE } from "../src/pi-read-projection.ts";
 import type { SpeculativeActionEvent } from "../src/runtime.ts";
 
 const roots: string[] = [];
@@ -64,7 +62,6 @@ function settings(candidateLimit = 1) {
 		enabled: true,
 		drafterEnabled: true,
 		candidateLimit,
-		drafterMaxDepth: 0,
 		maxConcurrentActions: candidateLimit,
 		tools: ["read"],
 		patternAware: { enabled: false },
@@ -419,81 +416,6 @@ describe("speculative action host", () => {
 		await host.dispose();
 	});
 
-	it("continues from the expanded read view while projecting a narrower Actor result", async () => {
-		const cwd = await temporaryWorkspace();
-		let executedInput: { path: string; offset?: number; limit?: number } | undefined;
-		const contexts: Parameters<CreateComplete>[1][] = [];
-		const tool: AgentTool<typeof readSchema> = {
-			name: "read",
-			label: "read",
-			description: "read",
-			parameters: readSchema,
-			execute: async (_id, input) => {
-				executedInput = input;
-				return {
-					content: [{ type: "text", text: "one\ntwo\nthree\nfour" }],
-					details: {
-						[READ_RANGE_COVERAGE_DETAILS_KEY]: {
-							kind: "text",
-							startLine: 1,
-							endLineExclusive: 5,
-							totalLines: 4,
-							payloadTextLength: 18,
-							maxLines: 2000,
-							maxBytes: 50 * 1024,
-						},
-					},
-				};
-			},
-		};
-		const host = createSpeculativeActionHost("session", {
-			cwd,
-			getSettings: () => ({ ...settings(), drafterMaxDepth: 1 }),
-			draftModel: model("draft"),
-			complete: async (_model, context) => {
-				contexts.push(context);
-				return contexts.length === 1
-					? drafterCall({ path: "notes.txt", offset: 1, limit: 1 })
-					: assistant([], "stop");
-			},
-			preflight: () => true,
-			projectionRules: [PI_READ_RANGE_PROJECTION_RULE],
-		});
-
-		await host.startTurn(startInput(tool));
-		await waitFor(() => host.runtime.inspect("session").sharedCandidates === 1);
-		await waitFor(() => contexts.length === 2);
-		expect(contexts[1]?.messages).toEqual([
-			expect.objectContaining({
-				role: "assistant",
-				content: [
-					expect.objectContaining({
-						type: "toolCall",
-						arguments: { path: "notes.txt", offset: 1, limit: 2000 },
-					}),
-				],
-			}),
-			expect.objectContaining({
-				role: "toolResult",
-				content: [{ type: "text", text: "one\ntwo\nthree\nfour" }],
-			}),
-		]);
-		const hit = await host.consume({
-			turnID: "turn-1",
-			tool: "read",
-			args: { path: "notes.txt", offset: 2, limit: 2 },
-			tools: [tool],
-		});
-
-		expect(hit?.result.content[0]).toEqual({
-			type: "text",
-			text: "two\nthree\n\n[1 more lines in file. Use offset=4 to continue.]",
-		});
-		expect(executedInput).toMatchObject({ offset: 1, limit: 2000 });
-		expect(contexts).toHaveLength(2);
-		await host.dispose();
-	});
-
 	it("reports authoritative misses and keeps cleanup failures out of actor lifecycle", async () => {
 		const cwd = await temporaryWorkspace();
 		const patternStore = new PatternAwareStore({ ...PATTERN_AWARE_DEFAULTS, minOccurrences: 1 });
@@ -684,76 +606,6 @@ describe("speculative action host", () => {
 		await waitFor(
 			() => events.filter((event) => event.type === "candidate" && event.state.status === "running").length === 2,
 		);
-		await host.dispose();
-	});
-
-	it("recycles a deduplicated read result into the next Drafter round without waiting for adoption", async () => {
-		const cwd = await temporaryWorkspace();
-		await Promise.all([
-			writeFile(path.join(cwd, "other.txt"), "other", "utf8"),
-			writeFile(path.join(cwd, "ignored.txt"), "ignored", "utf8"),
-		]);
-		const requests: Array<{ context: Parameters<CreateComplete>[1]; options: Parameters<CreateComplete>[2] }> = [];
-		const executed: string[] = [];
-		const requestCounts = [0, 0];
-		let releaseSlow!: () => void;
-		const slow = new Promise<void>((resolve) => {
-			releaseSlow = resolve;
-		});
-		const complete: CreateComplete = async (_model, context, requestOptions) => {
-			requests.push({ context, options: requestOptions });
-			const depth = context.messages.filter((message) => message.role === "toolResult").length;
-			const index = requestCounts[depth]++;
-			if (depth === 1 && index === 0) await slow;
-			if (depth === 1 && index === 1) return assistant([], "error");
-			return assistant(
-				[
-					{
-						type: "toolCall",
-						id: `draft-${depth}-${index}`,
-						name: "read",
-						arguments: { path: depth === 0 ? "notes.txt" : index === 0 ? "other.txt" : "ignored.txt" },
-					},
-				],
-				"toolUse",
-			);
-		};
-		const tool: AgentTool<typeof readSchema> = {
-			name: "read",
-			label: "read",
-			description: "read",
-			parameters: readSchema,
-			execute: async (_id, args) => {
-				executed.push(args.path);
-				return { content: [{ type: "text", text: `${args.path}:result` }], details: { path: args.path } };
-			},
-		};
-		const host = createSpeculativeActionHost("session", {
-			cwd,
-			getSettings: () => ({ ...settings(4), drafterMaxDepth: 1 }),
-			draftModel: model("draft"),
-			complete,
-			preflight: () => true,
-		});
-
-		await host.startTurn(startInput(tool));
-		await waitFor(() => requestCounts[0] === 4 && requestCounts[1] === 4 && executed.includes("ignored.txt"));
-		expect(executed).toContain("notes.txt");
-		expect(executed).not.toContain("other.txt");
-		expect(
-			await host.consume({
-				turnID: "turn-1",
-				id: "actor",
-				tool: "read",
-				args: { path: "notes.txt" },
-				tools: [tool],
-			}),
-		).toMatchObject({ result: { content: [{ type: "text", text: "notes.txt:result" }] } });
-		releaseSlow();
-		await waitFor(() => executed.includes("other.txt"));
-		expect(requests).toHaveLength(8);
-		expect(executed.sort()).toEqual(["ignored.txt", "notes.txt", "other.txt"]);
-		await host.finishTurn("turn-1", true);
 		await host.dispose();
 	});
 

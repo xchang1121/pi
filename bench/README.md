@@ -17,8 +17,7 @@ DEEPSEEK_API_KEY=... npm run bench:ablation -- \
   --instance axios__axios-5316 \
   --label baseline \
   --latency remote \
-  --candidate-limit 8 \
-  --drafter-max-depth 2
+  --candidate-limit 8
 ```
 
 The default 128-turn budget is deliberate: both 16- and 64-turn runs repeatedly
@@ -40,9 +39,6 @@ increasingly remote or isolated tools. The runner uses resource-version routes
 for read-only tools and the production Git-worktree world for file mutations.
 No process sandbox is bundled, so Bash predictions are matched but execute only
 through the Actor path unless the embedding host injects a runtime-wide world.
-
-Set `--drafter-max-depth 0` for the one-step Drafter ablation. Positive values
-bound output-informed continuation steps after the first action.
 
 Use `--drafter-disabled --pattern-aware --pattern-state <directory>` to isolate
 PatternAware. The explicit state directory also selects a stable logical
@@ -106,8 +102,7 @@ npm run bench:suite -- \
   --repeats 3 \
   --label baseline \
   --latency remote \
-  --candidate-limit 8 \
-  --drafter-max-depth 0
+  --candidate-limit 8
 ```
 
 The suite runner fails immediately if a task process fails, writes every task to

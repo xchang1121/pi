@@ -437,56 +437,6 @@ describe("structural speculative runtime", () => {
 		);
 	});
 
-	it("continues candidate rounds from shared results but waits to adopt exclusive branches", async () => {
-		for (const [tool, input, route] of [
-			["read", { path: "README.md" }, RESOURCE_ROUTE],
-			["write", { path: "out.txt", content: "done" }, MUTATION_ROUTE],
-		] as const) {
-			let continuations = 0;
-			const source: Source = {
-				id: "source",
-				enabled: () => true,
-				proposalCount: () => 3,
-				continuationMode: "candidate_round",
-				continueOn: ["execution_succeeded", "actor_adopted"],
-				propose: () => ({
-					id: `proposal:${tool}`,
-					source: "source",
-					revision: 0,
-					actions: [{ id: "next", type: "tool_call", tool, input }],
-				}),
-				continue: () => {
-					continuations++;
-					return undefined;
-				},
-			};
-			const fixture = harness({ source, resolveExecution: () => route });
-			await fixture.runtime.startTurn({ sessionID: "session", turnID: `turn:${tool}` });
-			await waitFor(() => fixture.executions() === 1);
-			await waitFor(() => (tool === "read" ? continuations === 3 : true));
-			expect(continuations).toBe(tool === "read" ? 3 : 0);
-
-			expect(
-				await fixture.runtime.consume({
-					sessionID: "session",
-					turnID: `turn:${tool}`,
-					id: `actor:${tool}`,
-					tool,
-					input,
-				}),
-			).toBe("speculative");
-			await waitFor(() => continuations === 3);
-			await fixture.runtime.finishTurn({
-				sessionID: "session",
-				turnID: `turn:${tool}`,
-				id: `actor:${tool}`,
-				tool,
-				input,
-				terminal: true,
-			});
-		}
-	});
-
 	it("does not deduplicate equal K(a) work across different execution routes", async () => {
 		const source: Source = {
 			id: "source",

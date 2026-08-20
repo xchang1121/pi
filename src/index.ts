@@ -61,7 +61,6 @@ export {
 export {
 	buildSingleToolCallPrompt,
 	clampCandidateLimit,
-	clampDrafterDepth,
 	DEFAULTS,
 	type DrafterToolDefinition,
 	type LegacySpeculativeToolGroups,

@@ -68,45 +68,6 @@ describe("faux LLM speculative action end to end", () => {
 		expect(speculative.toolLatencyMs[0]).toBeLessThan(40);
 	});
 
-	it("replays speculative tool results through a three-action Drafter trajectory", async () => {
-		const cwd = await workspace();
-		await Promise.all([
-			writeFile(path.join(cwd, "other.txt"), "other", "utf8"),
-			writeFile(path.join(cwd, "third.txt"), "third", "utf8"),
-		]);
-		const thinking = fauxThinking("inspect the next dependency before choosing the next tool ".repeat(5));
-		const result = await runAgent({
-			cwd,
-			sessionID: "drafter-rollout",
-			tools: [delayedRead(cwd, 90)],
-			actorTurns: [
-				turn([thinking, fauxToolCall("read", { path: "notes.txt" })]),
-				turn([thinking, fauxToolCall("read", { path: "other.txt" })]),
-				turn([thinking, fauxToolCall("read", { path: "third.txt" })]),
-				turn("done"),
-			],
-			actorTokensPerSecond: 160,
-			draftTurns: [
-				turn(fauxToolCall("read", { path: "notes.txt" })),
-				turn(fauxToolCall("read", { path: "other.txt" })),
-				turn(fauxToolCall("read", { path: "third.txt" })),
-				turn("no tool"),
-			],
-			draftTokensPerSecond: 2_000,
-			settings: { ...drafterSettings(), drafterMaxDepth: 2, maxConcurrentActions: 3 },
-		});
-
-		expect(result.summary).toMatchObject({
-			actorActions: 3,
-			speculativeHits: 3,
-			actorFallbacks: 0,
-		});
-		expect(result.executions.read).toBe(3);
-		expect(result.toolLatencyMs).toHaveLength(3);
-		expect(result.toolLatencyMs.every((duration) => duration < 40)).toBe(true);
-		expect(result.summary.hiddenLatencyMs).toBeGreaterThanOrEqual(240);
-	});
-
 	it("joins compatible work already in flight instead of starting Actor work", async () => {
 		const cwd = await workspace();
 		const result = await runAgent({
@@ -524,7 +485,6 @@ function drafterSettings(): SpeculativeAgentSettingsInput {
 	return {
 		enabled: true,
 		drafterEnabled: true,
-		drafterMaxDepth: 0,
 		candidateLimit: 1,
 		maxConcurrentActions: 1,
 		predictionTimeoutMs: 1_000,

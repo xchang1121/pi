@@ -34,7 +34,6 @@
 - Added production Pi `read` range projection backed by structured realized-output coverage; grep and find remain exact-key-only.
 - Added probation/protected speculative cache tiers: new results remain eviction-first until a successful actor hit promotes them, with bounded protected occupancy by entries and bytes.
 - Added aggregate, input-free K(a) rejection counts to hit and miss telemetry.
-- Added opt-in, adoption-gated Drafter continuation rounds: every confirmed prefix restores the configured independent-request width, shares the next-action budget with normal turn fanout, and admits fast responses without waiting for the batch; real-task ablation keeps the default depth at zero.
 - Added one `ExecutionWorldRouter` with the priority `runtime_sandbox` → registered local fallback → Actor fallback.
 - Added `resource_snapshot` as the local route for `read`, `grep`, `find`, and `ls`, and `workspace_branch` as the Git-worktree route for `write` and `edit`.
 - Added an explicit `execution_blocked` plan state. Blocked predictions remain matchable without being confused with an impossible dependency.
@@ -56,7 +55,7 @@
 - Native sandbox protocol v3 now forwards the configured shell and requires an explicit process-isolation attestation; Linux recursively enforces read-only host mounts and readiness probes verify mount isolation.
 - K(a) remains a uniform canonical action key; registered projection rules now require both a potential key relation and validated realized-output coverage before reconstructing an actor result.
 - Drafter rounds now issue `candidateLimit` independent one-action requests concurrently, retain one low-temperature accuracy sample and diverse remaining samples, and rely on the existing K(a) relation to deduplicate execution.
-- Drafter output budgets and arbitrary-count sampling are now configurable recommendations; configured request, rollout, and OCI worker counts no longer have hidden implementation caps.
+- Drafter output budgets and arbitrary-count sampling are now configurable recommendations; configured request and OCI worker counts no longer have hidden implementation caps.
 - Drafter and PatternAware now emit only source-neutral actions; neither source can select an execution mechanism.
 - Scheduler forecasts, resource arbitration, events, and cache snapshots derive isolation from the resolved route instead of K(a).
 - In-flight and retained candidates are reused only when both K(a) compatibility and execution-route identity hold.
@@ -82,5 +81,6 @@
 
 ### Removed
 
+- Removed Drafter multi-step rollouts after paired real-task ablation showed request and execution growth without end-to-end benefit; Drafter now predicts only the next action, while PatternAware retains learned multi-step prediction.
 - Removed the bundled OCI, native process, and Windows AppContainer backends and their setup paths. The package no longer installs or launches Docker/Podman and no longer mutates OS sandbox state.
 - Removed process-backend routing and installation settings from the Pi extension; embedding runtimes can inject a runtime-wide `ExecutionWorld` instead.

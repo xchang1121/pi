@@ -67,7 +67,6 @@ type BaseToolDefinition =
 export interface EffectiveSpeculativeActionSettings {
 	readonly enabled: boolean;
 	readonly drafterEnabled: boolean;
-	readonly drafterMaxDepth: number;
 	readonly drafterMaxTokens: number;
 	readonly drafterDeterministicCandidates: number;
 	readonly drafterTemperatureMin: number;
@@ -751,7 +750,6 @@ async function openDrafterSettings(ctx: ExtensionContext, controller: Speculativ
 		const choice = await ctx.ui.select("Drafter", [
 			`Enabled: ${settings.drafterEnabled ? "On" : "Off"}`,
 			`Model › ${settings.draftModel ?? activeModelReference(ctx)}`,
-			`Rollout depth: ${settings.drafterMaxDepth}`,
 			`Output tokens: ${settings.drafterMaxTokens}`,
 			`Deterministic requests: ${settings.drafterDeterministicCandidates}`,
 			`Temperature range: ${formatNumber(settings.drafterTemperatureMin)}-${formatNumber(settings.drafterTemperatureMax)}`,
@@ -762,9 +760,6 @@ async function openDrafterSettings(ctx: ExtensionContext, controller: Speculativ
 		if (choice.startsWith("Enabled:"))
 			controller.setSettings({ ...settings, drafterEnabled: !settings.drafterEnabled });
 		if (choice.startsWith("Model")) await editDraftModel(ctx, controller, settings);
-		if (choice.startsWith("Rollout depth:")) {
-			await editDrafterDepth(ctx, controller, settings);
-		}
 		if (choice.startsWith("Output tokens:")) {
 			await editPositiveInteger(ctx, controller, settings, "drafterMaxTokens", "Drafter output tokens");
 		}
@@ -981,22 +976,6 @@ async function editPositiveInteger(
 		...settings,
 		[field]: field === "candidateLimit" || field === "maxConcurrentActions" ? clampCandidateLimit(parsed) : parsed,
 	});
-}
-
-async function editDrafterDepth(
-	ctx: ExtensionContext,
-	controller: SpeculativeActionController,
-	settings: EffectiveSpeculativeActionSettings,
-): Promise<void> {
-	const title = "Drafter rollout depth";
-	const value = await ctx.ui.input(title, String(settings.drafterMaxDepth));
-	if (value === undefined) return;
-	const parsed = Number(value.trim());
-	if (!Number.isInteger(parsed) || parsed < 0) {
-		ctx.ui.notify(`${title} must be a non-negative integer.`, "warning");
-		return;
-	}
-	controller.setSettings({ ...settings, drafterMaxDepth: parsed });
 }
 
 async function editDrafterDeterministicCandidates(

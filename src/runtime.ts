@@ -94,8 +94,6 @@ export interface SpeculativePlanSource<
 	readonly requestLifetime?: "actor_decision" | "turn";
 	readonly multiStepEnabled?: (settings: SpeculativeActionSettings) => boolean;
 	readonly proposalCount?: (settings: SpeculativeActionSettings) => number;
-	/** A candidate round collapses equivalent parents and restores `proposalCount` breadth. */
-	readonly continuationMode?: "per_prediction" | "candidate_round";
 	readonly propose: (input: {
 		readonly startInput: StartInput;
 		readonly data: StateData;
@@ -118,8 +116,6 @@ export interface SpeculativePlanSource<
 		readonly feedback: unknown;
 		readonly output: Output;
 		readonly trigger: "execution_succeeded" | "actor_adopted";
-		readonly continuationIndex: number;
-		readonly continuationCount: number;
 		readonly signal: AbortSignal;
 	}) => MaybePromise<PlanUpdate | readonly PlanUpdate[] | undefined>;
 	/** Restrict continuation callbacks without coupling Runtime scheduling to a concrete source. */

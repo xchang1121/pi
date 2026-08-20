@@ -68,7 +68,6 @@ interface BenchmarkOptions {
 	readonly actorTemperature: number;
 	readonly drafter: Model<Api>;
 	readonly candidateLimit: number;
-	readonly drafterMaxDepth: number;
 	readonly drafterMaxTokens: number;
 	readonly drafterDeterministicCandidates: number;
 	readonly drafterTemperatureMin: number;
@@ -100,7 +99,6 @@ const { values } = parseArgs({
 		"actor-temperature": { type: "string", default: "0" },
 		drafter: { type: "string", default: "deepseek/deepseek-v4-flash" },
 		"candidate-limit": { type: "string", default: String(DEFAULTS.candidateLimit) },
-		"drafter-max-depth": { type: "string", default: String(DEFAULTS.drafterMaxDepth) },
 		"drafter-max-tokens": { type: "string", default: String(DEFAULTS.drafterMaxTokens) },
 		"drafter-deterministic-candidates": {
 			type: "string",
@@ -135,7 +133,6 @@ const options: BenchmarkOptions = {
 	actorTemperature: nonNegativeNumber(values["actor-temperature"], "--actor-temperature"),
 	drafter: model(values.drafter ?? "deepseek/deepseek-v4-flash"),
 	candidateLimit: positiveInteger(values["candidate-limit"], "--candidate-limit"),
-	drafterMaxDepth: nonNegativeInteger(values["drafter-max-depth"], "--drafter-max-depth"),
 	drafterMaxTokens: positiveInteger(values["drafter-max-tokens"], "--drafter-max-tokens"),
 	drafterDeterministicCandidates: nonNegativeInteger(
 		values["drafter-deterministic-candidates"],
@@ -243,7 +240,6 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 	const settings: SpeculativeAgentSettingsInput = {
 		enabled: true,
 		drafterEnabled: input.drafterEnabled,
-		drafterMaxDepth: input.drafterMaxDepth,
 		drafterMaxTokens: input.drafterMaxTokens,
 		drafterDeterministicCandidates: input.drafterDeterministicCandidates,
 		drafterTemperatureMin: input.drafterTemperatureMin,
@@ -552,7 +548,6 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 			actorTemperature: input.actorTemperature,
 			drafter: `${input.drafter.provider}/${input.drafter.id}`,
 			candidateLimit: input.candidateLimit,
-			drafterMaxDepth: input.drafterMaxDepth,
 			drafterMaxTokens: input.drafterMaxTokens,
 			drafterDeterministicCandidates: input.drafterDeterministicCandidates,
 			drafterTemperatureMin: input.drafterTemperatureMin,

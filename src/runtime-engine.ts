@@ -1935,11 +1935,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		trigger: "execution_succeeded" | "actor_adopted",
 		adoptedAction?: AdoptedAction,
 	): void => {
-		const candidateScoped = new Set<string>();
 		for (const node of nodes) {
-			const source = sourcesByID.get(node.source);
-			if (source?.continuationMode === "candidate_round" && candidateScoped.has(node.source)) continue;
-			if (source?.continuationMode === "candidate_round") candidateScoped.add(node.source);
 			queueContinuation(session, node, candidate, output, trigger, adoptedAction);
 		}
 	};
@@ -1960,10 +1956,6 @@ export function makeStructuralSpeculativeActionRuntime<
 		if (!context || !source?.continue) return;
 		if (source.multiStepEnabled?.(context.settings) === false) return;
 		if (source.continueOn && !source.continueOn.includes(trigger)) return;
-		if (source.continuationMode === "candidate_round") {
-			if (context.continuationTriggers.size > 0) return;
-			if (trigger === "execution_succeeded" && candidate.route.reuse !== "shared_result") return;
-		}
 		if (context.continuationTriggers.has(trigger)) return;
 		context.continuationTriggers.add(trigger);
 		const parentDecisionSequence =
@@ -1971,78 +1963,67 @@ export function makeStructuralSpeculativeActionRuntime<
 				? (current.predictionState.actorAction.decisionSequence ?? current.expectedDecisionSeq)
 				: current.expectedDecisionSeq;
 		const targetDecisionSequence = parentDecisionSequence + 1;
-		const continuationCount =
-			source.continuationMode === "candidate_round"
-				? clampCandidateLimit(source.proposalCount?.(context.settings))
-				: 1;
 		const requestLimit = clampCandidateLimit(source.proposalCount?.(context.settings));
 		const pending = context.continuationTail
 			.then(async () => {
-				const requests = Array.from({ length: continuationCount }, (_, continuationIndex) => {
-					const slot = claimSourceSlot(session, source.id, targetDecisionSequence, requestLimit);
-					if (!slot) return undefined;
-					context.continuationSlots.add(slot);
-					retainSourceRequest(slot);
-					return (async () => {
-						if (session.disposed || !slot.active) {
-							releaseSourceRequest(session, slot);
-							return;
-						}
-						const revision = session.plan.reserveRevision(node.proposalID);
-						if (revision === undefined) {
-							releaseSourceRequest(session, slot);
-							return;
-						}
-						const generation = new SourceGeneration();
-						slot.generations.add(generation);
-						session.pendingSourceRequests++;
-						const request = await runSourceRequest({
-							request: {
-								source: source.id,
-								turnID: context.startInput.turnID,
-								index: session.sourceRequestSequence++,
-								kind: "continuation",
-								targetDecisionSequence: slot.targetDecisionSequence,
-							},
-							generation,
-							timeoutMs: source.timeoutMs?.(context.settings),
-							produce: (requestSignal) =>
-								source.continue!({
-									startInput: context.startInput,
-									data: context.data,
-									settings: context.settings,
-									candidate: predictionCandidate(candidate, node),
-									...(adoptedAction ? { adoptedAction } : {}),
-									proposalID: node.proposalID,
-									actionID: node.action.id,
-									revision,
-									feedback: context.feedback,
-									output,
-									trigger,
-									continuationIndex,
-									continuationCount,
-									signal: requestSignal,
-								}),
-							count: (value) => asUpdates(value).length,
-						});
-						await sourceRequestFinished(
-							{
-								session,
-								startInput: context.startInput,
-								data: context.data,
-								settings: context.settings,
-								signal: generation.signal,
-								slot,
-							},
-							context.startInput.turnID,
-							source,
-							slot,
-							generation,
-							request,
-						);
-					})();
+				const slot = claimSourceSlot(session, source.id, targetDecisionSequence, requestLimit);
+				if (!slot) return;
+				context.continuationSlots.add(slot);
+				retainSourceRequest(slot);
+				if (session.disposed || !slot.active) {
+					releaseSourceRequest(session, slot);
+					return;
+				}
+				const revision = session.plan.reserveRevision(node.proposalID);
+				if (revision === undefined) {
+					releaseSourceRequest(session, slot);
+					return;
+				}
+				const generation = new SourceGeneration();
+				slot.generations.add(generation);
+				session.pendingSourceRequests++;
+				const request = await runSourceRequest({
+					request: {
+						source: source.id,
+						turnID: context.startInput.turnID,
+						index: session.sourceRequestSequence++,
+						kind: "continuation",
+						targetDecisionSequence: slot.targetDecisionSequence,
+					},
+					generation,
+					timeoutMs: source.timeoutMs?.(context.settings),
+					produce: (requestSignal) =>
+						source.continue!({
+							startInput: context.startInput,
+							data: context.data,
+							settings: context.settings,
+							candidate: predictionCandidate(candidate, node),
+							...(adoptedAction ? { adoptedAction } : {}),
+							proposalID: node.proposalID,
+							actionID: node.action.id,
+							revision,
+							feedback: context.feedback,
+							output,
+							trigger,
+							signal: requestSignal,
+						}),
+					count: (value) => asUpdates(value).length,
 				});
-				await Promise.allSettled(requests.filter((request) => request !== undefined));
+				await sourceRequestFinished(
+					{
+						session,
+						startInput: context.startInput,
+						data: context.data,
+						settings: context.settings,
+						signal: generation.signal,
+						slot,
+					},
+					context.startInput.turnID,
+					source,
+					slot,
+					generation,
+					request,
+				);
 			})
 			.catch(() => {
 				// Continuation failure cannot revoke completed work or Actor adoption.

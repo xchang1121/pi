@@ -292,12 +292,7 @@ describe("zero-modification Pi extension", () => {
 		await fixture.commands.get("speculative-action")?.handler("", fixture.context as ExtensionCommandContext);
 
 		expect(menus.get("Drafter")).toEqual(
-			expect.arrayContaining([
-				"Rollout depth: 0",
-				"Output tokens: 128",
-				"Deterministic requests: 1",
-				"Temperature range: 0.7-0.7",
-			]),
+			expect.arrayContaining(["Output tokens: 128", "Deterministic requests: 1", "Temperature range: 0.7-0.7"]),
 		);
 	});
 });
@@ -473,7 +468,6 @@ function effectiveSettings() {
 	return {
 		enabled: true,
 		drafterEnabled: true,
-		drafterMaxDepth: 2,
 		drafterMaxTokens: 128,
 		drafterDeterministicCandidates: 1,
 		drafterTemperatureMin: 0.7,

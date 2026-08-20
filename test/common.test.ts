@@ -15,7 +15,6 @@ import {
 import {
 	buildSingleToolCallPrompt,
 	clampCandidateLimit,
-	clampDrafterDepth,
 	DEFAULTS,
 	drafterRequestTemperature,
 	normalizeDrafterRequestSettings,
@@ -32,7 +31,6 @@ describe("speculative action common", () => {
 		expect(prompt).toContain("exactly one tool call");
 		expect(prompt).not.toMatch(/drafter|predict|speculat|likely next/i);
 		expect(DEFAULTS.drafterEnabled).toBe(true);
-		expect(DEFAULTS.drafterMaxDepth).toBe(0);
 	});
 
 	it("normalizes configured request counts without hidden upper bounds", () => {
@@ -40,7 +38,6 @@ describe("speculative action common", () => {
 		expect(clampCandidateLimit(4.9)).toBe(4);
 		expect(clampCandidateLimit(100)).toBe(100);
 		expect(clampCandidateLimit("4")).toBe(1);
-		expect([clampDrafterDepth(-1), clampDrafterDepth(2.9), clampDrafterDepth(9)]).toEqual([0, 2, 9]);
 	});
 
 	it("stratifies configurable Drafter sampling for arbitrary candidate counts", () => {
@@ -63,7 +60,6 @@ describe("speculative action common", () => {
 				drafterTemperatureMax: 0.5,
 			}),
 		).toEqual({
-			drafterMaxDepth: 0,
 			drafterMaxTokens: DEFAULTS.drafterMaxTokens,
 			drafterDeterministicCandidates: DEFAULTS.drafterDeterministicCandidates,
 			drafterTemperatureMin: 0.5,
