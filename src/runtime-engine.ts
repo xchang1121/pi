@@ -1405,11 +1405,12 @@ export function makeStructuralSpeculativeActionRuntime<
 		closeActorPhase(state, actorArrivedAt);
 		if (state.actorArrivedAt === undefined) {
 			state.actorArrivedAt = actorArrivedAt;
+			state.session.decisionSequence = Math.max(state.session.decisionSequence, state.decisionSequence);
+			clearLaunchTimers(state.session);
 			observeActorDecisionInterval(state.session, actorArrivedAt);
 		}
 		const candidatesAtArrival = allCandidates(state.sessionID);
 		const sequence = ++state.session.sequence;
-		clearLaunchTimers(state.session);
 		const actualCall = adapter.actual(input) as ActualToolCall;
 		const identity: ActorActionIdentity = {
 			id: actualCall.id ?? JSON.stringify([input.turnID, sequence]),
@@ -1440,6 +1441,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			if (!actualKey) {
 				actorAction.deferToFallback();
 				preemptForActor(state.session, { class: "global", units: 1 }, state.settings);
+				state.session.effects.enqueue(() => dispatchReady(state.session));
 				return undefined;
 			}
 
@@ -1771,9 +1773,9 @@ export function makeStructuralSpeculativeActionRuntime<
 		}
 	};
 
-	const advancePredictionFrontier = (state: Turn): void => {
-		if (!state.actorActions.length || state.decisionSequence <= state.session.decisionSequence) return;
-		state.session.decisionSequence = state.decisionSequence;
+	const settlePredictionFrontier = (state: Turn): void => {
+		if (!state.actorActions.length) return;
+		state.session.decisionSequence = Math.max(state.session.decisionSequence, state.decisionSequence);
 		const observation = state.actorActions.find((action) => action.actionKey);
 		for (const node of state.session.plan.due(state.decisionSequence)) {
 			if (node.predictionState.status !== "pending") continue;
@@ -2133,7 +2135,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		decisionSequence: number,
 	): readonly { readonly node: PlanRuntimeNode; readonly relation: ActionKeyMatch }[] => {
 		const groups = new Map<string, Array<{ readonly node: PlanRuntimeNode; readonly relation: ActionKeyMatch }>>();
-		for (const node of session.plan.pending()) {
+		for (const node of session.plan.matchable(decisionSequence)) {
 			if (!node.actionKey || node.action.type !== "tool_call") continue;
 			const relation = actionKeyMatch(node.actionKey, action, projectors);
 			if (!relation) continue;
@@ -2263,7 +2265,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		if (state.lifecycle !== "active") return;
 		const completedAt = performance.now();
 		closeActorPhase(state, completedAt);
-		advancePredictionFrontier(state);
+		settlePredictionFrontier(state);
 		if (state.actorActions.length) advanceColdCache(state.session, state.settings);
 		state.lifecycle = "closing";
 		state.generation.expire(cause("control", terminal ? "terminal_turn" : "turn_finished"));

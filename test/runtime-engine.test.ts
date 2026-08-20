@@ -968,13 +968,14 @@ describe("structural speculative runtime", () => {
 		});
 		let continuationStarted = false;
 		const executed: string[] = [];
+		const settlements: PredictionSettlement[] = [];
 		const source: Source = {
 			id: "source",
 			enabled: () => true,
 			requestLifetime: "actor_decision",
 			continueOn: ["actor_adopted"],
 			propose: () => plan("source", "parallel-continuation", { path: "parent.ts" }),
-			continue: async ({ proposalID, actionID, revision, trigger }) => {
+			continue: async ({ proposalID, revision, trigger }) => {
 				if (trigger !== "actor_adopted") return undefined;
 				continuationStarted = true;
 				await gate;
@@ -988,10 +989,12 @@ describe("structural speculative runtime", () => {
 							type: "tool_call",
 							tool: "read",
 							input: { path: "child.ts" },
-							dependsOn: [{ actionID, condition: "actor_adopted" }],
 						},
 					],
 				};
+			},
+			onSettled: ({ settlement }) => {
+				settlements.push(settlement);
 			},
 		};
 		const fixture = harness({
@@ -1028,7 +1031,25 @@ describe("structural speculative runtime", () => {
 
 		release();
 		await waitFor(() => executed.includes("child.ts"));
-		await fixture.runtime.finishTurn({ ...parent, terminal: true });
+		const sameBatchChild = { ...parent, id: "same-batch-child", input: { path: "child.ts" } };
+		expect(await fixture.runtime.consume(sameBatchChild)).toBe("child.ts:output");
+		await fixture.runtime.finishTurn({ ...parent, terminal: false });
+		expect(
+			settlements.map((settlement) =>
+				settlement.observation === "observed" ? settlement.actorAction.decisionSequence : undefined,
+			),
+		).toEqual([1]);
+
+		await fixture.runtime.startTurn({ sessionID: "session", turnID: "next-decision" });
+		expect(
+			await fixture.runtime.consume({ ...sameBatchChild, turnID: "next-decision", id: "next-decision-child" }),
+		).toBe("child.ts:output");
+		await fixture.runtime.finishTurn({ ...sameBatchChild, turnID: "next-decision", terminal: true });
+		expect(
+			settlements.map((settlement) =>
+				settlement.observation === "observed" ? settlement.actorAction.decisionSequence : undefined,
+			),
+		).toEqual([1, 2]);
 	});
 
 	it("keeps a bounded continuation alive across turns without extending turn completion", async () => {

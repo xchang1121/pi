@@ -49,6 +49,7 @@
 
 ### Fixed
 
+- Continuation work can be reused immediately, but its prediction is anchored to the first causally eligible Actor decision; same-batch reuse is no longer misattributed as a future-step match.
 - A continuation targeting the next Actor decision is no longer cancelled by a sibling tool call from the same parallel Actor response.
 - Probation cache aging now advances after each Actor decision batch, after matching, so a completed multi-step prediction remains adoptable through its declared deadline even when a batch contains multiple tool calls.
 - Query K(a) now preserves `read`'s omitted-limit semantics and rejects numeric views that Pi tools do not interpret as stable integer ranges.

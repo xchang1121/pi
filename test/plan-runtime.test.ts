@@ -53,6 +53,7 @@ describe("PlanRuntime", () => {
 		execution.cancel(cause("admission", "scheduler_preempted"), 1, 0);
 
 		expect(plan.get("plan", "future")).toMatchObject({
+			earliestDecisionSeq: 5,
 			expectedDecisionSeq: 5,
 			latestDecisionSeq: 7,
 			execution: { status: "cancelled" },
@@ -115,6 +116,13 @@ describe("PlanRuntime", () => {
 		plan.attachExecution("plan", "parent", "candidate", execution);
 		execution.start(0);
 		execution.succeed("output", 1, 1);
+		expect(plan.matchable(1).map((node) => node.action.id)).toEqual(["parent"]);
+		expect(
+			plan
+				.matchable(2)
+				.map((node) => node.action.id)
+				.sort(),
+		).toEqual(["parent", "settled", "succeeded"]);
 		expect(
 			plan
 				.launchable()
@@ -150,13 +158,21 @@ describe("PlanRuntime", () => {
 
 		expect(plan.get("plan", "short")).toMatchObject({ expectedDecisionSeq: 5, criticalPathMs: 10 });
 		expect(plan.get("plan", "critical")).toMatchObject({ expectedDecisionSeq: 5, criticalPathMs: 100 });
-		expect(plan.get("plan", "child")).toMatchObject({ expectedDecisionSeq: 6, criticalPathMs: 80 });
+		expect(plan.get("plan", "child")).toMatchObject({
+			earliestDecisionSeq: 6,
+			expectedDecisionSeq: 6,
+			criticalPathMs: 80,
+		});
 		expect(plan.takeReady(4).map((node) => node.action.id)).toEqual(["critical", "short"]);
 
 		const actor = { id: "actor", sequence: 99, decisionSequence: 7, turnID: "turn" } as const;
 		const opportunity = plan.claimMatch("plan", "critical", actor, { kind: "exact", distance: 0 })!;
 		plan.confirm(opportunity, actor, { status: "adopted", candidateID: "candidate" });
-		expect(plan.get("plan", "child")).toMatchObject({ expectedDecisionSeq: 8, latestDecisionSeq: 8 });
+		expect(plan.get("plan", "child")).toMatchObject({
+			earliestDecisionSeq: 8,
+			expectedDecisionSeq: 8,
+			latestDecisionSeq: 8,
+		});
 	});
 
 	it("keeps preparation work outside Actor prediction settlement", () => {

@@ -45,6 +45,7 @@ interface PlanRuntimeNodeBase {
 	readonly action: PlanAction;
 	readonly actionKey?: ActionKey;
 	readonly anchorDecisionSeq: number;
+	readonly earliestDecisionSeq: number;
 	readonly expectedDecisionSeq: number;
 	readonly latestDecisionSeq: number;
 	readonly criticalPathMs: number;
@@ -188,6 +189,7 @@ type MutableNode = {
 	action: PlanAction;
 	actionKey?: ActionKey;
 	anchorDecisionSeq: number;
+	earliestDecisionSeq: number;
 	expectedDecisionSeq: number;
 	latestDecisionSeq: number;
 	criticalPathMs: number;
@@ -277,8 +279,9 @@ export class PlanRuntime {
 		actorAction: ActorActionIdentity,
 		relation: ActionKeyMatch,
 	): PredictionOpportunity | undefined {
-		const node = this.mutable(proposalID, actionID)?.node;
-		const opportunity = node?.opportunity;
+		const value = this.mutable(proposalID, actionID);
+		if (!value || !this.isMatchable(value.plan, value.node, actorDecisionSequence(actorAction))) return undefined;
+		const opportunity = value.node.opportunity;
 		return opportunity?.claim(actorAction, relation) ? opportunity : undefined;
 	}
 
@@ -319,6 +322,15 @@ export class PlanRuntime {
 
 	pending(): readonly PredictionPlanRuntimeNode[] {
 		return this.values().filter(isPendingPrediction);
+	}
+
+	matchable(decisionSequence: number): readonly PredictionPlanRuntimeNode[] {
+		const sequence = Math.max(0, Math.floor(decisionSequence));
+		return this.mutableValues().flatMap(({ plan, node }) => {
+			if (!this.isMatchable(plan, node, sequence)) return [];
+			const snapshot = this.snapshot(plan, node);
+			return isPendingPrediction(snapshot) ? [snapshot] : [];
+		});
 	}
 
 	unsettled(): readonly PredictionPlanRuntimeNode[] {
@@ -470,6 +482,7 @@ export class PlanRuntime {
 			action: node.action,
 			...(node.actionKey ? { actionKey: node.actionKey } : {}),
 			anchorDecisionSeq: node.anchorDecisionSeq,
+			earliestDecisionSeq: node.earliestDecisionSeq,
 			expectedDecisionSeq: node.expectedDecisionSeq,
 			latestDecisionSeq: node.latestDecisionSeq,
 			criticalPathMs: node.criticalPathMs,
@@ -508,6 +521,14 @@ export class PlanRuntime {
 		});
 	}
 
+	private isMatchable(plan: MutablePlan, node: MutableNode, decisionSequence: number): boolean {
+		return (
+			node.opportunity?.state.status === "pending" &&
+			node.earliestDecisionSeq <= decisionSequence &&
+			this.dependenciesSatisfied(plan, node)
+		);
+	}
+
 	private recompute(plan: MutablePlan): void {
 		const actionSequence = (relativeHorizon: (action: PlanAction) => number) => {
 			const memo = new Map<string, number>();
@@ -531,6 +552,7 @@ export class PlanRuntime {
 			};
 			return calculate;
 		};
+		const earliest = actionSequence(() => 0);
 		const expected = actionSequence(horizon);
 		const latest = actionSequence(latestHorizon);
 		const dependents = new Map<string, MutableNode[]>();
@@ -552,6 +574,7 @@ export class PlanRuntime {
 			return value;
 		};
 		for (const node of plan.nodes.values()) {
+			node.earliestDecisionSeq = earliest(node);
 			node.expectedDecisionSeq = expected(node);
 			node.latestDecisionSeq = latest(node);
 			node.criticalPathMs = criticalPath(node);
@@ -577,6 +600,7 @@ function newNode(
 		action,
 		actionKey: undefined,
 		anchorDecisionSeq,
+		earliestDecisionSeq: anchorDecisionSeq + 1,
 		expectedDecisionSeq: anchorDecisionSeq + horizon(action) + 1,
 		latestDecisionSeq: anchorDecisionSeq + latestHorizon(action) + 1,
 		criticalPathMs: Math.max(1, finiteMetric(action.expectedDurationMs)),
