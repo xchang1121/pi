@@ -16,6 +16,7 @@ export type PatternAwareSettings = {
 	/** Maximum number of recursively predicted actions on one branch. */
 	readonly maxPredictionDepth: number;
 	readonly maxFutureGap: number;
+	/** Weighted future-gap quantile used as the expected launch horizon; the deadline keeps full observed support. */
 	readonly futureGapCoverage: number;
 	readonly decayHalfLifeEvents: number;
 	readonly minOccurrences: number;
@@ -278,7 +279,7 @@ export const PATTERN_AWARE_DEFAULTS: PatternAwareSettings = {
 	beamWidth: 4,
 	maxPredictionDepth: 6,
 	maxFutureGap: 8,
-	futureGapCoverage: 0.9,
+	futureGapCoverage: 0.25,
 	decayHalfLifeEvents: 2048,
 	minOccurrences: 3,
 	minBindingReplayProbability: 0.75,
