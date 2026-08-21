@@ -417,10 +417,26 @@ describe("speculative action host", () => {
 		await host.dispose();
 	});
 
-	it("keeps optional analysis and cleanup out of the actor lifecycle", async () => {
+	it("overlaps ordered pattern learning with the actor lifecycle and drains cleanup", async () => {
 		const cwd = await temporaryWorkspace();
 		const patternStore = new PatternAwareStore({ ...PATTERN_AWARE_DEFAULTS, minOccurrences: 1 });
-		const observed = vi.spyOn(patternStore, "observeBatch");
+		const originalObserve = patternStore.observeBatch.bind(patternStore);
+		let analysisComplete = false;
+		const observed = vi.spyOn(patternStore, "observeBatch").mockImplementation((...args) => {
+			const deadline = performance.now() + 100;
+			while (performance.now() < deadline) {
+				// Model an expensive synchronous mining pass from a large real trace.
+			}
+			const result = originalObserve(...args);
+			analysisComplete = true;
+			return result;
+		});
+		const predictionStates: boolean[] = [];
+		const originalPredict = patternStore.predict.bind(patternStore);
+		vi.spyOn(patternStore, "predict").mockImplementation((...args) => {
+			predictionStates.push(analysisComplete);
+			return originalPredict(...args);
+		});
 		let resolveStore!: (store: PatternAwareStore) => void;
 		const pendingStore = new Promise<PatternAwareStore>((resolve) => {
 			resolveStore = resolve;
@@ -472,14 +488,8 @@ describe("speculative action host", () => {
 		});
 		await new Promise<void>((resolve) => setImmediate(resolve));
 		expect(started).toBe(true);
-		resolveStore(patternStore);
 		await start;
-		await waitFor(() => actualEvents.filter((event) => event.type === "source_request").length === 1);
-		expect(
-			actualEvents
-				.filter((event) => event.type === "source_request")
-				.every((event) => event.request.settlement.status === "empty"),
-		).toBe(true);
+		await waitFor(() => host.runtime.inspect().pendingPredictions === 1);
 		expect(
 			await host.consume({
 				turnID: "turn-1",
@@ -489,6 +499,9 @@ describe("speculative action host", () => {
 				tools: [tool],
 			}),
 		).toBeUndefined();
+		resolveStore(patternStore);
+		await waitFor(() => actualEvents.filter((event) => event.type === "source_request").length === 1);
+		expect(actualEvents.find((event) => event.type === "source_request")?.request.settlement.status).toBe("aborted");
 		await host.actual({
 			turnID: "turn-1",
 			id: "actor",
@@ -499,6 +512,8 @@ describe("speculative action host", () => {
 			output: { result: await tool.execute("actor", { pattern: "one", path: "src" }), isError: false },
 		});
 		await host.finishTurn("turn-1");
+		expect(observed).not.toHaveBeenCalled();
+		await host.startTurn(startInput(tool, "turn-2"));
 
 		await waitFor(() =>
 			actualEvents.some(
@@ -508,10 +523,14 @@ describe("speculative action host", () => {
 					event.settlement.provider.durationMs === 12,
 			),
 		);
+		await waitFor(() => actualEvents.filter((event) => event.type === "source_request").length === 2);
 		expect(observed.mock.calls[0]?.[0][0]).toMatchObject({
 			input: { pattern: "one", path: "src" },
 			outputPaths: ["src/nested/notes.txt"],
 		});
+		const firstFreshPrediction = predictionStates.indexOf(true);
+		expect(firstFreshPrediction).toBeGreaterThan(0);
+		expect(predictionStates.slice(firstFreshPrediction).every(Boolean)).toBe(true);
 		await expect(host.dispose()).resolves.toBeUndefined();
 		expect(disposed).toBe(1);
 	});

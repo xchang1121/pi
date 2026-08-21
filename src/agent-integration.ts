@@ -213,6 +213,15 @@ export function createSpeculativeActionHost(
 			readonly options: SimpleStreamOptions;
 		}>
 	>();
+	let patternAnalysisTail: Promise<void> = Promise.resolve();
+	const queuePatternAnalysis = (analysis: () => void | Promise<void>) => {
+		patternAnalysisTail = patternAnalysisTail
+			.then(() => new Promise<void>((resolve) => setTimeout(resolve, 0)))
+			.then(analysis)
+			.catch(() => {
+				// Optional learning cannot poison later observations or the Actor lifecycle.
+			});
+	};
 	const authoritativeBatchKey = (batchSessionID: string, turnID: string) => JSON.stringify([batchSessionID, turnID]);
 	const clearAuthoritativeSession = (batchSessionID: string) => {
 		for (const [key, batch] of authoritativeBatches) {
@@ -272,6 +281,7 @@ export function createSpeculativeActionHost(
 	const finishPatternSession = async (): Promise<void> => {
 		drafterBatches.clear();
 		clearAuthoritativeSession(sessionID);
+		await patternAnalysisTail;
 		const store = options.patternStore
 			? await options.patternStore
 			: openedPatternStore
@@ -410,9 +420,11 @@ export function createSpeculativeActionHost(
 		id: "pattern_aware",
 		enabled: (settings) => sourcePatternSettings(settings).enabled,
 		multiStepEnabled: (settings) => sourcePatternSettings(settings).multiStepEnabled,
+		requestLifetime: "actor_decision",
 		propose: async ({ startInput, settings, definitions }) => {
 			const patternSettings = sourcePatternSettings(settings);
 			if (!patternSettings.enabled) return undefined;
+			await patternAnalysisTail;
 			const store = await resolvePatternStore(settings);
 			const candidates = store.predict(startInput.sessionID, definitionSchemaHashes(definitions), patternSettings);
 			if (!candidates.length) return undefined;
@@ -512,6 +524,7 @@ export function createSpeculativeActionHost(
 			for (const patternID of context?.patternIDs ?? []) context?.store.settled(patternID, settlement);
 		},
 		flush: async () => {
+			await patternAnalysisTail;
 			if (openedPatternStore) await (await openedPatternStore).store.flush();
 			if (options.patternStore) await (await options.patternStore).flush();
 		},
@@ -629,40 +642,40 @@ export function createSpeculativeActionHost(
 				// Turn warm-up is best-effort; concrete candidate preparation retries it.
 			});
 			if (!sourcePatternSettings(settings).enabled) return;
-			void resolvePatternStore(settings)
-				.then((store) =>
-					store.observeTurn({
-						sessionID: startInput.sessionID,
-						turnID: startInput.turnID,
-						phase: "start",
-						model: `${startInput.actorModel.provider}/${startInput.actorModel.id}`,
-					}),
-				)
-				.catch(() => undefined);
+			queuePatternAnalysis(async () => {
+				const store = await resolvePatternStore(settings);
+				store.observeTurn({
+					sessionID: startInput.sessionID,
+					turnID: startInput.turnID,
+					phase: "start",
+					model: `${startInput.actorModel.provider}/${startInput.actorModel.id}`,
+				});
+			});
 		},
-		onTurnFinished: async ({ startInput, settings, terminal, durationMs }) => {
+		onTurnFinished: ({ startInput, settings, terminal, durationMs }) => {
 			drafterBatches.delete(JSON.stringify([startInput.sessionID, startInput.turnID]));
 			const key = authoritativeBatchKey(startInput.sessionID, startInput.turnID);
 			const batch = authoritativeBatches.get(key);
 			authoritativeBatches.delete(key);
 			if (!sourcePatternSettings(settings).enabled) return;
-			const store = await resolvePatternStore(settings);
-			if (batch?.size) {
-				store.observeBatch(
-					[...batch.entries()].sort(([left], [right]) => left - right).map(([, event]) => event),
-					definitionSchemaHashes(
-						startInput.tools.map((tool) => ({ name: tool.name, inputSchema: tool.parameters })),
-					),
-				);
-			}
-			store.observeTurn({
-				sessionID: startInput.sessionID,
-				turnID: startInput.turnID,
-				phase: "finish",
-				terminal,
-				durationMs,
+			const events = batch?.size
+				? [...batch.entries()].sort(([left], [right]) => left - right).map(([, event]) => event)
+				: [];
+			const schemaHashes = definitionSchemaHashes(
+				startInput.tools.map((tool) => ({ name: tool.name, inputSchema: tool.parameters })),
+			);
+			queuePatternAnalysis(async () => {
+				const store = await resolvePatternStore(settings);
+				if (events.length) store.observeBatch(events, schemaHashes);
+				store.observeTurn({
+					sessionID: startInput.sessionID,
+					turnID: startInput.turnID,
+					phase: "finish",
+					terminal,
+					durationMs,
+				});
+				if (terminal) store.finishSession(startInput.sessionID);
 			});
-			if (terminal) store.finishSession(startInput.sessionID);
 		},
 		onEvent: options.onEvent,
 	});

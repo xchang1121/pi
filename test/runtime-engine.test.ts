@@ -2,7 +2,12 @@ import { describe, expect, it, vi } from "vitest";
 import { type ActionProjectionRule, READ_RANGE_ACTION_KEY_PROJECTOR } from "../src/action-key-projection.ts";
 import { buildPiActionKey } from "../src/action-semantics.ts";
 import type { SpeculativeExecutionRoute, WorldBranch, WorldCheckpoint } from "../src/execution-world.ts";
-import type { SpeculativeActionEvent, SpeculativeActionSettings, SpeculativePlanSource } from "../src/runtime.ts";
+import type {
+	CandidatePreflight,
+	SpeculativeActionEvent,
+	SpeculativeActionSettings,
+	SpeculativePlanSource,
+} from "../src/runtime.ts";
 import { makeStructuralSpeculativeActionRuntime } from "../src/runtime-engine.ts";
 import { cause, type PredictionSettlement, type ResourceValidation, zeroValidationMetrics } from "../src/settlement.ts";
 
@@ -66,6 +71,7 @@ function harness(input: {
 	readonly expired?: () => boolean | Promise<boolean>;
 	readonly capture?: () => unknown | Promise<unknown>;
 	readonly validate?: (version: unknown) => ResourceValidation;
+	readonly preflight?: (signal: AbortSignal) => CandidatePreflight | Promise<CandidatePreflight>;
 	readonly projection?: boolean;
 	readonly coveringAction?: ActionProjectionRule<string>["coveringAction"];
 	readonly onEvent?: (event: SpeculativeActionEvent<string>) => void | Promise<void>;
@@ -89,7 +95,7 @@ function harness(input: {
 						? MUTATION_ROUTE
 						: undefined,
 		actual: (call) => ({ id: call.id, tool: call.tool, input: call.input }),
-		preflightCandidate: () => ({ ok: true }),
+		preflightCandidate: ({ signal }) => input.preflight?.(signal) ?? { ok: true },
 		executeCandidate: async ({ tool, concrete, action, route, signal, parentWorld }) => {
 			executions++;
 			const version =
@@ -518,13 +524,18 @@ describe("structural speculative runtime", () => {
 		});
 	});
 
-	it("cancels next-action source requests when the Actor intent arrives", async () => {
+	it("expires both pending and admitting next-action requests when the Actor intent arrives", async () => {
 		let entered = 0;
+		let admissionEntered = false;
+		let releaseAdmission!: () => void;
+		const admission = new Promise<void>((resolve) => {
+			releaseAdmission = resolve;
+		});
 		const source: Source = {
 			id: "source",
 			enabled: () => true,
 			requestLifetime: "actor_decision",
-			proposalCount: () => 8,
+			proposalCount: () => 2,
 			propose: ({ proposalIndex, signal }) => {
 				entered++;
 				if (proposalIndex === 0) return plan("source", "empty", { path: "other.ts" });
@@ -533,18 +544,29 @@ describe("structural speculative runtime", () => {
 				});
 			},
 		};
-		const fixture = harness({ source });
+		const fixture = harness({
+			source,
+			preflight: async () => {
+				admissionEntered = true;
+				await admission;
+				return { ok: true };
+			},
+		});
 		await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn" });
-		await waitFor(() => entered === 8 && fixture.runtime.inspect().sharedCandidates === 1);
+		await waitFor(() => entered === 2 && admissionEntered);
 
 		expect(await fixture.runtime.consume(call("turn"))).toBeUndefined();
+		releaseAdmission();
 		await waitFor(() => fixture.runtime.inspect().pendingPredictions === 0);
-		await waitFor(() => fixture.events.filter((event) => event.type === "source_request").length === 8);
+		await waitFor(() => fixture.events.filter((event) => event.type === "source_request").length === 2);
+		expect(fixture.executions()).toBe(0);
 		expect(
 			fixture.events.filter(
 				(event) => event.type === "source_request" && event.request.settlement.status === "aborted",
 			),
-		).toHaveLength(7);
+		).toHaveLength(1);
+		await fixture.runtime.actual({ ...call("turn"), durationMs: 1, output: "actor" });
+		await fixture.runtime.finishTurn({ ...call("turn"), terminal: true });
 	});
 
 	it("queues unique candidates at capacity and starts each without admission loss", async () => {
@@ -978,7 +1000,7 @@ describe("structural speculative runtime", () => {
 		await new Promise((resolve) => setTimeout(resolve, 120));
 
 		await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn-2" });
-		await waitFor(() => fixture.runtime.inspect().pendingPredictions === 0);
+		await waitFor(() => fixture.runtime.inspect().deferredPlanActions === 1);
 		const second = { ...first, turnID: "turn-2", id: "second" };
 		expect(await fixture.runtime.consume(second)).toBeUndefined();
 		await fixture.runtime.actual({ ...second, durationMs: 1, output: "files" });

@@ -800,7 +800,8 @@ export function makeStructuralSpeculativeActionRuntime<
 		}
 		dispatchReady(session);
 		setTimeout(() => {
-			if (state.lifecycle === "active" && !state.generation.signal.aborted) launchSourceRequests(state);
+			if (state.lifecycle === "active" && state.actorArrivedAt === undefined && !state.generation.signal.aborted)
+				launchSourceRequests(state);
 		}, 0);
 	};
 
@@ -948,7 +949,6 @@ export function makeStructuralSpeculativeActionRuntime<
 	): Promise<void> => {
 		const session = scope.session;
 		session.pendingSourceRequests = Math.max(0, session.pendingSourceRequests - 1);
-		slot.generations.delete(generation);
 		try {
 			queueSourceRequestEvent(session, turnID, scope.settings, request);
 			if (
@@ -977,6 +977,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			session.planAdmissionTail = admission;
 			await admission;
 		} finally {
+			slot.generations.delete(generation);
 			releaseSourceRequest(session, slot);
 		}
 	};

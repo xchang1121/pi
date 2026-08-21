@@ -12,7 +12,7 @@ import {
 	type Message,
 } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { createSpeculativeActionHost, type SpeculativeAgentSettingsInput } from "../src/agent-integration.ts";
 import { PATTERN_AWARE_DEFAULTS, type PatternAwareSettings, PatternAwareStore } from "../src/pattern-aware.ts";
@@ -225,6 +225,27 @@ describe("faux LLM speculative action end to end", () => {
 		).toBe(true);
 		expect(evaluation.summary).toMatchObject({ actorActions: 3, speculativeHits: 2, actorFallbacks: 1 });
 		expect(evaluation.summary.executionAheadMs).toBeGreaterThan(100);
+
+		const observe = store.observeBatch.bind(store);
+		vi.spyOn(store, "observeBatch").mockImplementation((...args) => {
+			const deadline = performance.now() + 100;
+			while (performance.now() < deadline) {
+				// Replay the upper tail of PatternAware mining observed in historical traces.
+			}
+			return observe(...args);
+		});
+		const fastActor = await runAgent({
+			cwd,
+			sessionID: "pattern-fast-actor",
+			tools: patternTools(cwd, 20, "e.ts"),
+			actorTurns: sequenceTurns("e.ts", false),
+			actorTokensPerSecond: 4_000,
+			draftTurns: [],
+			settings: patternAwareSettings(patternSettings),
+			patternStore: store,
+		});
+		expect(fastActor.summary.actorActions).toBe(3);
+		expect(fastActor.executions).toEqual({ grep: 1, read: 2 });
 	});
 });
 
