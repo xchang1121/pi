@@ -683,7 +683,7 @@ export class PatternAwareStore {
 			const adoptionProbability = patternAdoptionProbability(patterns, this.clock, settings.decayHalfLifeEvents);
 			const conditionalProbability = clampProbability(calibration.probability * gapCoverage * variantProbability);
 			const empiricalProbability = clampProbability(continuation.pathProbability * conditionalProbability);
-			const beamScore = empiricalProbability * adoptionProbability * Math.max(1, Math.max(0, expectedDurationMs));
+			const expectedLatencyBenefitMs = empiricalProbability * Math.max(1, Math.max(0, expectedDurationMs));
 			const sameSessionEvidence =
 				activeSessionID === undefined
 					? 0
@@ -708,7 +708,7 @@ export class PatternAwareStore {
 				adoptionProbability,
 				expectedDurationMs,
 				ppmEstimate,
-				beamScore,
+				expectedLatencyBenefitMs,
 				sameSessionEvidence,
 			};
 		});
@@ -718,7 +718,7 @@ export class PatternAwareStore {
 				(left, right) =>
 					Number(right.sameSessionEvidence > 0) - Number(left.sameSessionEvidence > 0) ||
 					right.sameSessionEvidence - left.sameSessionEvidence ||
-					right.beamScore - left.beamScore ||
+					right.expectedLatencyBenefitMs - left.expectedLatencyBenefitMs ||
 					right.empiricalProbability - left.empiricalProbability ||
 					right.conditionalProbability - left.conditionalProbability ||
 					Number(right.representative.type === "tool_call") - Number(left.representative.type === "tool_call") ||
@@ -750,7 +750,7 @@ export class PatternAwareStore {
 				adoptionProbability,
 				expectedDurationMs,
 				ppmEstimate,
-				beamScore,
+				expectedLatencyBenefitMs,
 			} = prediction;
 			const beamRank = (emittedPerTool.get(representative.pattern.targetTool) ?? 0) + 1;
 			emittedPerTool.set(representative.pattern.targetTool, beamRank);
@@ -775,7 +775,7 @@ export class PatternAwareStore {
 				conditionalProbability,
 				adoptionProbability,
 				expectedDurationMs,
-				expectedLatencyBenefitMs: beamScore,
+				expectedLatencyBenefitMs,
 				dependencies: representative.pattern.dependencies,
 				continuation: nextContinuation,
 				depth: nextContinuation.visitedPatternIDs.length,
@@ -800,7 +800,7 @@ export class PatternAwareStore {
 						ppmEvidence: ppmEstimate?.evidence,
 						ppmEscapeMass: ppmEstimate?.escapeMass,
 						variantProbability,
-						beamScore,
+						expectedLatencyBenefitMs,
 						beamRank,
 						beamWidth: settings.beamWidth,
 						gapCoverage,
