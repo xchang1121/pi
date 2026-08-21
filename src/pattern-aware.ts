@@ -1029,9 +1029,14 @@ export class PatternAwareStore {
 			if (!bindings) return;
 			candidates.set(stableStringify(bindingMapStructure(bindings)), bindings);
 		};
-		for (const patternID of pool.patternIDs ?? []) remember(this.patterns.get(patternID)?.bindings);
+		const hasBindingEvidence = (bindings: Readonly<Record<string, PatternAwareBinding>>) =>
+			hasSufficientBindingProvenance(bindings, pool.samples, bindingEvidenceThreshold(this.settings));
+		for (const patternID of pool.patternIDs ?? []) {
+			const bindings = this.patterns.get(patternID)?.bindings;
+			if (bindings && hasBindingEvidence(bindings)) remember(bindings);
+		}
 		const currentBindings = inferBindings(context, target.input);
-		if (hasSufficientBindingProvenance(currentBindings, pool.samples, bindingEvidenceThreshold(this.settings))) {
+		if (firstRecurrenceProbe || hasBindingEvidence(currentBindings)) {
 			remember(currentBindings);
 		}
 		remember(

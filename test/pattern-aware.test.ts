@@ -670,6 +670,13 @@ describe("PatternAware", () => {
 	});
 
 	test("keeps constant patterns task-local until independently supported", async () => {
+		const local = new PatternAwareStore(settings({ minOccurrences: 2 }));
+		local.observe(input({ sessionID: "local", tool: "inspect", input: {} }));
+		local.observe(input({ sessionID: "local", tool: "read", input: { filePath: "README.md" } }));
+		expect(local.observe(input({ sessionID: "local", tool: "inspect", input: {} }))).toContainEqual(
+			expect.objectContaining({ tool: "read", input: { filePath: "README.md" } }),
+		);
+
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "pi-pattern-constant-pool-"));
 		temporary.push(directory);
 		const file = path.join(directory, "patterns.json");
