@@ -1427,7 +1427,7 @@ describe("PatternAware", () => {
 		);
 	});
 
-	test("keeps a same-session motif ahead of a higher-cost historical candidate", () => {
+	test("prioritizes a validated motif after its first same-session recurrence", () => {
 		const store = new PatternAwareStore(settings({ beamWidth: 1, maxContextLength: 1, maxFutureGap: 0 }));
 		for (let index = 0; index < 8; index++) {
 			store.observe(input({ sessionID: `history-${index}`, tool: "grep", input: {}, durationMs: 1 }));
@@ -1435,27 +1435,27 @@ describe("PatternAware", () => {
 				input({ sessionID: `history-${index}`, tool: "bash", input: { command: "npm test" }, durationMs: 100 }),
 			);
 		}
-		for (let index = 0; index < 2; index++) {
-			store.observe(
-				input({
-					sessionID: "active",
-					turnID: `active:${index}:grep`,
-					tool: "grep",
-					input: {},
-					outputPaths: ["README.md"],
-					durationMs: 1,
-				}),
-			);
-			store.observe(
-				input({
-					sessionID: "active",
-					turnID: `active:${index}:read`,
-					tool: "read",
-					input: { filePath: "README.md" },
-					durationMs: 1,
-				}),
-			);
-		}
+		trainGrepRead(store, "read-history-one", "src/one.ts");
+		trainGrepRead(store, "read-history-two", "src/two.ts");
+		store.observe(
+			input({
+				sessionID: "active",
+				turnID: "active:read:grep",
+				tool: "grep",
+				input: {},
+				outputPaths: ["README.md"],
+				durationMs: 1,
+			}),
+		);
+		store.observe(
+			input({
+				sessionID: "active",
+				turnID: "active:read",
+				tool: "read",
+				input: { filePath: "README.md" },
+				durationMs: 1,
+			}),
+		);
 
 		store.observe(
 			input({

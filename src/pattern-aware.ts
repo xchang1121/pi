@@ -714,8 +714,7 @@ export class PatternAwareStore {
 		const beam = predictions
 			.sort(
 				(left, right) =>
-					Number(right.sameSessionEvidence >= settings.minOccurrences) -
-						Number(left.sameSessionEvidence >= settings.minOccurrences) ||
+					Number(right.sameSessionEvidence > 0) - Number(left.sameSessionEvidence > 0) ||
 					right.beamScore - left.beamScore ||
 					right.empiricalProbability - left.empiricalProbability ||
 					right.conditionalProbability - left.conditionalProbability ||
