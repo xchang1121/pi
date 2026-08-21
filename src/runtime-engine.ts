@@ -134,7 +134,7 @@ function forecastFor(
 	node: PlanRuntimeNode,
 	route: SpeculativeExecutionRoute,
 	decisionSequence: number,
-	sourceLatencyMs = 0,
+	actorPhase?: PredictionForecast["actorPhase"],
 ): PredictionForecast {
 	return {
 		tool: node.action.tool,
@@ -142,7 +142,7 @@ function forecastFor(
 		...(node.action.expectedDurationMs !== undefined ? { expectedDurationMs: node.action.expectedDurationMs } : {}),
 		...(node.action.resourceDemand !== undefined ? { resourceDemand: node.action.resourceDemand } : {}),
 		decisionBatchesUntilCall: Math.max(0, node.expectedDecisionSeq - decisionSequence),
-		sourceLatencyMs,
+		...(actorPhase ? { actorPhase } : {}),
 		criticalPathMs: node.criticalPathMs,
 		...(node.action.expectedLatencyBenefitMs !== undefined
 			? { expectedLatencyBenefitMs: node.action.expectedLatencyBenefitMs }
@@ -353,17 +353,6 @@ function clearActorActions<SessionID, Output, StartInput, StateData>(
 
 function callKey(turnID: string, callID: string): string {
 	return JSON.stringify([turnID, callID]);
-}
-
-function observeActorDecisionInterval<SessionID, Output, StartInput, StateData>(
-	session: SessionState<SessionID, Output, StartInput, StateData>,
-	arrivedAt: number,
-): void {
-	const previous = session.lastActorArrivedAt;
-	session.lastActorArrivedAt = arrivedAt;
-	if (previous === undefined) return;
-	const interval = Math.max(0, arrivedAt - previous);
-	if (interval >= 25) session.scheduler.observeActorDecisionInterval(interval);
 }
 
 function closeActorPhase<SessionID, Output, StartInput, StateData>(
@@ -635,6 +624,7 @@ interface TurnState<SessionID, Output, StartInput, StateData> {
 	readonly generation: SourceGeneration;
 	readonly decisionSequence: number;
 	readonly actorActions: ActorAction[];
+	actorDecisionStartedAt: number;
 	actorArrivedAt?: number;
 	actorPhaseCompletedAt?: number;
 	lifecycle: "active" | "closing" | "finished";
@@ -782,6 +772,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			generation,
 			decisionSequence: session.decisionSequence + 1,
 			actorActions: [],
+			actorDecisionStartedAt: startedAt,
 			lifecycle: "active",
 		};
 		turns.set(key, state);
@@ -798,6 +789,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		} catch {
 			// Host analysis does not own runtime state.
 		}
+		state.actorDecisionStartedAt = performance.now();
 		dispatchReady(session);
 		setTimeout(() => {
 			if (state.lifecycle === "active" && state.actorArrivedAt === undefined && !state.generation.signal.aborted)
@@ -1207,6 +1199,20 @@ export function makeStructuralSpeculativeActionRuntime<
 	const dispatchReady = (session: Session, immediatePredictionID?: string): void => {
 		if (session.disposed) return;
 		settleBlockedPlanActions(session);
+		const actorTurn = [...session.turns]
+			.map((key) => turns.get(key))
+			.find(
+				(turn) =>
+					turn?.lifecycle === "active" &&
+					turn.actorArrivedAt === undefined &&
+					turn.decisionSequence === session.decisionSequence + 1,
+			);
+		const now = performance.now();
+		const actorPhase: PredictionForecast["actorPhase"] = actorTurn
+			? { kind: "decision", elapsedMs: Math.max(0, now - actorTurn.actorDecisionStartedAt) }
+			: session.lastActorArrivedAt === undefined
+				? undefined
+				: { kind: "cycle", elapsedMs: Math.max(0, now - session.lastActorArrivedAt) };
 		for (const node of session.plan.launchable()) {
 			if (!node.prediction || !node.actionKey || node.action.type !== "tool_call") continue;
 			const existingTimer = session.launchTimers.get(node.prediction.id);
@@ -1221,12 +1227,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			session.launchTimers.delete(node.prediction.id);
 			const context = session.actionContexts.get(node.identity.id);
 			if (!context?.executionRoute) continue;
-			const forecast = forecastFor(
-				node,
-				context.executionRoute,
-				session.decisionSequence,
-				context.predictionLatencyMs,
-			);
+			const forecast = forecastFor(node, context.executionRoute, session.decisionSequence, actorPhase);
 			const delay = node.prediction.id === immediatePredictionID ? 0 : session.scheduler.launchDelay(forecast);
 			if (delay <= 0) {
 				const promoted = session.plan.promote(node.proposalID, node.action.id);
@@ -1286,9 +1287,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		const candidateID = `spec_${sequence}_${node.actionKey.hash.slice(0, 12)}`;
 		const reuse = route.reuse === "exclusive_branch" ? "exclusive" : "shared";
 		const work = new CandidateExecution<WorldBranch<Output>>(reuse);
-		const scheduled = session.scheduler.evaluate([
-			forecastFor(node, route, session.decisionSequence, context.predictionLatencyMs),
-		]);
+		const scheduled = session.scheduler.evaluate([forecastFor(node, route, session.decisionSequence)]);
 		const candidate: Candidate = {
 			id: candidateID,
 			key: node.actionKey,
@@ -1474,7 +1473,13 @@ export function makeStructuralSpeculativeActionRuntime<
 			state.actorArrivedAt = actorArrivedAt;
 			state.session.decisionSequence = Math.max(state.session.decisionSequence, state.decisionSequence);
 			clearLaunchTimers(state.session);
-			observeActorDecisionInterval(state.session, actorArrivedAt);
+			const actorDecisionMs = Math.max(0, actorArrivedAt - state.actorDecisionStartedAt);
+			const previousActorArrivedAt = state.session.lastActorArrivedAt;
+			state.session.lastActorArrivedAt = actorArrivedAt;
+			state.session.scheduler.observeActorTiming(
+				actorDecisionMs,
+				previousActorArrivedAt === undefined ? undefined : actorArrivedAt - previousActorArrivedAt,
+			);
 		}
 		const candidatesAtArrival = allCandidates(state.sessionID);
 		const sequence = ++state.session.sequence;
@@ -2124,14 +2129,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			additional?.prediction && !nodes.some((node) => node.prediction?.id === additional.prediction.id)
 				? [...nodes, additional]
 				: nodes;
-		return unique.map((node) =>
-			forecastFor(
-				node,
-				candidate.route,
-				session.decisionSequence,
-				session.actionContexts.get(node.identity.id)?.predictionLatencyMs,
-			),
-		);
+		return unique.map((node) => forecastFor(node, candidate.route, session.decisionSequence));
 	};
 
 	const installWatcher = (session: Session, candidate: Candidate): void => {

@@ -12,7 +12,10 @@ export interface PredictionForecast {
 	readonly expectedDurationMs?: number;
 	readonly resourceDemand?: number;
 	readonly decisionBatchesUntilCall?: number;
-	readonly sourceLatencyMs?: number;
+	readonly actorPhase?: {
+		readonly kind: "decision" | "cycle";
+		readonly elapsedMs: number;
+	};
 	readonly criticalPathMs?: number;
 	readonly expectedLatencyBenefitMs?: number;
 }
@@ -51,7 +54,8 @@ interface SchedulerEntry<Job> {
 export class SpeculationScheduler<Job extends object> {
 	private readonly entries = new Map<Job, SchedulerEntry<Job>>();
 	private readonly serviceTimes = new Map<string, SampleWindow>();
-	private readonly actorDecisionIntervals = new SampleWindow();
+	private readonly actorDecisionDurations = new SampleWindow();
+	private readonly actorCycles = new SampleWindow();
 	private sequence = 0;
 
 	admit(
@@ -128,14 +132,14 @@ export class SpeculationScheduler<Job extends object> {
 		const decisionBatchesUntilCall = sequence(forecast.decisionBatchesUntilCall);
 		if (decisionBatchesUntilCall <= 1) return 0;
 		const duration = this.duration(forecast, 0.9);
-		const actorDecisionMs = this.actorDecisionIntervals.quantile(0.25, Math.max(50, duration * 2));
-		return Math.max(
-			0,
-			decisionBatchesUntilCall * actorDecisionMs -
-				duration -
-				finite(forecast.sourceLatencyMs) -
-				finite(safetyMarginMs),
-		);
+		const actorCycleMs = this.actorCycles.quantile(0.25, Math.max(50, duration * 2));
+		const actorDecisionMs = this.actorDecisionDurations.quantile(0.25, actorCycleMs);
+		const elapsedMs = finite(forecast.actorPhase?.elapsedMs);
+		const availableMs =
+			forecast.actorPhase?.kind === "decision"
+				? Math.max(0, actorDecisionMs - elapsedMs) + (decisionBatchesUntilCall - 1) * actorCycleMs
+				: Math.max(0, decisionBatchesUntilCall * actorCycleMs - elapsedMs);
+		return Math.max(0, availableMs - duration - finite(safetyMarginMs));
 	}
 
 	assessCompatibility(
@@ -154,8 +158,9 @@ export class SpeculationScheduler<Job extends object> {
 			: { compatible: false, code: "execution_fingerprint_changed" };
 	}
 
-	observeActorDecisionInterval(durationMs: number): void {
-		this.actorDecisionIntervals.observe(durationMs);
+	observeActorTiming(decisionDurationMs: number, cycleDurationMs?: number): void {
+		this.actorDecisionDurations.observe(decisionDurationMs);
+		if (cycleDurationMs !== undefined) this.actorCycles.observe(cycleDurationMs);
 	}
 
 	observeService(tool: string, durationMs: number): void {

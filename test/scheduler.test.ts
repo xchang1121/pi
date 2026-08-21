@@ -26,17 +26,31 @@ describe("SpeculationScheduler", () => {
 		expect(duplicate).toEqual(one);
 	});
 
-	it("uses conservative observed quantiles to schedule future actions", () => {
+	it("separates the current Actor decision from later tool cycles", () => {
 		const scheduler = new SpeculationScheduler<object>();
-		for (const duration of [80, 100, 120, 200]) scheduler.observeActorDecisionInterval(duration);
+		scheduler.observeActorTiming(40, 80);
+		scheduler.observeActorTiming(50, 100);
+		scheduler.observeActorTiming(60, 120);
+		scheduler.observeActorTiming(70, 200);
 		for (const duration of [20, 40, 60, 100]) scheduler.observeService("read", duration);
 		expect(
 			scheduler.launchDelay(
-				forecast({ decisionBatchesUntilCall: 3, sourceLatencyMs: 20, expectedDurationMs: 40 }),
+				forecast({
+					decisionBatchesUntilCall: 3,
+					actorPhase: { kind: "decision", elapsedMs: 20 },
+					expectedDurationMs: 40,
+				}),
+				10,
+			),
+		).toBe(110);
+		expect(
+			scheduler.launchDelay(
+				forecast({ decisionBatchesUntilCall: 3, actorPhase: { kind: "cycle", elapsedMs: 20 } }),
 				10,
 			),
 		).toBe(150);
-		expect(scheduler.launchDelay(forecast({ decisionBatchesUntilCall: 1, sourceLatencyMs: 1_000 }))).toBe(0);
+		expect(scheduler.launchDelay(forecast({ decisionBatchesUntilCall: 3 }), 10)).toBe(170);
+		expect(scheduler.launchDelay(forecast({ decisionBatchesUntilCall: 1 }))).toBe(0);
 	});
 
 	it("prioritizes explicit expected latency benefit without requiring it from every source", () => {

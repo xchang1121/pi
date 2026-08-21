@@ -956,27 +956,28 @@ describe("structural speculative runtime", () => {
 		await fixture.runtime.finishTurn({ ...call("turn-13"), terminal: true });
 	});
 
-	it("recalculates a distant prediction deadline across Actor turns", async () => {
+	it("keeps future launch deadlines phase-correct after an Actor action arrives", async () => {
 		let executions = 0;
 		const source: Source = {
 			id: "source",
 			enabled: () => true,
-			propose: ({ startInput }) =>
-				startInput.turnID === "turn-2"
-					? {
-							...plan("source", "distant", { path: "future.ts" }),
-							actions: [
-								{
-									id: "next",
-									type: "tool_call",
-									tool: "read",
-									input: { path: "future.ts" },
-									horizon: 2,
-									expectedDurationMs: 10,
-								},
-							],
-						}
-					: { id: "empty", source: "source", revision: 0, actions: [] },
+			propose: async ({ startInput }) => {
+				if (startInput.turnID !== "turn-3") return { id: "empty", source: "source", revision: 0, actions: [] };
+				await new Promise((resolve) => setTimeout(resolve, 50));
+				return {
+					...plan("source", "distant", { path: "future.ts" }),
+					actions: [
+						{
+							id: "next",
+							type: "tool_call",
+							tool: "read",
+							input: { path: "future.ts" },
+							horizon: 2,
+							expectedDurationMs: 10,
+						},
+					],
+				};
+			},
 		};
 		const fixture = harness({
 			source,
@@ -985,30 +986,35 @@ describe("structural speculative runtime", () => {
 				return "future";
 			},
 		});
-		await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn-1" });
-		await waitFor(() => fixture.runtime.inspect().pendingPredictions === 0);
-		const first: Call = {
-			sessionID: "session",
-			turnID: "turn-1",
-			id: "first",
-			tool: "find",
-			input: { pattern: "*" },
+		const actorTurn = async (turnID: string) => {
+			await fixture.runtime.startTurn({ sessionID: "session", turnID });
+			await new Promise((resolve) => setTimeout(resolve, 20));
+			const actorCall: Call = {
+				sessionID: "session",
+				turnID,
+				id: turnID,
+				tool: "find",
+				input: { pattern: "*" },
+			};
+			expect(await fixture.runtime.consume(actorCall)).toBeUndefined();
+			await new Promise((resolve) => setTimeout(resolve, 60));
+			await fixture.runtime.actual({ ...actorCall, durationMs: 60, output: "files" });
+			await fixture.runtime.finishTurn({ ...actorCall, terminal: false });
 		};
-		expect(await fixture.runtime.consume(first)).toBeUndefined();
-		await fixture.runtime.actual({ ...first, durationMs: 1, output: "files" });
-		await fixture.runtime.finishTurn({ ...first, terminal: false });
-		await new Promise((resolve) => setTimeout(resolve, 120));
+		await actorTurn("turn-1");
+		await actorTurn("turn-2");
 
-		await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn-2" });
+		await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn-3" });
 		await waitFor(() => fixture.runtime.inspect().deferredPlanActions === 1);
-		const second = { ...first, turnID: "turn-2", id: "second" };
-		expect(await fixture.runtime.consume(second)).toBeUndefined();
-		await fixture.runtime.actual({ ...second, durationMs: 1, output: "files" });
-		await new Promise((resolve) => setTimeout(resolve, 150));
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		const third = { ...call("turn-3"), id: "turn-3", tool: "find", input: { pattern: "*" } };
+		expect(await fixture.runtime.consume(third)).toBeUndefined();
+		await fixture.runtime.actual({ ...third, durationMs: 0, output: "files" });
+		await fixture.runtime.finishTurn({ ...third, terminal: false });
+		await new Promise((resolve) => setTimeout(resolve, 100));
 		expect(executions).toBe(0);
-
-		await waitFor(() => executions === 1);
-		await fixture.runtime.finishTurn({ ...call("turn-2"), terminal: true });
+		await waitFor(() => executions === 1, 80);
+		await fixture.runtime.finishTurn({ ...call("turn-3"), terminal: true });
 	});
 
 	it("records an exact match when isolation is unavailable without starting speculative execution", async () => {
