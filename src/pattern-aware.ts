@@ -342,6 +342,7 @@ export class PatternAwareStore {
 	private readonly history = new Map<string, PatternAwareEvent[]>();
 	private readonly observedActionKeys = new WeakMap<PatternAwareEvent, ActionKey | null>();
 	private readonly resolvedActionKeys = new Map<string, ActionKey>();
+	private readonly patternSupportSessions = new Map<string, ReadonlySet<string>>();
 	private trie = new PredictiveContextTrie();
 	private sequenceModel: PpmCountTrie;
 	private indexDirty = true;
@@ -412,6 +413,11 @@ export class PatternAwareStore {
 				};
 				this.pools.set(key, restored);
 				this.addControlOpportunities(restored, restored.samples.length);
+				for (const patternID of restored.patternIDs ?? []) {
+					if (this.patterns.get(patternID)?.dependencies.length === 0) {
+						this.patternSupportSessions.set(patternID, new Set(samples.map((sample) => sample.target.sessionID)));
+					}
+				}
 			}
 			for (const sample of pool.samples) {
 				this.clock = Math.max(this.clock, sample.target.sequence, ...sample.context.map((event) => event.sequence));
@@ -526,6 +532,7 @@ export class PatternAwareStore {
 		const pattern = mutablePattern(input);
 		if (!pattern || !structurallyEligible(pattern, this.settings)) return false;
 		this.patterns.set(pattern.id, pattern);
+		this.patternSupportSessions.delete(pattern.id);
 		this.clock = Math.max(this.clock, pattern.lastSeenSequence);
 		this.indexDirty = true;
 		this.trimPatterns();
@@ -587,6 +594,7 @@ export class PatternAwareStore {
 	) {
 		if (continuation.visitedPatternIDs.length >= settings.maxPredictionDepth) return [];
 		const predictiveHistory = actionHistory(history);
+		const activeSessionID = predictiveHistory.at(-1)?.sessionID;
 		const sequenceContext = predictiveHistory.map((event) => signatureToken(signature(event)));
 		const result: PatternAwareCandidate[] = [];
 		const groups = new Map<
@@ -603,6 +611,15 @@ export class PatternAwareStore {
 		for (const patternID of this.trie.matching(predictiveHistory)) {
 			const pattern = this.patterns.get(patternID);
 			if (!pattern || !structurallyEligible(pattern, settings)) continue;
+			const supportingSessions = this.patternSupportSessions.get(patternID);
+			if (
+				activeSessionID !== undefined &&
+				supportingSessions &&
+				pattern.dependencies.length === 0 &&
+				!supportingSessions.has(activeSessionID) &&
+				supportingSessions.size < settings.minOccurrences
+			)
+				continue;
 			if (pattern.targetSchemaHash && schemaHashes[pattern.targetTool] !== pattern.targetSchemaHash) continue;
 			if (!matchesSuffix(predictiveHistory, pattern.context)) continue;
 			const context = predictiveHistory.slice(-pattern.context.length);
@@ -1038,12 +1055,16 @@ export class PatternAwareStore {
 			);
 			if (retained.has(id)) continue;
 			retained.add(id);
+			const dependencies = bindingDependencies(bindings);
+			if (dependencies.length === 0) {
+				this.patternSupportSessions.set(id, new Set(support.map((sample) => sample.target.sessionID)));
+			} else this.patternSupportSessions.delete(id);
 			const historicalOpportunities = this.controlOpportunities(pool);
 			const lastSeenSequence = Math.max(...support.map((sample) => sample.target.sequence));
 			const existing = this.patterns.get(id);
 			if (existing) {
 				existing.bindings = bindings;
-				existing.dependencies = bindingDependencies(bindings);
+				existing.dependencies = dependencies;
 				existing.occurrences = support.length;
 				existing.replayMatches = support.length;
 				existing.historicalOpportunities = Math.max(existing.historicalOpportunities, historicalOpportunities);
@@ -1059,7 +1080,7 @@ export class PatternAwareStore {
 				context: signatures,
 				targetTool: target.tool,
 				bindings,
-				dependencies: bindingDependencies(bindings),
+				dependencies,
 				...(target.schemaHash ? { targetSchemaHash: target.schemaHash } : {}),
 				gapCounts: sampleGapCounts(support),
 				gapLastSeen: sampleGapLastSeen(support),
@@ -1095,6 +1116,7 @@ export class PatternAwareStore {
 		for (const patternID of pool.patternIDs ?? []) {
 			if (retained.has(patternID)) continue;
 			if (this.patterns.delete(patternID)) this.indexDirty = true;
+			this.patternSupportSessions.delete(patternID);
 			for (const [sessionID, pending] of this.pending) {
 				const active = pending.filter((item) => item.patternID !== patternID);
 				if (active.length) this.pending.set(sessionID, active);
@@ -1201,6 +1223,7 @@ export class PatternAwareStore {
 			.slice(0, this.patterns.size - limit);
 		for (const pattern of evicted) {
 			this.patterns.delete(pattern.id);
+			this.patternSupportSessions.delete(pattern.id);
 		}
 		if (evicted.length) this.indexDirty = true;
 	}

@@ -615,7 +615,7 @@ describe("PatternAware", () => {
 		]);
 	});
 
-	test("persists bounded analyzer pools so patterns can form across processes", async () => {
+	test("transfers data-flow patterns across processes before global support", async () => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "pi-pattern-pool-"));
 		temporary.push(directory);
 		const file = path.join(directory, "patterns.json");
@@ -631,7 +631,11 @@ describe("PatternAware", () => {
 
 		const second = new PatternAwareStore(settings({ minOccurrences: 2 }), file);
 		await second.load();
-		trainGrepRead(second, "two", "src/b.ts");
+		const candidates = second.observe(
+			input({ sessionID: "two", tool: "grep", input: {}, outputPaths: ["src/b.ts"] }),
+		);
+		expect(candidates).toContainEqual(expect.objectContaining({ tool: "read", input: { filePath: "src/b.ts" } }));
+		second.observe(input({ sessionID: "two", tool: "read", input: { filePath: "src/b.ts" } }));
 
 		expect(second.snapshot().some((item) => item.targetTool === "read")).toBe(true);
 	});
@@ -665,18 +669,31 @@ describe("PatternAware", () => {
 		]);
 	});
 
-	test("retains inference evidence across short-lived processes", async () => {
+	test("keeps constant patterns task-local until independently supported", async () => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "pi-pattern-constant-pool-"));
 		temporary.push(directory);
 		const file = path.join(directory, "patterns.json");
-
-		for (const sessionID of ["one", "two", "three", "four"]) {
+		const train = async (sessionID: string) => {
 			const store = new PatternAwareStore(settings({ minOccurrences: 2 }), file);
 			await store.load();
 			store.observe(input({ sessionID, tool: "inspect", input: {}, output: { kind: "path" } }));
 			store.observe(input({ sessionID, tool: "read", input: { filePath: "README.md" } }));
 			store.finishSession(sessionID);
 			await store.flush();
+		};
+
+		await train("one");
+		const isolated = new PatternAwareStore(settings({ minOccurrences: 2 }), file);
+		await isolated.load();
+		expect(
+			isolated
+				.observe(input({ sessionID: "probe", tool: "inspect", input: {}, output: { kind: "path" } }))
+				.some((candidate) => candidate.tool === "read"),
+		).toBe(false);
+		isolated.finishSession("probe");
+		await isolated.flush();
+		for (const sessionID of ["two", "three", "four"]) {
+			await train(sessionID);
 		}
 
 		const restored = new PatternAwareStore(settings({ minOccurrences: 2 }), file);
