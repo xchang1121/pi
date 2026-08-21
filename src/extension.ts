@@ -164,7 +164,7 @@ export function formatSpeculativeActionStatus(input: {
 		`Resource cache: ${settings.resourceCacheMaxEntries}`,
 		`Resource cache memory: ${formatBytes(settings.resourceCacheMaxBytes)}`,
 		`Prediction timeout: ${formatDuration(settings.predictionTimeoutMs)}`,
-		`PatternAware: ${settings.patternAware.enabled ? "On" : "Off"}; multi-step: ${settings.patternAware.multiStepEnabled ? "On" : "Off"} (beam ${settings.patternAware.beamWidth}, depth ${settings.patternAware.maxPredictionDepth}, support ${settings.patternAware.minOccurrences}, binding≥${settings.patternAware.minBindingReplayProbability}, gap ${settings.patternAware.maxFutureGap}, coverage ${formatPercent(settings.patternAware.futureGapCoverage)}, half-life ${settings.patternAware.decayHalfLifeEvents})`,
+		`PatternAware: ${settings.patternAware.enabled ? "On" : "Off"}; multi-step: ${settings.patternAware.multiStepEnabled ? "On" : "Off"} (beam/tool ${settings.patternAware.beamWidth}, depth ${settings.patternAware.maxPredictionDepth}, support ${settings.patternAware.minOccurrences}, binding≥${settings.patternAware.minBindingReplayProbability}, gap ${settings.patternAware.maxFutureGap}, coverage ${formatPercent(settings.patternAware.futureGapCoverage)}, half-life ${settings.patternAware.decayHalfLifeEvents})`,
 		`Prediction tools: ${toolsSummary(settings.tools)}`,
 		"Execution boundary: runtime sandbox first; resource snapshots or Git worktrees second; otherwise Actor fallback",
 		`Actor actions: ${metrics.speculativeHits}/${metrics.actorActions} speculative hits (${hitRate}%); fallbacks: ${metrics.actorFallbacks}`,
@@ -781,7 +781,7 @@ async function openPatternAwareSettings(ctx: ExtensionContext, controller: Specu
 		const choice = await ctx.ui.select("PatternAware", [
 			`Enabled: ${settings.patternAware.enabled ? "On" : "Off"}`,
 			`Learning › context ${settings.patternAware.maxContextLength}, support ${settings.patternAware.minOccurrences}`,
-			`Multi-step prediction › ${settings.patternAware.multiStepEnabled ? "On" : "Off"}, beam ${settings.patternAware.beamWidth}, depth ${settings.patternAware.maxPredictionDepth}`,
+			`Multi-step prediction › ${settings.patternAware.multiStepEnabled ? "On" : "Off"}, beam/tool ${settings.patternAware.beamWidth}, depth ${settings.patternAware.maxPredictionDepth}`,
 			BACK,
 		]);
 		if (!choice || choice === BACK) return;
@@ -833,7 +833,7 @@ async function openPatternMultiStep(ctx: ExtensionContext, controller: Speculati
 		const pattern = settings.patternAware;
 		const choice = await ctx.ui.select("PatternAware multi-step", [
 			`Enabled: ${pattern.multiStepEnabled ? "On" : "Off"}`,
-			`Beam width: ${pattern.beamWidth}`,
+			`Beam width per tool: ${pattern.beamWidth}`,
 			`Prediction depth: ${pattern.maxPredictionDepth}`,
 			`Minimum binding replay: ${formatPercent(pattern.minBindingReplayProbability)}`,
 			BACK,
@@ -845,8 +845,8 @@ async function openPatternMultiStep(ctx: ExtensionContext, controller: Speculati
 				patternAware: { ...pattern, multiStepEnabled: !pattern.multiStepEnabled },
 			});
 		}
-		if (choice.startsWith("Beam width:")) {
-			await editPatternInteger(ctx, controller, settings, "beamWidth", "Pattern beam width", false);
+		if (choice.startsWith("Beam width per tool:")) {
+			await editPatternInteger(ctx, controller, settings, "beamWidth", "Pattern beam width per tool", false);
 		}
 		if (choice.startsWith("Prediction depth:")) {
 			await editPatternInteger(ctx, controller, settings, "maxPredictionDepth", "Pattern prediction depth", false);

@@ -1393,7 +1393,7 @@ describe("PatternAware", () => {
 		expect(new Set(bash?.continuation.visitedPatternIDs).size).toBe(3);
 	});
 
-	test("uses PPM probability and expected hidden time to retain a bounded high-value beam", () => {
+	test("uses PPM value to retain a bounded beam for each competing tool", () => {
 		const store = new PatternAwareStore(settings({ beamWidth: 1, maxContextLength: 1, maxFutureGap: 0 }));
 		for (let index = 0; index < 8; index++) {
 			store.observe(input({ sessionID: `fast-${index}`, tool: "grep", input: {}, durationMs: 1 }));
@@ -1412,9 +1412,10 @@ describe("PatternAware", () => {
 		const candidates = store.predict("probe");
 		const diagnostic = JSON.parse(candidates[0]!.diagnostic);
 
-		expect(candidates).toHaveLength(1);
+		expect(candidates.map((candidate) => candidate.tool)).toEqual(["bash", "read"]);
 		expect(candidates[0]).toMatchObject({ tool: "bash", expectedDurationMs: 100 });
 		expect(diagnostic).toMatchObject({ beamRank: 1, beamWidth: 1, ppmOrder: 1 });
+		expect(candidates.map((candidate) => JSON.parse(candidate.diagnostic).beamRank)).toEqual([1, 1]);
 		expect(diagnostic.ppmProbability).toBeGreaterThan(0);
 		expect(diagnostic.ppmWeight).toBeGreaterThan(0);
 		expect(candidates[0]!.expectedLatencyBenefitMs).toBeGreaterThan(1);
@@ -1467,9 +1468,9 @@ describe("PatternAware", () => {
 			}),
 		);
 
-		expect(store.predict("active")).toEqual([
+		expect(store.predict("active")[0]).toEqual(
 			expect.objectContaining({ tool: "read", input: { filePath: "README.md" } }),
-		]);
+		);
 	});
 
 	test("calibrates PPM beam value with concrete actor-miss feedback", () => {

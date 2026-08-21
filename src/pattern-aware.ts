@@ -11,7 +11,7 @@ export type PatternAwareSettings = {
 	/** Admit future-gap/preparation candidates and expand completed predictions into a multi-step frontier. */
 	readonly multiStepEnabled: boolean;
 	readonly maxContextLength: number;
-	/** Maximum competing concrete actions retained at each PatternAware frontier. */
+	/** Maximum competing concrete actions retained per tool at each PatternAware frontier. */
 	readonly beamWidth: number;
 	/** Maximum number of recursively predicted actions on one branch. */
 	readonly maxPredictionDepth: number;
@@ -710,6 +710,7 @@ export class PatternAwareStore {
 				sameSessionEvidence,
 			};
 		});
+		const perTool = new Map<string, number>();
 		const beam = predictions
 			.sort(
 				(left, right) =>
@@ -723,8 +724,15 @@ export class PatternAwareStore {
 					left.representative.pattern.id.localeCompare(right.representative.pattern.id) ||
 					stableStringify(left.representative.input).localeCompare(stableStringify(right.representative.input)),
 			)
-			.slice(0, settings.beamWidth);
-		for (const [beamIndex, prediction] of beam.entries()) {
+			.filter((prediction) => {
+				const tool = prediction.representative.pattern.targetTool;
+				const count = perTool.get(tool) ?? 0;
+				if (count >= settings.beamWidth) return false;
+				perTool.set(tool, count + 1);
+				return true;
+			});
+		const emittedPerTool = new Map<string, number>();
+		for (const prediction of beam) {
 			const {
 				actionIdentity,
 				ordered,
@@ -742,6 +750,8 @@ export class PatternAwareStore {
 				ppmEstimate,
 				beamScore,
 			} = prediction;
+			const beamRank = (emittedPerTool.get(representative.pattern.targetTool) ?? 0) + 1;
+			emittedPerTool.set(representative.pattern.targetTool, beamRank);
 			const supportingPatternIDs = [...new Set(ordered.map((item) => item.pattern.id))];
 			const nextContinuation: PatternAwareContinuation = {
 				history: predictiveHistory,
@@ -789,7 +799,7 @@ export class PatternAwareStore {
 						ppmEscapeMass: ppmEstimate?.escapeMass,
 						variantProbability,
 						beamScore,
-						beamRank: beamIndex + 1,
+						beamRank,
 						beamWidth: settings.beamWidth,
 						gapCoverage,
 						expectedDurationMs,

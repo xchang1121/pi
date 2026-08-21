@@ -248,7 +248,7 @@ describe("faux LLM speculative action end to end", () => {
 		expect(fastActor.executions).toEqual({ grep: 1, read: 2 });
 	});
 
-	it("keeps a same-session PatternAware motif on the scheduler's one-slot beam", async () => {
+	it("does not let an unisolated tool crowd an executable tool off a one-slot scheduler", async () => {
 		const cwd = await workspace();
 		const patternSettings: PatternAwareSettings = {
 			...PATTERN_AWARE_DEFAULTS,
@@ -285,13 +285,14 @@ describe("faux LLM speculative action end to end", () => {
 			const sessionID = `historical-${index}`;
 			train(sessionID, sessionID, "bash", { command: "generate artifact" }, 500);
 		}
-		for (let index = 0; index < 2; index++) {
-			train("live-priority", `seed-${index}`, "read", { path: "notes.txt" }, 1, ["notes.txt"]);
+		for (let index = 0; index < 3; index++) {
+			const file = `historical-read-${index}.txt`;
+			train(`historical-read-${index}`, `seed-${index}`, "read", { path: file }, 120, [file]);
 		}
 
 		const result = await runAgent({
 			cwd,
-			sessionID: "live-priority",
+			sessionID: "tool-stratified-beam",
 			tools: [...patternTools(cwd, 120, "notes.txt"), fallbackBash(cwd)],
 			actorTurns: [
 				turn(fauxToolCall("grep", { pattern: "TODO", path: "." })),
