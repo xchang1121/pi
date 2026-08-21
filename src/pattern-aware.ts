@@ -1154,7 +1154,7 @@ export class PatternAwareStore {
 				patternID: pattern.id,
 				triggerSequence,
 				expectedInputs: applyBindingsVariants(pattern.bindings, context),
-				remaining: learnedHorizon(pattern, this.settings, this.clock),
+				remaining: learnedGroupHorizon([pattern], this.settings, this.clock, 1),
 			});
 		}
 		if (pending.length) this.pending.set(sessionID, pending);
@@ -2261,19 +2261,6 @@ function structurallyEligible(pattern: MutablePattern, settings: PatternAwareSet
 				pattern.feedback.issued === 0)) &&
 		pattern.replayMatches / Math.max(1, pattern.occurrences) >= settings.minBindingReplayProbability
 	);
-}
-
-function learnedHorizon(pattern: MutablePattern, settings: PatternAwareSettings, clock: number) {
-	const gaps = weightedGaps(pattern, settings, clock).filter(([gap]) => gap <= settings.maxFutureGap);
-	if (!gaps.length) return 0;
-	const total = gaps.reduce((sum, [, weight]) => sum + weight, 0);
-	const target = total * settings.futureGapCoverage;
-	let covered = 0;
-	for (const [gap, weight] of gaps) {
-		covered += weight;
-		if (covered >= target) return gap;
-	}
-	return gaps.at(-1)?.[0] ?? 0;
 }
 
 function learnedGroupHorizon(

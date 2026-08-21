@@ -233,13 +233,22 @@ describe("PatternAware", () => {
 
 	test("schedules at weighted gap coverage while retaining the largest observed deadline", () => {
 		const store = new PatternAwareStore(settings({ maxFutureGap: 8, futureGapCoverage: 0.8 }));
-		expect(store.registerValidatedPattern(validatedGapPattern({ "0": 9, "5": 1 }))).toBe(true);
+		const pattern = validatedGapPattern({ "0": 9, "5": 1 });
+		expect(store.registerValidatedPattern(pattern)).toBe(true);
 
 		store.observe(input({ sessionID: "probe", tool: "grep", input: { pattern: "TODO" } }));
 
 		expect(store.predict("probe").find((item) => item.tool === "read")).toMatchObject({
 			horizon: 0,
 			latestHorizon: 5,
+		});
+		for (let gap = 0; gap < 5; gap++) {
+			store.observe(input({ sessionID: "probe", tool: "bash", input: { command: `step-${gap}` } }));
+		}
+		store.observe(input({ sessionID: "probe", tool: "read", input: { path: "README.md" } }));
+		expect(store.snapshot().find((item) => item.id === pattern.id)).toMatchObject({
+			historicalOpportunities: pattern.historicalOpportunities + 1,
+			historicalMatches: pattern.historicalMatches + 1,
 		});
 	});
 
