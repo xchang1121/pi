@@ -1657,12 +1657,13 @@ function applyBindingsPartialWeightedVariants(
 		const next: Array<{ input: Record<string, unknown>; missing: PatternAwarePath[]; probability: number }> = [];
 		for (const variant of variants) {
 			for (const value of values) {
+				const input = withPath(variant.input, targetPath, value.value);
 				const candidate = {
-					input: structuredClone(variant.input),
+					input: input ?? variant.input,
 					missing: [...variant.missing],
 					probability: variant.probability * value.probability,
 				};
-				if (!setPath(candidate.input, targetPath, value.value)) candidate.missing.push(targetPath);
+				if (!input) candidate.missing.push(targetPath);
 				next.push(candidate);
 			}
 		}
@@ -2211,23 +2212,35 @@ function getPath(value: unknown, segments: PatternAwarePath): unknown {
 	return current;
 }
 
-function setPath(target: Record<string, unknown>, segments: PatternAwarePath, value: unknown) {
-	if (!segments.length) return false;
-	let current: Record<string, unknown> | unknown[] = target;
-	for (let index = 0; index < segments.length; index++) {
+function withPath(
+	target: Readonly<Record<string, unknown>>,
+	segments: PatternAwarePath,
+	value: unknown,
+): Record<string, unknown> | undefined {
+	if (!segments.length || segments.some(unsafePathSegment)) return undefined;
+	const update = (current: unknown, index: number): Record<string, unknown> | unknown[] => {
 		const segment = segments[index]!;
-		if (segment === "__proto__" || segment === "prototype" || segment === "constructor") return false;
-		const final = index === segments.length - 1;
-		if (final) {
-			(current as Record<string | number, unknown>)[segment] = value;
-			return true;
-		}
-		const next = segments[index + 1]!;
-		const container: Record<string, unknown> | unknown[] = typeof next === "number" ? [] : {};
-		(current as Record<string | number, unknown>)[segment] = container;
-		current = container;
-	}
-	return false;
+		const container: Record<string, unknown> | unknown[] =
+			typeof segment === "number"
+				? Array.isArray(current)
+					? [...current]
+					: []
+				: asRecord(current)
+					? { ...(current as Record<string, unknown>) }
+					: {};
+		const child =
+			index === segments.length - 1
+				? value
+				: update((current as Record<string | number, unknown> | undefined)?.[segment], index + 1);
+		if (typeof segment === "number") (container as unknown[])[segment] = child;
+		else (container as Record<string, unknown>)[segment] = child;
+		return container;
+	};
+	return update(target, 0) as Record<string, unknown>;
+}
+
+function unsafePathSegment(segment: string | number) {
+	return segment === "__proto__" || segment === "prototype" || segment === "constructor";
 }
 
 const leavesCache = new WeakMap<object, ReadonlyArray<[PatternAwarePath, unknown]>>();

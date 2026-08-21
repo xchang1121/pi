@@ -43,6 +43,16 @@ describe("PatternAware", () => {
 		expect(bindings['["offset"]']).toEqual({ type: "constant", value: 1 });
 	});
 
+	test("merges bindings that share nested object and array paths", () => {
+		const context = [event({ sessionID: "one", tool: "seed", input: { oldText: "before" } })];
+		const target = {
+			range: { start: 1, end: 2 },
+			edits: [{ oldText: "before", newText: "after" }],
+		};
+
+		expect(applyBindings(inferBindings(context, target), context)).toEqual(target);
+	});
+
 	test("derives adjacent paths and commands through bounded path templates", () => {
 		const context = [event({ sessionID: "one", tool: "read", input: { filePath: "services/alpha/config.ts" } })];
 		const bindings = inferBindings(context, {
