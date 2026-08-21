@@ -926,11 +926,7 @@ export class PatternAwareStore {
 			return undefined;
 		}
 		const cached = this.resolvedActionKeys.get(cacheKey);
-		if (cached) {
-			this.resolvedActionKeys.delete(cacheKey);
-			this.resolvedActionKeys.set(cacheKey, cached);
-			return cached;
-		}
+		if (cached) return cached;
 		let resolved: ActionKey | undefined;
 		try {
 			resolved = this.actionSemantics.actionKey(tool, input, schemaHash);
@@ -1004,7 +1000,8 @@ export class PatternAwareStore {
 			samples: [],
 		};
 		const previousSampleCount = pool.samples.length;
-		pool.samples.push({ context: [...context], target, gap });
+		// Internal contexts are immutable; preserving identity lets binding inference reuse its WeakMap cache.
+		pool.samples.push({ context, target, gap });
 		const sampleLimit = patternPoolSampleLimit(this.settings);
 		if (pool.samples.length > sampleLimit) pool.samples.splice(0, pool.samples.length - sampleLimit);
 		this.pools.set(poolKey, pool);
