@@ -94,6 +94,10 @@ function updateSource(update: PlanUpdate): string {
 	return "actions" in update ? update.source : update.source;
 }
 
+function planUpdateID(update: PlanUpdate): string {
+	return "actions" in update ? update.id : update.proposalID;
+}
+
 function immediateOnly(update: PlanUpdate): PlanUpdate {
 	if ("actions" in update) {
 		return {
@@ -596,7 +600,7 @@ interface SessionState<SessionID, Output, StartInput, StateData> {
 	readonly authoritativeToolIntervals: TimelineInterval[];
 	readonly authoritativeCandidateIDs: Set<string>;
 	actorAdmissionTail: Promise<void>;
-	planAdmissionTail: Promise<void>;
+	readonly planAdmissionTails: Map<string, Promise<void>>;
 	settings: SpeculativeActionSettings;
 	taskStartedAt?: number;
 	lastActorArrivedAt?: number;
@@ -711,7 +715,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			authoritativeToolIntervals: [],
 			authoritativeCandidateIDs: new Set(),
 			actorAdmissionTail: Promise.resolve(),
-			planAdmissionTail: Promise.resolve(),
+			planAdmissionTails: new Map(),
 			settings,
 			sequence: 0,
 			decisionSequence: 0,
@@ -865,8 +869,9 @@ export function makeStructuralSpeculativeActionRuntime<
 	};
 
 	const waitForSourceTasks = async (session: Session): Promise<void> => {
-		while (session.sourceTasks.size) await Promise.allSettled([...session.sourceTasks]);
-		await session.planAdmissionTail;
+		while (session.sourceTasks.size || session.planAdmissionTails.size) {
+			await Promise.allSettled([...session.sourceTasks, ...session.planAdmissionTails.values()]);
+		}
 	};
 
 	const launchSourceRequests = (state: Turn): void => {
@@ -951,23 +956,10 @@ export function makeStructuralSpeculativeActionRuntime<
 			) {
 				return;
 			}
-			session.pendingAdmissions++;
-			const admission = session.planAdmissionTail
-				.then(async () => {
-					if (session.disposed || !slot.active || scope.signal.aborted) return;
-					for (const update of asUpdates(request.value)) {
-						if (session.disposed || !slot.active || scope.signal.aborted) break;
-						await admitUpdate(scope, source, update, request);
-					}
-				})
-				.catch(() => {
-					// One malformed proposal cannot poison later independent admissions.
-				})
-				.finally(() => {
-					session.pendingAdmissions = Math.max(0, session.pendingAdmissions - 1);
-				});
-			session.planAdmissionTail = admission;
-			await admission;
+			for (const update of asUpdates(request.value)) {
+				if (session.disposed || !slot.active || scope.signal.aborted) break;
+				await admitUpdate(scope, source, update, request);
+			}
 		} finally {
 			slot.generations.delete(generation);
 			releaseSourceRequest(session, slot);
@@ -975,6 +967,30 @@ export function makeStructuralSpeculativeActionRuntime<
 	};
 
 	const admitUpdate = async (
+		scope: PlanAdmissionScope<SessionID, Output, StartInput, StateData>,
+		source: Source,
+		update: PlanUpdate,
+		request?: SettledSourceRequest,
+	): Promise<void> => {
+		const { session } = scope;
+		const key = planUpdateID(update);
+		const previous = session.planAdmissionTails.get(key) ?? Promise.resolve();
+		session.pendingAdmissions++;
+		let admission!: Promise<void>;
+		admission = previous
+			.then(() => applyUpdate(scope, source, update, request))
+			.catch(() => {
+				// One malformed proposal cannot poison later independent admissions.
+			})
+			.finally(() => {
+				session.pendingAdmissions = Math.max(0, session.pendingAdmissions - 1);
+				if (session.planAdmissionTails.get(key) === admission) session.planAdmissionTails.delete(key);
+			});
+		session.planAdmissionTails.set(key, admission);
+		await admission;
+	};
+
+	const applyUpdate = async (
 		scope: PlanAdmissionScope<SessionID, Output, StartInput, StateData>,
 		source: Source,
 		update: PlanUpdate,
@@ -989,6 +1005,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		for (const retired of applied.retired) retirePlanAction(session, retired, cause("plan", "superseded"));
 		const draftTokens = finiteMetric(acceptedUpdate.draftTokens);
 		session.tokenTotal += draftTokens;
+		const materializations: Promise<void>[] = [];
 		for (const action of applied.upserted) {
 			const node = session.plan.get(applied.plan.id, action.id);
 			if (!node || (node.predictionState && node.predictionState.status !== "pending")) continue;
@@ -1031,8 +1048,9 @@ export function makeStructuralSpeculativeActionRuntime<
 				void runPreparationHint(session, node);
 				continue;
 			}
-			await materializeAction(session, node);
+			materializations.push(materializeAction(session, node));
 		}
+		await Promise.all(materializations);
 		dispatchReady(session);
 	};
 

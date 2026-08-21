@@ -75,7 +75,11 @@ function harness(input: {
 	readonly projection?: boolean;
 	readonly coveringAction?: ActionProjectionRule<string>["coveringAction"];
 	readonly onEvent?: (event: SpeculativeActionEvent<string>) => void | Promise<void>;
-	readonly actionKey?: (tool: string, args: unknown) => ReturnType<typeof buildPiActionKey>;
+	readonly actionKey?: (
+		tool: string,
+		args: unknown,
+		context: { readonly type: "start" | "consume" },
+	) => ReturnType<typeof buildPiActionKey> | Promise<ReturnType<typeof buildPiActionKey>>;
 	readonly resolveExecution?: (tool: string) => SpeculativeExecutionRoute | undefined;
 }) {
 	const events: SpeculativeActionEvent<string>[] = [];
@@ -143,6 +147,56 @@ function call(turnID: string, input: Record<string, unknown> = { path: "README.m
 }
 
 describe("structural speculative runtime", () => {
+	it("admits independent actions and proposals without head-of-line blocking", async () => {
+		let releaseSlow!: () => void;
+		const slow = new Promise<void>((resolve) => {
+			releaseSlow = resolve;
+		});
+		let slowStarted = false;
+		const source: Source = {
+			id: "source",
+			enabled: () => true,
+			proposalCount: () => 2,
+			propose: ({ proposalIndex }) =>
+				proposalIndex === 0
+					? {
+							id: "proposal:0",
+							source: "source",
+							revision: 0,
+							actions: [
+								{ id: "slow", type: "tool_call", tool: "read", input: { path: "slow.ts" } },
+								{ id: "same-plan", type: "tool_call", tool: "read", input: { path: "same-plan.ts" } },
+							],
+						}
+					: plan("source", "proposal:1", { path: "other-plan.ts" }),
+		};
+		const fixture = harness({
+			source,
+			actionKey: async (tool, args, context) => {
+				if (context.type === "start" && (args as { path?: unknown }).path === "slow.ts") {
+					slowStarted = true;
+					await slow;
+				}
+				return buildPiActionKey(tool, args, "/workspace");
+			},
+		});
+
+		try {
+			await fixture.runtime.startTurn({ sessionID: "session", turnID: "parallel-admission" });
+			await waitFor(() => slowStarted);
+			await waitFor(() => fixture.executions() === 2, 500);
+			expect(await fixture.runtime.consume(call("parallel-admission", { path: "same-plan.ts" }))).toBe(
+				"speculative",
+			);
+		} finally {
+			releaseSlow();
+			await fixture.runtime.finishTurn({
+				...call("parallel-admission"),
+				terminal: true,
+			});
+		}
+	});
+
 	it("keeps preparation outside prediction settlement while launching its child for the same decision", async () => {
 		const issued = vi.fn();
 		const settled = vi.fn();
