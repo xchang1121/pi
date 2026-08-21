@@ -247,6 +247,75 @@ describe("faux LLM speculative action end to end", () => {
 		expect(fastActor.summary.actorActions).toBe(3);
 		expect(fastActor.executions).toEqual({ grep: 1, read: 2 });
 	});
+
+	it("keeps a same-session PatternAware motif on the scheduler's one-slot beam", async () => {
+		const cwd = await workspace();
+		const patternSettings: PatternAwareSettings = {
+			...PATTERN_AWARE_DEFAULTS,
+			beamWidth: 1,
+			maxContextLength: 1,
+			maxFutureGap: 0,
+			minOccurrences: 2,
+		};
+		const store = new PatternAwareStore(patternSettings, undefined, {
+			namespace: "pi-action-semantics-v1",
+			actionKey: (tool, input, schemaHash) => PI_ACTION_SEMANTICS.buildKey(tool, input, cwd, schemaHash),
+			projectors: [],
+		});
+		const train = (
+			sessionID: string,
+			turn: string,
+			tool: string,
+			input: Record<string, unknown>,
+			durationMs: number,
+			outputPaths?: readonly string[],
+		) => {
+			store.observe({
+				sessionID,
+				turnID: `${turn}:grep`,
+				tool: "grep",
+				input: { pattern: "TODO", path: "." },
+				...(outputPaths ? { outputPaths } : {}),
+				outcome: "success",
+				durationMs: 1,
+			});
+			store.observe({ sessionID, turnID: `${turn}:${tool}`, tool, input, outcome: "success", durationMs });
+		};
+		for (let index = 0; index < 8; index++) {
+			const sessionID = `historical-${index}`;
+			train(sessionID, sessionID, "bash", { command: "generate artifact" }, 500);
+		}
+		for (let index = 0; index < 2; index++) {
+			train("live-priority", `seed-${index}`, "read", { path: "notes.txt" }, 1, ["notes.txt"]);
+		}
+
+		const result = await runAgent({
+			cwd,
+			sessionID: "live-priority",
+			tools: [...patternTools(cwd, 120, "notes.txt"), fallbackBash(cwd)],
+			actorTurns: [
+				turn(fauxToolCall("grep", { pattern: "TODO", path: "." })),
+				turn([
+					fauxThinking("inspect the matching file before continuing ".repeat(4)),
+					fauxToolCall("read", { path: "notes.txt" }),
+				]),
+				turn("done"),
+			],
+			actorTokensPerSecond: 180,
+			draftTurns: [],
+			settings: {
+				...patternAwareSettings(patternSettings),
+				maxConcurrentActions: 1,
+				tools: ["grep", "read", "bash"],
+			},
+			patternStore: store,
+		});
+
+		expect(result.summary).toMatchObject({ actorActions: 2, speculativeHits: 1, actorFallbacks: 1 });
+		expect(result.executions).toEqual({ grep: 1, read: 1 });
+		expect(result.summary.executionAheadMs).toBeGreaterThanOrEqual(100);
+		expect(result.toolLatencyMs.at(-1)).toBeLessThan(40);
+	});
 });
 
 type ScriptedTurn = {

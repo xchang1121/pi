@@ -1426,6 +1426,52 @@ describe("PatternAware", () => {
 		);
 	});
 
+	test("keeps a same-session motif ahead of a higher-cost historical candidate", () => {
+		const store = new PatternAwareStore(settings({ beamWidth: 1, maxContextLength: 1, maxFutureGap: 0 }));
+		for (let index = 0; index < 8; index++) {
+			store.observe(input({ sessionID: `history-${index}`, tool: "grep", input: {}, durationMs: 1 }));
+			store.observe(
+				input({ sessionID: `history-${index}`, tool: "bash", input: { command: "npm test" }, durationMs: 100 }),
+			);
+		}
+		for (let index = 0; index < 2; index++) {
+			store.observe(
+				input({
+					sessionID: "active",
+					turnID: `active:${index}:grep`,
+					tool: "grep",
+					input: {},
+					outputPaths: ["README.md"],
+					durationMs: 1,
+				}),
+			);
+			store.observe(
+				input({
+					sessionID: "active",
+					turnID: `active:${index}:read`,
+					tool: "read",
+					input: { filePath: "README.md" },
+					durationMs: 1,
+				}),
+			);
+		}
+
+		store.observe(
+			input({
+				sessionID: "active",
+				turnID: "active:probe",
+				tool: "grep",
+				input: {},
+				outputPaths: ["README.md"],
+				durationMs: 1,
+			}),
+		);
+
+		expect(store.predict("active")).toEqual([
+			expect.objectContaining({ tool: "read", input: { filePath: "README.md" } }),
+		]);
+	});
+
 	test("calibrates PPM beam value with concrete actor-miss feedback", () => {
 		const store = new PatternAwareStore(settings({ beamWidth: 1, maxContextLength: 1, maxFutureGap: 0 }));
 		trainGrepRead(store, "one", "src/a.ts");
