@@ -2137,7 +2137,19 @@ function isPathSource(field: "input" | "output" | "outputPaths", sourcePath: Pat
 	);
 }
 
+const bindingEvaluationCache = new WeakMap<PatternAwareBinding, WeakMap<ReadonlyArray<PatternAwareEvent>, unknown>>();
+
 function evaluateBinding(binding: PatternAwareBinding, context: ReadonlyArray<PatternAwareEvent>): unknown {
+	let contexts = bindingEvaluationCache.get(binding);
+	if (contexts?.has(context)) return contexts.get(context);
+	contexts ??= new WeakMap();
+	bindingEvaluationCache.set(binding, contexts);
+	const value = evaluateBindingUncached(binding, context);
+	contexts.set(context, value);
+	return value;
+}
+
+function evaluateBindingUncached(binding: PatternAwareBinding, context: ReadonlyArray<PatternAwareEvent>): unknown {
 	if (binding.type === "constant") return binding.value;
 	if (binding.type === "each") {
 		const index = context.length + binding.relativeEvent;

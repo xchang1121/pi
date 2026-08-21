@@ -64,11 +64,27 @@ describe("PatternAware", () => {
 			command: "bun test services/alpha/config.test.ts",
 			workdir: "services/alpha",
 		});
-		const next = [event({ sessionID: "two", tool: "read", input: { filePath: "services/beta/config.ts" } })];
+		let inputReads = 0;
+		const nextEvent = event({ sessionID: "two", tool: "read", input: { filePath: "services/beta/config.ts" } });
+		const next = [
+			new Proxy(nextEvent, {
+				get(target, property, receiver) {
+					if (property === "input") inputReads++;
+					return Reflect.get(target, property, receiver);
+				},
+			}),
+		];
 		expect(applyBindings(bindings, next)).toEqual({
 			command: "bun test services/beta/config.test.ts",
 			workdir: "services/beta",
 		});
+		const readsAfterFirstApplication = inputReads;
+		expect(readsAfterFirstApplication).toBeGreaterThan(0);
+		expect(applyBindings(bindings, next)).toEqual({
+			command: "bun test services/beta/config.test.ts",
+			workdir: "services/beta",
+		});
+		expect(inputReads).toBe(readsAfterFirstApplication);
 	});
 
 	test("does not treat an opaque shell command as a filesystem path template", () => {
