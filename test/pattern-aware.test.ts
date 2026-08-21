@@ -1087,6 +1087,25 @@ describe("PatternAware", () => {
 		expect(candidates.reduce((sum, item) => sum + item.conditionalProbability, 0)).toBeLessThanOrEqual(1);
 	});
 
+	test("uses mapper simplicity as an evidence-annealed beam prior", () => {
+		const store = new PatternAwareStore(settings({ beamWidth: 1, maxContextLength: 1, maxFutureGap: 0 }));
+		const source = { type: "event" as const, relativeEvent: -1, field: "input" as const, path: ["path"] };
+		for (const [id, binding] of [
+			["z-direct", source],
+			["a-composite", { type: "template" as const, source, prefix: "wrong/", suffix: "" }],
+		] as const) {
+			expect(
+				store.registerValidatedPattern(
+					validatedGapPattern({ "0": 2 }, { id, occurrences: 2, bindings: { '["path"]': binding } }),
+				),
+			).toBe(true);
+		}
+
+		expect(
+			store.observe(input({ sessionID: "probe", tool: "grep", input: { path: "src/index.ts" } })),
+		).toContainEqual(expect.objectContaining({ tool: "read", input: { path: "src/index.ts" } }));
+	});
+
 	test("updates ranked variant evidence without changing the structural pattern identity", async () => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "pi-pattern-ranked-identity-"));
 		temporary.push(directory);
