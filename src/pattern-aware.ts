@@ -338,6 +338,7 @@ export class PatternAwareStore {
 	private readonly controlOpportunitiesByContext = new Map<string, number>();
 	private readonly pending = new Map<string, PendingValidation[]>();
 	private readonly history = new Map<string, PatternAwareEvent[]>();
+	private readonly observedActionKeys = new WeakMap<PatternAwareEvent, ActionKey | null>();
 	private trie = new PredictiveContextTrie();
 	private sequenceModel: PpmCountTrie;
 	private indexDirty = true;
@@ -903,16 +904,22 @@ export class PatternAwareStore {
 		targetSchemaHash: string | undefined,
 		sample: PatternSample,
 	) {
-		return applyBindingsVariants(bindings, sample.context).some((input) =>
-			this.actionInputCovers(
-				targetTool,
-				input,
-				targetSchemaHash,
-				sample.target.tool,
-				sample.target.input,
-				sample.target.schemaHash ?? targetSchemaHash,
-			),
-		);
+		if (targetTool !== sample.target.tool) return false;
+		let actor = this.observedActionKeys.get(sample.target);
+		if (actor === undefined && !this.observedActionKeys.has(sample.target)) {
+			actor =
+				this.resolveActionKey(
+					sample.target.tool,
+					sample.target.input,
+					sample.target.schemaHash ?? targetSchemaHash,
+				) ?? null;
+			this.observedActionKeys.set(sample.target, actor);
+		}
+		return applyBindingsVariants(bindings, sample.context).some((input) => {
+			const speculative = this.resolveActionKey(targetTool, input, targetSchemaHash);
+			if (!speculative || !actor) return sameValue(input, sample.target.input);
+			return actionKeyCovers(speculative, actor, this.actionSemantics?.projectors ?? []);
+		});
 	}
 
 	private minimizeProjectedBindings(bindings: Readonly<Record<string, PatternAwareBinding>>, pool: PatternPool) {
@@ -1640,11 +1647,32 @@ function findBinding(
 	return candidateBindings(context, target, true, isPathField(String(targetPath.at(-1) ?? "")))[0];
 }
 
+const candidateBindingCache = new WeakMap<
+	ReadonlyArray<PatternAwareEvent>,
+	Map<string, ReadonlyArray<PatternAwareBinding>>
+>();
+
 function candidateBindings(
 	context: ReadonlyArray<PatternAwareEvent>,
 	target: unknown,
 	includePathTemplates = true,
 	targetIsPath = false,
+): PatternAwareBinding[] {
+	const cacheKey = `${Number(includePathTemplates)}:${Number(targetIsPath)}:${stableStringify(target)}`;
+	const cache = candidateBindingCache.get(context) ?? new Map<string, ReadonlyArray<PatternAwareBinding>>();
+	candidateBindingCache.set(context, cache);
+	const cached = cache.get(cacheKey);
+	if (cached) return [...cached];
+	const result = inferCandidateBindings(context, target, includePathTemplates, targetIsPath);
+	cache.set(cacheKey, result);
+	return result;
+}
+
+function inferCandidateBindings(
+	context: ReadonlyArray<PatternAwareEvent>,
+	target: unknown,
+	includePathTemplates: boolean,
+	targetIsPath: boolean,
 ): PatternAwareBinding[] {
 	if (!includePathTemplates) return indexedBindings(context, target, targetIsPath);
 	const result: PatternAwareBinding[] = [];
@@ -1663,19 +1691,20 @@ function candidateBindings(
 				const pathSource = typeof source === "string" && isPathSource(field, sourcePath, source);
 				if (sameValue(source, target) && (!targetIsPath || pathSource)) result.push(direct);
 				if (typeof source !== "string" || typeof target !== "string") continue;
-				const sources: PatternAwareBinding[] = [direct];
+				const sources: Array<{ readonly binding: PatternAwareBinding; readonly value: string }> = [
+					{ binding: direct, value: source },
+				];
 				if (!pathSource) continue;
 				if (pathSources.length < MAX_PATH_SOURCES) pathSources.push({ binding: direct, value: source });
 				for (const operation of ["dirname", "basename", "normalize_path"] as const) {
 					const transformed: PatternAwareBinding = { type: "transform", operation, source: direct };
-					if (transform(operation, source) === target) result.push(transformed);
-					sources.push(transformed);
 					const value = transform(operation, source);
+					if (value === target) result.push(transformed);
+					sources.push({ binding: transformed, value });
 					if (pathSources.length < MAX_PATH_SOURCES) pathSources.push({ binding: transformed, value });
 				}
-				for (const binding of sources) {
-					const value = evaluateBinding(binding, context);
-					if (typeof value !== "string" || value.length < 3) continue;
+				for (const { binding, value } of sources) {
+					if (value.length < 3) continue;
 					const offset = target.indexOf(value);
 					if (offset < 0) continue;
 					result.push({
@@ -1705,10 +1734,19 @@ function candidateBindings(
 	}
 	if (targetIsPath && typeof target === "string") {
 		const sources = uniquePathSources(pathSources);
+		const normalizedTarget = normalizePath(target);
+		const joinMatches = new Map<string, Map<string, boolean>>();
 		for (const left of sources) {
 			for (const right of sources) {
 				if (left === right) continue;
-				if (normalizePath(path.join(left.value, right.value)) !== normalizePath(target)) continue;
+				const matchesByRight = joinMatches.get(left.value) ?? new Map<string, boolean>();
+				joinMatches.set(left.value, matchesByRight);
+				let matches = matchesByRight.get(right.value);
+				if (matches === undefined) {
+					matches = path.join(left.value, right.value).replaceAll("\\", "/") === normalizedTarget;
+					matchesByRight.set(right.value, matches);
+				}
+				if (!matches) continue;
 				result.push({ type: "join", operation: "join_path", left: left.binding, right: right.binding });
 			}
 		}
