@@ -1478,6 +1478,114 @@ describe("PatternAware", () => {
 		);
 	});
 
+	test("retains promoted exact actions beyond bounded context but not beyond the session", () => {
+		const store = new PatternAwareStore(
+			settings({ maxContextLength: 1, maxFutureGap: 0, minOccurrences: 2 }),
+			undefined,
+			piActionSemantics(),
+		);
+		const sessionID = "long-recurrence";
+		const command = { command: "npm test -- src/slow.test.ts" };
+		store.observe(input({ sessionID, tool: "bash", input: command, durationMs: 500 }));
+		for (let index = 0; index < 3; index++) {
+			store.observe(input({ sessionID, tool: "read", input: { path: `src/before-${index}.ts` } }));
+		}
+		expect(store.predict(sessionID).some((candidate) => candidate.patternID.startsWith("action-backoff:"))).toBe(
+			false,
+		);
+
+		store.observe(input({ sessionID, tool: "bash", input: command, durationMs: 700 }));
+		for (let index = 0; index < 3; index++) {
+			store.observe(input({ sessionID, tool: "read", input: { path: `src/after-${index}.ts` } }));
+		}
+		const recurrent = store
+			.predict(sessionID)
+			.find((candidate) => candidate.patternID.startsWith("action-backoff:"));
+		expect(recurrent).toMatchObject({
+			tool: "bash",
+			input: command,
+			horizon: 0,
+			latestHorizon: 0,
+			expectedDurationMs: 600,
+		});
+		expect(JSON.parse(recurrent!.diagnostic)).toMatchObject({ context: [], mapperConfidence: 1 });
+		const learnedPatternIDs = new Set(store.snapshot().map((pattern) => pattern.id));
+		expect(recurrent!.supportingPatternIDs.every((patternID) => learnedPatternIDs.has(patternID))).toBe(true);
+
+		store.finishSession(sessionID);
+		store.observe(input({ sessionID: "other", tool: "read", input: { path: "src/other.ts" } }));
+		expect(store.predict("other").some((candidate) => candidate.patternID.startsWith("action-backoff:"))).toBe(
+			false,
+		);
+	});
+
+	test("uses canonical K(a) identity and rejects stale schemas or non-learning observations", () => {
+		const store = new PatternAwareStore(settings({ minOccurrences: 2 }), undefined, piActionSemantics());
+		store.observe(
+			input({ sessionID: "canonical", tool: "read", input: { path: "src/a.ts" }, schemaHash: "read-v1" }),
+		);
+		store.observe(input({ sessionID: "canonical", tool: "grep", input: { pattern: "separator" } }));
+		store.observe(
+			input({
+				sessionID: "canonical",
+				tool: "read",
+				input: { path: "src/a.ts", offset: 1 },
+				schemaHash: "read-v1",
+			}),
+		);
+		const canonical = store
+			.predict("canonical", { read: "read-v1" })
+			.find((candidate) => candidate.patternID.startsWith("action-backoff:"));
+		expect(canonical).toMatchObject({ tool: "read", input: { path: "src/a.ts" } });
+		expect(
+			store
+				.predict("canonical", { read: "read-v2" })
+				.some((candidate) => candidate.patternID.startsWith("action-backoff:")),
+		).toBe(false);
+
+		for (let index = 0; index < 2; index++) {
+			store.observe(
+				input({
+					sessionID: "not-learned",
+					tool: "bash",
+					input: { command: "npm test" },
+					learnTarget: false,
+				}),
+			);
+		}
+		expect(
+			store.predict("not-learned").some((candidate) => candidate.patternID.startsWith("action-backoff:")),
+		).toBe(false);
+	});
+
+	test("merges exact backoff with contextual evidence before applying the per-tool beam", () => {
+		const store = new PatternAwareStore(settings({ beamWidth: 1, minOccurrences: 2 }), undefined, piActionSemantics());
+		const command = { command: "npm test" };
+		expect(
+			store.registerValidatedPattern(
+				validatedGapPattern(
+					{ "0": 2 },
+					{
+						id: "contextual-bash",
+						context: [{ tool: "grep", outcome: "success" }],
+						targetTool: "bash",
+						bindings: { '["command"]': { type: "constant", value: command.command } },
+					},
+				),
+			),
+		).toBe(true);
+		for (let index = 0; index < 2; index++) {
+			store.observe(input({ sessionID: "merged", tool: "bash", input: command, durationMs: 100 }));
+		}
+		store.observe(input({ sessionID: "merged", tool: "grep", input: { pattern: "trigger" } }));
+		const matches = store.predict("merged").filter((candidate) => candidate.tool === "bash");
+
+		expect(matches).toHaveLength(1);
+		expect(matches[0]?.input).toEqual(command);
+		expect(matches[0]?.supportingPatternIDs).toContain("contextual-bash");
+		expect(JSON.parse(matches[0]!.diagnostic).beamRank).toBe(1);
+	});
+
 	test("backs off across matching suffix contexts", () => {
 		const store = new PatternAwareStore(settings());
 		for (const [sessionID, filePath] of [

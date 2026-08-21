@@ -248,6 +248,49 @@ describe("faux LLM speculative action end to end", () => {
 		expect(fastActor.executions).toEqual({ grep: 1, read: 2 });
 	});
 
+	it("hides a promoted exact-action recurrence after its short context has changed", async () => {
+		const cwd = await workspace();
+		await writeFile(path.join(cwd, "other.txt"), "other", "utf8");
+		const patternSettings: PatternAwareSettings = {
+			...PATTERN_AWARE_DEFAULTS,
+			maxContextLength: 1,
+			maxFutureGap: 0,
+			minOccurrences: 2,
+		};
+		const store = new PatternAwareStore(patternSettings, undefined, {
+			namespace: "pi-action-semantics-v1",
+			actionKey: (tool, input, schemaHash) => PI_ACTION_SEMANTICS.buildKey(tool, input, cwd, schemaHash),
+			projectors: [],
+		});
+		const result = await runAgent({
+			cwd,
+			sessionID: "exact-action-backoff",
+			tools: patternTools(cwd, 120, "notes.txt"),
+			actorTurns: [
+				turn(fauxToolCall("read", { path: "notes.txt" })),
+				turn(fauxToolCall("grep", { pattern: "separator", path: "." })),
+				turn(fauxToolCall("read", { path: "notes.txt" })),
+				turn(fauxToolCall("read", { path: "other.txt" })),
+				turn([
+					fauxThinking("verify the previously inspected file before answering ".repeat(4)),
+					fauxToolCall("read", { path: "notes.txt" }),
+				]),
+				turn("done"),
+			],
+			actorTokensPerSecond: 180,
+			draftTurns: [],
+			settings: patternAwareSettings(patternSettings),
+			patternStore: store,
+		});
+		const actorSettlements = result.events.filter((event) => event.type === "actor_action");
+
+		expect(actorSettlements).toHaveLength(5);
+		expect(actorSettlements.at(-1)?.settlement.provider.kind).toBe("speculative");
+		expect(result.summary).toMatchObject({ actorActions: 5, speculativeHits: 1, actorFallbacks: 4 });
+		expect(result.summary.executionAheadMs).toBeGreaterThanOrEqual(100);
+		expect(result.toolLatencyMs.at(-1)).toBeLessThan(40);
+	});
+
 	it("does not let an unisolated tool crowd an executable tool off a one-slot scheduler", async () => {
 		const cwd = await workspace();
 		const patternSettings: PatternAwareSettings = {

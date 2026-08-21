@@ -262,6 +262,14 @@ type PatternPool = {
 	patternIDs?: string[];
 };
 
+type RecurrentAction = {
+	readonly action: ActionKey;
+	readonly input: Record<string, unknown>;
+	count: number;
+	totalDurationMs: number;
+	lastSeenSequence: number;
+};
+
 type PendingValidation = {
 	readonly patternID: string;
 	readonly triggerSequence: number;
@@ -340,6 +348,7 @@ export class PatternAwareStore {
 	private readonly controlOpportunitiesByContext = new Map<string, number>();
 	private readonly pending = new Map<string, PendingValidation[]>();
 	private readonly history = new Map<string, PatternAwareEvent[]>();
+	private readonly recurrentActions = new Map<string, Map<string, RecurrentAction>>();
 	private readonly observedActionKeys = new WeakMap<PatternAwareEvent, ActionKey | null>();
 	private readonly resolvedActionKeys = new Map<string, ActionKey>();
 	private readonly patternSupportSessions = new Map<string, ReadonlySet<string>>();
@@ -474,6 +483,7 @@ export class PatternAwareStore {
 					event.sequence,
 				);
 				this.learn(prior, event);
+				this.observeRecurrentAction(event);
 			}
 		}
 		history.push(...events);
@@ -518,6 +528,7 @@ export class PatternAwareStore {
 		for (const item of pending ?? []) this.recordValidation(item.patternID, false);
 		this.pending.delete(sessionID);
 		this.history.delete(sessionID);
+		this.recurrentActions.delete(sessionID);
 		this.persist();
 	}
 
@@ -702,8 +713,14 @@ export class PatternAwareStore {
 				Math.max(1, Math.max(0, expectedDurationMs));
 			return {
 				actionIdentity: hash(identity),
-				ordered,
-				representative,
+				type: representative.type,
+				tool: representative.pattern.targetTool,
+				input: representative.input,
+				missing: representative.missing,
+				patternID: representative.pattern.id,
+				supportingPatternIDs: [...new Set(ordered.map((item) => item.pattern.id))],
+				context: representative.pattern.context,
+				dependencies: representative.pattern.dependencies,
 				horizon,
 				latestHorizon,
 				gapCoverage,
@@ -718,98 +735,97 @@ export class PatternAwareStore {
 				expectedLatencyBenefitMs,
 			};
 		});
-		const perTool = new Map<string, number>();
-		const beam = predictions
-			.sort(
+		for (const recurrent of this.recurrentPredictions(
+			activeSessionID,
+			schemaHashes,
+			sequenceContext,
+			continuation,
+			settings,
+		)) {
+			const index = predictions.findIndex((prediction) => prediction.actionIdentity === recurrent.actionIdentity);
+			if (index < 0) {
+				predictions.push(recurrent);
+				continue;
+			}
+			const existing = predictions[index]!;
+			const preferred =
+				recurrent.expectedLatencyBenefitMs > existing.expectedLatencyBenefitMs ? recurrent : existing;
+			predictions[index] = {
+				...preferred,
+				supportingPatternIDs: [
+					...new Set([...existing.supportingPatternIDs, ...recurrent.supportingPatternIDs]),
+				],
+			};
+		}
+		const beam = perToolBeam(
+			predictions.sort(
 				(left, right) =>
 					right.expectedLatencyBenefitMs - left.expectedLatencyBenefitMs ||
 					right.empiricalProbability - left.empiricalProbability ||
 					right.conditionalProbability - left.conditionalProbability ||
-					Number(right.representative.type === "tool_call") - Number(left.representative.type === "tool_call") ||
+					Number(right.type === "tool_call") - Number(left.type === "tool_call") ||
 					left.horizon - right.horizon ||
-					left.representative.pattern.id.localeCompare(right.representative.pattern.id) ||
-					stableStringify(left.representative.input).localeCompare(stableStringify(right.representative.input)),
-			)
-			.filter((prediction) => {
-				const tool = prediction.representative.pattern.targetTool;
-				const count = perTool.get(tool) ?? 0;
-				if (count >= settings.beamWidth) return false;
-				perTool.set(tool, count + 1);
-				return true;
-			});
+					left.patternID.localeCompare(right.patternID) ||
+					stableStringify(left.input).localeCompare(stableStringify(right.input)),
+			),
+			settings.beamWidth,
+			(prediction) => prediction.tool,
+		);
 		const emittedPerTool = new Map<string, number>();
 		for (const prediction of beam) {
-			const {
-				actionIdentity,
-				ordered,
-				representative,
-				horizon,
-				latestHorizon,
-				gapCoverage,
-				replayProbability,
-				variantProbability,
-				conditionalProbability,
-				empiricalProbability,
-				adoptionProbability,
-				expectedDurationMs,
-				ppmEstimate,
-				mapperConfidence,
-				expectedLatencyBenefitMs,
-			} = prediction;
-			const beamRank = (emittedPerTool.get(representative.pattern.targetTool) ?? 0) + 1;
-			emittedPerTool.set(representative.pattern.targetTool, beamRank);
-			const supportingPatternIDs = [...new Set(ordered.map((item) => item.pattern.id))];
+			const beamRank = (emittedPerTool.get(prediction.tool) ?? 0) + 1;
+			emittedPerTool.set(prediction.tool, beamRank);
 			const nextContinuation: PatternAwareContinuation = {
 				history: predictiveHistory,
-				visitedPatternIDs: [...continuation.visitedPatternIDs, representative.pattern.id],
-				pathProbability: empiricalProbability,
+				visitedPatternIDs: [...continuation.visitedPatternIDs, prediction.patternID],
+				pathProbability: prediction.empiricalProbability,
 			};
 			result.push({
-				type: representative.type,
+				type: prediction.type,
 				source: "pattern_aware",
-				tool: representative.pattern.targetTool,
-				input: representative.input,
-				missing: representative.missing,
-				patternID: representative.pattern.id,
-				actionIdentity,
-				supportingPatternIDs,
-				horizon,
-				latestHorizon,
-				empiricalProbability,
-				conditionalProbability,
-				adoptionProbability,
-				expectedDurationMs,
-				expectedLatencyBenefitMs,
-				dependencies: representative.pattern.dependencies,
+				tool: prediction.tool,
+				input: prediction.input,
+				missing: prediction.missing,
+				patternID: prediction.patternID,
+				actionIdentity: prediction.actionIdentity,
+				supportingPatternIDs: prediction.supportingPatternIDs,
+				horizon: prediction.horizon,
+				latestHorizon: prediction.latestHorizon,
+				empiricalProbability: prediction.empiricalProbability,
+				conditionalProbability: prediction.conditionalProbability,
+				adoptionProbability: prediction.adoptionProbability,
+				expectedDurationMs: prediction.expectedDurationMs,
+				expectedLatencyBenefitMs: prediction.expectedLatencyBenefitMs,
+				dependencies: prediction.dependencies,
 				continuation: nextContinuation,
 				depth: nextContinuation.visitedPatternIDs.length,
 				diagnostic: JSON.stringify(
 					{
 						source: "pattern_aware",
-						patternID: representative.pattern.id,
-						supportingPatterns: supportingPatternIDs,
-						context: representative.pattern.context,
-						tool: representative.pattern.targetTool,
-						input: representative.input,
-						missing: representative.missing,
-						empiricalProbability,
-						conditionalProbability,
-						adoptionProbability,
-						replayProbability,
-						horizon,
-						latestHorizon,
-						ppmProbability: ppmEstimate?.probability,
-						ppmOrder: ppmEstimate?.order,
-						ppmEvidence: ppmEstimate?.evidence,
-						ppmEscapeMass: ppmEstimate?.escapeMass,
-						mapperConfidence,
-						variantProbability,
-						expectedLatencyBenefitMs,
+						patternID: prediction.patternID,
+						supportingPatterns: prediction.supportingPatternIDs,
+						context: prediction.context,
+						tool: prediction.tool,
+						input: prediction.input,
+						missing: prediction.missing,
+						empiricalProbability: prediction.empiricalProbability,
+						conditionalProbability: prediction.conditionalProbability,
+						adoptionProbability: prediction.adoptionProbability,
+						replayProbability: prediction.replayProbability,
+						horizon: prediction.horizon,
+						latestHorizon: prediction.latestHorizon,
+						ppmProbability: prediction.ppmEstimate?.probability,
+						ppmOrder: prediction.ppmEstimate?.order,
+						ppmEvidence: prediction.ppmEstimate?.evidence,
+						ppmEscapeMass: prediction.ppmEstimate?.escapeMass,
+						mapperConfidence: prediction.mapperConfidence,
+						variantProbability: prediction.variantProbability,
+						expectedLatencyBenefitMs: prediction.expectedLatencyBenefitMs,
 						beamRank,
 						beamWidth: settings.beamWidth,
-						gapCoverage,
-						expectedDurationMs,
-						dependencies: representative.pattern.dependencies,
+						gapCoverage: prediction.gapCoverage,
+						expectedDurationMs: prediction.expectedDurationMs,
+						dependencies: prediction.dependencies,
 						depth: nextContinuation.visitedPatternIDs.length,
 					},
 					null,
@@ -818,6 +834,74 @@ export class PatternAwareStore {
 			});
 		}
 		return result;
+	}
+
+	private recurrentPredictions(
+		sessionID: string | undefined,
+		schemaHashes: Readonly<Record<string, string>>,
+		sequenceContext: readonly string[],
+		continuation: PatternAwareContinuation,
+		settings: PatternAwareSettings,
+	) {
+		const actions = sessionID ? this.recurrentActions.get(sessionID) : undefined;
+		if (!actions?.size) return [];
+		const values = [...actions.values()].filter((item) => {
+			const current = schemaHashes[item.action.tool];
+			return current === undefined || current === item.action.schemaHash;
+		});
+		const massByTool = new Map<string, number>();
+		for (const item of values) {
+			const mass = item.count * recencyWeight(item.lastSeenSequence, this.clock, settings.decayHalfLifeEvents);
+			massByTool.set(item.action.tool, (massByTool.get(item.action.tool) ?? 0) + mass);
+		}
+		const rank = (item: RecurrentAction) =>
+			recencyWeight(item.lastSeenSequence, this.clock, settings.decayHalfLifeEvents) *
+			Math.max(item.count, item.totalDurationMs);
+		const candidates = perToolBeam(
+			values
+				.filter((item) => item.count >= settings.minOccurrences)
+				.filter((item) => !continuation.visitedPatternIDs.includes(`action-backoff:${hash(item.action.key)}`))
+				.sort(
+					(left, right) =>
+						rank(right) - rank(left) ||
+						left.action.key.localeCompare(right.action.key),
+				),
+			settings.beamWidth,
+			(item) => item.action.tool,
+		);
+		return candidates.map((item) => {
+			const patternID = `action-backoff:${hash(item.action.key)}`;
+			const mass = item.count * recencyWeight(item.lastSeenSequence, this.clock, settings.decayHalfLifeEvents);
+			const conditionalProbability = clampProbability(mass / Math.max(mass, massByTool.get(item.action.tool) ?? 0));
+			const empiricalProbability = clampProbability(continuation.pathProbability * conditionalProbability);
+			const expectedDurationMs = item.totalDurationMs / Math.max(1, item.count);
+			const ppmEstimate = this.sequenceModel.estimate(sequenceContext, item.action.tool);
+			const expectedLatencyBenefitMs =
+				empiricalProbability * (ppmEstimate?.probability ?? 1) * Math.max(1, expectedDurationMs);
+			return {
+					actionIdentity: hash(stableStringify({ type: "tool_call", actionKey: item.action.key })),
+					type: "tool_call" as const,
+					tool: item.action.tool,
+					input: structuredClone(item.input),
+					missing: [] as PatternAwarePath[],
+					patternID,
+					supportingPatternIDs: [] as string[],
+					context: [] as PatternAwareEventSignature[],
+					dependencies: [] as PatternAwareDependency[],
+					horizon: 0,
+					latestHorizon: 0,
+					gapCoverage: 1,
+					replayProbability: conditionalProbability,
+					variantProbability: 1,
+					conditionalProbability,
+					empiricalProbability,
+					adoptionProbability: 1,
+					expectedDurationMs,
+					ppmEstimate,
+					mapperConfidence: 1,
+					expectedLatencyBenefitMs,
+				};
+		});
 	}
 
 	issued(patternID: string) {
@@ -891,6 +975,34 @@ export class PatternAwareStore {
 		this.trie = new PredictiveContextTrie();
 		for (const pattern of this.patterns.values()) this.trie.insert(pattern);
 		this.indexDirty = false;
+	}
+
+	private observeRecurrentAction(event: PatternAwareEvent) {
+		const action = this.resolveActionKey(event.tool, event.input, event.schemaHash);
+		if (!action) return;
+		const actions = this.recurrentActions.get(event.sessionID) ?? new Map<string, RecurrentAction>();
+		const existing = actions.get(action.key);
+		const durationMs = Number.isFinite(event.durationMs) ? Math.max(0, event.durationMs) : 0;
+		if (existing) {
+			existing.count = Math.min(Number.MAX_SAFE_INTEGER, existing.count + 1);
+			existing.totalDurationMs = Math.min(Number.MAX_VALUE / 2, existing.totalDurationMs + durationMs);
+			existing.lastSeenSequence = event.sequence;
+		} else {
+			actions.set(action.key, {
+				action,
+				input: structuredClone(event.input),
+				count: 1,
+				totalDurationMs: durationMs,
+				lastSeenSequence: event.sequence,
+			});
+		}
+		this.recurrentActions.set(event.sessionID, actions);
+		if (actions.size <= this.settings.maxPatterns) return;
+		const oldest = [...actions.entries()].sort(
+			([leftKey, left], [rightKey, right]) =>
+				left.lastSeenSequence - right.lastSeenSequence || leftKey.localeCompare(rightKey),
+		)[0];
+		if (oldest) actions.delete(oldest[0]);
 	}
 
 	private learn(history: ReadonlyArray<PatternAwareEvent>, target: PatternAwareEvent) {
@@ -2555,6 +2667,17 @@ function patternAdoptionProbability(patterns: ReadonlyArray<MutablePattern>, clo
 function recencyWeight(lastSeen: number, clock: number, halfLife: number) {
 	if (halfLife <= 0) return 1;
 	return 2 ** (-Math.max(0, clock - lastSeen) / halfLife);
+}
+
+function perToolBeam<Value>(values: readonly Value[], width: number, tool: (value: Value) => string) {
+	const counts = new Map<string, number>();
+	return values.filter((value) => {
+		const name = tool(value);
+		const count = counts.get(name) ?? 0;
+		if (count >= width) return false;
+		counts.set(name, count + 1);
+		return true;
+	});
 }
 
 function readonlyPattern(pattern: MutablePattern, clock: number, halfLife: number): PatternAwarePattern {
