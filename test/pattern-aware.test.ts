@@ -364,13 +364,18 @@ describe("PatternAware", () => {
 		expect(store.predict("probe").find((item) => item.tool === "read")?.horizon).toBe(3);
 	});
 
-	test("does not count multiple gap views of one target as independent mapper support", () => {
+	test("does not promote multiple gap views of one target into repeated support", () => {
 		const store = new PatternAwareStore(settings({ maxContextLength: 1, maxFutureGap: 1, minOccurrences: 2 }));
 		store.observe(input({ sessionID: "one", tool: "grep", input: { pattern: "a" }, outputPaths: ["src"] }));
 		store.observe(input({ sessionID: "one", tool: "grep", input: { pattern: "b" }, outputPaths: ["src/a.ts"] }));
 		store.observe(input({ sessionID: "one", tool: "read", input: { filePath: "src/a.ts" } }));
 		store.observe(input({ sessionID: "probe", tool: "grep", input: { pattern: "TODO" }, outputPaths: ["src/b.ts"] }));
 
+		expect(store.snapshot().filter((item) => item.targetTool === "read")).toEqual([
+			expect.objectContaining({ occurrences: 1, gapCounts: { "0": 1 } }),
+		]);
+		const candidate = store.predict("probe").find((item) => item.tool === "read")!;
+		store.issued(candidate.patternID);
 		expect(store.predict("probe").filter((item) => item.tool === "read")).toHaveLength(0);
 	});
 
@@ -612,7 +617,7 @@ describe("PatternAware", () => {
 		await first.flush();
 
 		const persisted = JSON.parse(await fs.readFile(file, "utf8"));
-		expect(persisted.patterns).toHaveLength(0);
+		expect(persisted.patterns).toEqual([expect.objectContaining({ targetTool: "read", occurrences: 1 })]);
 		expect(persisted.pools.length).toBeGreaterThan(0);
 
 		const second = new PatternAwareStore(settings({ minOccurrences: 2 }), file);
@@ -692,13 +697,38 @@ describe("PatternAware", () => {
 		});
 	});
 
-	test("admits a replayable relation after two positive examples", () => {
-		const store = new PatternAwareStore(PATTERN_AWARE_DEFAULTS);
+	test("probes an adjacent transition once and preserves feedback until configured promotion", () => {
+		const store = new PatternAwareStore(settings({ minOccurrences: 3 }));
 		trainGrepRead(store, "one", "src/a.ts");
-		expect(store.snapshot()).toEqual([]);
+		expect(store.snapshot().find((item) => item.targetTool === "read")).toMatchObject({
+			occurrences: 1,
+			feedback: { issued: 0 },
+		});
 
-		trainGrepRead(store, "two", "src/b.ts");
-		expect(store.snapshot()).toContainEqual(expect.objectContaining({ targetTool: "read", occurrences: 2 }));
+		const candidate = store
+			.observe(input({ sessionID: "two", tool: "grep", input: {}, outputPaths: ["src/b.ts"] }))
+			.find((item) => item.tool === "read")!;
+		expect(candidate.input).toEqual({ filePath: "src/b.ts" });
+		store.issued(candidate.patternID);
+		store.settled(candidate.patternID, adoptedSettlement());
+		expect(store.predict("two").filter((item) => item.tool === "read")).toHaveLength(0);
+
+		store.observe(input({ sessionID: "two", tool: "read", input: { filePath: "src/b.ts" } }));
+		expect(store.snapshot().find((item) => item.targetTool === "read")).toMatchObject({
+			occurrences: 2,
+			feedback: { issued: 1, matched: 1, adopted: 1 },
+		});
+		expect(
+			store.observe(input({ sessionID: "three", tool: "grep", input: {}, outputPaths: ["src/c.ts"] })),
+		).not.toContainEqual(expect.objectContaining({ tool: "read" }));
+		store.observe(input({ sessionID: "three", tool: "read", input: { filePath: "src/c.ts" } }));
+		expect(
+			store.observe(input({ sessionID: "four", tool: "grep", input: {}, outputPaths: ["src/d.ts"] })),
+		).toContainEqual(expect.objectContaining({ tool: "read", input: { filePath: "src/d.ts" } }));
+		expect(store.snapshot().find((item) => item.targetTool === "read")).toMatchObject({
+			occurrences: 3,
+			feedback: { issued: 1 },
+		});
 	});
 
 	test("emits weak control-flow candidates for bounded utility admission", () => {

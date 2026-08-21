@@ -164,7 +164,7 @@ export function formatSpeculativeActionStatus(input: {
 		`Resource cache: ${settings.resourceCacheMaxEntries}`,
 		`Resource cache memory: ${formatBytes(settings.resourceCacheMaxBytes)}`,
 		`Prediction timeout: ${formatDuration(settings.predictionTimeoutMs)}`,
-		`PatternAware: ${settings.patternAware.enabled ? "On" : "Off"}; multi-step: ${settings.patternAware.multiStepEnabled ? "On" : "Off"} (beam/tool ${settings.patternAware.beamWidth}, depth ${settings.patternAware.maxPredictionDepth}, support ${settings.patternAware.minOccurrences}, binding≥${settings.patternAware.minBindingReplayProbability}, gap ${settings.patternAware.maxFutureGap}, coverage ${formatPercent(settings.patternAware.futureGapCoverage)}, half-life ${settings.patternAware.decayHalfLifeEvents})`,
+		`PatternAware: ${settings.patternAware.enabled ? "On" : "Off"}; multi-step: ${settings.patternAware.multiStepEnabled ? "On" : "Off"} (beam/tool ${settings.patternAware.beamWidth}, depth ${settings.patternAware.maxPredictionDepth}, promotion ${settings.patternAware.minOccurrences}, binding≥${settings.patternAware.minBindingReplayProbability}, gap ${settings.patternAware.maxFutureGap}, coverage ${formatPercent(settings.patternAware.futureGapCoverage)}, half-life ${settings.patternAware.decayHalfLifeEvents})`,
 		`Prediction tools: ${toolsSummary(settings.tools)}`,
 		"Execution boundary: runtime sandbox first; resource snapshots or Git worktrees second; otherwise Actor fallback",
 		`Actor actions: ${metrics.speculativeHits}/${metrics.actorActions} speculative hits (${hitRate}%); fallbacks: ${metrics.actorFallbacks}`,
@@ -780,7 +780,7 @@ async function openPatternAwareSettings(ctx: ExtensionContext, controller: Specu
 		const settings = controller.settings();
 		const choice = await ctx.ui.select("PatternAware", [
 			`Enabled: ${settings.patternAware.enabled ? "On" : "Off"}`,
-			`Learning › context ${settings.patternAware.maxContextLength}, support ${settings.patternAware.minOccurrences}`,
+			`Learning › context ${settings.patternAware.maxContextLength}, promotion ${settings.patternAware.minOccurrences}`,
 			`Multi-step prediction › ${settings.patternAware.multiStepEnabled ? "On" : "Off"}, beam/tool ${settings.patternAware.beamWidth}, depth ${settings.patternAware.maxPredictionDepth}`,
 			BACK,
 		]);
@@ -805,7 +805,7 @@ async function openPatternLearning(ctx: ExtensionContext, controller: Speculativ
 			`Future gap: ${pattern.maxFutureGap}`,
 			`Future gap coverage: ${formatPercent(pattern.futureGapCoverage)}`,
 			`Decay half-life: ${pattern.decayHalfLifeEvents} events`,
-			`Minimum occurrences: ${pattern.minOccurrences}`,
+			`Promotion occurrences: ${pattern.minOccurrences}`,
 			`Pattern capacity: ${pattern.maxPatterns}`,
 			BACK,
 		]);
@@ -818,8 +818,8 @@ async function openPatternLearning(ctx: ExtensionContext, controller: Speculativ
 		}
 		if (choice.startsWith("Future gap coverage:")) await editFutureGapCoverage(ctx, controller, settings);
 		if (choice.startsWith("Decay half-life:")) await editPatternHalfLife(ctx, controller, settings);
-		if (choice.startsWith("Minimum occurrences:")) {
-			await editPatternInteger(ctx, controller, settings, "minOccurrences", "Minimum occurrences", false);
+		if (choice.startsWith("Promotion occurrences:")) {
+			await editPatternInteger(ctx, controller, settings, "minOccurrences", "Promotion occurrences", false);
 		}
 		if (choice.startsWith("Pattern capacity:")) {
 			await editPatternInteger(ctx, controller, settings, "maxPatterns", "Pattern capacity", false);

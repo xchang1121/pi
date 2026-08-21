@@ -19,6 +19,7 @@ export type PatternAwareSettings = {
 	/** Weighted future-gap quantile used as the expected launch horizon; the deadline keeps full observed support. */
 	readonly futureGapCoverage: number;
 	readonly decayHalfLifeEvents: number;
+	/** Support required to promote a relation after its single bounded first-recurrence probe. */
 	readonly minOccurrences: number;
 	/** Minimum historical replay precision required for a concrete argument mapper. */
 	readonly minBindingReplayProbability: number;
@@ -1006,10 +1007,19 @@ export class PatternAwareStore {
 		if (pool.samples.length > sampleLimit) pool.samples.splice(0, pool.samples.length - sampleLimit);
 		this.pools.set(poolKey, pool);
 		this.addControlOpportunities(pool, pool.samples.length - previousSampleCount);
-		if (pool.samples.length < this.settings.minOccurrences) {
+		const firstRecurrenceProbe = gap === 0 && context.length === 1 && pool.samples.length === 1;
+		const probationary =
+			firstRecurrenceProbe ||
+			(pool.patternIDs ?? []).some(
+				(patternID) =>
+					(this.patterns.get(patternID)?.occurrences ?? this.settings.minOccurrences) <
+					this.settings.minOccurrences,
+			);
+		if (pool.samples.length < this.settings.minOccurrences && !probationary) {
 			this.retirePoolPatterns(pool, new Set());
 			return;
 		}
+		const minimumSupport = probationary ? pool.samples.length : this.settings.minOccurrences;
 		const candidates = new Map<string, Record<string, PatternAwareBinding>>();
 		const remember = (bindings: Record<string, PatternAwareBinding> | undefined) => {
 			if (!bindings) return;
@@ -1031,7 +1041,7 @@ export class PatternAwareStore {
 		const retained = new Set<string>();
 		for (const candidate of candidates.values()) {
 			const { bindings, support } = this.minimizeProjectedBindings(candidate, pool);
-			if (support.length < this.settings.minOccurrences) continue;
+			if (support.length < minimumSupport) continue;
 			const id = hash(
 				stableStringify({
 					context: signatures,
@@ -2263,7 +2273,11 @@ function leaves(value: unknown, prefix: Array<string | number> = []): Array<[Arr
 
 function structurallyEligible(pattern: MutablePattern, settings: PatternAwareSettings) {
 	return (
-		pattern.occurrences >= settings.minOccurrences &&
+		(pattern.occurrences >= settings.minOccurrences ||
+			(pattern.occurrences === 1 &&
+				pattern.context.length === 1 &&
+				pattern.gapCounts["0"] === 1 &&
+				pattern.feedback.issued === 0)) &&
 		pattern.replayMatches / Math.max(1, pattern.occurrences) >= settings.minBindingReplayProbability
 	);
 }
