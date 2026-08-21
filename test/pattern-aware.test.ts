@@ -1194,6 +1194,30 @@ describe("PatternAware", () => {
 		expect(after?.historicalMatches).toBe(pattern.historicalMatches + 1);
 	});
 
+	test("memoizes repeated deterministic K(a) resolution", () => {
+		const semantics = piActionSemantics();
+		let resolutions = 0;
+		const store = new PatternAwareStore(settings(), undefined, {
+			...semantics,
+			actionKey: (...args) => {
+				resolutions++;
+				return semantics.actionKey(...args);
+			},
+		});
+		store.registerValidatedPattern(
+			validatedGapPattern(
+				{ "0": 10 },
+				{ id: "memoized-action-key", bindings: { '["path"]': { type: "constant", value: "src/index.ts" } } },
+			),
+		);
+
+		const first = store.observe(input({ sessionID: "memoized", tool: "grep", input: { pattern: "symbol" } }));
+		const afterFirstPrediction = resolutions;
+		expect(first.find((candidate) => candidate.tool === "read")?.input).toEqual({ path: "src/index.ts" });
+		store.predict("memoized");
+		expect(resolutions).toBe(afterFirstPrediction);
+	});
+
 	test("validates any emitted binding variant instead of only the top-ranked input", () => {
 		const store = new PatternAwareStore(settings());
 		const pattern = validatedGapPattern(

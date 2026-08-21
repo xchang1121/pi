@@ -49,6 +49,7 @@ export type PatternAwareEventInput = {
 export type PatternAwareActionSemantics = {
 	/** Stable persistence namespace for the action-key contract. */
 	readonly namespace?: string;
+	/** Deterministic K(a) projection for one namespace; repeated inputs may be memoized. */
 	readonly actionKey: (
 		tool: string,
 		input: Readonly<Record<string, unknown>>,
@@ -339,6 +340,7 @@ export class PatternAwareStore {
 	private readonly pending = new Map<string, PendingValidation[]>();
 	private readonly history = new Map<string, PatternAwareEvent[]>();
 	private readonly observedActionKeys = new WeakMap<PatternAwareEvent, ActionKey | null>();
+	private readonly resolvedActionKeys = new Map<string, ActionKey>();
 	/** Non-persisted support counts keep a session's own learned motif ahead of workspace history. */
 	private readonly sameSessionOccurrences = new Map<string, ReadonlyMap<string, number>>();
 	private trie = new PredictiveContextTrie();
@@ -916,11 +918,32 @@ export class PatternAwareStore {
 	}
 
 	private resolveActionKey(tool: string, input: Readonly<Record<string, unknown>>, schemaHash: string | undefined) {
+		if (!this.actionSemantics) return undefined;
+		let cacheKey: string;
 		try {
-			return this.actionSemantics?.actionKey(tool, input, schemaHash);
+			cacheKey = JSON.stringify([tool, schemaHash, input]);
 		} catch {
 			return undefined;
 		}
+		const cached = this.resolvedActionKeys.get(cacheKey);
+		if (cached) {
+			this.resolvedActionKeys.delete(cacheKey);
+			this.resolvedActionKeys.set(cacheKey, cached);
+			return cached;
+		}
+		let resolved: ActionKey | undefined;
+		try {
+			resolved = this.actionSemantics.actionKey(tool, input, schemaHash);
+		} catch {
+			return undefined;
+		}
+		if (!resolved) return undefined;
+		this.resolvedActionKeys.set(cacheKey, resolved);
+		if (this.resolvedActionKeys.size > this.settings.maxPatterns) {
+			const oldest = this.resolvedActionKeys.keys().next().value;
+			if (oldest !== undefined) this.resolvedActionKeys.delete(oldest);
+		}
+		return resolved;
 	}
 
 	private bindingsCoverSample(
