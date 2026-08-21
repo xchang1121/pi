@@ -1067,8 +1067,57 @@ describe("structural speculative runtime", () => {
 		await fixture.runtime.finishTurn({ ...third, terminal: false });
 		await new Promise((resolve) => setTimeout(resolve, 100));
 		expect(executions).toBe(0);
-		await waitFor(() => executions === 1, 80);
+		await waitFor(() => executions === 1);
 		await fixture.runtime.finishTurn({ ...call("turn-3"), terminal: true });
+	});
+
+	it("promotes a streamed Actor intent without claiming or committing its prediction", async () => {
+		const settlements: PredictionSettlement[] = [];
+		const source: Source = {
+			id: "source",
+			enabled: () => true,
+			propose: () => ({
+				id: "future",
+				source: "source",
+				revision: 0,
+				actions: [
+					{
+						id: "next",
+						type: "tool_call",
+						tool: "read",
+						input: { path: "future.ts" },
+						horizon: 3,
+						expectedDurationMs: 10,
+					},
+				],
+			}),
+			onSettled: ({ settlement }) => {
+				settlements.push(settlement);
+			},
+		};
+		const fixture = harness({
+			source,
+			execute: () => "future",
+		});
+		await fixture.runtime.startTurn({ sessionID: "session", turnID: "streaming-intent" });
+		await waitFor(() => fixture.runtime.inspect().deferredPlanActions === 1);
+		await new Promise((resolve) => setTimeout(resolve, 25));
+		expect(fixture.executions()).toBe(0);
+
+		const actorCall = call("streaming-intent", { path: "future.ts" });
+		await fixture.runtime.previewActorCall(actorCall);
+		await waitFor(() => fixture.executions() === 1, 80);
+		await waitFor(() =>
+			fixture.events.some((event) => event.type === "candidate" && event.state.status === "succeeded"),
+		);
+		expect(settlements).toEqual([]);
+		expect(fixture.events.some((event) => event.type === "actor_action")).toBe(false);
+		expect(await fixture.runtime.consume(actorCall)).toBe("future");
+		await fixture.runtime.finishTurn({ ...actorCall, terminal: true });
+		expect(settlements).toHaveLength(1);
+		expect(settlements[0]).toMatchObject({
+			match: { matched: true, adoption: { status: "adopted" } },
+		});
 	});
 
 	it("records an exact match when isolation is unavailable without starting speculative execution", async () => {

@@ -82,6 +82,34 @@ describe("zero-modification Pi extension", () => {
 		expect(fixture.host.actual).not.toHaveBeenCalled();
 	});
 
+	it("forwards a completed streamed tool call as a provisional Actor preview", async () => {
+		const fixture = await createFixture();
+		await fixture.emit("session_start", {}, fixture.context);
+		await fixture.emit("context", { messages: [] }, fixture.context);
+		await fixture.emit(
+			"message_update",
+			{
+				assistantMessageEvent: {
+					type: "toolcall_end",
+					toolCall: { type: "toolCall", id: "actor-read", name: "read", arguments: { path: "notes.txt" } },
+				},
+			},
+			fixture.context,
+		);
+		await vi.waitFor(() => expect(fixture.host.previewActorCall).toHaveBeenCalledOnce());
+		expect(fixture.host.previewActorCall).toHaveBeenCalledWith(
+			{
+				turnID: "turn_1",
+				id: "actor-read",
+				tool: "read",
+				args: { path: "notes.txt" },
+				tools: expect.any(Array),
+			},
+			undefined,
+		);
+		expect(fixture.host.consume).not.toHaveBeenCalled();
+	});
+
 	it("preserves stock renderers on every wrapper for interactive and HTML output", async () => {
 		const fixture = await createFixture();
 		await fixture.emit("session_start", {}, fixture.context);
@@ -415,6 +443,7 @@ function mockHost(consume: SpeculativeActionHost["consume"] = async () => undefi
 			}),
 		} as unknown as SpeculativeActionHost["runtime"],
 		startTurn: vi.fn(),
+		previewActorCall: vi.fn(),
 		consume: vi.fn(consume),
 		actual: vi.fn(),
 		finishTurn: vi.fn(),

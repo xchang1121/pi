@@ -107,6 +107,7 @@ interface SpeculativeActionController {
 	readonly attachUI: (ui: ExtensionUIContext) => void;
 	readonly detachUI: () => void;
 	readonly startTurn: (messages: AgentMessage[], context: ExtensionContext) => Promise<void>;
+	readonly previewActorCall: (tool: string, callID: string, input: unknown, signal?: AbortSignal) => void;
 	readonly finishTurn: (terminal?: boolean) => Promise<void>;
 	readonly execute: (
 		tool: string,
@@ -194,6 +195,17 @@ export function createSpeculativeActionExtension(
 		});
 		pi.on("context", async (event, ctx) => {
 			await controller?.startTurn(event.messages, ctx);
+		});
+		pi.on("message_update", (event, ctx) => {
+			const update = event.assistantMessageEvent;
+			if (update.type === "toolcall_end") {
+				controller?.previewActorCall(
+					update.toolCall.name,
+					update.toolCall.id,
+					update.toolCall.arguments,
+					ctx.signal,
+				);
+			}
 		});
 		pi.on("turn_end", async () => {
 			await controller?.finishTurn(false);
@@ -357,6 +369,13 @@ async function installController(
 			} catch {
 				// Speculation is optional; the actor request remains authoritative.
 			}
+		},
+		previewActorCall: (tool, callID, input, signal) => {
+			const turnID = currentTurnID;
+			if (!turnID || !baseDefinitions.has(tool)) return;
+			void recoverSpeculation(() =>
+				host.previewActorCall({ turnID, id: callID, tool, args: input, tools: turnTools }, signal),
+			);
 		},
 		finishTurn: async (terminal = false) => {
 			const turnID = currentTurnID ?? (terminal ? lastTurnID : undefined);

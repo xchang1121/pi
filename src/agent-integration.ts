@@ -129,6 +129,7 @@ export interface SpeculativeActionHost {
 		AgentConsumeInput
 	>;
 	readonly startTurn: (input: Omit<AgentStartInput, "sessionID">, signal?: AbortSignal) => Promise<void>;
+	readonly previewActorCall: (input: Omit<AgentConsumeInput, "sessionID">, signal?: AbortSignal) => Promise<void>;
 	readonly consume: (
 		input: Omit<AgentConsumeInput, "sessionID">,
 		signal?: AbortSignal,
@@ -684,6 +685,7 @@ export function createSpeculativeActionHost(
 		sessionID,
 		runtime,
 		startTurn: (input, signal) => runtime.startTurn({ ...input, sessionID }, signal),
+		previewActorCall: (input, signal) => runtime.previewActorCall({ ...input, sessionID }, signal),
 		consume: (input, signal) => runtime.consume({ ...input, sessionID }, signal),
 		actual: (input) => runtime.actual({ ...input, sessionID }),
 		finishTurn: async (turnID, terminal = false) => {

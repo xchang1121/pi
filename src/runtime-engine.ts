@@ -1481,6 +1481,35 @@ export function makeStructuralSpeculativeActionRuntime<
 		}
 	};
 
+	const actorActionKey = async (input: ConsumeInput, call: ActualToolCall): Promise<ActionKey | undefined> => {
+		try {
+			return await adapter.actionKey(call.tool, call.input, { type: "consume", consumeInput: input });
+		} catch {
+			return undefined;
+		}
+	};
+
+	const previewActorCall = async (input: ConsumeInput, signal?: AbortSignal): Promise<void> => {
+		const state = turns.get(turnKey(input.sessionID, input.turnID));
+		if (!state || state.lifecycle !== "active" || signal?.aborted || masterEnabled === false) return;
+		const actualCall = adapter.actual(input) as ActualToolCall;
+		const action = await actorActionKey(input, actualCall);
+		if (!action || signal?.aborted || state.lifecycle !== "active" || turns.get(state.key) !== state) {
+			return;
+		}
+		await Promise.all(
+			predictionMatches(state.session, action, state.decisionSequence).map(({ node }) =>
+				promoteForActor(state.session, node),
+			),
+		);
+		if (signal?.aborted || state.lifecycle !== "active" || turns.get(state.key) !== state) return;
+		const preferred = rankCandidates(
+			action,
+			allCandidates(state.sessionID).filter((candidate) => candidateWorld(candidate) === undefined),
+		)[0]?.candidate;
+		if (preferred?.work.execution.status === "queued") startQueuedCandidates(state.session, preferred);
+	};
+
 	const consume = async (input: ConsumeInput, signal?: AbortSignal): Promise<Output | undefined> => {
 		const actorArrivedAt = performance.now();
 		const state = turns.get(turnKey(input.sessionID, input.turnID));
@@ -1509,15 +1538,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			turnID: input.turnID,
 		};
 		const admission = enterActorAdmission(state.session);
-		let actualKey: ActionKey | undefined;
-		try {
-			actualKey = await adapter.actionKey(actualCall.tool, actualCall.input, {
-				type: "consume",
-				consumeInput: input,
-			});
-		} catch {
-			actualKey = undefined;
-		}
+		const actualKey = await actorActionKey(input, actualCall);
 		const actorAction = new ActorAction({
 			identity,
 			tool: actualCall.tool,
@@ -2615,7 +2636,18 @@ export function makeStructuralSpeculativeActionRuntime<
 		}
 	};
 
-	return { startTurn, consume, actual, finishTurn, settingsChanged, releaseSession, disposeSession, dispose, inspect };
+	return {
+		startTurn,
+		previewActorCall,
+		consume,
+		actual,
+		finishTurn,
+		settingsChanged,
+		releaseSession,
+		disposeSession,
+		dispose,
+		inspect,
+	};
 
 	function allCandidates(sessionID: SessionID): Candidate[] {
 		return uniqueCandidates([...jobs.values(sessionID), ...results.values(sessionID), ...branches.values(sessionID)]);
