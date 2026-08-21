@@ -23,6 +23,7 @@ export type PlanNodeExecution =
 	| { readonly status: "deferred" }
 	| { readonly status: "execution_blocked"; readonly cause: ResolutionCause }
 	| { readonly status: "scheduled" }
+	| { readonly status: "queued"; readonly candidateID: string }
 	| { readonly status: "running"; readonly candidateID: string }
 	| { readonly status: "succeeded"; readonly candidateID: string }
 	| { readonly status: "failed" | "cancelled"; readonly cause: ResolutionCause; readonly candidateID?: string };
@@ -702,7 +703,7 @@ function executionSettled(execution: PlanNodeExecution): boolean {
 function executionProjection(execution: MutableNodeExecution): PlanNodeExecution {
 	if (execution.status !== "attached") return execution;
 	const state = execution.owner.execution;
-	if (state.status === "queued") return { status: "scheduled" };
+	if (state.status === "queued") return { status: "queued", candidateID: execution.candidateID };
 	if (state.status === "running") return { status: "running", candidateID: execution.candidateID };
 	if (state.status === "succeeded") return { status: "succeeded", candidateID: execution.candidateID };
 	return {

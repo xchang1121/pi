@@ -2552,7 +2552,10 @@ export function makeStructuralSpeculativeActionRuntime<
 			),
 			deferredPlanActions: planNodes.filter((node) => node.execution.status === "deferred").length,
 			activePlanActions: planNodes.filter(
-				(node) => node.execution.status === "scheduled" || node.execution.status === "running",
+				(node) =>
+					node.execution.status === "scheduled" ||
+					node.execution.status === "queued" ||
+					node.execution.status === "running",
 			).length,
 			executionBlockedPlanActions: planNodes.filter((node) => node.execution.status === "execution_blocked").length,
 			blockedPlanActions: planNodes.filter((node) => node.readiness === "blocked").length,

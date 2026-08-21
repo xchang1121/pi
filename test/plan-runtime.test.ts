@@ -11,6 +11,7 @@ describe("PlanRuntime", () => {
 		plan.takeReady(0);
 		const execution = new CandidateExecution<string>("shared");
 		plan.attachExecution("plan", "parent", "candidate", execution);
+		expect(plan.get("plan", "parent")?.execution).toEqual({ status: "queued", candidateID: "candidate" });
 		execution.start(1);
 		execution.fail(cause("execution", "tool_failed"), 2, 1);
 		const actor = { id: "actor", sequence: 1, turnID: "turn" } as const;
