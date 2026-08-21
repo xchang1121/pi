@@ -202,9 +202,14 @@ describe("faux LLM speculative action end to end", () => {
 		const evaluation = await runAgent({
 			cwd,
 			sessionID: "pattern-evaluation",
-			tools: patternTools(cwd, 70, "e.ts"),
-			actorTurns: sequenceTurns("e.ts", true),
-			actorTokensPerSecond: 180,
+			tools: patternTools(cwd, 120, "e.ts"),
+			actorTurns: [
+				turn(fauxToolCall("grep", { pattern: "TODO", path: "." })),
+				turn(fauxToolCall("read", { path: "e.ts" }), 230),
+				turn(fauxToolCall("read", { path: "shared.txt" })),
+				turn("done"),
+			],
+			actorTokensPerSecond: 4_000,
 			draftTurns: [],
 			settings: patternAwareSettings(patternSettings),
 			patternStore: store,
@@ -224,7 +229,12 @@ describe("faux LLM speculative action end to end", () => {
 				.every((prediction) => prediction.source === "pattern_aware"),
 		).toBe(true);
 		expect(evaluation.summary).toMatchObject({ actorActions: 3, speculativeHits: 2, actorFallbacks: 1 });
-		expect(evaluation.summary.executionAheadMs).toBeGreaterThan(100);
+		expect(evaluation.summary.executionAheadMs).toBeGreaterThanOrEqual(200);
+		expect(evaluation.summary.serializedMs - evaluation.summary.endToEndMs).toBeCloseTo(
+			evaluation.summary.hiddenLatencyMs,
+		);
+		expect(evaluation.executions).toEqual({ grep: 1, read: 2 });
+		expect(evaluation.toolLatencyMs.at(-1)).toBeLessThan(40);
 
 		const observe = store.observeBatch.bind(store);
 		vi.spyOn(store, "observeBatch").mockImplementation((...args) => {

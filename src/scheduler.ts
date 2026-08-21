@@ -19,6 +19,8 @@ export interface PredictionForecast {
 	readonly criticalPathMs?: number;
 	readonly expectedLatencyBenefitMs?: number;
 	readonly background?: boolean;
+	/** Explicit plan dependencies have settled, so statistical time-to-use no longer gates launch. */
+	readonly dependenciesResolved?: boolean;
 }
 
 export interface ScheduledWork {
@@ -148,6 +150,7 @@ export class SpeculationScheduler<Job extends object> {
 	}
 
 	launchDelay(forecast: PredictionForecast, safetyMarginMs = 10): number {
+		if (forecast.dependenciesResolved) return 0;
 		const decisionBatchesUntilCall = sequence(forecast.decisionBatchesUntilCall);
 		if (decisionBatchesUntilCall <= 1) return 0;
 		const duration = this.duration(forecast, 0.9);

@@ -50,6 +50,9 @@ describe("SpeculationScheduler", () => {
 			),
 		).toBe(150);
 		expect(scheduler.launchDelay(forecast({ decisionBatchesUntilCall: 3 }), 10)).toBe(170);
+		expect(
+			scheduler.launchDelay(forecast({ decisionBatchesUntilCall: 3, dependenciesResolved: true }), 10),
+		).toBe(0);
 		expect(scheduler.launchDelay(forecast({ decisionBatchesUntilCall: 1 }))).toBe(0);
 	});
 
