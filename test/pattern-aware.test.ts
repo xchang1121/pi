@@ -307,9 +307,10 @@ describe("PatternAware", () => {
 		store.settled("attributed", unmatchedSettlement());
 		store.settled("attributed", rejectedSettlement("freshness", "resource_changed"));
 		const afterFreshnessRejection = store.predict("probe").find((item) => item.patternID === "attributed")!;
+		const diagnostic = JSON.parse(afterFreshnessRejection.diagnostic);
 		expect(afterFreshnessRejection.adoptionProbability).toBe(0);
 		expect(afterFreshnessRejection.expectedLatencyBenefitMs / afterFreshnessRejection.expectedDurationMs).toBeCloseTo(
-			afterFreshnessRejection.empiricalProbability,
+			afterFreshnessRejection.empiricalProbability * (diagnostic.ppmProbability ?? 1) * diagnostic.mapperConfidence,
 		);
 		store.settled("attributed", adoptedSettlement());
 
@@ -1110,16 +1111,20 @@ describe("PatternAware", () => {
 		expect(candidates.reduce((sum, item) => sum + item.conditionalProbability, 0)).toBeLessThanOrEqual(1);
 	});
 
-	test("uses mapper simplicity as an evidence-annealed beam prior", () => {
+	test("charges evidence-annealed mapper complexity for transforms and ungrounded payloads", () => {
 		const store = new PatternAwareStore(settings({ beamWidth: 1, maxContextLength: 1, maxFutureGap: 0 }));
 		const source = { type: "event" as const, relativeEvent: -1, field: "input" as const, path: ["path"] };
-		for (const [id, binding] of [
-			["z-direct", source],
-			["a-composite", { type: "template" as const, source, prefix: "wrong/", suffix: "" }],
+		for (const [id, binding, averageDurationMs] of [
+			["z-direct", source, 100],
+			["a-composite", { type: "template" as const, source, prefix: "wrong/", suffix: "" }, 100],
+			["a-memorized", { type: "constant" as const, value: "README.md" }, 120],
 		] as const) {
 			expect(
 				store.registerValidatedPattern(
-					validatedGapPattern({ "0": 2 }, { id, occurrences: 2, bindings: { '["path"]': binding } }),
+					validatedGapPattern(
+						{ "0": 2 },
+						{ id, occurrences: 2, bindings: { '["path"]': binding }, averageDurationMs },
+					),
 				),
 			).toBe(true);
 		}
@@ -1554,9 +1559,13 @@ describe("PatternAware", () => {
 		expect(diagnostic).toMatchObject({ beamRank: 1, beamWidth: 1, ppmOrder: 1 });
 		expect(candidates.map((candidate) => JSON.parse(candidate.diagnostic).beamRank)).toEqual([1, 1]);
 		expect(diagnostic.ppmProbability).toBeGreaterThan(0);
+		expect(diagnostic.mapperConfidence).toBeGreaterThan(0);
 		expect(candidates[0]!.expectedLatencyBenefitMs).toBeGreaterThan(1);
 		expect(candidates[0]!.expectedLatencyBenefitMs).toBeCloseTo(
-			candidates[0]!.empiricalProbability * diagnostic.ppmProbability * candidates[0]!.expectedDurationMs,
+			candidates[0]!.empiricalProbability *
+				diagnostic.ppmProbability *
+				diagnostic.mapperConfidence *
+				candidates[0]!.expectedDurationMs,
 		);
 		expect(candidates[0]!.continuation.pathProbability).toBe(candidates[0]!.empiricalProbability);
 	});

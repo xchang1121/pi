@@ -693,11 +693,7 @@ export class PatternAwareStore {
 			const adoptionProbability = patternAdoptionProbability(patterns, this.clock, settings.decayHalfLifeEvents);
 			const conditionalProbability = clampProbability(replayProbability * gapCoverage * variantProbability);
 			const empiricalProbability = clampProbability(continuation.pathProbability * conditionalProbability);
-			const mapperComplexity = Math.min(
-				...ordered.map((item) =>
-					Object.values(item.pattern.bindings).reduce((total, binding) => total + bindingComplexity(binding), 0),
-				),
-			);
+			const mapperComplexity = Math.min(...ordered.map((item) => bindingMapComplexity(item.pattern.bindings)));
 			const mapperConfidence = totalWeight / (totalWeight + mapperComplexity);
 			const expectedLatencyBenefitMs =
 				empiricalProbability *
@@ -718,6 +714,7 @@ export class PatternAwareStore {
 				adoptionProbability,
 				expectedDurationMs,
 				ppmEstimate,
+				mapperConfidence,
 				expectedLatencyBenefitMs,
 			};
 		});
@@ -756,6 +753,7 @@ export class PatternAwareStore {
 				adoptionProbability,
 				expectedDurationMs,
 				ppmEstimate,
+				mapperConfidence,
 				expectedLatencyBenefitMs,
 			} = prediction;
 			const beamRank = (emittedPerTool.get(representative.pattern.targetTool) ?? 0) + 1;
@@ -804,6 +802,7 @@ export class PatternAwareStore {
 						ppmOrder: ppmEstimate?.order,
 						ppmEvidence: ppmEstimate?.evidence,
 						ppmEscapeMass: ppmEstimate?.escapeMass,
+						mapperConfidence,
 						variantProbability,
 						expectedLatencyBenefitMs,
 						beamRank,
@@ -2055,12 +2054,27 @@ function bindingMapStructure(bindings: Readonly<Record<string, PatternAwareBindi
 	return Object.fromEntries(Object.entries(bindings).map(([key, binding]) => [key, bindingStructure(binding)]));
 }
 
-function bindingComplexity(binding: PatternAwareBinding): number {
-	if (binding.type === "constant" || binding.type === "event" || binding.type === "each") return 0;
+const bindingMapComplexityCache = new WeakMap<object, number>();
+
+function bindingMapComplexity(bindings: Readonly<Record<string, PatternAwareBinding>>): number {
+	const cached = bindingMapComplexityCache.get(bindings);
+	if (cached !== undefined) return cached;
+	const complexity = Object.entries(bindings).reduce(
+		(total, [encoded, binding]) => total + bindingComplexity(binding, decodePath(encoded)),
+		0,
+	);
+	bindingMapComplexityCache.set(bindings, complexity);
+	return complexity;
+}
+
+function bindingComplexity(binding: PatternAwareBinding, targetPath: PatternAwarePath): number {
+	if (binding.type === "constant") return Number(requiresProvenance(targetPath, binding.value));
+	if (binding.type === "event" || binding.type === "each") return 0;
 	if (binding.type === "coalesce")
-		return 1 + binding.sources.reduce((total, source) => total + bindingComplexity(source), 0);
-	if (binding.type === "join") return 1 + bindingComplexity(binding.left) + bindingComplexity(binding.right);
-	return 1 + bindingComplexity(binding.source);
+		return 1 + binding.sources.reduce((total, source) => total + bindingComplexity(source, targetPath), 0);
+	if (binding.type === "join")
+		return 1 + bindingComplexity(binding.left, targetPath) + bindingComplexity(binding.right, targetPath);
+	return 1 + bindingComplexity(binding.source, targetPath);
 }
 
 function bindingStructure(value: unknown): unknown {
