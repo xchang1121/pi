@@ -261,6 +261,23 @@ export class PlanRuntime {
 		return true;
 	}
 
+	rearmExecution(candidateID: string): boolean {
+		let rearmed = false;
+		for (const { node } of this.mutableValues()) {
+			if (
+				node.execution.status !== "attached" ||
+				node.execution.candidateID !== candidateID ||
+				node.opportunity?.state.status !== "pending" ||
+				!executionSettled(executionProjection(node.execution))
+			) {
+				continue;
+			}
+			node.execution = { status: "deferred" };
+			rearmed = true;
+		}
+		return rearmed;
+	}
+
 	bindActionKey(proposalID: string, actionID: string, actionKey: ActionKey): boolean {
 		const node = this.mutable(proposalID, actionID)?.node;
 		if (!node || node.actionKey) return false;

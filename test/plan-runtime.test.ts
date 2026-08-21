@@ -59,10 +59,15 @@ describe("PlanRuntime", () => {
 			execution: { status: "cancelled" },
 			predictionState: { status: "pending" },
 		});
+		expect(plan.rearmExecution("candidate")).toBe(true);
+		const retry = new CandidateExecution<string>("shared");
+		plan.attachExecution("plan", "future", "retry", retry);
+		retry.cancel(cause("freshness", "resource_changed"), 2, 0);
 		expect(plan.due(6)).toEqual([]);
 		expect(plan.due(7).map((node) => node.action.id)).toEqual(["future"]);
 		const actor = { id: "actor", sequence: 7, turnID: "turn" } as const;
 		const opportunity = plan.claimMatch("plan", "future", actor, { kind: "exact", distance: 0 })!;
+		expect(plan.rearmExecution("retry")).toBe(false);
 
 		const settlement = plan.confirm(opportunity, actor, {
 			status: "rejected",

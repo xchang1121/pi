@@ -861,7 +861,7 @@ describe("structural speculative runtime", () => {
 		expect(fixture.runtime.inspect()).toMatchObject({ activeTurns: 0, pendingPredictions: 0 });
 	});
 
-	it("launches at the expected step but retains the prediction until its latest horizon", async () => {
+	it("rearms invalidated work while retaining a prediction until its latest horizon", async () => {
 		let executions = 0;
 		const settlements: PredictionSettlement[] = [];
 		const source: Source = {
@@ -890,23 +890,21 @@ describe("structural speculative runtime", () => {
 		};
 		const fixture = harness({
 			source,
-			execute: () => {
-				executions++;
-				return "future";
-			},
+			execute: () => `future:${++executions}`,
 		});
 		await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn-1" });
 		await waitFor(() => executions === 1);
 
-		const unrelated: Call = {
+		const mutation: Call = {
 			sessionID: "session",
 			turnID: "turn-1",
-			id: "unrelated",
-			tool: "find",
-			input: { pattern: "*" },
+			id: "mutation",
+			tool: "write",
+			input: { path: "future.ts", content: "new" },
 		};
-		expect(await fixture.runtime.consume(unrelated)).toBeUndefined();
-		await fixture.runtime.actual({ ...unrelated, durationMs: 1, output: "files" });
+		expect(await fixture.runtime.consume(mutation)).toBeUndefined();
+		await fixture.runtime.actual({ ...mutation, durationMs: 1, output: "written" });
+		await waitFor(() => executions === 2);
 		expect(settlements).toEqual([]);
 		await fixture.runtime.finishTurn({ ...call("turn-1"), terminal: false });
 		await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn-2" });
@@ -918,7 +916,7 @@ describe("structural speculative runtime", () => {
 				tool: "read",
 				input: { path: "future.ts" },
 			}),
-		).toBe("future");
+		).toBe("future:2");
 		await fixture.runtime.finishTurn({ ...call("turn-2"), terminal: true });
 		expect(settlements).toContainEqual(
 			expect.objectContaining({

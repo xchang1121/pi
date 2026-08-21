@@ -1634,7 +1634,7 @@ export function makeStructuralSpeculativeActionRuntime<
 						actorAction.reject(candidate.id, choice.match, before.cause);
 						rejection = before.cause;
 						rejectedCandidateID = candidate.id;
-						if (before.status === "stale") discardCandidate(state.session, candidate, before.cause);
+						if (before.status === "stale") invalidateCandidates(state.session, [candidate], before.cause);
 						continue;
 					}
 				}
@@ -1660,7 +1660,7 @@ export function makeStructuralSpeculativeActionRuntime<
 						actorAction.reject(candidate.id, choice.match, after.cause);
 						rejection = after.cause;
 						rejectedCandidateID = candidate.id;
-						if (after.status === "stale") discardCandidate(state.session, candidate, after.cause);
+						if (after.status === "stale") invalidateCandidates(state.session, [candidate], after.cause);
 						continue;
 					}
 				}
@@ -2108,7 +2108,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			if (candidate.work.execution.status === "succeeded") {
 				const validation = await validateCandidate(candidate);
 				if (validation.status === "stale") {
-					discardCandidate(session, candidate, validation.cause);
+					invalidateCandidates(session, [candidate], validation.cause);
 					continue;
 				}
 				if (validation.status === "indeterminate") continue;
@@ -2176,7 +2176,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		if (!branch?.watch) return;
 		try {
 			branch.watch((changedPath) => {
-				discardCandidate(session, candidate, cause("freshness", "resource_changed", changedPath));
+				invalidateCandidates(session, [candidate], cause("freshness", "resource_changed", changedPath));
 			});
 		} catch {
 			// Exact validation remains authoritative when a backend cannot install a watcher.
@@ -2304,7 +2304,12 @@ export function makeStructuralSpeculativeActionRuntime<
 		}
 	};
 
-	const cancelCandidate = (session: Session, candidate: Candidate, failure: ResolutionCause): void => {
+	const cancelCandidate = (
+		session: Session,
+		candidate: Candidate,
+		failure: ResolutionCause,
+		dispatch = true,
+	): void => {
 		const state = candidate.work.execution;
 		const startedAt = state.status === "running" ? state.startedAt : performance.now();
 		const completedAt = performance.now();
@@ -2312,15 +2317,31 @@ export function makeStructuralSpeculativeActionRuntime<
 		session.scheduler.discard(candidate);
 		removeCandidate(session, candidate);
 		if (settled) queueCandidateEvent(session, candidate);
-		dispatchReady(session);
+		if (dispatch) dispatchReady(session);
 	};
 
-	const discardCandidate = (session: Session, candidate: Candidate, failure: ResolutionCause): void => {
+	const discardCandidate = (
+		session: Session,
+		candidate: Candidate,
+		failure: ResolutionCause,
+		dispatch = true,
+	): void => {
 		if (candidate.work.execution.status === "queued" || candidate.work.execution.status === "running") {
-			cancelCandidate(session, candidate, failure);
+			cancelCandidate(session, candidate, failure, dispatch);
 			return;
 		}
 		removeCandidate(session, candidate);
+	};
+
+	const invalidateCandidates = (session: Session, candidates: Iterable<Candidate>, failure: ResolutionCause): void => {
+		let invalidated = false;
+		for (const candidate of new Set(candidates)) {
+			if (candidateByID(session.id, candidate.id) !== candidate) continue;
+			discardCandidate(session, candidate, failure, false);
+			session.plan.rearmExecution(candidate.id);
+			invalidated = true;
+		}
+		if (invalidated) dispatchReady(session);
 	};
 
 	const removeCandidate = (session: Session, candidate: Candidate): void => {
@@ -2366,10 +2387,11 @@ export function makeStructuralSpeculativeActionRuntime<
 				}
 			}
 		}
-		for (const candidate of invalid) {
-			if (reservationAvailable(candidate.work.reservation))
-				discardCandidate(session, candidate, cause("freshness", "authoritative_resource_changed"));
-		}
+		invalidateCandidates(
+			session,
+			[...invalid].filter((candidate) => reservationAvailable(candidate.work.reservation)),
+			cause("freshness", "authoritative_resource_changed"),
+		);
 	};
 
 	const pruneActionContexts = (session: Session): void => {
