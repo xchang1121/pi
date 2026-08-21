@@ -18,6 +18,7 @@ export interface PredictionForecast {
 	};
 	readonly criticalPathMs?: number;
 	readonly expectedLatencyBenefitMs?: number;
+	readonly background?: boolean;
 }
 
 export interface ScheduledWork {
@@ -26,6 +27,7 @@ export interface ScheduledWork {
 	readonly decisionBatchesUntilCall: number;
 	readonly criticalPathMs: number;
 	readonly priorityMs: number;
+	readonly background: boolean;
 }
 
 export type SchedulerAdmission =
@@ -92,6 +94,22 @@ export class SpeculationScheduler<Job extends object> {
 		capacity: number | SpeculativeResourceBudget,
 		canPreempt: (job: Job) => boolean = () => true,
 	): readonly Job[] {
+		return this.preemptFor(resource, capacity, (entry) => canPreempt(entry.job));
+	}
+
+	preemptBackgroundForForeground(
+		resource: SpeculativeResourceProfile,
+		capacity: number | SpeculativeResourceBudget,
+		canPreempt: (job: Job) => boolean = () => true,
+	): readonly Job[] {
+		return this.preemptFor(resource, capacity, (entry) => entry.work.background && canPreempt(entry.job));
+	}
+
+	private preemptFor(
+		resource: SpeculativeResourceProfile,
+		capacity: number | SpeculativeResourceBudget,
+		canPreempt: (entry: SchedulerEntry<Job>) => boolean,
+	): readonly Job[] {
 		const budget = normalizeBudget(capacity);
 		const remaining = [...this.entries.values()];
 		const victims: SchedulerEntry<Job>[] = [];
@@ -103,7 +121,7 @@ export class SpeculationScheduler<Job extends object> {
 			)
 		) {
 			const victim = remaining
-				.filter((entry) => !victims.includes(entry) && canPreempt(entry.job))
+				.filter((entry) => !victims.includes(entry) && canPreempt(entry))
 				.sort(compareVictim)[0];
 			if (!victim) break;
 			victims.push(victim);
@@ -125,6 +143,7 @@ export class SpeculationScheduler<Job extends object> {
 			decisionBatchesUntilCall: Math.min(...evaluated.map((item) => item.decisionBatchesUntilCall)),
 			criticalPathMs: Math.max(...evaluated.map((item) => item.criticalPathMs)),
 			priorityMs: Math.max(...evaluated.map((item) => item.priorityMs)),
+			background: evaluated.every((item) => item.background),
 		};
 	}
 
@@ -192,6 +211,7 @@ export class SpeculationScheduler<Job extends object> {
 				forecast.expectedLatencyBenefitMs === undefined
 					? criticalPathMs
 					: finite(forecast.expectedLatencyBenefitMs),
+			background: forecast.background === true,
 		};
 	}
 
@@ -227,11 +247,13 @@ function emptyWork(): ScheduledWork {
 		decisionBatchesUntilCall: 0,
 		criticalPathMs: 0,
 		priorityMs: 0,
+		background: false,
 	};
 }
 
 function compareVictim<Job>(left: SchedulerEntry<Job>, right: SchedulerEntry<Job>): number {
 	return (
+		Number(right.work.background) - Number(left.work.background) ||
 		right.work.decisionBatchesUntilCall - left.work.decisionBatchesUntilCall ||
 		left.work.priorityMs - right.work.priorityMs ||
 		left.work.criticalPathMs - right.work.criticalPathMs ||

@@ -339,6 +339,7 @@ export function createSpeculativeActionHost(
 		conditionalProbability: candidate.conditionalProbability,
 		expectedDurationMs: candidate.expectedDurationMs,
 		expectedLatencyBenefitMs: candidate.expectedLatencyBenefitMs,
+		...(candidate.background ? { background: true } : {}),
 		depth: candidate.depth,
 		...(dependsOn?.length ? { dependsOn } : {}),
 		feedback: { ...patternAwareRuntimeContext(store, candidate), patternIDs: candidate.supportingPatternIDs },

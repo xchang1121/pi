@@ -1519,6 +1519,47 @@ describe("PatternAware", () => {
 		);
 	});
 
+	test("admits one background exact-action sample only after the tool proves reuse", () => {
+		const store = new PatternAwareStore(
+			settings({ maxContextLength: 1, maxFutureGap: 0, minOccurrences: 2 }),
+			undefined,
+			piActionSemantics(),
+		);
+		store.observe(input({ sessionID: "cold", tool: "bash", input: { command: "first" } }));
+		store.observe(input({ sessionID: "cold", tool: "bash", input: { command: "second" } }));
+		expect(store.predict("cold").some((candidate) => candidate.background)).toBe(false);
+
+		const sessionID = "sampled";
+		for (let index = 0; index < 2; index++) {
+			store.observe(input({ sessionID, tool: "bash", input: { command: "stable" }, durationMs: 100 }));
+			store.observe(input({ sessionID, tool: "read", input: { path: "stable.ts" }, durationMs: 10 }));
+		}
+		store.observe(input({ sessionID, tool: "bash", input: { command: "slow-a" }, durationMs: 900 }));
+		store.observe(input({ sessionID, tool: "bash", input: { command: "slow-b" }, durationMs: 1_000 }));
+		store.observe(input({ sessionID, tool: "read", input: { path: "slow.ts" }, durationMs: 2_000 }));
+
+		const recurrent = store
+			.predict(sessionID)
+			.filter((candidate) => candidate.patternID.startsWith("action-backoff:"));
+		const sampled = recurrent.filter((candidate) => candidate.background);
+		expect(sampled).toHaveLength(1);
+		expect(recurrent.at(-1)).toBe(sampled[0]);
+
+		store.observe(
+			input({ sessionID, tool: sampled[0]!.tool, input: sampled[0]!.input, durationMs: sampled[0]!.expectedDurationMs }),
+		);
+		expect(
+			store
+				.predict(sessionID)
+				.find(
+					(candidate) =>
+						candidate.patternID.startsWith("action-backoff:") &&
+						candidate.tool === sampled[0]!.tool &&
+						JSON.stringify(candidate.input) === JSON.stringify(sampled[0]!.input),
+				)?.background,
+		).toBeUndefined();
+	});
+
 	test("uses canonical K(a) identity and rejects stale schemas or non-learning observations", () => {
 		const store = new PatternAwareStore(settings({ minOccurrences: 2 }), undefined, piActionSemantics());
 		store.observe(

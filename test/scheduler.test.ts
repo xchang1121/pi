@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { type PredictionForecast, SpeculationScheduler } from "../src/scheduler.ts";
 
 describe("SpeculationScheduler", () => {
-	it("never lets one speculative forecast evict another", () => {
+	it("does not evict foreground work during ordinary admission", () => {
 		const scheduler = new SpeculationScheduler<object>();
 		const first = {};
 		const second = {};
@@ -65,6 +65,20 @@ describe("SpeculationScheduler", () => {
 			criticalPathMs: 50,
 			priorityMs: 50,
 		});
+	});
+
+	it("promotes shared work on foreground evidence and lets background work yield", () => {
+		const scheduler = new SpeculationScheduler<object>();
+		expect(scheduler.evaluate([forecast({ background: true }), forecast({ background: true })]).background).toBe(
+			true,
+		);
+		expect(scheduler.evaluate([forecast({ background: true }), forecast()]).background).toBe(false);
+
+		const foreground = {};
+		const background = {};
+		scheduler.admit(foreground, [forecast({ expectedLatencyBenefitMs: 1 })], 2);
+		scheduler.admit(background, [forecast({ background: true, expectedLatencyBenefitMs: 1_000 })], 2);
+		expect(scheduler.preemptBackgroundForForeground({ class: "filesystem", units: 1 }, 2)).toEqual([background]);
 	});
 
 	it("preempts the latest and least critical work for an authoritative action", () => {

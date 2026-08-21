@@ -22,6 +22,8 @@ export interface PlanAction {
 	readonly conditionalProbability?: number;
 	readonly expectedDurationMs?: number;
 	readonly expectedLatencyBenefitMs?: number;
+	/** Uses only otherwise-idle speculative capacity and yields first under contention. */
+	readonly background?: boolean;
 	readonly resourceDemand?: number;
 	readonly depth?: number;
 	readonly dependsOn?: readonly PlanActionDependency[];

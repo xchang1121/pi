@@ -174,6 +174,7 @@ export type PatternAwareCandidate = {
 	readonly adoptionProbability: number;
 	readonly expectedDurationMs: number;
 	readonly expectedLatencyBenefitMs: number;
+	readonly background?: boolean;
 	readonly dependencies: ReadonlyArray<PatternAwareDependency>;
 	readonly continuation: PatternAwareContinuation;
 	readonly depth: number;
@@ -712,6 +713,7 @@ export class PatternAwareStore {
 				mapperConfidence *
 				Math.max(1, Math.max(0, expectedDurationMs));
 			return {
+				background: false,
 				actionIdentity: hash(identity),
 				type: representative.type,
 				tool: representative.pattern.targetTool,
@@ -749,28 +751,39 @@ export class PatternAwareStore {
 			}
 			const existing = predictions[index]!;
 			const preferred =
-				recurrent.expectedLatencyBenefitMs > existing.expectedLatencyBenefitMs ? recurrent : existing;
+				recurrent.background !== existing.background
+					? recurrent.background
+						? existing
+						: recurrent
+					: recurrent.expectedLatencyBenefitMs > existing.expectedLatencyBenefitMs
+						? recurrent
+						: existing;
 			predictions[index] = {
 				...preferred,
+				background: existing.background && recurrent.background,
 				supportingPatternIDs: [
 					...new Set([...existing.supportingPatternIDs, ...recurrent.supportingPatternIDs]),
 				],
 			};
 		}
-		const beam = perToolBeam(
-			predictions.sort(
-				(left, right) =>
-					right.expectedLatencyBenefitMs - left.expectedLatencyBenefitMs ||
-					right.empiricalProbability - left.empiricalProbability ||
-					right.conditionalProbability - left.conditionalProbability ||
-					Number(right.type === "tool_call") - Number(left.type === "tool_call") ||
-					left.horizon - right.horizon ||
-					left.patternID.localeCompare(right.patternID) ||
-					stableStringify(left.input).localeCompare(stableStringify(right.input)),
-			),
+		const comparePredictions = (left: (typeof predictions)[number], right: (typeof predictions)[number]) =>
+			right.expectedLatencyBenefitMs - left.expectedLatencyBenefitMs ||
+			right.empiricalProbability - left.empiricalProbability ||
+			right.conditionalProbability - left.conditionalProbability ||
+			Number(right.type === "tool_call") - Number(left.type === "tool_call") ||
+			left.horizon - right.horizon ||
+			left.patternID.localeCompare(right.patternID) ||
+			stableStringify(left.input).localeCompare(stableStringify(right.input));
+		const backgroundLast = (left: (typeof predictions)[number], right: (typeof predictions)[number]) =>
+			Number(left.background) - Number(right.background) || comparePredictions(left, right);
+		const selected = perToolBeam(
+			predictions.sort(backgroundLast),
 			settings.beamWidth,
 			(prediction) => prediction.tool,
 		);
+		const sample = selected.find((prediction) => prediction.background);
+		const beam = selected.filter((prediction) => !prediction.background);
+		if (sample) beam.push(sample);
 		const emittedPerTool = new Map<string, number>();
 		for (const prediction of beam) {
 			const beamRank = (emittedPerTool.get(prediction.tool) ?? 0) + 1;
@@ -796,6 +809,7 @@ export class PatternAwareStore {
 				adoptionProbability: prediction.adoptionProbability,
 				expectedDurationMs: prediction.expectedDurationMs,
 				expectedLatencyBenefitMs: prediction.expectedLatencyBenefitMs,
+				...(prediction.background ? { background: true } : {}),
 				dependencies: prediction.dependencies,
 				continuation: nextContinuation,
 				depth: nextContinuation.visitedPatternIDs.length,
@@ -821,6 +835,7 @@ export class PatternAwareStore {
 						mapperConfidence: prediction.mapperConfidence,
 						variantProbability: prediction.variantProbability,
 						expectedLatencyBenefitMs: prediction.expectedLatencyBenefitMs,
+						background: prediction.background === true,
 						beamRank,
 						beamWidth: settings.beamWidth,
 						gapCoverage: prediction.gapCoverage,
@@ -857,12 +872,17 @@ export class PatternAwareStore {
 		const rank = (item: RecurrentAction) =>
 			recencyWeight(item.lastSeenSequence, this.clock, settings.decayHalfLifeEvents) *
 			Math.max(item.count, item.totalDurationMs);
+		const provenTools = new Set(
+			values.filter((item) => item.count >= settings.minOccurrences).map((item) => item.action.tool),
+		);
 		const candidates = perToolBeam(
 			values
-				.filter((item) => item.count >= settings.minOccurrences)
+				.filter((item) => item.count >= settings.minOccurrences || provenTools.has(item.action.tool))
 				.filter((item) => !continuation.visitedPatternIDs.includes(`action-backoff:${hash(item.action.key)}`))
 				.sort(
 					(left, right) =>
+						Number(right.count >= settings.minOccurrences) -
+							Number(left.count >= settings.minOccurrences) ||
 						rank(right) - rank(left) ||
 						left.action.key.localeCompare(right.action.key),
 				),
@@ -879,6 +899,7 @@ export class PatternAwareStore {
 			const expectedLatencyBenefitMs =
 				empiricalProbability * (ppmEstimate?.probability ?? 1) * Math.max(1, expectedDurationMs);
 			return {
+				background: item.count < settings.minOccurrences,
 					actionIdentity: hash(stableStringify({ type: "tool_call", actionKey: item.action.key })),
 					type: "tool_call" as const,
 					tool: item.action.tool,

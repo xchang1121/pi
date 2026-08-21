@@ -623,7 +623,7 @@ describe("structural speculative runtime", () => {
 		await fixture.runtime.finishTurn({ ...call("turn"), terminal: true });
 	});
 
-	it("queues unique candidates at capacity and starts each without admission loss", async () => {
+	it("queues unique candidates without letting background work take foreground capacity", async () => {
 		let releaseFirst!: () => void;
 		const firstGate = new Promise<void>((resolve) => {
 			releaseFirst = resolve;
@@ -637,8 +637,15 @@ describe("structural speculative runtime", () => {
 				source: "source",
 				revision: 0,
 				actions: [
+					{
+						id: "second",
+						type: "tool_call",
+						tool: "read",
+						input: { path: "second.ts" },
+						background: true,
+						expectedLatencyBenefitMs: 10_000,
+					},
 					{ id: "first", type: "tool_call", tool: "read", input: { path: "first.ts" } },
-					{ id: "second", type: "tool_call", tool: "read", input: { path: "second.ts" } },
 				],
 			}),
 		};
@@ -662,6 +669,64 @@ describe("structural speculative runtime", () => {
 		expect(
 			fixture.events.filter((event) => event.type === "candidate" && event.state.status === "cancelled"),
 		).toEqual([]);
+	});
+
+	it("preempts running background work when a later foreground proposal arrives", async () => {
+		let releaseForeground!: () => void;
+		const foregroundReady = new Promise<void>((resolve) => {
+			releaseForeground = resolve;
+		});
+		const executed: string[] = [];
+		const source: Source = {
+			id: "source",
+			enabled: () => true,
+			proposalCount: () => 2,
+			propose: async ({ proposalIndex }) => {
+				if (proposalIndex > 0) await foregroundReady;
+				return {
+					id: `yield:${proposalIndex}`,
+					source: "source",
+					revision: 0,
+					actions: [
+						{
+							id: "next",
+							type: "tool_call",
+							tool: "read",
+							input: { path: proposalIndex === 0 ? "background.ts" : "foreground.ts" },
+							...(proposalIndex === 0 ? { background: true } : {}),
+						},
+					],
+				};
+			},
+		};
+		const fixture = harness({
+			source,
+			settings: () => ({ ...settings, maxConcurrentActions: 1 }),
+			execute: async (_tool, input, signal) => {
+				const path = String(input.path);
+				executed.push(path);
+				if (path !== "background.ts") return path;
+				return new Promise((_, reject) => {
+					signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+				});
+			},
+		});
+		await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn" });
+		await waitFor(() => executed.length === 1);
+		expect(executed).toEqual(["background.ts"]);
+
+		releaseForeground();
+		await waitFor(() => executed.length === 2);
+		expect(executed).toEqual(["background.ts", "foreground.ts"]);
+		expect(
+			fixture.events.some(
+				(event) =>
+					event.type === "candidate" &&
+					event.state.status === "cancelled" &&
+					event.state.cause.code === "scheduler_preempted",
+			),
+		).toBe(true);
+		await fixture.runtime.finishTurn({ ...call("turn"), terminal: true });
 	});
 
 	it("promotes an Actor-matched queued candidate and preempts unrelated work", async () => {

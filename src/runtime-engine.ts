@@ -151,6 +151,7 @@ function forecastFor(
 		...(node.action.expectedLatencyBenefitMs !== undefined
 			? { expectedLatencyBenefitMs: node.action.expectedLatencyBenefitMs }
 			: {}),
+		...(node.action.background ? { background: true } : {}),
 	};
 }
 
@@ -575,6 +576,7 @@ interface CandidateRecord<Output, StartInput, StateData> {
 	expectedDecisionSeq: number;
 	criticalPathMs: number;
 	priorityMs: number;
+	background: boolean;
 	estimatedBytes: number;
 	projectionCoverage: readonly ActionProjectionCoverage[];
 	validationMs: number;
@@ -1231,6 +1233,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			: session.lastActorArrivedAt === undefined
 				? undefined
 				: { kind: "cycle", elapsedMs: Math.max(0, now - session.lastActorArrivedAt) };
+		const immediate: PlanRuntimeNode[] = [];
 		for (const node of session.plan.launchable()) {
 			if (!node.prediction || !node.actionKey || node.action.type !== "tool_call") continue;
 			const existingTimer = session.launchTimers.get(node.prediction.id);
@@ -1249,7 +1252,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			const delay = node.prediction.id === immediatePredictionID ? 0 : session.scheduler.launchDelay(forecast);
 			if (delay <= 0) {
 				const promoted = session.plan.promote(node.proposalID, node.action.id);
-				if (promoted.status === "scheduled") void launchNode(session, promoted.node);
+				if (promoted.status === "scheduled") immediate.push(promoted.node);
 				continue;
 			}
 			const timer = setTimeout(() => {
@@ -1259,6 +1262,10 @@ export function makeStructuralSpeculativeActionRuntime<
 			}, delay);
 			session.launchTimers.set(node.prediction.id, timer);
 		}
+		const foreground = immediate.filter((node) => !node.action.background);
+		const background = immediate.filter((node) => node.action.background);
+		const foregroundAdmissions = Promise.allSettled(foreground.map((node) => launchNode(session, node)));
+		void foregroundAdmissions.then(() => Promise.allSettled(background.map((node) => launchNode(session, node))));
 		startQueuedCandidates(session);
 	};
 
@@ -1329,6 +1336,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			expectedDecisionSeq: node.expectedDecisionSeq,
 			criticalPathMs: scheduled.criticalPathMs,
 			priorityMs: scheduled.priorityMs,
+			background: scheduled.background,
 			estimatedBytes: 0,
 			projectionCoverage: [],
 			validationMs: 0,
@@ -1363,6 +1371,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		candidate.expectedDecisionSeq = Math.min(candidate.expectedDecisionSeq, node.expectedDecisionSeq);
 		candidate.criticalPathMs = Math.max(candidate.criticalPathMs, scheduled.criticalPathMs);
 		candidate.priorityMs = Math.max(candidate.priorityMs, scheduled.priorityMs);
+		candidate.background = scheduled.background;
 		const execution = candidate.work.execution;
 		if (execution.status === "succeeded") {
 			queueContinuation(session, node, candidate, execution.output.output, "execution_succeeded");
@@ -1383,6 +1392,7 @@ export function makeStructuralSpeculativeActionRuntime<
 					Number(right === preferred) - Number(left === preferred) ||
 					Number(!reservationAvailable(right.work.reservation)) -
 						Number(!reservationAvailable(left.work.reservation)) ||
+					Number(left.background) - Number(right.background) ||
 					left.expectedDecisionSeq - right.expectedDecisionSeq ||
 					right.priorityMs - left.priorityMs ||
 					right.criticalPathMs - left.criticalPathMs ||
@@ -1390,11 +1400,26 @@ export function makeStructuralSpeculativeActionRuntime<
 					left.createdAt - right.createdAt,
 			);
 		for (const candidate of queued) {
-			const admission = session.scheduler.admit(
+			if (candidate.work.execution.status !== "queued") continue;
+			let admission = session.scheduler.admit(
 				candidate,
 				forecastsForCandidate(session, candidate),
 				concurrentLimit(session.settings),
 			);
+			if (!admission.admitted && !candidate.background) {
+				for (const victim of session.scheduler.preemptBackgroundForForeground(
+					admission.work.resource,
+					concurrentLimit(session.settings),
+					(candidate) => reservationAvailable(candidate.work.reservation),
+				)) {
+					cancelCandidate(session, victim, cause("admission", "scheduler_preempted"), false);
+				}
+				admission = session.scheduler.admit(
+					candidate,
+					forecastsForCandidate(session, candidate),
+					concurrentLimit(session.settings),
+				);
+			}
 			if (!admission.admitted && !(authoritative && candidate === preferred)) continue;
 			const startedAt = performance.now();
 			if (!candidate.work.start(startedAt)) continue;

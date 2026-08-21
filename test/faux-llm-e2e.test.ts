@@ -248,7 +248,7 @@ describe("faux LLM speculative action end to end", () => {
 		expect(fastActor.executions).toEqual({ grep: 1, read: 2 });
 	});
 
-	it("hides a promoted exact-action recurrence after its short context has changed", async () => {
+	it("hides a sampled exact-action recurrence after its tool proves reuse", async () => {
 		const cwd = await workspace();
 		await writeFile(path.join(cwd, "other.txt"), "other", "utf8");
 		const patternSettings: PatternAwareSettings = {
@@ -273,7 +273,7 @@ describe("faux LLM speculative action end to end", () => {
 				turn(fauxToolCall("read", { path: "other.txt" })),
 				turn([
 					fauxThinking("verify the previously inspected file before answering ".repeat(4)),
-					fauxToolCall("read", { path: "notes.txt" }),
+					fauxToolCall("read", { path: "other.txt" }),
 				]),
 				turn("done"),
 			],
