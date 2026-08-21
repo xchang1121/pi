@@ -1473,6 +1473,26 @@ describe("PatternAware", () => {
 		);
 	});
 
+	test("orders competing live motifs by their same-session support", () => {
+		const store = new PatternAwareStore(settings({ beamWidth: 1, maxContextLength: 1, maxFutureGap: 0 }));
+		const train = (sessionID: string, outputPath: string, filePath: string, durationMs: number) => {
+			store.observe(input({ sessionID, tool: "grep", input: {}, outputPaths: [outputPath] }));
+			store.observe(input({ sessionID, tool: "read", input: { filePath }, durationMs }));
+		};
+		train("direct-one", "src/one.ts", "src/one.ts", 100);
+		train("direct-two", "lib/two.ts", "lib/two.ts", 100);
+		train("parent-one", "src/one.ts", "src", 1);
+		train("parent-two", "lib/two.ts", "lib", 1);
+		train("active", "active/direct.ts", "active/direct.ts", 100);
+		train("active", "active/parent-one.ts", "active", 1);
+		train("active", "active/parent-two.ts", "active", 1);
+		store.observe(input({ sessionID: "active", tool: "grep", input: {}, outputPaths: ["probe/file.ts"] }));
+
+		expect(store.predict("active")[0]).toEqual(
+			expect.objectContaining({ tool: "read", input: { filePath: "probe" } }),
+		);
+	});
+
 	test("calibrates PPM beam value with concrete actor-miss feedback", () => {
 		const store = new PatternAwareStore(settings({ beamWidth: 1, maxContextLength: 1, maxFutureGap: 0 }));
 		trainGrepRead(store, "one", "src/a.ts");

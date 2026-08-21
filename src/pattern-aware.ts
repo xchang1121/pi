@@ -715,6 +715,7 @@ export class PatternAwareStore {
 			.sort(
 				(left, right) =>
 					Number(right.sameSessionEvidence > 0) - Number(left.sameSessionEvidence > 0) ||
+					right.sameSessionEvidence - left.sameSessionEvidence ||
 					right.beamScore - left.beamScore ||
 					right.empiricalProbability - left.empiricalProbability ||
 					right.conditionalProbability - left.conditionalProbability ||
