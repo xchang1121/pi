@@ -342,8 +342,6 @@ export class PatternAwareStore {
 	private readonly history = new Map<string, PatternAwareEvent[]>();
 	private readonly observedActionKeys = new WeakMap<PatternAwareEvent, ActionKey | null>();
 	private readonly resolvedActionKeys = new Map<string, ActionKey>();
-	/** Non-persisted support counts keep a session's own learned motif ahead of workspace history. */
-	private readonly sameSessionOccurrences = new Map<string, ReadonlyMap<string, number>>();
 	private trie = new PredictiveContextTrie();
 	private sequenceModel: PpmCountTrie;
 	private indexDirty = true;
@@ -589,7 +587,6 @@ export class PatternAwareStore {
 	) {
 		if (continuation.visitedPatternIDs.length >= settings.maxPredictionDepth) return [];
 		const predictiveHistory = actionHistory(history);
-		const activeSessionID = predictiveHistory.at(-1)?.sessionID;
 		const sequenceContext = predictiveHistory.map((event) => signatureToken(signature(event)));
 		const result: PatternAwareCandidate[] = [];
 		const groups = new Map<
@@ -685,15 +682,6 @@ export class PatternAwareStore {
 			const conditionalProbability = clampProbability(calibration.probability * gapCoverage * variantProbability);
 			const empiricalProbability = clampProbability(continuation.pathProbability * conditionalProbability);
 			const expectedLatencyBenefitMs = empiricalProbability * Math.max(1, Math.max(0, expectedDurationMs));
-			const sameSessionEvidence =
-				activeSessionID === undefined
-					? 0
-					: Math.max(
-							0,
-							...patterns.map(
-								(pattern) => this.sameSessionOccurrences.get(pattern.id)?.get(activeSessionID) ?? 0,
-							),
-						);
 			return {
 				actionIdentity: hash(identity),
 				ordered,
@@ -710,15 +698,12 @@ export class PatternAwareStore {
 				expectedDurationMs,
 				ppmEstimate,
 				expectedLatencyBenefitMs,
-				sameSessionEvidence,
 			};
 		});
 		const perTool = new Map<string, number>();
 		const beam = predictions
 			.sort(
 				(left, right) =>
-					Number(right.sameSessionEvidence > 0) - Number(left.sameSessionEvidence > 0) ||
-					right.sameSessionEvidence - left.sameSessionEvidence ||
 					right.expectedLatencyBenefitMs - left.expectedLatencyBenefitMs ||
 					right.empiricalProbability - left.empiricalProbability ||
 					right.conditionalProbability - left.conditionalProbability ||
@@ -1067,7 +1052,6 @@ export class PatternAwareStore {
 				existing.gapLastSeen = sampleGapLastSeen(support);
 				existing.averageDurationMs = averageTargetDuration(support);
 				existing.lastSeenSequence = lastSeenSequence;
-				this.sameSessionOccurrences.set(id, sampleSessionOccurrences(support));
 				continue;
 			}
 			this.patterns.set(id, {
@@ -1087,7 +1071,6 @@ export class PatternAwareStore {
 				averageDurationMs: averageTargetDuration(support),
 				lastSeenSequence,
 			});
-			this.sameSessionOccurrences.set(id, sampleSessionOccurrences(support));
 			this.indexDirty = true;
 		}
 		this.retirePoolPatterns(pool, retained);
@@ -1112,7 +1095,6 @@ export class PatternAwareStore {
 		for (const patternID of pool.patternIDs ?? []) {
 			if (retained.has(patternID)) continue;
 			if (this.patterns.delete(patternID)) this.indexDirty = true;
-			this.sameSessionOccurrences.delete(patternID);
 			for (const [sessionID, pending] of this.pending) {
 				const active = pending.filter((item) => item.patternID !== patternID);
 				if (active.length) this.pending.set(sessionID, active);
@@ -1219,7 +1201,6 @@ export class PatternAwareStore {
 			.slice(0, this.patterns.size - limit);
 		for (const pattern of evicted) {
 			this.patterns.delete(pattern.id);
-			this.sameSessionOccurrences.delete(pattern.id);
 		}
 		if (evicted.length) this.indexDirty = true;
 	}
@@ -2787,15 +2768,6 @@ function patternPoolSampleLimit(settings: Pick<PatternAwareSettings, "minOccurre
 function sampleGapCounts(samples: ReadonlyArray<PatternSample>) {
 	const counts: Record<string, number> = {};
 	for (const sample of samples) counts[String(sample.gap)] = (counts[String(sample.gap)] ?? 0) + 1;
-	return counts;
-}
-
-function sampleSessionOccurrences(samples: ReadonlyArray<PatternSample>) {
-	const counts = new Map<string, number>();
-	for (const sample of samples) {
-		const sessionID = sample.target.sessionID;
-		counts.set(sessionID, (counts.get(sessionID) ?? 0) + 1);
-	}
 	return counts;
 }
 
