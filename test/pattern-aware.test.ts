@@ -1512,17 +1512,14 @@ describe("PatternAware", () => {
 		expect(diagnostic).toMatchObject({ beamRank: 1, beamWidth: 1, ppmOrder: 1 });
 		expect(candidates.map((candidate) => JSON.parse(candidate.diagnostic).beamRank)).toEqual([1, 1]);
 		expect(diagnostic.ppmProbability).toBeGreaterThan(0);
-		expect(diagnostic.ppmWeight).toBeGreaterThan(0);
 		expect(candidates[0]!.expectedLatencyBenefitMs).toBeGreaterThan(1);
 		expect(candidates[0]!.expectedLatencyBenefitMs).toBeCloseTo(
-			candidates[0]!.empiricalProbability * candidates[0]!.expectedDurationMs,
+			candidates[0]!.empiricalProbability * diagnostic.ppmProbability * candidates[0]!.expectedDurationMs,
 		);
-		expect(candidates[0]!.continuation.pathProbability).toBeCloseTo(
-			candidates[0]!.expectedLatencyBenefitMs / candidates[0]!.expectedDurationMs,
-		);
+		expect(candidates[0]!.continuation.pathProbability).toBe(candidates[0]!.empiricalProbability);
 	});
 
-	test("calibrates PPM beam value with concrete actor-miss feedback", () => {
+	test("combines tool-level PPM value with concrete action feedback", () => {
 		const store = new PatternAwareStore(settings({ beamWidth: 1, maxContextLength: 1, maxFutureGap: 0 }));
 		trainGrepRead(store, "one", "src/a.ts");
 		trainGrepRead(store, "two", "src/b.ts");

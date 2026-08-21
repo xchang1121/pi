@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { type ActionKey, type ActionKeyProjector, actionKeyCovers } from "./action-semantics.ts";
-import { PpmCountTrie, type PpmCountTrieRow, type PpmProbabilityEstimate } from "./ppm-count-trie.ts";
+import { PpmCountTrie, type PpmCountTrieRow } from "./ppm-count-trie.ts";
 import type { PredictionSettlement, ResolutionStage } from "./settlement.ts";
 
 export type PatternAwareSettings = {
@@ -690,15 +690,11 @@ export class PatternAwareStore {
 							recencyWeight(item.pattern.lastSeenSequence, this.clock, settings.decayHalfLifeEvents),
 					0,
 				) / Math.max(1, totalWeight);
-			const calibration = calibratePatternProbability(
-				replayProbability,
-				patternEvidence(patterns, this.clock, settings.decayHalfLifeEvents),
-				ppmEstimate,
-			);
 			const adoptionProbability = patternAdoptionProbability(patterns, this.clock, settings.decayHalfLifeEvents);
-			const conditionalProbability = clampProbability(calibration.probability * gapCoverage * variantProbability);
+			const conditionalProbability = clampProbability(replayProbability * gapCoverage * variantProbability);
 			const empiricalProbability = clampProbability(continuation.pathProbability * conditionalProbability);
-			const expectedLatencyBenefitMs = empiricalProbability * Math.max(1, Math.max(0, expectedDurationMs));
+			const expectedLatencyBenefitMs =
+				empiricalProbability * (ppmEstimate?.probability ?? 1) * Math.max(1, Math.max(0, expectedDurationMs));
 			return {
 				actionIdentity: hash(identity),
 				ordered,
@@ -707,7 +703,6 @@ export class PatternAwareStore {
 				latestHorizon,
 				gapCoverage,
 				replayProbability,
-				calibration,
 				variantProbability,
 				conditionalProbability,
 				empiricalProbability,
@@ -746,7 +741,6 @@ export class PatternAwareStore {
 				latestHorizon,
 				gapCoverage,
 				replayProbability,
-				calibration,
 				variantProbability,
 				conditionalProbability,
 				empiricalProbability,
@@ -798,7 +792,6 @@ export class PatternAwareStore {
 						horizon,
 						latestHorizon,
 						ppmProbability: ppmEstimate?.probability,
-						ppmWeight: calibration.ppmWeight,
 						ppmOrder: ppmEstimate?.order,
 						ppmEvidence: ppmEstimate?.evidence,
 						ppmEscapeMass: ppmEstimate?.escapeMass,
@@ -2476,33 +2469,6 @@ function backoffProbability(patterns: ReadonlyArray<MutablePattern>, clock: numb
 		estimate = local * (1 - escapeProbability) + estimate * escapeProbability;
 	}
 	return Math.max(0, Math.min(1, estimate));
-}
-
-function patternEvidence(patterns: ReadonlyArray<MutablePattern>, clock: number, halfLife: number) {
-	return Math.max(
-		1,
-		...patterns.map((pattern) => {
-			const feedback = feedbackEvidence(pattern, clock, halfLife);
-			return (
-				pattern.historicalOpportunities * recencyWeight(pattern.lastSeenSequence, clock, halfLife) +
-				feedback.matched +
-				feedback.mismatched
-			);
-		}),
-	);
-}
-
-function calibratePatternProbability(
-	replayProbability: number,
-	replayEvidence: number,
-	ppmEstimate: PpmProbabilityEstimate | undefined,
-) {
-	if (!ppmEstimate) return { probability: clampProbability(replayProbability), ppmWeight: 0 };
-	const ppmWeight = ppmEstimate.evidence / Math.max(1, ppmEstimate.evidence + replayEvidence * 2);
-	return {
-		probability: clampProbability(replayProbability * (1 - ppmWeight) + ppmEstimate.probability * ppmWeight),
-		ppmWeight,
-	};
 }
 
 function clampProbability(value: number) {
