@@ -25,6 +25,15 @@ describe("PpmCountTrie", () => {
 		expect(model.estimate(["grep", "success"], "read")?.order).toBe(2);
 	});
 
+	it("starts at the shortest deterministic suffix instead of a sparse extension", () => {
+		const model = new PpmCountTrie(2);
+		for (let index = 0; index < 8; index++) model.observe(["stable"], "read", index);
+		model.observe(["rare", "stable"], "read", 8);
+
+		expect(model.estimate(["rare", "stable"], "read")?.order).toBe(1);
+		expect(model.probability(["rare", "stable"], "read")).toBe(model.probability(["new", "stable"], "read"));
+	});
+
 	it("escapes from an unseen long context to a shorter suffix", () => {
 		const model = new PpmCountTrie(3);
 		for (let index = 0; index < 6; index++) model.observe(["grep"], "read", index);

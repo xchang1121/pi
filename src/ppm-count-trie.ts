@@ -85,7 +85,12 @@ export class PpmCountTrie {
 		if (wasEmpty && current.total > 0) this.populatedContexts++;
 	}
 
-	estimate(history: readonly string[], target: string, sequence = 0, halfLife = 0): PpmProbabilityEstimate | undefined {
+	estimate(
+		history: readonly string[],
+		target: string,
+		sequence = 0,
+		halfLife = 0,
+	): PpmProbabilityEstimate | undefined {
 		if (!target || this.root.total <= 0) return undefined;
 		const suffixNodes: Array<{ readonly node: CountNode; readonly order: number }> = [{ node: this.root, order: 0 }];
 		let current = this.root;
@@ -98,15 +103,16 @@ export class PpmCountTrie {
 			current = child;
 			if (current.total > 0) suffixNodes.push({ node: current, order });
 		}
+		// PPM*: a shorter deterministic suffix has more evidence than its equally deterministic extensions.
+		const deterministic = suffixNodes.findIndex(({ node, order }) => order > 0 && node.targets.size === 1);
+		if (deterministic >= 0) suffixNodes.length = deterministic + 1;
 
 		let remaining = 1;
 		let probability = 0;
 		let matchedOrder = -1;
 		let evidence = 0;
 		for (const item of suffixNodes.reverse()) {
-			const weighted = [...item.node.targets.values()].map((value) =>
-				decayedCount(value, sequence, halfLife),
-			);
+			const weighted = [...item.node.targets.values()].map((value) => decayedCount(value, sequence, halfLife));
 			const total = weighted.reduce((sum, count) => sum + count, 0);
 			const distinct = weighted.filter((count) => count > 0).length;
 			if (total <= 0 || distinct <= 0) continue;
