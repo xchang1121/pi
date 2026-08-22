@@ -676,7 +676,12 @@ export class PatternAwareStore {
 			const latestHorizon = Math.max(horizon, learnedGroupHorizon(patterns, settings, this.clock, 1));
 			const gapCoverage = groupGapCoverage(patterns, horizon, settings, this.clock);
 			const replayProbability = backoffProbability(patterns, this.clock, settings.decayHalfLifeEvents);
-			const ppmEstimate = this.sequenceModel.estimate(sequenceContext, representative.pattern.targetTool);
+			const ppmEstimate = this.sequenceModel.estimate(
+				sequenceContext,
+				representative.pattern.targetTool,
+				this.clock,
+				settings.decayHalfLifeEvents,
+			);
 			const totalWeight = ordered.reduce(
 				(total, item) =>
 					total +
@@ -895,7 +900,12 @@ export class PatternAwareStore {
 			const conditionalProbability = clampProbability(mass / Math.max(mass, massByTool.get(item.action.tool) ?? 0));
 			const empiricalProbability = clampProbability(continuation.pathProbability * conditionalProbability);
 			const expectedDurationMs = item.totalDurationMs / Math.max(1, item.count);
-			const ppmEstimate = this.sequenceModel.estimate(sequenceContext, item.action.tool);
+			const ppmEstimate = this.sequenceModel.estimate(
+				sequenceContext,
+				item.action.tool,
+				this.clock,
+				settings.decayHalfLifeEvents,
+			);
 			const expectedLatencyBenefitMs =
 				empiricalProbability * (ppmEstimate?.probability ?? 1) * Math.max(1, expectedDurationMs);
 			return {

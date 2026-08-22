@@ -37,11 +37,25 @@ describe("PpmCountTrie", () => {
 		expect(estimate?.escapeMass).toBeLessThanOrEqual(1);
 	});
 
-	it("returns no estimate for a target absent from every backoff order", () => {
-		const model = new PpmCountTrie(2);
-		model.observe(["grep"], "read");
-
-		expect(model.estimate(["grep"], "bash")).toBeUndefined();
+	it("forgets stale target majorities while preserving disabled and stationary ordering", () => {
+		const model = new PpmCountTrie(1);
+		for (const context of [[], ["shift"]] as const) {
+			model.setCount(context, "read", 10, 10);
+			model.setCount(context, "find", 4, 28);
+		}
+		const rawRead = model.probability(["shift"], "read")!;
+		const rawFind = model.probability(["shift"], "find")!;
+		expect(rawRead).toBeGreaterThan(rawFind);
+		expect(model.probability(["shift"], "read", 30, 0)).toBe(rawRead);
+		expect(model.probability(["shift"], "find", 30, 8)).toBeGreaterThan(
+			model.probability(["shift"], "read", 30, 8) ?? 1,
+		);
+		model.setCount(["stationary"], "read", 8, 30);
+		model.setCount(["stationary"], "find", 4, 30);
+		expect(model.probability(["stationary"], "read", 34, 8)).toBeGreaterThan(
+			model.probability(["stationary"], "find", 34, 8) ?? 1,
+		);
+		expect(model.estimate(["shift"], "bash", 30, 8)).toBeUndefined();
 	});
 
 	it("keeps probabilities finite under large and fractional restored counts", () => {

@@ -85,7 +85,7 @@ export class PpmCountTrie {
 		if (wasEmpty && current.total > 0) this.populatedContexts++;
 	}
 
-	estimate(history: readonly string[], target: string): PpmProbabilityEstimate | undefined {
+	estimate(history: readonly string[], target: string, sequence = 0, halfLife = 0): PpmProbabilityEstimate | undefined {
 		if (!target || this.root.total <= 0) return undefined;
 		const suffixNodes: Array<{ readonly node: CountNode; readonly order: number }> = [{ node: this.root, order: 0 }];
 		let current = this.root;
@@ -104,10 +104,14 @@ export class PpmCountTrie {
 		let matchedOrder = -1;
 		let evidence = 0;
 		for (const item of suffixNodes.reverse()) {
-			const distinct = item.node.targets.size;
-			if (item.node.total <= 0 || distinct <= 0) continue;
-			const denominator = item.node.total + distinct;
-			const count = item.node.targets.get(target)?.count ?? 0;
+			const weighted = [...item.node.targets.values()].map((value) =>
+				decayedCount(value, sequence, halfLife),
+			);
+			const total = weighted.reduce((sum, count) => sum + count, 0);
+			const distinct = weighted.filter((count) => count > 0).length;
+			if (total <= 0 || distinct <= 0) continue;
+			const denominator = total + distinct;
+			const count = decayedCount(item.node.targets.get(target), sequence, halfLife);
 			if (count > 0) {
 				probability += remaining * (count / denominator);
 				if (item.order > matchedOrder) {
@@ -126,8 +130,8 @@ export class PpmCountTrie {
 		};
 	}
 
-	probability(history: readonly string[], target: string): number | undefined {
-		return this.estimate(history, target)?.probability;
+	probability(history: readonly string[], target: string, sequence = 0, halfLife = 0): number | undefined {
+		return this.estimate(history, target, sequence, halfLife)?.probability;
 	}
 
 	snapshot(maxContexts = Number.POSITIVE_INFINITY): readonly PpmCountTrieRow[] {
@@ -228,6 +232,12 @@ function safeTotal(value: number): number {
 
 function clampProbability(value: number): number {
 	return Math.max(0, Math.min(1, Number.isFinite(value) ? value : 0));
+}
+
+function decayedCount(value: TargetCount | undefined, sequence: number, halfLife: number): number {
+	if (!value) return 0;
+	if (!Number.isFinite(sequence) || !Number.isFinite(halfLife) || halfLife <= 0) return value.count;
+	return value.count * 2 ** (-Math.max(0, sequence - value.lastSeen) / halfLife);
 }
 
 function validContext(value: unknown): value is readonly string[] {
