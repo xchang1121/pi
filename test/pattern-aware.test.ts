@@ -307,11 +307,8 @@ describe("PatternAware", () => {
 		store.settled("attributed", unmatchedSettlement());
 		store.settled("attributed", rejectedSettlement("freshness", "resource_changed"));
 		const afterFreshnessRejection = store.predict("probe").find((item) => item.patternID === "attributed")!;
-		const diagnostic = JSON.parse(afterFreshnessRejection.diagnostic);
 		expect(afterFreshnessRejection.adoptionProbability).toBe(0);
-		expect(afterFreshnessRejection.expectedLatencyBenefitMs / afterFreshnessRejection.expectedDurationMs).toBeCloseTo(
-			afterFreshnessRejection.empiricalProbability * (diagnostic.ppmProbability ?? 1) * diagnostic.mapperConfidence,
-		);
+		expect(afterFreshnessRejection.expectedLatencyBenefitMs).toBe(0);
 		store.settled("attributed", adoptedSettlement());
 
 		const pattern = store.snapshot().find((item) => item.id === "attributed");
