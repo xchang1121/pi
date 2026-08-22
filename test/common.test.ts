@@ -44,22 +44,26 @@ describe("speculative action common", () => {
 		const baseline = normalizeDrafterRequestSettings(undefined);
 		expect([0, 1, 2].map((index) => drafterRequestTemperature(index, 3, baseline))).toEqual([0, 0.7, 0.7]);
 		const diverse = normalizeDrafterRequestSettings({
+			drafterMaxDepth: 3,
 			drafterDeterministicCandidates: 1,
 			drafterTemperatureMin: 0.4,
 			drafterTemperatureMax: 1.6,
 		});
+		expect(diverse.drafterMaxDepth).toBe(3);
 		expect(drafterRequestTemperature(0, 1, diverse)).toBe(0);
 		expect([0, 1, 2].map((index) => drafterRequestTemperature(index, 3, diverse))).toEqual([0, 0.4, 1.6]);
 		expect(drafterRequestTemperature(1, 2, diverse)).toBe(1);
 		expect(drafterRequestTemperature(100, 101, diverse)).toBeCloseTo(1.6);
 		expect(
 			normalizeDrafterRequestSettings({
+				drafterMaxDepth: -1,
 				drafterMaxTokens: 0,
 				drafterDeterministicCandidates: -1,
 				drafterTemperatureMin: 2,
 				drafterTemperatureMax: 0.5,
 			}),
 		).toEqual({
+			drafterMaxDepth: DEFAULTS.drafterMaxDepth,
 			drafterMaxTokens: DEFAULTS.drafterMaxTokens,
 			drafterDeterministicCandidates: DEFAULTS.drafterDeterministicCandidates,
 			drafterTemperatureMin: 0.5,

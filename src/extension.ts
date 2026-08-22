@@ -67,6 +67,7 @@ type BaseToolDefinition =
 export interface EffectiveSpeculativeActionSettings {
 	readonly enabled: boolean;
 	readonly drafterEnabled: boolean;
+	readonly drafterMaxDepth: number;
 	readonly drafterMaxTokens: number;
 	readonly drafterDeterministicCandidates: number;
 	readonly drafterTemperatureMin: number;
@@ -160,7 +161,7 @@ export function formatSpeculativeActionStatus(input: {
 		`Drafter: ${settings.drafterEnabled ? "On" : "Off"}`,
 		`Draft model: ${settings.draftModel ?? "active model"}`,
 		`Drafter requests: ${settings.candidateLimit}`,
-		`Drafter request policy: ${settings.drafterMaxTokens} tokens; ${settings.drafterDeterministicCandidates} deterministic; temperature ${formatNumber(settings.drafterTemperatureMin)}-${formatNumber(settings.drafterTemperatureMax)}`,
+		`Drafter request policy: rollout depth ${settings.drafterMaxDepth}; ${settings.drafterMaxTokens} tokens; ${settings.drafterDeterministicCandidates} deterministic; temperature ${formatNumber(settings.drafterTemperatureMin)}-${formatNumber(settings.drafterTemperatureMax)}`,
 		`Concurrent actions: ${settings.maxConcurrentActions}`,
 		`Resource cache: ${settings.resourceCacheMaxEntries}`,
 		`Resource cache memory: ${formatBytes(settings.resourceCacheMaxBytes)}`,
@@ -753,7 +754,7 @@ async function openPredictionSources(ctx: ExtensionContext, controller: Speculat
 	while (true) {
 		const settings = controller.settings();
 		const choice = await ctx.ui.select("Prediction sources", [
-			`Drafter › ${settings.drafterEnabled ? "On" : "Off"}, ${settings.draftModel ?? activeModelReference(ctx)}`,
+			`Drafter › ${settings.drafterEnabled ? "On" : "Off"}, ${settings.draftModel ?? activeModelReference(ctx)}, rollout ${settings.drafterMaxDepth}`,
 			`PatternAware › ${settings.patternAware.enabled ? "On" : "Off"}, ${settings.patternAware.multiStepEnabled ? "multi-step" : "single-step"}`,
 			BACK,
 		]);
@@ -769,6 +770,7 @@ async function openDrafterSettings(ctx: ExtensionContext, controller: Speculativ
 		const choice = await ctx.ui.select("Drafter", [
 			`Enabled: ${settings.drafterEnabled ? "On" : "Off"}`,
 			`Model › ${settings.draftModel ?? activeModelReference(ctx)}`,
+			`Rollout depth: ${settings.drafterMaxDepth}`,
 			`Output tokens: ${settings.drafterMaxTokens}`,
 			`Deterministic requests: ${settings.drafterDeterministicCandidates}`,
 			`Temperature range: ${formatNumber(settings.drafterTemperatureMin)}-${formatNumber(settings.drafterTemperatureMax)}`,
@@ -779,11 +781,20 @@ async function openDrafterSettings(ctx: ExtensionContext, controller: Speculativ
 		if (choice.startsWith("Enabled:"))
 			controller.setSettings({ ...settings, drafterEnabled: !settings.drafterEnabled });
 		if (choice.startsWith("Model")) await editDraftModel(ctx, controller, settings);
+		if (choice.startsWith("Rollout depth:")) {
+			await editDrafterNonNegativeInteger(ctx, controller, settings, "drafterMaxDepth", "Drafter rollout depth");
+		}
 		if (choice.startsWith("Output tokens:")) {
 			await editPositiveInteger(ctx, controller, settings, "drafterMaxTokens", "Drafter output tokens");
 		}
 		if (choice.startsWith("Deterministic requests:")) {
-			await editDrafterDeterministicCandidates(ctx, controller, settings);
+			await editDrafterNonNegativeInteger(
+				ctx,
+				controller,
+				settings,
+				"drafterDeterministicCandidates",
+				"Deterministic Drafter requests",
+			);
 		}
 		if (choice.startsWith("Temperature range:")) {
 			await editDrafterTemperatureRange(ctx, controller, settings);
@@ -997,20 +1008,21 @@ async function editPositiveInteger(
 	});
 }
 
-async function editDrafterDeterministicCandidates(
+async function editDrafterNonNegativeInteger(
 	ctx: ExtensionContext,
 	controller: SpeculativeActionController,
 	settings: EffectiveSpeculativeActionSettings,
+	field: "drafterMaxDepth" | "drafterDeterministicCandidates",
+	title: string,
 ): Promise<void> {
-	const title = "Deterministic Drafter requests";
-	const value = await ctx.ui.input(title, String(settings.drafterDeterministicCandidates));
+	const value = await ctx.ui.input(title, String(settings[field]));
 	if (value === undefined) return;
 	const parsed = Number(value.trim());
 	if (!Number.isInteger(parsed) || parsed < 0) {
 		ctx.ui.notify(`${title} must be a non-negative integer.`, "warning");
 		return;
 	}
-	controller.setSettings({ ...settings, drafterDeterministicCandidates: parsed });
+	controller.setSettings({ ...settings, [field]: parsed });
 }
 
 async function editDrafterTemperatureRange(

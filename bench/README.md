@@ -25,6 +25,10 @@ ended before the Agent completed otherwise plausible patches. A result with
 `turnLimitReached=true` is incomplete and cannot support an algorithm-retention
 decision.
 
+Use `--drafter-max-depth N` to ablate output-informed Drafter successors. The
+default is `1`; `0` preserves single-step behavior. Continuations replace the
+same source's request for the next decision instead of increasing request width.
+
 PowerShell:
 
 ```powershell

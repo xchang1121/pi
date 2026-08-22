@@ -20,6 +20,7 @@ export interface DrafterToolDefinition {
 }
 
 export interface DrafterRequestSettings {
+	readonly drafterMaxDepth: number;
 	readonly drafterMaxTokens: number;
 	readonly drafterDeterministicCandidates: number;
 	readonly drafterTemperatureMin: number;
@@ -27,6 +28,7 @@ export interface DrafterRequestSettings {
 }
 
 const DRAFTER_DEFAULTS: DrafterRequestSettings = {
+	drafterMaxDepth: 1,
 	drafterMaxTokens: 128,
 	drafterDeterministicCandidates: 1,
 	drafterTemperatureMin: 0.7,
@@ -86,6 +88,7 @@ export function normalizeDrafterRequestSettings(value: unknown): DrafterRequestS
 	const lower = nonNegativeNumber(input.drafterTemperatureMin, DEFAULTS.drafterTemperatureMin);
 	const upper = nonNegativeNumber(input.drafterTemperatureMax, DEFAULTS.drafterTemperatureMax);
 	return {
+		drafterMaxDepth: nonNegativeInteger(input.drafterMaxDepth, DEFAULTS.drafterMaxDepth),
 		drafterMaxTokens: positiveInteger(input.drafterMaxTokens, DEFAULTS.drafterMaxTokens),
 		drafterDeterministicCandidates: nonNegativeInteger(
 			input.drafterDeterministicCandidates,

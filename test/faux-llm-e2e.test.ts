@@ -64,6 +64,45 @@ describe("faux LLM speculative action end to end", () => {
 		expect(result.executions.read).toBe(1);
 	});
 
+	it("moves an output-informed Drafter request ahead without increasing request count", async () => {
+		const cwd = await workspace();
+		await writeFile(path.join(cwd, "target.txt"), "target", "utf8");
+		const prompt = "Read notes.txt, then use its result before reading target.txt.";
+		const draftResponse: FauxResponseStep = (context) => {
+			const results = context.messages.filter((message) => message.role === "toolResult").length;
+			return results < 2
+				? fauxAssistantMessage(fauxToolCall("read", { path: results === 0 ? "notes.txt" : "target.txt" }), {
+						stopReason: "toolUse",
+					})
+				: fauxAssistantMessage("no tool");
+		};
+		const run = (sessionID: string, drafterMaxDepth: number) =>
+			runAgent({
+				cwd,
+				sessionID,
+				prompt,
+				tools: [delayedRead(cwd, (file) => (file === "notes.txt" ? 60 : 180))],
+				actorTurns: [
+					turn(fauxToolCall("read", { path: "notes.txt" }), 300),
+					turn(fauxToolCall("read", { path: "target.txt" })),
+					turn("done"),
+				],
+				actorTokensPerSecond: 4_000,
+				draftTurns: [],
+				draftResponses: Array.from({ length: 4 }, () => draftResponse),
+				settings: { ...drafterSettings(), drafterMaxDepth },
+			});
+		const baseline = await run("rollout-baseline", 0);
+		const treatment = await run("rollout-treatment", 1);
+
+		expect(treatment.summary.sourceRequests).toBe(baseline.summary.sourceRequests);
+		expect(treatment.summary).toMatchObject({ actorActions: 2, speculativeHits: 2, actorFallbacks: 0 });
+		expect(treatment.executions.read).toBe(2);
+		expect(baseline.toolLatencyMs[1]).toBeGreaterThan(140);
+		expect(treatment.toolLatencyMs[1]).toBeLessThan(40);
+		expect(baseline.summary.endToEndMs - treatment.summary.endToEndMs).toBeGreaterThan(100);
+	});
+
 	it("masks completed tool latency across fragmented Actor and Drafter streams", async () => {
 		const cwd = await workspace();
 		const tool = delayedRead(cwd, 120);

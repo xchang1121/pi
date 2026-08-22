@@ -1,7 +1,14 @@
 import { createHash } from "node:crypto";
 import path from "node:path";
 import type { AgentTool, AgentToolCall, AgentToolResult } from "@earendil-works/pi-agent-core";
-import type { Api, AssistantMessage, Context, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
+import type {
+	Api,
+	AssistantMessage,
+	Context,
+	Model,
+	SimpleStreamOptions,
+	ToolResultMessage,
+} from "@earendil-works/pi-ai";
 import { validateToolArguments } from "@earendil-works/pi-ai";
 import type { ActionProjectionRule } from "./action-key-projection.ts";
 import { type ActionKey, type ActionSemanticsRegistry, PI_ACTION_SEMANTICS } from "./action-semantics.ts";
@@ -46,6 +53,8 @@ import type { ToolInvocation, ToolSettlement } from "./tool-settlement.ts";
 export interface SpeculativeAgentSettingsInput {
 	readonly enabled?: boolean;
 	readonly drafterEnabled?: boolean;
+	/** Output-informed successor actions retained after the first Drafter action. */
+	readonly drafterMaxDepth?: number;
 	/** Recommended maximum output budget for each one-action Drafter request. */
 	readonly drafterMaxTokens?: number;
 	/** Number of leading Drafter requests sent at temperature zero. */
@@ -306,12 +315,55 @@ export function createSpeculativeActionHost(
 		AgentConsumeInput,
 		AgentStateData
 	>;
-	const drafterPlanAction = (id: string, call: AgentToolCall): PlanAction => ({
+	type DrafterPlanFeedback = {
+		readonly kind: "drafter_plan";
+		readonly model: Model<Api>;
+		readonly context: Context;
+		readonly options: SimpleStreamOptions;
+		readonly message: AssistantMessage;
+		readonly depth: number;
+	};
+	const asDrafterPlanFeedback = (value: unknown): DrafterPlanFeedback | undefined =>
+		value && typeof value === "object" && (value as { kind?: unknown }).kind === "drafter_plan"
+			? (value as DrafterPlanFeedback)
+			: undefined;
+	const drafterPlanAction = (
+		id: string,
+		call: AgentToolCall,
+		feedback: DrafterPlanFeedback,
+		dependsOn?: PlanAction["dependsOn"],
+	): PlanAction => ({
 		id,
 		type: "tool_call",
 		tool: call.name,
 		input: call.arguments,
 		diagnostic: JSON.stringify({ toolCallID: call.id, tool: call.name, input: call.arguments }, null, 2),
+		depth: feedback.depth,
+		feedback,
+		...(dependsOn?.length ? { dependsOn } : {}),
+	});
+	const drafterFeedback = (
+		model: Model<Api>,
+		context: Context,
+		requestOptions: SimpleStreamOptions,
+		message: AssistantMessage,
+		call: AgentToolCall,
+		depth: number,
+	): DrafterPlanFeedback => ({
+		kind: "drafter_plan",
+		model,
+		context,
+		options: requestOptions,
+		message: { ...message, content: message.content.filter((item) => item.type !== "toolCall" || item === call) },
+		depth,
+	});
+	const drafterToolResult = (call: AgentToolCall, output: ToolSettlement): ToolResultMessage => ({
+		...output.result,
+		role: "toolResult",
+		toolCallId: call.id,
+		toolName: call.name,
+		isError: output.isError,
+		timestamp: Date.now(),
 	});
 	type PatternPlanFeedback = PatternAwareRuntimeContext & { readonly patternIDs: ReadonlyArray<string> };
 	const asPatternPlanFeedback = (value: unknown): PatternPlanFeedback | undefined => {
@@ -349,6 +401,14 @@ export function createSpeculativeActionHost(
 		enabled: (settings) => settings.drafterEnabled ?? DEFAULTS.drafterEnabled,
 		timeoutMs: (settings) => settings.predictionTimeoutMs,
 		requestLifetime: "actor_decision",
+		multiStepEnabled: (settings, feedback) => {
+			const maxDepth = sourceDrafterSettings(settings).drafterMaxDepth;
+			if (maxDepth === 0) return false;
+			if (feedback === undefined) return true;
+			const previous = asDrafterPlanFeedback(feedback);
+			return previous !== undefined && previous.depth < maxDepth;
+		},
+		continueOn: ["execution_succeeded"],
 		proposalCount: (settings) => clampCandidateLimit(settings.candidateLimit ?? DEFAULTS.candidateLimit),
 		propose: async ({
 			startInput: input,
@@ -409,11 +469,40 @@ export function createSpeculativeActionHost(
 			}
 			const call = message.content.find((item): item is AgentToolCall => item.type === "toolCall");
 			if (!call) return undefined;
+			const feedback = drafterFeedback(prepared.model, prepared.context, draftOptions, message, call, 0);
 			return {
 				id: proposalID,
 				source: "drafter",
 				revision: 0,
-				actions: [drafterPlanAction(`${proposalIndex}:${call.id}`, call)],
+				actions: [drafterPlanAction(`${proposalIndex}:${call.id}`, call, feedback)],
+				draftTokens: usageTokenCount(message.usage),
+			};
+		},
+		continue: async ({ proposalID, actionID, revision, feedback, output, signal }) => {
+			const previous = asDrafterPlanFeedback(feedback);
+			if (!previous || signal.aborted) return undefined;
+			const previousCall = previous.message.content.find((item): item is AgentToolCall => item.type === "toolCall");
+			if (!previousCall) return undefined;
+			const context: Context = {
+				...previous.context,
+				messages: [...previous.context.messages, previous.message, drafterToolResult(previousCall, output)],
+			};
+			const message = await options.complete(previous.model, context, { ...previous.options, signal });
+			if (message.stopReason === "error" || message.stopReason === "aborted") {
+				throw new Error(message.errorMessage ?? `Drafter stopped with ${message.stopReason}`);
+			}
+			const call = message.content.find((item): item is AgentToolCall => item.type === "toolCall");
+			if (!call) return undefined;
+			const next = drafterFeedback(previous.model, context, previous.options, message, call, previous.depth + 1);
+			return {
+				proposalID,
+				source: "drafter",
+				revision,
+				upsert: [
+					drafterPlanAction(`${actionID}/rollout:${next.depth}:${call.id}`, call, next, [
+						{ actionID, condition: "execution_succeeded" },
+					]),
+				],
 				draftTokens: usageTokenCount(message.usage),
 			};
 		},

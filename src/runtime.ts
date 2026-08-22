@@ -92,7 +92,7 @@ export interface SpeculativePlanSource<
 	readonly timeoutMs?: (settings: SpeculativeActionSettings) => number | undefined;
 	/** Stop requests that can only predict the next Actor decision once that decision arrives. */
 	readonly requestLifetime?: "actor_decision" | "turn";
-	readonly multiStepEnabled?: (settings: SpeculativeActionSettings) => boolean;
+	readonly multiStepEnabled?: (settings: SpeculativeActionSettings, feedback?: unknown) => boolean;
 	readonly proposalCount?: (settings: SpeculativeActionSettings) => number;
 	readonly propose: (input: {
 		readonly startInput: StartInput;

@@ -67,6 +67,7 @@ interface BenchmarkOptions {
 	readonly actorMaxTokens: number;
 	readonly actorTemperature: number;
 	readonly drafter: Model<Api>;
+	readonly drafterMaxDepth: number;
 	readonly candidateLimit: number;
 	readonly drafterMaxTokens: number;
 	readonly drafterDeterministicCandidates: number;
@@ -98,6 +99,7 @@ const { values } = parseArgs({
 		"actor-max-tokens": { type: "string", default: "8192" },
 		"actor-temperature": { type: "string", default: "0" },
 		drafter: { type: "string", default: "deepseek/deepseek-v4-flash" },
+		"drafter-max-depth": { type: "string", default: String(DEFAULTS.drafterMaxDepth) },
 		"candidate-limit": { type: "string", default: String(DEFAULTS.candidateLimit) },
 		"drafter-max-tokens": { type: "string", default: String(DEFAULTS.drafterMaxTokens) },
 		"drafter-deterministic-candidates": {
@@ -132,6 +134,7 @@ const options: BenchmarkOptions = {
 	actorMaxTokens: positiveInteger(values["actor-max-tokens"], "--actor-max-tokens"),
 	actorTemperature: nonNegativeNumber(values["actor-temperature"], "--actor-temperature"),
 	drafter: model(values.drafter ?? "deepseek/deepseek-v4-flash"),
+	drafterMaxDepth: nonNegativeInteger(values["drafter-max-depth"], "--drafter-max-depth"),
 	candidateLimit: positiveInteger(values["candidate-limit"], "--candidate-limit"),
 	drafterMaxTokens: positiveInteger(values["drafter-max-tokens"], "--drafter-max-tokens"),
 	drafterDeterministicCandidates: nonNegativeInteger(
@@ -240,6 +243,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 	const settings: SpeculativeAgentSettingsInput = {
 		enabled: true,
 		drafterEnabled: input.drafterEnabled,
+		drafterMaxDepth: input.drafterMaxDepth,
 		drafterMaxTokens: input.drafterMaxTokens,
 		drafterDeterministicCandidates: input.drafterDeterministicCandidates,
 		drafterTemperatureMin: input.drafterTemperatureMin,

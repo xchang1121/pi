@@ -593,6 +593,7 @@ describe("speculative action host", () => {
 			cwd,
 			getSettings: () => ({
 				...settings(11),
+				drafterMaxDepth: 0,
 				drafterMaxTokens: 96,
 				drafterDeterministicCandidates: 2,
 				drafterTemperatureMin: 0.4,

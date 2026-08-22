@@ -65,6 +65,7 @@ Example:
   "draftModel": "deepseek/deepseek-chat",
   "candidateLimit": 8,
   "maxConcurrentActions": 8,
+  "drafterMaxDepth": 1,
   "drafterMaxTokens": 128,
   "tools": ["read", "grep", "find", "ls", "bash", "write", "edit"],
   "patternAware": {
@@ -73,6 +74,8 @@ Example:
   }
 }
 ```
+
+`drafterMaxDepth` is the number of output-informed successor requests allowed after each initial one-action Drafter request. A successor occupies that source's existing slot for the next Actor decision rather than increasing per-decision request width; set it to `0` for single-step Drafter behavior.
 
 The former `resourceCached` / `sandbox` / `predictionOnly` object is accepted only as a migration input and is normalized to the single `tools` list.
 
