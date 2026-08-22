@@ -1408,13 +1408,17 @@ export function makeStructuralSpeculativeActionRuntime<
 				concurrentLimit(session.settings),
 			);
 			if (!admission.admitted && !candidate.background) {
-				const causallyReady = nodesForCandidate(session, candidate.id).some((node) => node.action.dependsOn?.length);
+				const causallyReady = nodesForCandidate(session, candidate.id).some(
+					(node) => node.action.dependsOn?.length,
+				);
 				for (const victim of session.scheduler.preemptFor(
 					admission.work.resource,
 					concurrentLimit(session.settings),
 					(victim) =>
 						reservationAvailable(victim.work.reservation) &&
 						(victim.background ||
+							(candidate.expectedDecisionSeq <= victim.expectedDecisionSeq &&
+								candidate.priorityMs > victim.priorityMs) ||
 							(causallyReady && victim.expectedDecisionSeq > candidate.expectedDecisionSeq)),
 				)) {
 					cancelCandidate(session, victim, cause("admission", "scheduler_preempted"), false);

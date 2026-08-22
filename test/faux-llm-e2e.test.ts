@@ -89,6 +89,86 @@ describe("faux LLM speculative action end to end", () => {
 		expect(result.summary.attemptLeadMs).toBeGreaterThan(result.summary.executionAheadMs);
 	});
 
+	it("replaces an early low-utility pattern with a late high-utility draft for the same decision", async () => {
+		const cwd = await workspace();
+		await Promise.all([
+			writeFile(path.join(cwd, "wrong.txt"), "wrong", "utf8"),
+			writeFile(path.join(cwd, "target.txt"), "target", "utf8"),
+		]);
+		const patternSettings: PatternAwareSettings = {
+			...PATTERN_AWARE_DEFAULTS,
+			beamWidth: 1,
+			maxContextLength: 1,
+			maxFutureGap: 0,
+			minOccurrences: 2,
+		};
+		const store = new PatternAwareStore(patternSettings, undefined, {
+			namespace: "pi-action-semantics-v1",
+			actionKey: (tool, input, schemaHash) => PI_ACTION_SEMANTICS.buildKey(tool, input, cwd, schemaHash),
+			projectors: [],
+		});
+		for (const sessionID of ["training-one", "training-two"]) {
+			store.observe({
+				sessionID,
+				turnID: `${sessionID}:grep`,
+				tool: "grep",
+				input: { pattern: "target" },
+				outputPaths: ["wrong.txt"],
+				outcome: "success",
+				durationMs: 1,
+			});
+			store.observe({
+				sessionID,
+				turnID: `${sessionID}:read`,
+				tool: "read",
+				input: { path: "wrong.txt" },
+				outcome: "success",
+				durationMs: 1,
+			});
+			store.finishSession(sessionID);
+		}
+		store.observe({
+			sessionID: "utility-replacement",
+			turnID: "probe:grep",
+			tool: "grep",
+			input: { pattern: "target" },
+			outputPaths: ["wrong.txt"],
+			outcome: "success",
+			durationMs: 1,
+		});
+
+		const result = await runAgent({
+			cwd,
+			sessionID: "utility-replacement",
+			tools: [delayedRead(cwd, 250)],
+			actorTurns: [turn(fauxToolCall("read", { path: "target.txt" }), 300), turn("done")],
+			actorTokensPerSecond: 4_000,
+			draftTurns: [turn(fauxToolCall("read", { path: "target.txt" }), 20), turn("no tool")],
+			draftTokensPerSecond: 4_000,
+			settings: {
+				...patternAwareSettings(patternSettings),
+				drafterEnabled: true,
+				candidateLimit: 1,
+				maxConcurrentActions: 1,
+				tools: ["read"],
+			},
+			patternStore: store,
+		});
+
+		expect(result.summary).toMatchObject({ actorActions: 1, speculativeHits: 1, actorFallbacks: 0 });
+		expect(result.summary.executionAheadMs).toBeGreaterThanOrEqual(200);
+		expect(result.summary.hitLatencyMs).toBeLessThan(40);
+		expect(result.executions.read).toBe(2);
+		expect(
+			result.events.some(
+				(event) =>
+					event.type === "candidate" &&
+					event.state.status === "cancelled" &&
+					event.state.cause.code === "scheduler_preempted",
+			),
+		).toBe(true);
+	});
+
 	it("matches Bash across fragmented model streams but executes only through the Actor", async () => {
 		const cwd = await workspace();
 		const result = await runAgent({
