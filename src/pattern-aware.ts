@@ -2683,7 +2683,7 @@ function patternAdoptionProbability(patterns: ReadonlyArray<MutablePattern>, clo
 		adopted += evidence.adopted;
 		rejected += evidence.rejected;
 	}
-	return adopted + rejected === 0 ? 1 : clampProbability(adopted / (adopted + rejected));
+	return clampProbability((1 + adopted) / (1 + adopted + rejected));
 }
 
 function recencyWeight(lastSeen: number, clock: number, halfLife: number) {

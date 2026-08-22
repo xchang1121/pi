@@ -296,7 +296,7 @@ describe("PatternAware", () => {
 	});
 
 	test("derives orthogonal feedback only from authoritative prediction settlements", () => {
-		const store = new PatternAwareStore(settings({ minOccurrences: 2 }));
+		const store = new PatternAwareStore(settings({ minOccurrences: 2, decayHalfLifeEvents: 1 }));
 		expect(store.registerValidatedPattern(validatedGapPattern({ "0": 10 }, { id: "attributed" }))).toBe(true);
 		store.observe(input({ sessionID: "probe", tool: "grep", input: { pattern: "TODO" } }));
 		const beforeUnobserved = store.predict("probe").find((item) => item.patternID === "attributed");
@@ -307,22 +307,36 @@ describe("PatternAware", () => {
 		store.settled("attributed", unmatchedSettlement());
 		store.settled("attributed", rejectedSettlement("freshness", "resource_changed"));
 		const afterFreshnessRejection = store.predict("probe").find((item) => item.patternID === "attributed")!;
-		expect(afterFreshnessRejection.adoptionProbability).toBe(0);
-		expect(afterFreshnessRejection.expectedLatencyBenefitMs).toBe(0);
+		const diagnostic = JSON.parse(afterFreshnessRejection.diagnostic);
+		expect(afterFreshnessRejection.adoptionProbability).toBeCloseTo(0.5);
+		expect(afterFreshnessRejection.expectedLatencyBenefitMs / afterFreshnessRejection.expectedDurationMs).toBeCloseTo(
+			afterFreshnessRejection.empiricalProbability *
+				afterFreshnessRejection.adoptionProbability *
+				(diagnostic.ppmProbability ?? 1) *
+				diagnostic.mapperConfidence,
+		);
+		store.settled("attributed", rejectedSettlement("freshness", "resource_changed"));
+		const afterRepeatedRejection = store.predict("probe").find((item) => item.patternID === "attributed")!;
+		expect(afterRepeatedRejection.adoptionProbability).toBeCloseTo(1 / 3);
 		store.settled("attributed", adoptedSettlement());
 
 		const pattern = store.snapshot().find((item) => item.id === "attributed");
+		expect(pattern?.adoptionProbability).toBeCloseTo(0.5);
 		expect(pattern).toMatchObject({
-			adoptionProbability: 0.5,
 			feedback: {
 				issued: 4,
-				observed: 3,
-				matched: 2,
+				observed: 4,
+				matched: 3,
 				adopted: 1,
-				rejectedAfterMatch: { freshness: 1 },
+				rejectedAfterMatch: { freshness: 2 },
 				unobserved: { "source:timeout": 1 },
 			},
 		});
+		for (let index = 0; index < 4; index++)
+			store.observe(input({ sessionID: `decay-${index}`, tool: "lsp", input: { operation: "symbols" } }));
+		expect(store.predict("probe").find((item) => item.patternID === "attributed")!.adoptionProbability).toBeGreaterThan(
+			pattern!.adoptionProbability,
+		);
 		const afterObservedMiss = store.predict("probe").find((item) => item.patternID === "attributed");
 		expect(afterObservedMiss!.empiricalProbability).toBeLessThan(beforeUnobserved!.empiricalProbability);
 	});
