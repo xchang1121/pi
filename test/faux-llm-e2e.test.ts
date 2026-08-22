@@ -31,6 +31,39 @@ afterEach(async () => {
 });
 
 describe("faux LLM speculative action end to end", () => {
+	it("gives the first Drafter request the current user message", async () => {
+		const cwd = await workspace();
+		await writeFile(path.join(cwd, "target.txt"), "target", "utf8");
+		const prompt = "Inspect target.txt before answering.";
+		const result = await runAgent({
+			cwd,
+			sessionID: "current-user-context",
+			prompt,
+			tools: [delayedRead(cwd, 80)],
+			actorTurns: [turn(fauxToolCall("read", { path: "target.txt" }), 120), turn("done")],
+			actorTokensPerSecond: 4_000,
+			draftTurns: [],
+			draftResponses: [
+				(context) =>
+					fauxAssistantMessage(
+						fauxToolCall("read", {
+							path: context.messages.some(
+								(message) => message.role === "user" && JSON.stringify(message.content).includes("target.txt"),
+							)
+								? "target.txt"
+								: "notes.txt",
+						}),
+						{ stopReason: "toolUse" },
+					),
+				fauxAssistantMessage("no tool"),
+			],
+			settings: drafterSettings(),
+		});
+
+		expect(result.summary).toMatchObject({ actorActions: 1, speculativeHits: 1, actorFallbacks: 0 });
+		expect(result.executions.read).toBe(1);
+	});
+
 	it("masks completed tool latency across fragmented Actor and Drafter streams", async () => {
 		const cwd = await workspace();
 		const tool = delayedRead(cwd, 120);
@@ -556,10 +589,12 @@ type ScriptedTurn = {
 type RunAgentInput = {
 	readonly cwd: string;
 	readonly sessionID: string;
+	readonly prompt?: string;
 	readonly tools: readonly AgentTool[];
 	readonly actorTurns: readonly ScriptedTurn[];
 	readonly actorTokensPerSecond: number;
 	readonly draftTurns: readonly ScriptedTurn[];
+	readonly draftResponses?: readonly FauxResponseStep[];
 	readonly draftTokensPerSecond?: number;
 	readonly settings: SpeculativeAgentSettingsInput;
 	readonly patternStore?: PatternAwareStore;
@@ -602,7 +637,7 @@ async function runAgent(input: RunAgentInput) {
 		tokenSize: { min: 1, max: 1 },
 	});
 	actor.setResponses(scriptedResponses(input.actorTurns));
-	drafter.setResponses(scriptedResponses(input.draftTurns));
+	drafter.setResponses(input.draftResponses ? [...input.draftResponses] : scriptedResponses(input.draftTurns));
 	const events: SpeculativeActionEvent<string>[] = [];
 	const executions: Record<string, number> = {};
 	const toolLatencyMs: number[] = [];
@@ -689,6 +724,11 @@ async function runAgent(input: RunAgentInput) {
 			tools: actorTools,
 		},
 	});
+	const prompt: AgentMessage = {
+		role: "user",
+		content: input.prompt ?? "Fix the reported issue by inspecting the relevant files.",
+		timestamp: Date.now(),
+	};
 	agent.subscribe(async (event, signal) => {
 		if (event.type === "message_update") streamEvents.push(event.assistantMessageEvent.type);
 		if (event.type === "turn_start") {
@@ -700,7 +740,9 @@ async function runAgent(input: RunAgentInput) {
 					actorModel: actor.getModel(),
 					context: {
 						systemPrompt: agent.state.systemPrompt,
-						messages: standardMessages(agent.state.messages),
+						messages: standardMessages(
+							turnSequence === 1 ? [...agent.state.messages, prompt] : agent.state.messages,
+						),
 						tools: measuredTools,
 					},
 					actorOptions: { signal },
@@ -718,7 +760,7 @@ async function runAgent(input: RunAgentInput) {
 	});
 
 	try {
-		await agent.prompt("Fix the reported issue by inspecting the relevant files.");
+		await agent.prompt(prompt);
 		if (input.settings.enabled !== false) {
 			await waitFor(
 				() => events.filter((event) => event.type === "actor_action").length === toolLatencyMs.length,

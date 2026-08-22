@@ -362,6 +362,11 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 			tools: actorTools,
 		},
 	});
+	const prompt: AgentMessage = {
+		role: "user",
+		content: `${task.row.problem_statement}\n\nWork in the checked-out repository and finish the implementation. Do not use network access to look up the answer.`,
+		timestamp: Date.now(),
+	};
 	agent.subscribe(async (event, signal) => {
 		if (event.type === "turn_start") {
 			currentTurnID = `turn-${++turnSequence}`;
@@ -372,7 +377,9 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 					actorModel: input.actor,
 					context: {
 						systemPrompt: agent.state.systemPrompt,
-						messages: standardMessages(agent.state.messages),
+						messages: standardMessages(
+							turnSequence === 1 ? [...agent.state.messages, prompt] : agent.state.messages,
+						),
 						tools,
 					},
 					actorOptions: { signal },
@@ -397,9 +404,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 		agent.abort();
 	}, input.timeoutMs);
 	try {
-		await agent.prompt(
-			`${task.row.problem_statement}\n\nWork in the checked-out repository and finish the implementation. Do not use network access to look up the answer.`,
-		);
+		await agent.prompt(prompt);
 	} finally {
 		taskCompletedAt = performance.now();
 		clearTimeout(timeout);
