@@ -188,6 +188,7 @@ export function createSpeculativeActionExtension(
 	return (pi) => {
 		let controller: SpeculativeActionController | undefined;
 		const wrapperSources = new Map<string, string>();
+		const streamedCalls = new Map<number, { arguments: string; previewed: boolean }>();
 
 		pi.on("session_start", async (_event, ctx) => {
 			await controller?.dispose();
@@ -195,17 +196,31 @@ export function createSpeculativeActionExtension(
 			controller.attachUI(ctx.ui);
 		});
 		pi.on("context", async (event, ctx) => {
+			streamedCalls.clear();
 			await controller?.startTurn(event.messages, ctx);
 		});
 		pi.on("message_update", (event, ctx) => {
 			const update = event.assistantMessageEvent;
-			if (update.type === "toolcall_end") {
-				controller?.previewActorCall(
-					update.toolCall.name,
-					update.toolCall.id,
-					update.toolCall.arguments,
-					ctx.signal,
-				);
+			if (update.type === "toolcall_delta") {
+				const call = update.partial.content[update.contentIndex];
+				if (call?.type !== "toolCall") return;
+				const state = streamedCalls.get(update.contentIndex) ?? { arguments: "", previewed: false };
+				state.arguments += update.delta;
+				streamedCalls.set(update.contentIndex, state);
+				const input = completeJsonObject(state.arguments);
+				if (input && !state.previewed && call.name && call.id && controller) {
+					state.previewed = true;
+					controller.previewActorCall(call.name, call.id, input, ctx.signal);
+				}
+			} else if (update.type === "toolcall_end") {
+				if (!streamedCalls.get(update.contentIndex)?.previewed)
+					controller?.previewActorCall(
+						update.toolCall.name,
+						update.toolCall.id,
+						update.toolCall.arguments,
+						ctx.signal,
+					);
+				streamedCalls.delete(update.contentIndex);
 			}
 		});
 		pi.on("turn_end", async () => {
@@ -228,6 +243,17 @@ export function createSpeculativeActionExtension(
 		};
 		pi.registerCommand("speculative-action", command);
 	};
+}
+
+function completeJsonObject(value: string): Record<string, unknown> | undefined {
+	try {
+		const parsed: unknown = JSON.parse(value);
+		return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
+			? (parsed as Record<string, unknown>)
+			: undefined;
+	} catch {
+		return undefined;
+	}
 }
 
 const speculativeActionExtension = createSpeculativeActionExtension();

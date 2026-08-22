@@ -82,21 +82,33 @@ describe("zero-modification Pi extension", () => {
 		expect(fixture.host.actual).not.toHaveBeenCalled();
 	});
 
-	it("forwards a completed streamed tool call as a provisional Actor preview", async () => {
+	it("previews complete streamed arguments before the tool call ends", async () => {
 		const fixture = await createFixture();
 		await fixture.emit("session_start", {}, fixture.context);
 		await fixture.emit("context", { messages: [] }, fixture.context);
+		const partial = {
+			content: [{ type: "toolCall", id: "actor-read", name: "read", arguments: {} }],
+		};
+		for (const delta of ['{"path":', '"notes.txt"}']) {
+			await fixture.emit(
+				"message_update",
+				{ assistantMessageEvent: { type: "toolcall_delta", contentIndex: 0, delta, partial } },
+				fixture.context,
+			);
+		}
+		await vi.waitFor(() => expect(fixture.host.previewActorCall).toHaveBeenCalledOnce());
 		await fixture.emit(
 			"message_update",
 			{
 				assistantMessageEvent: {
 					type: "toolcall_end",
+					contentIndex: 0,
 					toolCall: { type: "toolCall", id: "actor-read", name: "read", arguments: { path: "notes.txt" } },
+					partial,
 				},
 			},
 			fixture.context,
 		);
-		await vi.waitFor(() => expect(fixture.host.previewActorCall).toHaveBeenCalledOnce());
 		expect(fixture.host.previewActorCall).toHaveBeenCalledWith(
 			{
 				turnID: "turn_1",
