@@ -48,10 +48,10 @@ export class PpmCountTrie {
 		return this.populatedContexts;
 	}
 
-	observe(history: readonly string[], target: string, sequence = 0): void {
+	observe(history: readonly string[], target: string, sequence = 0, halfLife = 0): void {
 		if (!target) return;
 		const lastSeen = nonNegativeInteger(sequence);
-		this.increment(this.root, target, 1, lastSeen);
+		this.increment(this.root, target, 1, lastSeen, halfLife);
 		let current = this.root;
 		const suffix = history.slice(-this.order);
 		for (let index = suffix.length - 1; index >= 0; index--) {
@@ -60,7 +60,7 @@ export class PpmCountTrie {
 			const child = current.children.get(token) ?? node();
 			current.children.set(token, child);
 			current = child;
-			this.increment(current, target, 1, lastSeen);
+			this.increment(current, target, 1, lastSeen, halfLife);
 		}
 	}
 
@@ -201,8 +201,17 @@ export class PpmCountTrie {
 		this.restore(this.snapshot(limit));
 	}
 
-	private increment(current: CountNode, target: string, count: number, lastSeen: number): void {
+	private increment(current: CountNode, target: string, count: number, lastSeen: number, halfLife: number): void {
 		const wasEmpty = current.total === 0;
+		// Move every sufficient statistic to the new event time before adding evidence.
+		if (halfLife > 0 && lastSeen > current.lastSeen) {
+			current.total = 0;
+			for (const value of current.targets.values()) {
+				value.count = safeCount(decayedCount(value, lastSeen, halfLife));
+				value.lastSeen = lastSeen;
+				current.total = safeTotal(current.total + value.count);
+			}
+		}
 		const previous = current.targets.get(target);
 		const nextCount = safeCount((previous?.count ?? 0) + count);
 		current.targets.set(target, {

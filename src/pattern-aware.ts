@@ -478,6 +478,7 @@ export class PatternAwareStore {
 					prior.map((item) => signatureToken(signature(item))),
 					event.tool,
 					event.sequence,
+					this.settings.decayHalfLifeEvents,
 				);
 				this.learn(prior, event);
 				this.observeRecurrentAction(event);

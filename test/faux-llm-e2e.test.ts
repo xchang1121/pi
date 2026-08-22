@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -506,24 +507,7 @@ describe("faux LLM speculative action end to end", () => {
 			minOccurrences: 2,
 		};
 		const store = patternStore(cwd, patternSettings);
-		let readSchemaHash: string | undefined;
-		const observeBatch = store.observeBatch.bind(store);
-		const schemaProbe = vi.spyOn(store, "observeBatch").mockImplementation((events) => {
-			readSchemaHash ??= events.find((event) => event.tool === "read")?.schemaHash;
-			observeBatch(events);
-		});
-		await runAgent({
-			cwd,
-			sessionID: "schema-probe",
-			tools: [delayedRead(cwd, 1)],
-			actorTurns: [turn(fauxToolCall("read", { path: "notes.txt" })), turn("done")],
-			actorTokensPerSecond: 4_000,
-			draftTurns: [],
-			settings: patternAwareSettings(patternSettings),
-			patternStore: store,
-		});
-		schemaProbe.mockRestore();
-		if (!readSchemaHash) throw new Error("read schema was not observed");
+		const readSchemaHash = schemaHash(readSchema);
 		const sessionID = "configured-action-backoff";
 		for (const [index, [file, durationMs]] of (
 			[
@@ -567,6 +551,65 @@ describe("faux LLM speculative action end to end", () => {
 		expect(result.summary).toMatchObject({ actorActions: 1, speculativeHits: 1, actorFallbacks: 0 });
 		expect(result.summary.executionAheadMs).toBeGreaterThanOrEqual(100);
 		expect(result.toolLatencyMs.at(-1)).toBeLessThan(40);
+	});
+
+	it("prioritizes fresh recurrence evidence under a one-slot scheduler", async () => {
+		const cwd = await workspace();
+		await writeFile(path.join(cwd, "old.txt"), "old", "utf8");
+		const patternSettings: PatternAwareSettings = {
+			...PATTERN_AWARE_DEFAULTS,
+			beamWidth: 4,
+			decayHalfLifeEvents: 64,
+			maxContextLength: 1,
+			maxFutureGap: 0,
+		};
+		const store = patternStore(cwd, patternSettings);
+		const sessionID = "decayed-recurrence";
+		let turnID = 0;
+		const observe = (tool: "read" | "find", input: Record<string, unknown>) => {
+			store.observe({
+				sessionID,
+				turnID: `training-${turnID++}`,
+				tool,
+				input,
+				outcome: "success",
+				durationMs: 80,
+				schemaHash: schemaHash(tool === "read" ? readSchema : findSchema),
+			});
+		};
+		for (let index = 0; index < 32; index++) observe("read", { path: "old.txt" });
+		for (let index = 0; index < 256; index++) {
+			store.observeTurn({ sessionID, turnID: `gap-${index}`, phase: index % 2 ? "finish" : "start" });
+		}
+		observe("read", { path: "old.txt" });
+		for (let index = 0; index < 3; index++) observe("find", { pattern: "target" });
+		store.observe({
+			sessionID,
+			turnID: "context-marker",
+			tool: "write",
+			input: { path: "marker.txt", content: "marker" },
+			outcome: "success",
+			durationMs: 1,
+			learnTarget: false,
+		});
+
+		const result = await runAgent({
+			cwd,
+			sessionID,
+			tools: [delayedRead(cwd, 80), delayedStep("find", findSchema, 80)],
+			actorTurns: [turn(fauxToolCall("find", { pattern: "target" }), 40), turn("done")],
+			actorTokensPerSecond: 4_000,
+			draftTurns: [],
+			settings: {
+				...patternAwareSettings(patternSettings),
+				maxConcurrentActions: 1,
+				tools: ["read", "find"],
+			},
+			patternStore: store,
+		});
+
+		expect(result.summary).toMatchObject({ actorActions: 1, speculativeHits: 1, actorFallbacks: 0 });
+		expect(result.summary.executionAheadMs).toBeGreaterThan(0);
 	});
 
 	it("does not let an unisolated tool crowd an executable tool off a one-slot scheduler", async () => {
@@ -967,6 +1010,23 @@ function patternAwareSettings(patternAware: PatternAwareSettings): SpeculativeAg
 		patternAware,
 		tools: ["grep", "read"],
 	};
+}
+
+function schemaHash(value: unknown): string {
+	return createHash("sha256")
+		.update(JSON.stringify(stableValue(value)))
+		.digest("hex")
+		.slice(0, 32);
+}
+
+function stableValue(value: unknown): unknown {
+	if (Array.isArray(value)) return value.map(stableValue);
+	if (!value || typeof value !== "object") return value;
+	return Object.fromEntries(
+		Object.entries(value as Record<string, unknown>)
+			.sort(([left], [right]) => left.localeCompare(right))
+			.map(([key, item]) => [key, stableValue(item)]),
+	);
 }
 
 async function workspace(): Promise<string> {

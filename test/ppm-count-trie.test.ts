@@ -67,6 +67,20 @@ describe("PpmCountTrie", () => {
 		expect(model.estimate(["shift"], "bash", 30, 8)).toBeUndefined();
 	});
 
+	it("does not refresh a stale count bucket when one old target recurs", () => {
+		const model = new PpmCountTrie(1);
+		for (let sequence = 0; sequence < 32; sequence++) model.observe(["context"], "old", sequence, 64);
+		for (let sequence = 32; sequence < 288; sequence++) model.observe(["noise"], "noise", sequence, 64);
+		model.observe(["context"], "old", 288, 64);
+
+		const oldCount = model.snapshot().find((row) => row.context[0] === "context")?.counts.old;
+		expect(oldCount).toBeLessThan(3);
+		for (let sequence = 289; sequence < 292; sequence++) model.observe(["context"], "new", sequence, 64);
+		expect(model.probability(["context"], "new", 292, 64)).toBeGreaterThan(
+			model.probability(["context"], "old", 292, 64) ?? 1,
+		);
+	});
+
 	it("keeps probabilities finite under large and fractional restored counts", () => {
 		const model = new PpmCountTrie(2);
 		model.setCount([], "read", Number.MAX_SAFE_INTEGER, 1);
