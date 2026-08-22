@@ -780,11 +780,8 @@ export class PatternAwareStore {
 			settings.beamWidth,
 			(prediction) => prediction.tool,
 		);
-		const sample = selected.find((prediction) => prediction.background);
-		const beam = selected.filter((prediction) => !prediction.background);
-		if (sample) beam.push(sample);
 		const emittedPerTool = new Map<string, number>();
-		for (const prediction of beam) {
+		for (const prediction of selected) {
 			const beamRank = (emittedPerTool.get(prediction.tool) ?? 0) + 1;
 			emittedPerTool.set(prediction.tool, beamRank);
 			const nextContinuation: PatternAwareContinuation = {

@@ -491,32 +491,66 @@ describe("faux LLM speculative action end to end", () => {
 		expect(fastActor.executions).toEqual({ grep: 1, read: 2 });
 	});
 
-	it("hides a sampled exact-action recurrence after its tool proves reuse", async () => {
+	it("uses the configured recurrence beam to hide a lower-ranked first reuse", async () => {
 		const cwd = await workspace();
-		await writeFile(path.join(cwd, "other.txt"), "other", "utf8");
+		await Promise.all([
+			writeFile(path.join(cwd, "notes.txt"), "notes", "utf8"),
+			writeFile(path.join(cwd, "slow.txt"), "slow", "utf8"),
+			writeFile(path.join(cwd, "target.txt"), "target", "utf8"),
+		]);
 		const patternSettings: PatternAwareSettings = {
 			...PATTERN_AWARE_DEFAULTS,
+			beamWidth: 4,
 			maxContextLength: 1,
 			maxFutureGap: 0,
 			minOccurrences: 2,
 		};
-		const store = new PatternAwareStore(patternSettings, undefined, {
-			namespace: "pi-action-semantics-v1",
-			actionKey: (tool, input, schemaHash) => PI_ACTION_SEMANTICS.buildKey(tool, input, cwd, schemaHash),
-			projectors: [],
+		const store = patternStore(cwd, patternSettings);
+		let readSchemaHash: string | undefined;
+		const observeBatch = store.observeBatch.bind(store);
+		const schemaProbe = vi.spyOn(store, "observeBatch").mockImplementation((events) => {
+			readSchemaHash ??= events.find((event) => event.tool === "read")?.schemaHash;
+			observeBatch(events);
 		});
+		await runAgent({
+			cwd,
+			sessionID: "schema-probe",
+			tools: [delayedRead(cwd, 1)],
+			actorTurns: [turn(fauxToolCall("read", { path: "notes.txt" })), turn("done")],
+			actorTokensPerSecond: 4_000,
+			draftTurns: [],
+			settings: patternAwareSettings(patternSettings),
+			patternStore: store,
+		});
+		schemaProbe.mockRestore();
+		if (!readSchemaHash) throw new Error("read schema was not observed");
+		const sessionID = "configured-action-backoff";
+		for (const [index, [file, durationMs]] of (
+			[
+				["notes.txt", 5],
+				["notes.txt", 5],
+				["slow.txt", 200],
+				["target.txt", 120],
+			] as const
+		).entries()) {
+			store.observe({
+				sessionID,
+				turnID: `${sessionID}:${index}`,
+				tool: "read",
+				input: { path: file },
+				outcome: "success",
+				durationMs,
+				schemaHash: readSchemaHash,
+			});
+		}
 		const result = await runAgent({
 			cwd,
-			sessionID: "exact-action-backoff",
-			tools: patternTools(cwd, 120, "notes.txt"),
+			sessionID,
+			tools: [delayedRead(cwd, (file) => (file === "slow.txt" ? 200 : file === "target.txt" ? 120 : 5))],
 			actorTurns: [
-				turn(fauxToolCall("read", { path: "notes.txt" })),
-				turn(fauxToolCall("grep", { pattern: "separator", path: "." })),
-				turn(fauxToolCall("read", { path: "notes.txt" })),
-				turn(fauxToolCall("read", { path: "other.txt" })),
 				turn([
 					fauxThinking("verify the previously inspected file before answering ".repeat(4)),
-					fauxToolCall("read", { path: "other.txt" }),
+					fauxToolCall("read", { path: "target.txt" }),
 				]),
 				turn("done"),
 			],
@@ -527,9 +561,10 @@ describe("faux LLM speculative action end to end", () => {
 		});
 		const actorSettlements = result.events.filter((event) => event.type === "actor_action");
 
-		expect(actorSettlements).toHaveLength(5);
+		expect(actorSettlements).toHaveLength(1);
 		expect(actorSettlements.at(-1)?.settlement.provider.kind).toBe("speculative");
-		expect(result.summary).toMatchObject({ actorActions: 5, speculativeHits: 1, actorFallbacks: 4 });
+		expect(actorSettlements.at(-1)?.settlement.matchedPredictions).not.toHaveLength(0);
+		expect(result.summary).toMatchObject({ actorActions: 1, speculativeHits: 1, actorFallbacks: 0 });
 		expect(result.summary.executionAheadMs).toBeGreaterThanOrEqual(100);
 		expect(result.toolLatencyMs.at(-1)).toBeLessThan(40);
 	});

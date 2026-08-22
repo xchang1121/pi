@@ -1540,9 +1540,9 @@ describe("PatternAware", () => {
 		expect(store.predict("other").some((candidate) => candidate.patternID.startsWith("action-backoff:"))).toBe(false);
 	});
 
-	test("admits one background exact-action sample only after the tool proves reuse", () => {
+	test("bounds background exact-action samples by the configured per-tool beam", () => {
 		const store = new PatternAwareStore(
-			settings({ maxContextLength: 1, maxFutureGap: 0, minOccurrences: 2 }),
+			settings({ beamWidth: 2, maxContextLength: 1, maxFutureGap: 0, minOccurrences: 2 }),
 			undefined,
 			piActionSemantics(),
 		);
@@ -1563,27 +1563,30 @@ describe("PatternAware", () => {
 			.predict(sessionID)
 			.filter((candidate) => candidate.patternID.startsWith("action-backoff:"));
 		const sampled = recurrent.filter((candidate) => candidate.background);
-		expect(sampled).toHaveLength(1);
-		expect(recurrent.at(-1)).toBe(sampled[0]);
+		expect(sampled).toHaveLength(2);
+		expect(new Set(sampled.map((candidate) => candidate.tool))).toEqual(new Set(["bash", "read"]));
 
-		store.observe(
-			input({
-				sessionID,
-				tool: sampled[0]!.tool,
-				input: sampled[0]!.input,
-				durationMs: sampled[0]!.expectedDurationMs,
-			}),
-		);
-		expect(
-			store
-				.predict(sessionID)
-				.find(
-					(candidate) =>
-						candidate.patternID.startsWith("action-backoff:") &&
-						candidate.tool === sampled[0]!.tool &&
-						JSON.stringify(candidate.input) === JSON.stringify(sampled[0]!.input),
+		for (const candidate of sampled) {
+			store.observe(
+				input({
+					sessionID,
+					tool: candidate.tool,
+					input: candidate.input,
+					durationMs: candidate.expectedDurationMs,
+				}),
+			);
+		}
+		const promoted = store.predict(sessionID);
+		for (const candidate of sampled) {
+			expect(
+				promoted.find(
+					(item) =>
+						item.patternID.startsWith("action-backoff:") &&
+						item.tool === candidate.tool &&
+						JSON.stringify(item.input) === JSON.stringify(candidate.input),
 				)?.background,
-		).toBeUndefined();
+			).toBeUndefined();
+		}
 	});
 
 	test("uses canonical K(a) identity and rejects stale schemas or non-learning observations", () => {
