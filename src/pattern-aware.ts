@@ -1910,15 +1910,17 @@ function inferCandidateBindings(
 				const sources: Array<{ readonly binding: PatternAwareBinding; readonly value: string }> = [
 					{ binding: direct, value: source },
 				];
-				if (!pathSource) continue;
-				if (pathSources.length < MAX_PATH_SOURCES) pathSources.push({ binding: direct, value: source });
-				for (const operation of ["dirname", "basename", "normalize_path"] as const) {
-					const transformed: PatternAwareBinding = { type: "transform", operation, source: direct };
-					const value = transform(operation, source);
-					if (value === target) result.push(transformed);
-					sources.push({ binding: transformed, value });
-					if (pathSources.length < MAX_PATH_SOURCES) pathSources.push({ binding: transformed, value });
+				if (pathSource) {
+					if (pathSources.length < MAX_PATH_SOURCES) pathSources.push({ binding: direct, value: source });
+					for (const operation of ["dirname", "basename", "normalize_path"] as const) {
+						const transformed: PatternAwareBinding = { type: "transform", operation, source: direct };
+						const value = transform(operation, source);
+						if (value === target) result.push(transformed);
+						sources.push({ binding: transformed, value });
+						if (pathSources.length < MAX_PATH_SOURCES) pathSources.push({ binding: transformed, value });
+					}
 				}
+				if (targetIsPath && !pathSource) continue;
 				for (const { binding, value } of sources) {
 					if (value.length < 3) continue;
 					const offset = target.indexOf(value);

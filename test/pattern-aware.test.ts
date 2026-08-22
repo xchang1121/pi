@@ -106,20 +106,31 @@ describe("PatternAware", () => {
 		).toEqual(target);
 	});
 
-	test("does not infer arbitrary case changes or string concatenation as reusable argument semantics", () => {
-		const context = [event({ sessionID: "one", tool: "inspect", input: { left: "Alpha", right: "Beta" } })];
-		const target = { normalized: "alpha", command: "Alpha:Beta" };
+	test("interpolates one non-path value without inventing case, multi-source, short, or path semantics", () => {
+		const context = [
+			event({ sessionID: "one", tool: "inspect", input: { left: "Alpha", right: "Beta", short: "xy" } }),
+		];
+		const target = {
+			normalized: "alpha",
+			command: "run Alpha now",
+			joined: "Alpha:Beta",
+			query: "pre-xy-post",
+			filePath: "out/Alpha.txt",
+		};
 		const bindings = inferBindings(context, target);
 
 		expect(bindings).toMatchObject({
 			'["normalized"]': { type: "constant", value: "alpha" },
-			'["command"]': { type: "constant", value: "Alpha:Beta" },
+			'["command"]': { type: "template", prefix: "run ", suffix: " now" },
+			'["joined"]': { type: "template", prefix: "", suffix: ":Beta" },
+			'["query"]': { type: "constant", value: "pre-xy-post" },
+			'["filePath"]': { type: "constant", value: "out/Alpha.txt" },
 		});
 		expect(
 			applyBindings(bindings, [
-				event({ sessionID: "two", tool: "inspect", input: { left: "Gamma", right: "Delta" } }),
+				event({ sessionID: "two", tool: "inspect", input: { left: "Gamma", right: "Delta", short: "zz" } }),
 			]),
-		).toEqual(target);
+		).toEqual({ ...target, command: "run Gamma now", joined: "Gamma:Beta" });
 	});
 
 	test("learns online after repeated authoritative chains and predicts without an LLM", () => {
