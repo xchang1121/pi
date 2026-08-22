@@ -767,7 +767,7 @@ describe("structural speculative runtime", () => {
 		await fixture.runtime.finishTurn({ ...call("contention"), terminal: true });
 	});
 
-	it("promotes an Actor-matched queued or running candidate and preempts unrelated work", async () => {
+	it("preempts only to start queued Actor work and joins running work at its existing capacity", async () => {
 		for (const mode of ["queued", "running"] as const) {
 			const executed: string[] = [];
 			const aborted: string[] = [];
@@ -817,15 +817,14 @@ describe("structural speculative runtime", () => {
 
 			expect(await fixture.runtime.consume(call("turn", { path: "target.ts" }))).toBe("target");
 			expect(executed).toEqual(["busy.ts", "target.ts"]);
-			expect(aborted).toEqual(["busy.ts"]);
-			expect(
-				fixture.events.find(
-					(event) =>
-						event.type === "candidate" &&
-						event.state.status === "cancelled" &&
-						event.state.cause.code === "preempted_by_actor",
-				),
-			).toBeDefined();
+			expect(aborted).toEqual(mode === "queued" ? ["busy.ts"] : []);
+			const preemption = fixture.events.find(
+				(event) =>
+					event.type === "candidate" &&
+					event.state.status === "cancelled" &&
+					event.state.cause.code === "preempted_by_actor",
+			);
+			expect(preemption !== undefined).toBe(mode === "queued");
 		}
 	});
 

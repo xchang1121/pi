@@ -1648,13 +1648,13 @@ export function makeStructuralSpeculativeActionRuntime<
 					rejectedCandidateID = candidate.id;
 					continue;
 				}
-				preemptForActor(
-					state.session,
-					resourceProfile(candidate.route.isolation),
-					state.settings,
-					matchingCandidates,
-				);
 				if (candidate.work.execution.status === "queued") {
+					preemptForActor(
+						state.session,
+						resourceProfile(candidate.route.isolation),
+						state.settings,
+						matchingCandidates,
+					);
 					startQueuedCandidates(state.session, candidate, true);
 				}
 				admission.release();
@@ -2039,7 +2039,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		const context = session.actionContexts.get(node.identity.id);
 		const source = context ? sourcesByID.get(context.identity.source) : undefined;
 		if (!context || !source?.continue) return;
-		if (source.multiStepEnabled?.(context.settings) === false) return;
+		if (source.multiStepEnabled?.(context.settings, context.feedback) === false) return;
 		if (source.continueOn && !source.continueOn.includes(trigger)) return;
 		if (context.continuationTriggers.has(trigger)) return;
 		context.continuationTriggers.add(trigger);
