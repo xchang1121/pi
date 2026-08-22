@@ -710,7 +710,6 @@ export class PatternAwareStore {
 			const expectedLatencyBenefitMs =
 				empiricalProbability *
 				adoptionProbability *
-				(ppmEstimate?.probability ?? 1) *
 				mapperConfidence *
 				Math.max(1, Math.max(0, expectedDurationMs));
 			return {

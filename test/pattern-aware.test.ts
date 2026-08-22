@@ -312,7 +312,6 @@ describe("PatternAware", () => {
 		expect(afterFreshnessRejection.expectedLatencyBenefitMs / afterFreshnessRejection.expectedDurationMs).toBeCloseTo(
 			afterFreshnessRejection.empiricalProbability *
 				afterFreshnessRejection.adoptionProbability *
-				(diagnostic.ppmProbability ?? 1) *
 				diagnostic.mapperConfidence,
 		);
 		store.settled("attributed", rejectedSettlement("freshness", "resource_changed"));
@@ -1695,7 +1694,7 @@ describe("PatternAware", () => {
 		expect(new Set(bash?.continuation.visitedPatternIDs).size).toBe(3);
 	});
 
-	test("uses PPM value to retain a bounded beam for each competing tool", () => {
+	test("does not count tool-level PPM twice when valuing concrete patterns", () => {
 		const store = new PatternAwareStore(settings({ beamWidth: 1, maxContextLength: 1, maxFutureGap: 0 }));
 		for (let index = 0; index < 8; index++) {
 			store.observe(input({ sessionID: `fast-${index}`, tool: "grep", input: {}, durationMs: 1 }));
@@ -1723,14 +1722,13 @@ describe("PatternAware", () => {
 		expect(candidates[0]!.expectedLatencyBenefitMs).toBeGreaterThan(1);
 		expect(candidates[0]!.expectedLatencyBenefitMs).toBeCloseTo(
 			candidates[0]!.empiricalProbability *
-				diagnostic.ppmProbability *
 				diagnostic.mapperConfidence *
 				candidates[0]!.expectedDurationMs,
 		);
 		expect(candidates[0]!.continuation.pathProbability).toBe(candidates[0]!.empiricalProbability);
 	});
 
-	test("combines tool-level PPM value with concrete action feedback", () => {
+	test("combines concrete pattern value with action feedback", () => {
 		const store = new PatternAwareStore(settings({ beamWidth: 1, maxContextLength: 1, maxFutureGap: 0 }));
 		trainGrepRead(store, "one", "src/a.ts");
 		trainGrepRead(store, "two", "src/b.ts");
