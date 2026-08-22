@@ -22,6 +22,8 @@ import { summarizeSpeculativeTrace } from "../src/trace-summary.ts";
 const roots: string[] = [];
 const readSchema = Type.Object({ path: Type.String() });
 const grepSchema = Type.Object({ pattern: Type.String(), path: Type.Optional(Type.String()) });
+const findSchema = Type.Object({ pattern: Type.String(), path: Type.Optional(Type.String()) });
+const lsSchema = Type.Object({ path: Type.Optional(Type.String()) });
 const bashSchema = Type.Object({ command: Type.String() });
 
 afterEach(async () => {
@@ -102,30 +104,12 @@ describe("faux LLM speculative action end to end", () => {
 			maxFutureGap: 0,
 			minOccurrences: 2,
 		};
-		const store = new PatternAwareStore(patternSettings, undefined, {
-			namespace: "pi-action-semantics-v1",
-			actionKey: (tool, input, schemaHash) => PI_ACTION_SEMANTICS.buildKey(tool, input, cwd, schemaHash),
-			projectors: [],
-		});
+		const store = patternStore(cwd, patternSettings);
 		for (const sessionID of ["training-one", "training-two"]) {
-			store.observe({
-				sessionID,
-				turnID: `${sessionID}:grep`,
-				tool: "grep",
-				input: { pattern: "target" },
-				outputPaths: ["wrong.txt"],
-				outcome: "success",
-				durationMs: 1,
-			});
-			store.observe({
-				sessionID,
-				turnID: `${sessionID}:read`,
-				tool: "read",
-				input: { path: "wrong.txt" },
-				outcome: "success",
-				durationMs: 1,
-			});
-			store.finishSession(sessionID);
+			trainPattern(store, sessionID, [
+				["grep", { pattern: "target" }, 1, ["wrong.txt"]],
+				["read", { path: "wrong.txt" }, 1],
+			]);
 		}
 		store.observe({
 			sessionID: "utility-replacement",
@@ -167,6 +151,65 @@ describe("faux LLM speculative action end to end", () => {
 					event.state.cause.code === "scheduler_preempted",
 			),
 		).toBe(true);
+	});
+
+	it("lets a nearer draft displace ready work for a later decision", async () => {
+		const cwd = await workspace();
+		await Promise.all([
+			writeFile(path.join(cwd, "slow.txt"), "slow", "utf8"),
+			writeFile(path.join(cwd, "target.txt"), "target", "utf8"),
+		]);
+		const patternSettings: PatternAwareSettings = {
+			...PATTERN_AWARE_DEFAULTS,
+			beamWidth: 1,
+			maxContextLength: 3,
+			maxFutureGap: 0,
+			minOccurrences: 2,
+			minBindingReplayProbability: 0.5,
+		};
+		const store = patternStore(cwd, patternSettings);
+		for (const sessionID of ["training-one", "training-two", "training-three", "training-four"]) {
+			trainPattern(store, sessionID, [
+				["grep", { pattern: "target" }, 1],
+				["find", { pattern: "step" }, 20],
+				["ls", { path: "." }, 20],
+				["read", { path: "slow.txt" }, 500],
+			]);
+		}
+		store.observe({
+			sessionID: "deadline-dominance",
+			turnID: "probe:grep",
+			tool: "grep",
+			input: { pattern: "target" },
+			outcome: "success",
+			durationMs: 1,
+		});
+
+		const result = await runAgent({
+			cwd,
+			sessionID: "deadline-dominance",
+			tools: [
+				delayedStep("find", findSchema, 20),
+				delayedStep("ls", lsSchema, 20),
+				delayedRead(cwd, (file) => (file === "slow.txt" ? 500 : 200)),
+			],
+			actorTurns: [turn(fauxToolCall("read", { path: "target.txt" }), 400), turn("done")],
+			actorTokensPerSecond: 4_000,
+			draftTurns: [turn(fauxToolCall("read", { path: "target.txt" }), 100), turn("no tool")],
+			draftTokensPerSecond: 4_000,
+			settings: {
+				...patternAwareSettings(patternSettings),
+				drafterEnabled: true,
+				candidateLimit: 1,
+				maxConcurrentActions: 1,
+				tools: ["find", "ls", "read"],
+			},
+			patternStore: store,
+		});
+
+		expect(result.summary).toMatchObject({ actorActions: 1, speculativeHits: 1, actorFallbacks: 0 });
+		expect(result.summary.executionAheadMs).toBeGreaterThanOrEqual(150);
+		expect(result.summary.hitLatencyMs).toBeLessThan(40);
 	});
 
 	it("matches Bash across fragmented model streams but executes only through the Actor", async () => {
@@ -650,15 +693,28 @@ function standardMessages(messages: readonly AgentMessage[]): Message[] {
 	) as Message[];
 }
 
-function delayedRead(cwd: string, durationMs: number): AgentTool<typeof readSchema> {
+function delayedRead(cwd: string, durationMs: number | ((file: string) => number)): AgentTool<typeof readSchema> {
 	return {
 		name: "read",
 		label: "read",
 		description: "Read a workspace file",
 		parameters: readSchema,
 		execute: async (_callID, args, signal) => {
-			await delay(durationMs, signal);
+			await delay(typeof durationMs === "number" ? durationMs : durationMs(args.path), signal);
 			return textResult(await readFile(path.join(cwd, args.path), "utf8"));
+		},
+	};
+}
+
+function delayedStep(name: "find" | "ls", parameters: AgentTool["parameters"], durationMs: number): AgentTool {
+	return {
+		name,
+		label: name,
+		description: `Run ${name}`,
+		parameters,
+		execute: async (_callID, _args, signal) => {
+			await delay(durationMs, signal);
+			return textResult(name);
 		},
 	};
 }
@@ -715,6 +771,36 @@ function drafterSettings(): SpeculativeAgentSettingsInput {
 		patternAware: { enabled: false },
 		tools: ["read"],
 	};
+}
+
+type PatternTrainingStep = readonly [
+	tool: string,
+	input: Readonly<Record<string, unknown>>,
+	durationMs: number,
+	outputPaths?: ReadonlyArray<string>,
+];
+
+function patternStore(cwd: string, settings: PatternAwareSettings): PatternAwareStore {
+	return new PatternAwareStore(settings, undefined, {
+		namespace: "pi-action-semantics-v1",
+		actionKey: (tool, input, schemaHash) => PI_ACTION_SEMANTICS.buildKey(tool, input, cwd, schemaHash),
+		projectors: [],
+	});
+}
+
+function trainPattern(store: PatternAwareStore, sessionID: string, steps: ReadonlyArray<PatternTrainingStep>): void {
+	for (const [index, [tool, input, durationMs, outputPaths]] of steps.entries()) {
+		store.observe({
+			sessionID,
+			turnID: `${sessionID}:${index}`,
+			tool,
+			input: structuredClone(input),
+			...(outputPaths ? { outputPaths } : {}),
+			outcome: "success",
+			durationMs,
+		});
+	}
+	store.finishSession(sessionID);
 }
 
 function patternAwareSettings(patternAware: PatternAwareSettings): SpeculativeAgentSettingsInput {
