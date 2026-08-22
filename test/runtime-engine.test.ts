@@ -767,52 +767,66 @@ describe("structural speculative runtime", () => {
 		await fixture.runtime.finishTurn({ ...call("contention"), terminal: true });
 	});
 
-	it("promotes an Actor-matched queued candidate and preempts unrelated work", async () => {
-		const executed: string[] = [];
-		const source: Source = {
-			id: "source",
-			enabled: () => true,
-			propose: () => ({
-				id: "promotion",
-				source: "source",
-				revision: 0,
-				actions: [
-					{ id: "busy", type: "tool_call", tool: "read", input: { path: "busy.ts" } },
-					{
-						id: "target",
-						type: "tool_call",
-						tool: "read",
-						input: { path: "target.ts" },
-						resourceDemand: 2,
-					},
-				],
-			}),
-		};
-		const fixture = harness({
-			source,
-			settings: () => ({ ...settings, maxConcurrentActions: 1 }),
-			execute: async (_tool, input, signal) => {
-				const path = String(input.path);
-				executed.push(path);
-				if (path !== "busy.ts") return "target";
-				return new Promise((_, reject) => {
-					signal.addEventListener("abort", () => reject(signal.reason), { once: true });
-				});
-			},
-		});
-		await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn" });
-		await waitFor(() => fixture.runtime.inspect().sharedCandidates === 2 && executed.length === 1);
+	it("promotes an Actor-matched queued or running candidate and preempts unrelated work", async () => {
+		for (const mode of ["queued", "running"] as const) {
+			const executed: string[] = [];
+			const aborted: string[] = [];
+			const source: Source = {
+				id: "source",
+				enabled: () => true,
+				propose: () => ({
+					id: `promotion-${mode}`,
+					source: "source",
+					revision: 0,
+					actions: [
+						{ id: "busy", type: "tool_call", tool: "read", input: { path: "busy.ts" } },
+						{
+							id: "target",
+							type: "tool_call",
+							tool: "read",
+							input: { path: "target.ts" },
+							resourceDemand: mode === "queued" ? 2 : 1,
+						},
+					],
+				}),
+			};
+			const fixture = harness({
+				source,
+				settings: () => ({ ...settings, maxConcurrentActions: mode === "queued" ? 1 : 2 }),
+				execute: async (_tool, input, signal) => {
+					const path = String(input.path);
+					executed.push(path);
+					if (path === "target.ts") {
+						await new Promise((resolve) => setTimeout(resolve, 80));
+						return "target";
+					}
+					return new Promise((_, reject) => {
+						signal.addEventListener(
+							"abort",
+							() => {
+								aborted.push(path);
+								reject(signal.reason);
+							},
+							{ once: true },
+						);
+					});
+				},
+			});
+			await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn" });
+			await waitFor(() => executed.length === (mode === "queued" ? 1 : 2));
 
-		expect(await fixture.runtime.consume(call("turn", { path: "target.ts" }))).toBe("target");
-		expect(executed).toEqual(["busy.ts", "target.ts"]);
-		expect(
-			fixture.events.find(
-				(event) =>
-					event.type === "candidate" &&
-					event.state.status === "cancelled" &&
-					event.state.cause.code === "preempted_by_actor",
-			),
-		).toBeDefined();
+			expect(await fixture.runtime.consume(call("turn", { path: "target.ts" }))).toBe("target");
+			expect(executed).toEqual(["busy.ts", "target.ts"]);
+			expect(aborted).toEqual(["busy.ts"]);
+			expect(
+				fixture.events.find(
+					(event) =>
+						event.type === "candidate" &&
+						event.state.status === "cancelled" &&
+						event.state.cause.code === "preempted_by_actor",
+				),
+			).toBeDefined();
+		}
 	});
 
 	it("cannot commit a speculative world when output projection fails", async () => {

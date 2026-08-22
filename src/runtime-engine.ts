@@ -1607,6 +1607,7 @@ export function makeStructuralSpeculativeActionRuntime<
 				(candidate) => candidateWorld(candidate) === undefined,
 			);
 			const ranked = rankCandidates(actualKey, candidates);
+			const matchingCandidates = ranked.map(({ candidate }) => candidate);
 			let selected:
 				| {
 						readonly candidate: Candidate;
@@ -1647,8 +1648,13 @@ export function makeStructuralSpeculativeActionRuntime<
 					rejectedCandidateID = candidate.id;
 					continue;
 				}
+				preemptForActor(
+					state.session,
+					resourceProfile(candidate.route.isolation),
+					state.settings,
+					matchingCandidates,
+				);
 				if (candidate.work.execution.status === "queued") {
-					preemptForActor(state.session, resourceProfile(candidate.route.isolation), state.settings, candidate);
 					startQueuedCandidates(state.session, candidate, true);
 				}
 				admission.release();
@@ -2331,12 +2337,12 @@ export function makeStructuralSpeculativeActionRuntime<
 		session: Session,
 		resource: ReturnType<typeof resourceProfile>,
 		settings: SpeculativeActionSettings,
-		protectedCandidate?: Candidate,
+		protectedCandidates: readonly Candidate[] = [],
 	): void => {
 		for (const candidate of session.scheduler.preemptFor(
 			resource,
 			concurrentLimit(settings),
-			(candidate) => candidate !== protectedCandidate && reservationAvailable(candidate.work.reservation),
+			(candidate) => !protectedCandidates.includes(candidate) && reservationAvailable(candidate.work.reservation),
 		)) {
 			cancelCandidate(session, candidate, cause("admission", "preempted_by_actor"));
 		}
