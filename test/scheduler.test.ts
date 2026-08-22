@@ -63,7 +63,7 @@ describe("SpeculationScheduler", () => {
 		scheduler.admit(unlikelyLong, [forecast({ expectedDurationMs: 500, expectedLatencyBenefitMs: 10 })], 2);
 		scheduler.admit(likelyShort, [forecast({ expectedDurationMs: 50, expectedLatencyBenefitMs: 40 })], 2);
 
-		expect(scheduler.preemptForAuthoritative({ class: "filesystem", units: 1 }, 2)).toEqual([unlikelyLong]);
+		expect(scheduler.preemptFor({ class: "filesystem", units: 1 }, 2)).toEqual([unlikelyLong]);
 		expect(scheduler.evaluate([forecast({ expectedDurationMs: 50 })])).toMatchObject({
 			criticalPathMs: 50,
 			priorityMs: 50,
@@ -81,7 +81,7 @@ describe("SpeculationScheduler", () => {
 		const background = {};
 		scheduler.admit(foreground, [forecast({ expectedLatencyBenefitMs: 1 })], 2);
 		scheduler.admit(background, [forecast({ background: true, expectedLatencyBenefitMs: 1_000 })], 2);
-		expect(scheduler.preemptBackgroundForForeground({ class: "filesystem", units: 1 }, 2)).toEqual([background]);
+		expect(scheduler.preemptFor({ class: "filesystem", units: 1 }, 2, (job) => job === background)).toEqual([background]);
 	});
 
 	it("preempts the latest and least critical work for an authoritative action", () => {
@@ -90,7 +90,7 @@ describe("SpeculationScheduler", () => {
 		const farNoncritical = {};
 		scheduler.admit(nearCritical, [forecast({ decisionBatchesUntilCall: 1, criticalPathMs: 500 })], 2);
 		scheduler.admit(farNoncritical, [forecast({ decisionBatchesUntilCall: 4, criticalPathMs: 10 })], 2);
-		expect(scheduler.preemptForAuthoritative({ class: "filesystem", units: 1 }, 2)).toEqual([farNoncritical]);
+		expect(scheduler.preemptFor({ class: "filesystem", units: 1 }, 2)).toEqual([farNoncritical]);
 		expect(scheduler.snapshot().map((entry) => entry.job)).toEqual([nearCritical]);
 	});
 
@@ -102,7 +102,7 @@ describe("SpeculationScheduler", () => {
 		scheduler.admit(idle, [forecast({ decisionBatchesUntilCall: 1 })], 2);
 
 		expect(
-			scheduler.preemptForAuthoritative({ class: "filesystem", units: 1 }, 2, (candidate) => candidate !== joined),
+			scheduler.preemptFor({ class: "filesystem", units: 1 }, 2, (candidate) => candidate !== joined),
 		).toEqual([idle]);
 		expect(scheduler.snapshot().map((entry) => entry.job)).toEqual([joined]);
 	});

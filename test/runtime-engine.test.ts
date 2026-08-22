@@ -671,29 +671,48 @@ describe("structural speculative runtime", () => {
 		).toEqual([]);
 	});
 
-	it("preempts running background work when a later foreground proposal arrives", async () => {
-		let releaseForeground!: () => void;
-		const foregroundReady = new Promise<void>((resolve) => {
-			releaseForeground = resolve;
+	it("gives resolved causal work capacity without evicting an equal-deadline sibling", async () => {
+		let releaseContinuation!: () => void;
+		const continuationGate = new Promise<void>((resolve) => {
+			releaseContinuation = resolve;
 		});
 		const executed: string[] = [];
+		const aborted: string[] = [];
+		let childCompleted = false;
+		const read = (id: string, horizon = 0, background = false) => ({
+			id,
+			type: "tool_call" as const,
+			tool: "read",
+			input: { path: `${id}.ts` },
+			horizon,
+			expectedDurationMs: 1,
+			background,
+		});
 		const source: Source = {
 			id: "source",
 			enabled: () => true,
-			proposalCount: () => 2,
-			propose: async ({ proposalIndex }) => {
-				if (proposalIndex > 0) await foregroundReady;
+			continueOn: ["execution_succeeded"],
+			propose: () => ({
+				id: "contention",
+				source: "source",
+				revision: 0,
+				actions: [read("parent"), read("background", 0, true), read("same", 1), read("later", 2)],
+			}),
+			continue: async ({ proposalID, actionID, revision, candidate }) => {
+				if (candidate.input.path !== "parent.ts") return undefined;
+				await continuationGate;
 				return {
-					id: `yield:${proposalIndex}`,
+					proposalID,
 					source: "source",
-					revision: 0,
-					actions: [
+					revision,
+					upsert: [
 						{
-							id: "next",
+							id: "child",
 							type: "tool_call",
 							tool: "read",
-							input: { path: proposalIndex === 0 ? "background.ts" : "foreground.ts" },
-							...(proposalIndex === 0 ? { background: true } : {}),
+							input: { path: "child.ts" },
+							resourceDemand: 2,
+							dependsOn: [{ actionID, condition: "execution_succeeded" }],
 						},
 					],
 				};
@@ -701,23 +720,42 @@ describe("structural speculative runtime", () => {
 		};
 		const fixture = harness({
 			source,
-			settings: () => ({ ...settings, maxConcurrentActions: 1 }),
+			settings: () => ({ ...settings, maxConcurrentActions: 3 }),
 			execute: async (_tool, input, signal) => {
 				const path = String(input.path);
 				executed.push(path);
-				if (path !== "background.ts") return path;
+				if (path === "parent.ts") return path;
+				if (path === "child.ts") {
+					await new Promise((resolve) => setTimeout(resolve, 80));
+					childCompleted = true;
+					return path;
+				}
 				return new Promise((_, reject) => {
-					signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+					signal.addEventListener(
+						"abort",
+						() => {
+							aborted.push(path);
+							reject(signal.reason);
+						},
+						{ once: true },
+					);
 				});
 			},
 		});
-		await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn" });
-		await waitFor(() => executed.length === 1);
-		expect(executed).toEqual(["background.ts"]);
 
-		releaseForeground();
-		await waitFor(() => executed.length === 2);
-		expect(executed).toEqual(["background.ts", "foreground.ts"]);
+		await fixture.runtime.startTurn({ sessionID: "session", turnID: "contention" });
+		await waitFor(() => executed.includes("parent.ts"));
+		expect(await fixture.runtime.consume(call("contention", { path: "parent.ts" }))).toBe("parent.ts");
+		await waitFor(() => executed.length === 4);
+		releaseContinuation();
+		await waitFor(() => childCompleted);
+		expect(aborted.sort()).toEqual(["background.ts", "later.ts"]);
+		expect(aborted).not.toContain("same.ts");
+
+		const startedAt = performance.now();
+		expect(await fixture.runtime.consume(call("contention", { path: "child.ts" }))).toBe("child.ts");
+		expect(performance.now() - startedAt).toBeLessThan(25);
+		expect(executed.filter((path) => path === "child.ts")).toHaveLength(1);
 		expect(
 			fixture.events.some(
 				(event) =>
@@ -726,7 +764,7 @@ describe("structural speculative runtime", () => {
 					event.state.cause.code === "scheduler_preempted",
 			),
 		).toBe(true);
-		await fixture.runtime.finishTurn({ ...call("turn"), terminal: true });
+		await fixture.runtime.finishTurn({ ...call("contention"), terminal: true });
 	});
 
 	it("promotes an Actor-matched queued candidate and preempts unrelated work", async () => {

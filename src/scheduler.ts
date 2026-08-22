@@ -91,26 +91,10 @@ export class SpeculationScheduler<Job extends object> {
 		return this.entries.delete(job);
 	}
 
-	preemptForAuthoritative(
+	preemptFor(
 		resource: SpeculativeResourceProfile,
 		capacity: number | SpeculativeResourceBudget,
 		canPreempt: (job: Job) => boolean = () => true,
-	): readonly Job[] {
-		return this.preemptFor(resource, capacity, (entry) => canPreempt(entry.job));
-	}
-
-	preemptBackgroundForForeground(
-		resource: SpeculativeResourceProfile,
-		capacity: number | SpeculativeResourceBudget,
-		canPreempt: (job: Job) => boolean = () => true,
-	): readonly Job[] {
-		return this.preemptFor(resource, capacity, (entry) => entry.work.background && canPreempt(entry.job));
-	}
-
-	private preemptFor(
-		resource: SpeculativeResourceProfile,
-		capacity: number | SpeculativeResourceBudget,
-		canPreempt: (entry: SchedulerEntry<Job>) => boolean,
 	): readonly Job[] {
 		const budget = normalizeBudget(capacity);
 		const remaining = [...this.entries.values()];
@@ -123,7 +107,7 @@ export class SpeculationScheduler<Job extends object> {
 			)
 		) {
 			const victim = remaining
-				.filter((entry) => !victims.includes(entry) && canPreempt(entry))
+				.filter((entry) => !victims.includes(entry) && canPreempt(entry.job))
 				.sort(compareVictim)[0];
 			if (!victim) break;
 			victims.push(victim);
