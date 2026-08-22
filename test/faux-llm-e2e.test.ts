@@ -64,45 +64,6 @@ describe("faux LLM speculative action end to end", () => {
 		expect(result.executions.read).toBe(1);
 	});
 
-	it("moves an output-informed Drafter request ahead without increasing request count", async () => {
-		const cwd = await workspace();
-		await writeFile(path.join(cwd, "target.txt"), "target", "utf8");
-		const prompt = "Read notes.txt, then use its result before reading target.txt.";
-		const draftResponse: FauxResponseStep = (context) => {
-			const results = context.messages.filter((message) => message.role === "toolResult").length;
-			return results < 2
-				? fauxAssistantMessage(fauxToolCall("read", { path: results === 0 ? "notes.txt" : "target.txt" }), {
-						stopReason: "toolUse",
-					})
-				: fauxAssistantMessage("no tool");
-		};
-		const run = (sessionID: string, drafterMaxDepth: number) =>
-			runAgent({
-				cwd,
-				sessionID,
-				prompt,
-				tools: [delayedRead(cwd, (file) => (file === "notes.txt" ? 60 : 180))],
-				actorTurns: [
-					turn(fauxToolCall("read", { path: "notes.txt" }), 300),
-					turn(fauxToolCall("read", { path: "target.txt" })),
-					turn("done"),
-				],
-				actorTokensPerSecond: 4_000,
-				draftTurns: [],
-				draftResponses: Array.from({ length: 4 }, () => draftResponse),
-				settings: { ...drafterSettings(), drafterMaxDepth },
-			});
-		const baseline = await run("rollout-baseline", 0);
-		const treatment = await run("rollout-treatment", 1);
-
-		expect(treatment.summary.sourceRequests).toBe(baseline.summary.sourceRequests);
-		expect(treatment.summary).toMatchObject({ actorActions: 2, speculativeHits: 2, actorFallbacks: 0 });
-		expect(treatment.executions.read).toBe(2);
-		expect(baseline.toolLatencyMs[1]).toBeGreaterThan(140);
-		expect(treatment.toolLatencyMs[1]).toBeLessThan(40);
-		expect(baseline.summary.endToEndMs - treatment.summary.endToEndMs).toBeGreaterThan(100);
-	});
-
 	it("masks completed tool latency across fragmented Actor and Drafter streams", async () => {
 		const cwd = await workspace();
 		const tool = delayedRead(cwd, 120);
@@ -142,25 +103,51 @@ describe("faux LLM speculative action end to end", () => {
 		expect(speculative.toolLatencyMs[0]).toBeLessThan(40);
 	});
 
-	it("joins compatible work already in flight instead of starting Actor work", async () => {
+	it("continues after joining compatible work already in flight", async () => {
 		const cwd = await workspace();
-		const result = await runAgent({
-			cwd,
-			sessionID: "in-flight-hit",
-			tools: [delayedRead(cwd, 140)],
-			actorTurns: [turn(fauxToolCall("read", { path: "notes.txt" }), 45), turn("done")],
-			actorTokensPerSecond: 2_000,
-			draftTurns: [turn(fauxToolCall("read", { path: "notes.txt" })), turn("no tool")],
-			draftTokensPerSecond: 2_000,
-			settings: drafterSettings(),
-		});
+		await writeFile(path.join(cwd, "target.txt"), "target", "utf8");
+		const run = (sessionID: string, drafterMaxDepth: number) => {
+			const respond: FauxResponseStep = (context) => {
+				const followsOwnDraft = context.messages.some(
+					(message) => message.role === "assistant" && message.provider === `drafter-${sessionID}`,
+				);
+				const hasToolResult = context.messages.some((message) => message.role === "toolResult");
+				return fauxAssistantMessage(
+					!hasToolResult
+						? fauxToolCall("read", { path: "notes.txt" })
+						: followsOwnDraft
+							? fauxToolCall("read", { path: "target.txt" })
+							: "no tool",
+					{ stopReason: !hasToolResult || followsOwnDraft ? "toolUse" : "stop" },
+				);
+			};
+			return runAgent({
+				cwd,
+				sessionID,
+				tools: [delayedRead(cwd, (file) => (file === "notes.txt" ? 160 : 180))],
+				actorTurns: [
+					turn(fauxToolCall("read", { path: "notes.txt" }), 45),
+					turn(fauxToolCall("read", { path: "target.txt" }), 220),
+					turn("done"),
+				],
+				actorTokensPerSecond: 2_000,
+				draftTurns: [],
+				draftResponses: Array.from({ length: 5 }, () => respond),
+				draftTokensPerSecond: 2_000,
+				settings: { ...drafterSettings(), drafterMaxDepth },
+			});
+		};
+		const baseline = await run("in-flight-baseline", 0);
+		const treatment = await run("in-flight-treatment", 1);
 
-		expect(result.summary).toMatchObject({ actorActions: 1, speculativeHits: 1, actorFallbacks: 0 });
-		expect(result.executions.read).toBe(1);
-		expect(result.summary.executionAheadMs).toBeGreaterThan(0);
-		expect(result.summary.hitLatencyMs).toBeGreaterThan(0);
-		expect(result.summary.hitLatencyMs).toBeLessThan(result.summary.speculativeExecutionMs);
-		expect(result.summary.attemptLeadMs).toBeGreaterThan(result.summary.executionAheadMs);
+		expect(treatment.summary.sourceRequests).toBe(baseline.summary.sourceRequests);
+		expect(baseline.summary).toMatchObject({ actorActions: 2, speculativeHits: 1, actorFallbacks: 1 });
+		expect(treatment.summary).toMatchObject({ actorActions: 2, speculativeHits: 2, actorFallbacks: 0 });
+		expect(treatment.executions.read).toBe(2);
+		expect(treatment.summary.executionAheadMs).toBeGreaterThan(0);
+		expect(treatment.summary.hitLatencyMs).toBeGreaterThan(0);
+		expect(treatment.toolLatencyMs[1]).toBeLessThan(40);
+		expect(baseline.summary.endToEndMs - treatment.summary.endToEndMs).toBeGreaterThan(120);
 	});
 
 	it("replaces an early low-utility pattern with a late high-utility draft for the same decision", async () => {

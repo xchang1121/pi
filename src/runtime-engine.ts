@@ -1489,9 +1489,10 @@ export function makeStructuralSpeculativeActionRuntime<
 			installWatcher(session, candidate);
 			queueCandidateContinuations(
 				session,
-				nodesForCandidate(session, candidate.id).filter(
-					(node) => session.plan.get(node.proposalID, node.action.id)?.predictionState?.status === "pending",
-				),
+				nodesForCandidate(session, candidate.id).filter((node) => {
+					const status = session.plan.get(node.proposalID, node.action.id)?.predictionState?.status;
+					return status === "pending" || status === "matching";
+				}),
 				candidate,
 				output,
 				"execution_succeeded",
