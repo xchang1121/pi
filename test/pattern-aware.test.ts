@@ -1754,34 +1754,41 @@ describe("PatternAware", () => {
 		expect(after!.expectedLatencyBenefitMs).toBeLessThan(before!.expectedLatencyBenefitMs);
 	});
 
-	test("allows a recurring motif to extend until the explicit prediction-depth bound", () => {
-		const store = new PatternAwareStore(
-			settings({ beamWidth: 1, maxContextLength: 1, maxFutureGap: 0, maxPredictionDepth: 3 }),
-		);
-		for (const sessionID of ["one", "two"]) {
-			for (let step = 0; step < 4; step++) {
-				store.observe(input({ sessionID, tool: "read", input: { path: "loop.ts" } }));
+	test("unfolds recurrence only through distinct finite-motif contexts", () => {
+		const train = (length: number, maxPredictionDepth = 6) => {
+			const store = new PatternAwareStore(
+				settings({ beamWidth: 1, maxContextLength: 3, maxFutureGap: 0, maxPredictionDepth }),
+			);
+			for (const sessionID of ["one", "two"]) {
+				for (let depth = 0; depth < length; depth++) {
+					store.observe(
+						input({ sessionID, tool: "read", input: { path: `src/${sessionID}.ts${".test".repeat(depth)}` } }),
+					);
+				}
 			}
-		}
+			return store;
+		};
+		const unfold = (store: PatternAwareStore, sessionID: string) => {
+			store.observe(input({ sessionID, tool: "read", input: { path: "src/probe.ts" } }));
+			const candidates = [];
+			let candidate = store.predict(sessionID)[0];
+			while (candidate) {
+				candidates.push(candidate);
+				candidate = store.continue(
+					candidate.continuation,
+					input({ sessionID, tool: "read", input: candidate.input, learnTarget: false }),
+				)[0];
+			}
+			return candidates;
+		};
 
-		store.observe(input({ sessionID: "probe", tool: "read", input: { path: "loop.ts" } }));
-		const first = store.predict("probe")[0]!;
-		const second = store.continue(
-			first.continuation,
-			input({ sessionID: "probe", tool: "read", input: { path: "loop.ts" }, learnTarget: false }),
-		)[0]!;
-		const third = store.continue(
-			second.continuation,
-			input({ sessionID: "probe", tool: "read", input: { path: "loop.ts" }, learnTarget: false }),
-		)[0]!;
-		const exhausted = store.continue(
-			third.continuation,
-			input({ sessionID: "probe", tool: "read", input: { path: "loop.ts" }, learnTarget: false }),
+		expect(unfold(train(2), "shallow").map((candidate) => candidate.input.path)).toEqual(["src/probe.ts.test"]);
+		const motif = unfold(train(4), "motif");
+		expect(motif.map((candidate) => candidate.input.path)).toEqual(
+			[1, 2, 3].map((depth) => `src/probe.ts${".test".repeat(depth)}`),
 		);
-
-		expect([first.depth, second.depth, third.depth]).toEqual([1, 2, 3]);
-		expect(new Set(third.continuation.visitedPatternIDs).size).toBe(1);
-		expect(exhausted).toEqual([]);
+		expect(new Set(motif.map((candidate) => candidate.patternID)).size).toBe(3);
+		expect(unfold(train(4, 2), "bounded")).toHaveLength(2);
 	});
 
 	test("replays held-out workflows with top-one bindings across a three-step frontier", () => {

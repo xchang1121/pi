@@ -622,7 +622,8 @@ export class PatternAwareStore {
 		this.ensureIndex();
 		for (const patternID of this.trie.matching(predictiveHistory)) {
 			const pattern = this.patterns.get(patternID);
-			if (!pattern || !structurallyEligible(pattern, settings)) continue;
+			if (!pattern || continuation.visitedPatternIDs.includes(patternID) || !structurallyEligible(pattern, settings))
+				continue;
 			const supportingSessions = this.patternSupportSessions.get(patternID);
 			if (
 				activeSessionID !== undefined &&
