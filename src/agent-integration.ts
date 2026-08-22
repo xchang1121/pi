@@ -663,12 +663,9 @@ export function createSpeculativeActionHost(
 			const events = batch?.size
 				? [...batch.entries()].sort(([left], [right]) => left - right).map(([, event]) => event)
 				: [];
-			const schemaHashes = definitionSchemaHashes(
-				startInput.tools.map((tool) => ({ name: tool.name, inputSchema: tool.parameters })),
-			);
 			queuePatternAnalysis(async () => {
 				const store = await resolvePatternStore(settings);
-				if (events.length) store.observeBatch(events, schemaHashes);
+				if (events.length) store.observeBatch(events);
 				store.observeTurn({
 					sessionID: startInput.sessionID,
 					turnID: startInput.turnID,

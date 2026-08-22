@@ -440,13 +440,13 @@ export class PatternAwareStore {
 		this.trimPatterns();
 	}
 
-	observe(input: PatternAwareEventInput, schemaHashes: Readonly<Record<string, string>> = {}) {
-		return this.observeEvents([input], schemaHashes);
+	observe(input: PatternAwareEventInput) {
+		this.observeEvents([input]);
 	}
 
-	observeBatch(inputs: ReadonlyArray<PatternAwareEventInput>, schemaHashes: Readonly<Record<string, string>> = {}) {
+	observeBatch(inputs: ReadonlyArray<PatternAwareEventInput>) {
 		const first = inputs[0];
-		if (!first) return [];
+		if (!first) return;
 		if (inputs.some((input) => input.sessionID !== first.sessionID || input.turnID !== first.turnID)) {
 			throw new Error("PatternAware batch actions must belong to one provider turn");
 		}
@@ -454,17 +454,13 @@ export class PatternAwareStore {
 			.map((input, index) => ({ input, index, key: canonicalBatchActionKey(input) }))
 			.sort((left, right) => left.key.localeCompare(right.key) || left.index - right.index)
 			.map((item) => item.input);
-		return this.observeEvents(ordered, schemaHashes, first.turnID);
+		this.observeEvents(ordered, first.turnID);
 	}
 
-	private observeEvents(
-		inputs: ReadonlyArray<PatternAwareEventInput>,
-		schemaHashes: Readonly<Record<string, string>>,
-		batchID?: string,
-	) {
-		if (!this.settings.enabled) return [];
+	private observeEvents(inputs: ReadonlyArray<PatternAwareEventInput>, batchID?: string) {
+		if (!this.settings.enabled) return;
 		const first = inputs[0];
-		if (!first) return [];
+		if (!first) return;
 		const events = inputs.map(
 			(input, index): PatternAwareEvent => ({
 				...input,
@@ -495,7 +491,6 @@ export class PatternAwareStore {
 		this.trimPatterns();
 		this.sequenceModel.trim(this.settings.maxPatterns);
 		this.persist();
-		return this.predict(first.sessionID, schemaHashes);
 	}
 
 	observeTurn(input: {
@@ -507,7 +502,7 @@ export class PatternAwareStore {
 		readonly agent?: string;
 		readonly model?: string;
 	}) {
-		return this.observe({
+		this.observe({
 			sessionID: input.sessionID,
 			turnID: input.turnID,
 			tool: "$llm",
@@ -767,9 +762,7 @@ export class PatternAwareStore {
 			predictions[index] = {
 				...preferred,
 				background: existing.background && recurrent.background,
-				supportingPatternIDs: [
-					...new Set([...existing.supportingPatternIDs, ...recurrent.supportingPatternIDs]),
-				],
+				supportingPatternIDs: [...new Set([...existing.supportingPatternIDs, ...recurrent.supportingPatternIDs])],
 			};
 		}
 		const comparePredictions = (left: (typeof predictions)[number], right: (typeof predictions)[number]) =>
@@ -887,8 +880,7 @@ export class PatternAwareStore {
 				.filter((item) => !continuation.visitedPatternIDs.includes(`action-backoff:${hash(item.action.key)}`))
 				.sort(
 					(left, right) =>
-						Number(right.count >= settings.minOccurrences) -
-							Number(left.count >= settings.minOccurrences) ||
+						Number(right.count >= settings.minOccurrences) - Number(left.count >= settings.minOccurrences) ||
 						rank(right) - rank(left) ||
 						left.action.key.localeCompare(right.action.key),
 				),
@@ -911,28 +903,28 @@ export class PatternAwareStore {
 				empiricalProbability * (ppmEstimate?.probability ?? 1) * Math.max(1, expectedDurationMs);
 			return {
 				background: item.count < settings.minOccurrences,
-					actionIdentity: hash(stableStringify({ type: "tool_call", actionKey: item.action.key })),
-					type: "tool_call" as const,
-					tool: item.action.tool,
-					input: structuredClone(item.input),
-					missing: [] as PatternAwarePath[],
-					patternID,
-					supportingPatternIDs: [] as string[],
-					context: [] as PatternAwareEventSignature[],
-					dependencies: [] as PatternAwareDependency[],
-					horizon: 0,
-					latestHorizon: 0,
-					gapCoverage: 1,
-					replayProbability: conditionalProbability,
-					variantProbability: 1,
-					conditionalProbability,
-					empiricalProbability,
-					adoptionProbability: 1,
-					expectedDurationMs,
-					ppmEstimate,
-					mapperConfidence: 1,
-					expectedLatencyBenefitMs,
-				};
+				actionIdentity: hash(stableStringify({ type: "tool_call", actionKey: item.action.key })),
+				type: "tool_call" as const,
+				tool: item.action.tool,
+				input: structuredClone(item.input),
+				missing: [] as PatternAwarePath[],
+				patternID,
+				supportingPatternIDs: [] as string[],
+				context: [] as PatternAwareEventSignature[],
+				dependencies: [] as PatternAwareDependency[],
+				horizon: 0,
+				latestHorizon: 0,
+				gapCoverage: 1,
+				replayProbability: conditionalProbability,
+				variantProbability: 1,
+				conditionalProbability,
+				empiricalProbability,
+				adoptionProbability: 1,
+				expectedDurationMs,
+				ppmEstimate,
+				mapperConfidence: 1,
+				expectedLatencyBenefitMs,
+			};
 		});
 	}
 

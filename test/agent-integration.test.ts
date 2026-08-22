@@ -417,7 +417,7 @@ describe("speculative action host", () => {
 		await host.dispose();
 	});
 
-	it("overlaps ordered pattern learning with the actor lifecycle and drains cleanup", async () => {
+	it("orders pattern learning without generating discarded predictions", async () => {
 		const cwd = await temporaryWorkspace();
 		const patternStore = new PatternAwareStore({ ...PATTERN_AWARE_DEFAULTS, minOccurrences: 1 });
 		const originalObserve = patternStore.observeBatch.bind(patternStore);
@@ -528,9 +528,7 @@ describe("speculative action host", () => {
 			input: { pattern: "one", path: "src" },
 			outputPaths: ["src/nested/notes.txt"],
 		});
-		const firstFreshPrediction = predictionStates.indexOf(true);
-		expect(firstFreshPrediction).toBeGreaterThan(0);
-		expect(predictionStates.slice(firstFreshPrediction).every(Boolean)).toBe(true);
+		expect(predictionStates).toEqual([false, true]);
 		await expect(host.dispose()).resolves.toBeUndefined();
 		expect(disposed).toBe(1);
 	});
