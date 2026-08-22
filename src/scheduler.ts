@@ -138,13 +138,7 @@ export class SpeculationScheduler<Job extends object> {
 		const decisionBatchesUntilCall = sequence(forecast.decisionBatchesUntilCall);
 		if (decisionBatchesUntilCall <= 1) return 0;
 		const duration = this.duration(forecast, 0.9);
-		const actorCycleMs = this.actorCycles.quantile(0.25, Math.max(50, duration * 2));
-		const actorDecisionMs = this.actorDecisionDurations.quantile(0.25, actorCycleMs);
-		const elapsedMs = finite(forecast.actorPhase?.elapsedMs);
-		const availableMs =
-			forecast.actorPhase?.kind === "decision"
-				? Math.max(0, actorDecisionMs - elapsedMs) + (decisionBatchesUntilCall - 1) * actorCycleMs
-				: Math.max(0, decisionBatchesUntilCall * actorCycleMs - elapsedMs);
+		const availableMs = this.actorRunway(forecast, duration) ?? 0;
 		return Math.max(0, availableMs - duration - finite(safetyMarginMs));
 	}
 
@@ -189,6 +183,9 @@ export class SpeculationScheduler<Job extends object> {
 			units: Math.max(baseResource.units, units(forecast.resourceDemand)),
 		};
 		const criticalPathMs = Math.max(expectedDurationMs, finite(forecast.criticalPathMs));
+		const runwayMs = this.actorRunway(forecast);
+		const benefitDurationMs = positive(forecast.expectedDurationMs, expectedDurationMs);
+		const runwayScale = runwayMs === undefined ? 1 : Math.min(1, runwayMs / benefitDurationMs);
 		return {
 			expectedDurationMs,
 			resource,
@@ -197,9 +194,34 @@ export class SpeculationScheduler<Job extends object> {
 			priorityMs:
 				forecast.expectedLatencyBenefitMs === undefined
 					? criticalPathMs
-					: finite(forecast.expectedLatencyBenefitMs),
+					: finite(forecast.expectedLatencyBenefitMs) * runwayScale,
 			background: forecast.background === true,
 		};
+	}
+
+	private actorRunway(forecast: PredictionForecast, fallbackDurationMs?: number): number | undefined {
+		const phase =
+			forecast.actorPhase ??
+			(fallbackDurationMs === undefined ? undefined : { kind: "cycle" as const, elapsedMs: 0 });
+		if (!phase) return undefined;
+		const fallbackCycleMs = fallbackDurationMs === undefined ? undefined : Math.max(50, fallbackDurationMs * 2);
+		const cycleMs =
+			fallbackCycleMs === undefined
+				? this.actorCycles.estimate(0.25)
+				: this.actorCycles.quantile(0.25, fallbackCycleMs);
+		const decisionMs =
+			fallbackCycleMs === undefined
+				? this.actorDecisionDurations.estimate(0.25)
+				: this.actorDecisionDurations.quantile(0.25, cycleMs ?? fallbackCycleMs);
+		const decisions = sequence(forecast.decisionBatchesUntilCall);
+		if (phase.kind === "decision") {
+			if (decisionMs === undefined) return undefined;
+			const futureCycles = Math.max(0, decisions - 1);
+			if (futureCycles > 0 && cycleMs === undefined) return undefined;
+			return Math.max(0, decisionMs - phase.elapsedMs) + futureCycles * (cycleMs ?? 0);
+		}
+		if (cycleMs !== undefined) return Math.max(0, decisions * cycleMs - phase.elapsedMs);
+		return decisions === 1 ? decisionMs : undefined;
 	}
 
 	private duration(forecast: PredictionForecast, quantile = 0.5): number {
@@ -221,7 +243,11 @@ class SampleWindow {
 	}
 
 	quantile(value: number, fallback: number): number {
-		if (!this.values.length) return positive(fallback, 1);
+		return this.estimate(value) ?? positive(fallback, 1);
+	}
+
+	estimate(value: number): number | undefined {
+		if (!this.values.length) return undefined;
 		const sorted = [...this.values].sort((left, right) => left - right);
 		return sorted[Math.floor((sorted.length - 1) * Math.max(0, Math.min(1, value)))]!;
 	}

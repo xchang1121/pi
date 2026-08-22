@@ -70,6 +70,29 @@ describe("SpeculationScheduler", () => {
 		});
 	});
 
+	it("caps expected benefit by observed Actor runway without inventing cold-start timing", () => {
+		const scheduler = new SpeculationScheduler<object>();
+		const long = forecast({
+			expectedDurationMs: 1_000,
+			expectedLatencyBenefitMs: 240,
+			actorPhase: { kind: "decision", elapsedMs: 0 },
+		});
+		expect(scheduler.evaluate([long]).priorityMs).toBe(240);
+
+		scheduler.observeActorTiming(20);
+		scheduler.observeService("read", 10);
+		const short = forecast({
+			expectedDurationMs: 80,
+			expectedLatencyBenefitMs: 40,
+			actorPhase: { kind: "decision", elapsedMs: 0 },
+		});
+		expect(scheduler.evaluate([long]).priorityMs).toBeCloseTo(4.8);
+		expect(scheduler.evaluate([short]).priorityMs).toBe(10);
+		expect(scheduler.evaluate([{ ...short, actorPhase: { kind: "cycle", elapsedMs: 500 } }]).priorityMs).toBe(10);
+		const { actorPhase: _, ...withoutPhase } = long;
+		expect(scheduler.evaluate([withoutPhase]).priorityMs).toBe(240);
+	});
+
 	it("promotes shared work on foreground evidence and lets background work yield", () => {
 		const scheduler = new SpeculationScheduler<object>();
 		expect(scheduler.evaluate([forecast({ background: true }), forecast({ background: true })]).background).toBe(

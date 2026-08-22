@@ -1217,9 +1217,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		}
 	};
 
-	const dispatchReady = (session: Session, immediatePredictionID?: string): void => {
-		if (session.disposed) return;
-		settleBlockedPlanActions(session);
+	const actorPhaseFor = (session: Session, now = performance.now()): PredictionForecast["actorPhase"] => {
 		const actorTurn = [...session.turns]
 			.map((key) => turns.get(key))
 			.find(
@@ -1228,12 +1226,18 @@ export function makeStructuralSpeculativeActionRuntime<
 					turn.actorArrivedAt === undefined &&
 					turn.decisionSequence === session.decisionSequence + 1,
 			);
-		const now = performance.now();
-		const actorPhase: PredictionForecast["actorPhase"] = actorTurn
+		return actorTurn
 			? { kind: "decision", elapsedMs: Math.max(0, now - actorTurn.actorDecisionStartedAt) }
 			: session.lastActorArrivedAt === undefined
 				? undefined
 				: { kind: "cycle", elapsedMs: Math.max(0, now - session.lastActorArrivedAt) };
+	};
+
+	const dispatchReady = (session: Session, immediatePredictionID?: string): void => {
+		if (session.disposed) return;
+		settleBlockedPlanActions(session);
+		const now = performance.now();
+		const actorPhase = actorPhaseFor(session, now);
 		const immediate: PlanRuntimeNode[] = [];
 		for (const node of session.plan.launchable()) {
 			if (!node.prediction || !node.actionKey || node.action.type !== "tool_call") continue;
@@ -1313,7 +1317,9 @@ export function makeStructuralSpeculativeActionRuntime<
 		const candidateID = `spec_${sequence}_${node.actionKey.hash.slice(0, 12)}`;
 		const reuse = route.reuse === "exclusive_branch" ? "exclusive" : "shared";
 		const work = new CandidateExecution<WorldBranch<Output>>(reuse);
-		const scheduled = session.scheduler.evaluate([forecastFor(node, route, session.decisionSequence)]);
+		const scheduled = session.scheduler.evaluate([
+			forecastFor(node, route, session.decisionSequence, actorPhaseFor(session)),
+		]);
 		const candidate: Candidate = {
 			id: candidateID,
 			key: node.actionKey,
@@ -2199,7 +2205,8 @@ export function makeStructuralSpeculativeActionRuntime<
 			additional?.prediction && !nodes.some((node) => node.prediction?.id === additional.prediction.id)
 				? [...nodes, additional]
 				: nodes;
-		return unique.map((node) => forecastFor(node, candidate.route, session.decisionSequence));
+		const actorPhase = actorPhaseFor(session);
+		return unique.map((node) => forecastFor(node, candidate.route, session.decisionSequence, actorPhase));
 	};
 
 	const installWatcher = (session: Session, candidate: Candidate): void => {

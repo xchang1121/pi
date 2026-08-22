@@ -153,6 +153,57 @@ describe("faux LLM speculative action end to end", () => {
 		).toBe(true);
 	});
 
+	it("uses the Actor runway to prioritize realizable hidden latency", async () => {
+		const cwd = await workspace();
+		await Promise.all([
+			writeFile(path.join(cwd, "wrong.txt"), "wrong", "utf8"),
+			writeFile(path.join(cwd, "target.txt"), "target", "utf8"),
+		]);
+		const patternSettings: PatternAwareSettings = {
+			...PATTERN_AWARE_DEFAULTS,
+			beamWidth: 2,
+			maxContextLength: 1,
+			maxFutureGap: 0,
+			minOccurrences: 2,
+		};
+		const store = patternStore(cwd, patternSettings);
+		for (let index = 0; index < 6; index++) {
+			const target = index < 4;
+			trainPattern(store, `runway-training-${index}`, [
+				["grep", { pattern: "target" }, 1],
+				["read", { path: target ? "target.txt" : "wrong.txt" }, target ? 80 : 1_000],
+			]);
+		}
+		const grep = patternTools(cwd, 1, "target.txt").find((tool) => tool.name === "grep")!;
+
+		const result = await runAgent({
+			cwd,
+			sessionID: "runway-priority",
+			tools: [grep, delayedRead(cwd, (file) => (file === "wrong.txt" ? 1_000 : 80))],
+			actorTurns: [
+				turn(fauxToolCall("grep", { pattern: "target" }), 10),
+				turn(fauxToolCall("read", { path: "target.txt" }), 100),
+				turn("done"),
+			],
+			actorTokensPerSecond: 4_000,
+			draftTurns: [],
+			settings: {
+				...patternAwareSettings(patternSettings),
+				maxConcurrentActions: 1,
+			},
+			patternStore: store,
+		});
+		expect(result.summary).toMatchObject({
+			actorActions: 2,
+			speculativeHits: 1,
+			actorFallbacks: 1,
+			candidateTerminalCauses: { "admission:scheduler_preempted": 1 },
+		});
+		expect(result.executions).toEqual({ grep: 1, read: 2 });
+		expect(result.summary.executionAheadMs).toBeGreaterThanOrEqual(60);
+		expect(result.toolLatencyMs.at(-1)).toBeLessThan(30);
+	});
+
 	it("lets a nearer draft displace ready work for a later decision", async () => {
 		const cwd = await workspace();
 		await Promise.all([
