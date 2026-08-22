@@ -247,17 +247,25 @@ describe("PatternAware", () => {
 		expect(candidate).toMatchObject({ horizon: 1, latestHorizon: 1 });
 	});
 
-	test("schedules at weighted gap coverage while retaining the largest observed deadline", () => {
-		const store = new PatternAwareStore(settings({ maxFutureGap: 8, futureGapCoverage: 0.8 }));
+	test("separates eventual probability from weighted gap timing and retains the observed deadline", () => {
+		const gapSettings = settings({ maxFutureGap: 8, futureGapCoverage: 0.8 });
+		const store = new PatternAwareStore(gapSettings);
+		const immediate = new PatternAwareStore(gapSettings);
 		const pattern = validatedGapPattern({ "0": 9, "5": 1 });
 		expect(store.registerValidatedPattern(pattern)).toBe(true);
+		expect(immediate.registerValidatedPattern(validatedGapPattern({ "0": 10 }))).toBe(true);
 
 		store.observe(input({ sessionID: "probe", tool: "grep", input: { pattern: "TODO" } }));
+		immediate.observe(input({ sessionID: "probe", tool: "grep", input: { pattern: "TODO" } }));
 
-		expect(store.predict("probe").find((item) => item.tool === "read")).toMatchObject({
+		const candidate = store.predict("probe").find((item) => item.tool === "read");
+		const immediateCandidate = immediate.predict("probe").find((item) => item.tool === "read");
+		expect(candidate).toMatchObject({
 			horizon: 0,
 			latestHorizon: 5,
 		});
+		expect(immediateCandidate).toMatchObject({ horizon: 0, latestHorizon: 0 });
+		expect(candidate?.conditionalProbability).toBe(immediateCandidate?.conditionalProbability);
 		for (let gap = 0; gap < 5; gap++) {
 			store.observe(input({ sessionID: "probe", tool: "bash", input: { command: `step-${gap}` } }));
 		}

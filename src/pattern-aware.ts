@@ -703,7 +703,7 @@ export class PatternAwareStore {
 					0,
 				) / Math.max(1, totalWeight);
 			const adoptionProbability = patternAdoptionProbability(patterns, this.clock, settings.decayHalfLifeEvents);
-			const conditionalProbability = clampProbability(replayProbability * gapCoverage * variantProbability);
+			const conditionalProbability = clampProbability(replayProbability * variantProbability);
 			const empiricalProbability = clampProbability(continuation.pathProbability * conditionalProbability);
 			const mapperComplexity = Math.min(...ordered.map((item) => bindingMapComplexity(item.pattern.bindings)));
 			const mapperConfidence = totalWeight / (totalWeight + mapperComplexity);
