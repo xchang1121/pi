@@ -1756,12 +1756,6 @@ export function makeStructuralSpeculativeActionRuntime<
 		if (preview?.state.status === "pending") {
 			preview.state = { status: "cancelled" };
 			preview = undefined;
-		} else if (preview?.state.status === "candidate" && preview.state.origin === "preview") {
-			const candidate = candidateByID(state.sessionID, preview.state.candidateID);
-			if (candidate?.work.execution.status !== "succeeded") {
-				abandonActorPreview(state, preview, cause("control", "actor_preview_incomplete"));
-				preview = undefined;
-			}
 		}
 		const previewCandidateID = preview?.state.status === "candidate" ? preview.state.candidateID : undefined;
 		expireSourceHorizon(state.session, state.decisionSequence, cause("control", "actor_action_arrived"));

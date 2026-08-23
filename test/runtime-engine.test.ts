@@ -1275,15 +1275,24 @@ describe("structural speculative runtime", () => {
 		});
 	});
 
-	it("discards an unconsumed Actor preview and never starts one without an isolation route", async () => {
+	it("discards unconsumed previews, joins in-flight intent, and requires isolation", async () => {
 		let committed = 0;
 		let disposed = 0;
+		let releaseSlow!: () => void;
+		const slow = new Promise<void>((resolve) => {
+			releaseSlow = resolve;
+		});
 		const fixture = harness({
 			source: { id: "disabled", enabled: () => false, propose: () => undefined },
-			execute: (tool, input, signal) =>
+			execute: (tool, input) =>
 				input.content === "slow"
-					? new Promise<never>((_resolve, reject) =>
-							signal.addEventListener("abort", () => reject(signal.reason), { once: true }),
+					? slow.then(() =>
+							world(`${tool}:${String(input.path)}`, {
+								checkpoint: { backend: "test", id: "slow", lineage: "slow", depth: 0 },
+								resources: ["."],
+								onCommit: () => committed++,
+								onDispose: () => disposed++,
+							}),
 						)
 					: world(`${tool}:${String(input.path)}`, {
 							checkpoint: { backend: "test", id: "preview", lineage: "preview", depth: 0 },
@@ -1326,10 +1335,12 @@ describe("structural speculative runtime", () => {
 		};
 		await fixture.runtime.previewActorCall(slowCall);
 		await waitFor(() => fixture.executions() === 2);
-		const arrivedAt = performance.now();
-		expect(await fixture.runtime.consume(slowCall)).toBeUndefined();
-		expect(performance.now() - arrivedAt).toBeLessThan(40);
-		await fixture.runtime.actual({ ...slowCall, durationMs: 0, output: "actor" });
+		const consumed = fixture.runtime.consume(slowCall);
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		releaseSlow();
+		expect(await consumed).toBe("write:slow.txt");
+		expect(fixture.executions()).toBe(2);
+		expect(committed).toBe(1);
 		await fixture.runtime.finishTurn({ ...slowCall, terminal: true });
 	});
 

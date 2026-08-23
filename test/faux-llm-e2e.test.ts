@@ -108,14 +108,14 @@ describe("faux LLM speculative action end to end", () => {
 	it("overlaps an isolated Actor call with its remaining stream without speculative credit", async () => {
 		const cwd = await workspace();
 		const actorTurns = [
-			turn([fauxToolCall("read", { path: "notes.txt" }), fauxText("stream tail ".repeat(8))]),
+			turn([fauxToolCall("read", { path: "notes.txt" }), fauxText("stream tail ".repeat(4))]),
 			turn("done"),
 		];
 		const run = (sessionID: string, actorPreview?: "call") =>
 			runAgent({
 				cwd,
 				sessionID,
-				tools: [delayedRead(cwd, 25)],
+				tools: [delayedRead(cwd, 250)],
 				actorTurns,
 				actorTokensPerSecond: 500,
 				draftTurns: [],
