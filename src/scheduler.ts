@@ -19,7 +19,7 @@ export interface PredictionForecast {
 	readonly criticalPathMs?: number;
 	readonly expectedLatencyBenefitMs?: number;
 	readonly background?: boolean;
-	/** Explicit plan dependencies have settled, so statistical time-to-use no longer gates launch. */
+	/** Dependencies have settled and this action is their immediate zero-horizon successor. */
 	readonly dependenciesResolved?: boolean;
 }
 

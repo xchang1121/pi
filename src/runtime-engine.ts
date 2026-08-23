@@ -150,7 +150,9 @@ function forecastFor(
 			? { expectedLatencyBenefitMs: node.action.expectedLatencyBenefitMs }
 			: {}),
 		...(node.action.background ? { background: true } : {}),
-		...((node.action.dependsOn?.length ?? 0) > 0 ? { dependenciesResolved: true } : {}),
+		...((node.action.dependsOn?.length ?? 0) > 0 && (node.action.horizon ?? 0) <= 0
+			? { dependenciesResolved: true }
+			: {}),
 	};
 }
 

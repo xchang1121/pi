@@ -1452,6 +1452,44 @@ describe("structural speculative runtime", () => {
 		await fixture.runtime.finishTurn({ ...call("queued-confirmation"), terminal: true });
 	});
 
+	it("keeps a future continuation on the Actor runway after its dependency resolves", async () => {
+		const started = new Map<string, number>();
+		const source: Source = {
+			id: "source",
+			enabled: () => true,
+			continueOn: ["execution_succeeded"],
+			propose: () => plan("source", "timed-continuation", { path: "parent.ts" }),
+			continue: ({ proposalID, actionID, revision }) => ({
+				proposalID,
+				source: "source",
+				revision,
+				upsert: [
+					{
+						id: "future-child",
+						type: "tool_call",
+						tool: "read",
+						input: { path: "child.ts" },
+						horizon: 2,
+						expectedDurationMs: 5,
+						dependsOn: [{ actionID, condition: "execution_succeeded" }],
+					},
+				],
+			}),
+		};
+		const fixture = harness({
+			source,
+			execute: (_tool, input) => {
+				started.set(String(input.path), performance.now());
+				return "output";
+			},
+		});
+
+		await fixture.runtime.startTurn({ sessionID: "session", turnID: "timed-continuation" });
+		await waitFor(() => started.has("child.ts"), 500);
+		expect(started.get("child.ts")! - started.get("parent.ts")!).toBeGreaterThan(75);
+		await fixture.runtime.finishTurn({ ...call("timed-continuation"), terminal: true });
+	});
+
 	it("keeps a next-decision continuation alive across parallel tools in one Actor decision", async () => {
 		let release!: () => void;
 		const gate = new Promise<void>((resolve) => {
