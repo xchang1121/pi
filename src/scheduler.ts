@@ -225,10 +225,8 @@ export class SpeculationScheduler<Job extends object> {
 	}
 
 	private duration(forecast: PredictionForecast, quantile = 0.5): number {
-		return (
-			this.serviceTimes.get(forecast.tool)?.quantile(quantile, positive(forecast.expectedDurationMs, 1)) ??
-			positive(forecast.expectedDurationMs, 1)
-		);
+		const actionDuration = positive(forecast.expectedDurationMs, 1);
+		return Math.max(actionDuration, this.serviceTimes.get(forecast.tool)?.quantile(quantile, actionDuration) ?? 0);
 	}
 }
 
