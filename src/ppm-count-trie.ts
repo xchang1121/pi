@@ -198,7 +198,56 @@ export class PpmCountTrie {
 	trim(maxContexts: number): void {
 		const limit = Math.max(1, Math.floor(maxContexts));
 		if (this.size <= limit) return;
-		this.restore(this.snapshot(limit));
+		if (!Number.isFinite(limit)) {
+			this.restore(this.snapshot(limit));
+			return;
+		}
+		const descendants: Array<{
+			readonly node: CountNode;
+			readonly depth: number;
+			readonly key: string;
+		}> = [];
+		const collect = (current: CountNode, reverseContext: readonly string[]): void => {
+			if (current !== this.root && current.total > 0) {
+				const context = [...reverseContext].reverse();
+				descendants.push({ node: current, depth: context.length, key: contextKey(context) });
+			}
+			for (const [token, child] of current.children) collect(child, [...reverseContext, token]);
+		};
+		collect(this.root, []);
+		descendants.sort(
+			(left, right) =>
+				right.node.total - left.node.total ||
+				right.depth - left.depth ||
+				right.node.lastSeen - left.node.lastSeen ||
+				left.key.localeCompare(right.key),
+		);
+		const retainedCount = Math.max(0, limit - Number(this.root.total > 0));
+		const discarded = new Set(descendants.slice(retainedCount).map((item) => item.node));
+		const prune = (current: CountNode): void => {
+			if (discarded.has(current)) {
+				current.targets.clear();
+				current.total = 0;
+				current.lastSeen = 0;
+			} else if (current.total > 0) {
+				// Preserve snapshot/restore's target order and shared context timestamp.
+				const lastSeen = current.lastSeen;
+				const targets = [...current.targets].sort(([left], [right]) => left.localeCompare(right));
+				current.targets.clear();
+				current.total = 0;
+				for (const [target, value] of targets) {
+					value.lastSeen = lastSeen;
+					current.targets.set(target, value);
+					current.total = safeTotal(current.total + value.count);
+				}
+			}
+			for (const [token, child] of current.children) {
+				prune(child);
+				if (child.total === 0 && child.children.size === 0) current.children.delete(token);
+			}
+		};
+		prune(this.root);
+		this.populatedContexts -= discarded.size;
 	}
 
 	private increment(current: CountNode, target: string, count: number, lastSeen: number, halfLife: number): void {

@@ -115,16 +115,28 @@ describe("PpmCountTrie", () => {
 		]);
 	});
 
-	it("trims low-evidence contexts while retaining the root", () => {
+	it("trims in place with the same decay state as snapshot restoration", () => {
 		const model = new PpmCountTrie(2);
-		for (let index = 0; index < 5; index++) model.observe(["popular"], "read", index);
-		model.observe(["rare-a"], "bash", 6);
-		model.observe(["rare-b"], "grep", 7);
+		model.observe(["ancestor", "leaf"], "read", 1, 2);
+		model.observe(["ancestor", "leaf"], "bash", 5, 2);
+		model.observe(["rare"], "grep", 6, 2);
+		const restored = new PpmCountTrie(2);
+		restored.restore(model.snapshot(2));
 
 		model.trim(2);
 
-		expect(model.size).toBe(2);
-		expect(model.snapshot().map((row) => row.context)).toEqual([[], ["popular"]]);
+		expect(model.snapshot()).toEqual(restored.snapshot());
+		expect(model.snapshot().map((row) => row.context)).toEqual([[], ["ancestor", "leaf"]]);
+		for (const target of ["read", "bash", "grep"]) {
+			expect(model.estimate(["ancestor", "leaf"], target, 8, 2)).toEqual(
+				restored.estimate(["ancestor", "leaf"], target, 8, 2),
+			);
+		}
+		model.observe(["ancestor", "leaf"], "read", 10, 2);
+		restored.observe(["ancestor", "leaf"], "read", 10, 2);
+		model.trim(2);
+		restored.trim(2);
+		expect(model.snapshot()).toEqual(restored.snapshot());
 	});
 
 	it("reconfigures to a shorter order without losing retained suffix evidence", () => {
