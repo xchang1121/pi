@@ -154,10 +154,19 @@ export type ActorActionProvider =
 	  }
 	| {
 			readonly kind: "actor";
+			readonly origin: "fallback";
 			readonly durationMs: number;
 			readonly isError: boolean;
 			readonly toolExecution: TimelineInterval;
 			readonly executionBlockedTiming?: ExecutionBlockedTiming;
+	  }
+	| {
+			readonly kind: "actor";
+			readonly origin: "preview";
+			readonly candidateID: string;
+			readonly durationMs: number;
+			readonly isError: false;
+			readonly toolExecution: TimelineInterval;
 	  };
 
 export interface ActorActionSettlement {

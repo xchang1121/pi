@@ -25,6 +25,7 @@ export interface SpeculativeCacheSnapshot {
 
 export interface CandidateEventDescriptor {
 	readonly id: string;
+	readonly origin: "prediction" | "actor_preview";
 	readonly tool: string;
 	readonly actionKeyHash: string;
 	readonly execution: SpeculativeExecution;

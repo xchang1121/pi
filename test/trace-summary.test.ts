@@ -192,6 +192,7 @@ function authoritativeEvents(): SpeculativeActionEvent<string>[] {
 				rejections: [],
 				provider: {
 					kind: "actor",
+					origin: "fallback",
 					durationMs: 12,
 					isError: false,
 					toolExecution: { startedAt: 40, completedAt: 52 },
@@ -205,6 +206,7 @@ function authoritativeEvents(): SpeculativeActionEvent<string>[] {
 function candidate(id: string): CandidateEventDescriptor {
 	return {
 		id,
+		origin: "prediction",
 		tool: "read",
 		actionKeyHash: `hash-${id}`,
 		execution: "resource_snapshot",

@@ -170,7 +170,7 @@ export function formatSpeculativeActionStatus(input: {
 		`PatternAware: ${settings.patternAware.enabled ? "On" : "Off"}; multi-step: ${settings.patternAware.multiStepEnabled ? "On" : "Off"} (beam/tool ${settings.patternAware.beamWidth}, depth ${settings.patternAware.maxPredictionDepth}, promotion ${settings.patternAware.minOccurrences}, binding≥${settings.patternAware.minBindingReplayProbability}, gap ${settings.patternAware.maxFutureGap}, coverage ${formatPercent(settings.patternAware.futureGapCoverage)}, half-life ${settings.patternAware.decayHalfLifeEvents})`,
 		`Prediction tools: ${toolsSummary(settings.tools)}`,
 		"Execution boundary: runtime sandbox first; resource snapshots or Git worktrees second; otherwise Actor fallback",
-		`Actor actions: ${metrics.speculativeHits}/${metrics.actorActions} speculative hits (${hitRate}%); fallbacks: ${metrics.actorFallbacks}`,
+		`Actor actions: ${metrics.speculativeHits}/${metrics.actorActions} speculative hits (${hitRate}%); previews: ${metrics.actorPreviews}; fallbacks: ${metrics.actorFallbacks}`,
 		`Predictions: ${metrics.predictionsMatched}/${metrics.predictionsObserved} matched (${formatPercent(metrics.predictionPrecision)}); ${metrics.predictionsAdopted}/${metrics.predictionsMatched} adopted (${formatPercent(metrics.adoptionYield)}); unobserved: ${metrics.predictionsSettled - metrics.predictionsObserved}`,
 		`Prediction rejections after match: ${countSummary(metrics.predictionRejectedAfterMatch)}`,
 		`Actor candidate rejections: ${countSummary(metrics.actorCandidateRejections)}`,
@@ -1261,7 +1261,9 @@ export function formatSpeculativeActionEvent(event: SpeculativeActionEvent<strin
 		case "candidate":
 			parts.push(event.candidate.tool, event.candidate.source, event.state.status);
 			if (event.state.status === "running") {
-				parts.push(`predicted ${compactEventText(event.candidate.predictedAction)}`);
+				parts.push(
+					`${event.candidate.origin === "actor_preview" ? "previewed" : "predicted"} ${compactEventText(event.candidate.predictedAction)}`,
+				);
 			} else if (event.state.status === "succeeded") {
 				parts.push(formatDuration(event.state.executionMs));
 			} else {
@@ -1281,8 +1283,13 @@ export function formatSpeculativeActionEvent(event: SpeculativeActionEvent<strin
 					`${formatDuration(event.settlement.provider.timing.attemptLeadMs)} attempt lead`,
 				);
 			} else {
-				parts.push(`${formatDuration(event.settlement.provider.durationMs)} Actor execution`);
-				const timing = event.settlement.provider.executionBlockedTiming;
+				parts.push(
+					`${formatDuration(event.settlement.provider.durationMs)} Actor ${event.settlement.provider.origin} execution`,
+				);
+				const timing =
+					event.settlement.provider.origin === "fallback"
+						? event.settlement.provider.executionBlockedTiming
+						: undefined;
 				if (timing) {
 					parts.push(
 						`${formatDuration(timing.executionAheadMs)} potentially hidden`,

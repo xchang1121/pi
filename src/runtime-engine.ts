@@ -19,7 +19,6 @@ import { PostSettlementQueue } from "./post-settlement.ts";
 import { actionResourceProfile, resourceProfile } from "./resource-budget.ts";
 import type {
 	AdoptedAction,
-	CandidatePreflight,
 	SpeculativeActionEvent,
 	SpeculativeActionRuntime,
 	SpeculativeActionRuntimeAdapter,
@@ -404,6 +403,7 @@ function candidateEventDescriptor<Output, StartInput, StateData>(
 		source: candidate.owner.draft.source ?? "cache",
 		depth: candidate.owner.draft.depth ?? 0,
 		id: candidate.id,
+		origin: candidate.origin,
 		tool: candidate.key.tool,
 		actionKeyHash: candidate.key.hash,
 		execution: candidate.route.isolation,
@@ -556,6 +556,7 @@ interface PlanAdmissionScope<SessionID, Output, StartInput, StateData> {
 
 interface CandidateRecord<Output, StartInput, StateData> {
 	readonly id: string;
+	readonly origin: "prediction" | "actor_preview";
 	readonly key: ActionKey;
 	readonly route: SpeculativeExecutionRoute;
 	readonly work: CandidateExecution<WorldBranch<Output>>;
@@ -585,6 +586,16 @@ interface CandidateRecord<Output, StartInput, StateData> {
 	validationFiles: number;
 	validationMode?: "watcher" | "exact";
 	projectionMs: number;
+}
+
+type ActorPreviewState =
+	| { readonly status: "pending" }
+	| { readonly status: "candidate"; readonly candidateID: string; readonly origin: "prediction" | "preview" }
+	| { readonly status: "cancelled" };
+
+interface ActorPreviewRecord {
+	task: Promise<void>;
+	state: ActorPreviewState;
 }
 
 interface SessionState<SessionID, Output, StartInput, StateData> {
@@ -632,6 +643,7 @@ interface TurnState<SessionID, Output, StartInput, StateData> {
 	readonly decisionSequence: number;
 	readonly actorActions: ActorAction[];
 	readonly actorToolHints: Set<string>;
+	readonly actorPreviews: Map<string, ActorPreviewRecord>;
 	actorDecisionStartedAt: number;
 	actorArrivedAt?: number;
 	actorPhaseCompletedAt?: number;
@@ -781,6 +793,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			decisionSequence: session.decisionSequence + 1,
 			actorActions: [],
 			actorToolHints: new Set(),
+			actorPreviews: new Map(),
 			actorDecisionStartedAt: startedAt,
 			lifecycle: "active",
 		};
@@ -1059,6 +1072,63 @@ export function makeStructuralSpeculativeActionRuntime<
 		dispatchReady(session);
 	};
 
+	const executionRouteFor = async (input: {
+		readonly startInput: StartInput;
+		readonly data: StateData;
+		readonly settings: SpeculativeActionSettings;
+		readonly draft: SpeculativeDraftCandidate;
+		readonly action: ActionKey;
+		readonly concrete: Record<string, unknown>;
+		readonly callID: string;
+		readonly index: number;
+		readonly signal: AbortSignal;
+	}): Promise<
+		| { readonly ok: true; readonly route: SpeculativeExecutionRoute }
+		| { readonly ok: false; readonly cause: ResolutionCause }
+	> => {
+		let route: SpeculativeExecutionRoute | undefined;
+		try {
+			route = await adapter.resolveExecution({
+				startInput: input.startInput,
+				data: input.data,
+				settings: input.settings,
+				candidate: input.draft,
+				tool: input.action.tool,
+				concrete: input.concrete,
+				action: input.action,
+				signal: input.signal,
+			});
+		} catch {
+			route = undefined;
+		}
+		if (input.signal.aborted) return { ok: false, cause: cause("source", "generation_expired") };
+		if (!route) {
+			return {
+				ok: false,
+				cause: cause("execution", "isolation_unavailable", "No safe speculative execution route is available."),
+			};
+		}
+		try {
+			const preflight = await adapter.preflightCandidate({
+				startInput: input.startInput,
+				data: input.data,
+				settings: input.settings,
+				candidate: input.draft,
+				tool: input.action.tool,
+				concrete: input.concrete,
+				action: input.action,
+				route,
+				callID: input.callID,
+				index: input.index,
+				signal: input.signal,
+			});
+			if (!preflight.ok) return { ok: false, cause: cause("admission", preflight.reason, preflight.detail) };
+		} catch (error) {
+			return { ok: false, cause: cause("admission", "preflight_failed", errorDetail(error)) };
+		}
+		return input.signal.aborted ? { ok: false, cause: cause("source", "generation_expired") } : { ok: true, route };
+	};
+
 	const materializeAction = async (session: Session, node: PlanRuntimeNode): Promise<void> => {
 		if (!node.prediction || node.actionKey || node.execution.status !== "deferred") return;
 		const context = session.actionContexts.get(node.identity.id);
@@ -1088,65 +1158,29 @@ export function makeStructuralSpeculativeActionRuntime<
 			failUnlaunchable(session, node, cause("matching", "action_not_keyable"));
 			return;
 		}
-		let route: SpeculativeExecutionRoute | undefined;
-		try {
-			route = await adapter.resolveExecution({
-				startInput: context.startInput,
-				data: context.data,
-				settings: context.settings,
-				candidate: context.draft,
-				tool: node.action.tool,
-				concrete: executionInput,
-				action: key,
-				signal: context.admissionSignal,
-			});
-		} catch {
-			route = undefined;
-		}
-		if (context.admissionSignal.aborted) {
-			failUnlaunchable(session, node, cause("source", "generation_expired"));
-			return;
-		}
-		if (!route) {
-			const blocked = cause(
-				"execution",
-				"isolation_unavailable",
-				"No safe speculative execution route is available.",
-			);
+		const admission = await executionRouteFor({
+			startInput: context.startInput,
+			data: context.data,
+			settings: context.settings,
+			draft: context.draft,
+			action: key,
+			concrete: executionInput,
+			callID: `spec_${session.candidateSequence + 1}`,
+			index: session.candidateSequence,
+			signal: context.admissionSignal,
+		});
+		if (!admission.ok) {
+			if (admission.cause.stage !== "execution" || admission.cause.code !== "isolation_unavailable") {
+				failUnlaunchable(session, node, admission.cause);
+				return;
+			}
 			session.plan.bindActionKey(node.proposalID, node.action.id, key);
-			if (!session.plan.markExecutionBlocked(node.proposalID, node.action.id, blocked)) {
+			if (!session.plan.markExecutionBlocked(node.proposalID, node.action.id, admission.cause)) {
 				failUnlaunchable(session, node, cause("plan", "execution_route_state_invalid"));
 			}
 			return;
 		}
-		context.executionRoute = route;
-		const callID = `spec_${session.candidateSequence + 1}`;
-		let preflight: CandidatePreflight;
-		try {
-			preflight = await adapter.preflightCandidate({
-				startInput: context.startInput,
-				data: context.data,
-				settings: context.settings,
-				candidate: context.draft,
-				tool: node.action.tool,
-				concrete: executionInput,
-				action: key,
-				route,
-				callID,
-				index: session.candidateSequence,
-				signal: context.admissionSignal,
-			});
-		} catch (error) {
-			preflight = { ok: false, reason: "preflight_failed", detail: errorDetail(error) };
-		}
-		if (!preflight.ok) {
-			failUnlaunchable(session, node, cause("admission", preflight.reason, preflight.detail));
-			return;
-		}
-		if (context.admissionSignal.aborted) {
-			failUnlaunchable(session, node, cause("source", "generation_expired"));
-			return;
-		}
+		context.executionRoute = admission.route;
 		session.plan.bindActionKey(node.proposalID, node.action.id, key);
 	};
 
@@ -1327,6 +1361,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		]);
 		const candidate: Candidate = {
 			id: candidateID,
+			origin: "prediction",
 			key: node.actionKey,
 			route,
 			work,
@@ -1360,10 +1395,12 @@ export function makeStructuralSpeculativeActionRuntime<
 			session.id,
 			candidate,
 			(existing, match) =>
+				existing.origin === "prediction" &&
 				sameSpeculativeExecutionRoute(existing.route, route) &&
 				candidateWorld(existing) === parent &&
 				canShareInFlight(existing, node.actionKey!, match, projectionRules),
 			(existing) =>
+				existing.origin === "prediction" &&
 				sameSpeculativeExecutionRoute(existing.route, route) &&
 				candidateWorld(existing) === parent &&
 				activeExecution(existing),
@@ -1554,31 +1591,161 @@ export function makeStructuralSpeculativeActionRuntime<
 		}
 	};
 
-	const previewActorCall = async (input: ConsumeInput, signal?: AbortSignal): Promise<void> => {
+	const previewActorCall = (input: ConsumeInput, signal?: AbortSignal): Promise<void> => {
 		const state = turns.get(turnKey(input.sessionID, input.turnID));
-		if (!state || state.lifecycle !== "active" || signal?.aborted || masterEnabled === false) return;
-		const actualCall = adapter.actual(input) as ActualToolCall;
-		const action = await actorActionKey(input, actualCall);
-		if (!action || signal?.aborted || state.lifecycle !== "active" || turns.get(state.key) !== state) {
-			return;
+		if (!state || state.lifecycle !== "active" || signal?.aborted || masterEnabled === false) {
+			return Promise.resolve();
 		}
+		const actualCall = adapter.actual(input) as ActualToolCall;
+		if (!actualCall.id) return promoteActorCall(state, input, actualCall, undefined, signal);
+		const existing = state.actorPreviews.get(actualCall.id);
+		if (existing) return existing.task;
+		const record: ActorPreviewRecord = {
+			task: Promise.resolve(),
+			state: { status: "pending" },
+		};
+		state.actorPreviews.set(actualCall.id, record);
+		record.task = promoteActorCall(state, input, actualCall, record, signal);
+		return record.task;
+	};
+
+	const promoteActorCall = async (
+		state: Turn,
+		input: ConsumeInput,
+		actualCall: ActualToolCall,
+		record: ActorPreviewRecord | undefined,
+		signal?: AbortSignal,
+	): Promise<void> => {
+		const attemptStartedAt = performance.now();
+		const active = () =>
+			!signal?.aborted &&
+			record?.state.status !== "cancelled" &&
+			state.lifecycle === "active" &&
+			turns.get(state.key) === state &&
+			masterEnabled !== false;
+		const action = await actorActionKey(input, actualCall);
+		if (!action || !active()) return;
 		await Promise.all(
 			predictionMatches(state.session, action, state.decisionSequence).map(({ node }) =>
 				promoteForActor(state.session, node),
 			),
 		);
-		if (signal?.aborted || state.lifecycle !== "active" || turns.get(state.key) !== state) return;
+		if (!active()) return;
 		const preferred = rankCandidates(
 			action,
-			allCandidates(state.sessionID).filter((candidate) => candidateWorld(candidate) === undefined),
+			allCandidates(state.sessionID).filter(
+				(candidate) => candidate.origin === "prediction" && candidateWorld(candidate) === undefined,
+			),
 		)[0]?.candidate;
-		if (preferred?.work.execution.status === "queued") startQueuedCandidates(state.session, preferred);
+		if (preferred) {
+			if (record) record.state = { status: "candidate", candidateID: preferred.id, origin: "prediction" };
+			if (preferred.work.execution.status === "queued") {
+				startQueuedCandidates(state.session, preferred, true);
+			}
+			return;
+		}
+		if (!record || !state.candidateNames.includes(actualCall.tool)) return;
+		const executionSignal = signal ?? state.generation.signal;
+		const concrete = asConcreteInput(action.input);
+		if (!concrete) return;
+		const draft: SpeculativeDraftCandidate = {
+			type: "tool_call",
+			tool: actualCall.tool,
+			input: action.input,
+			source: "actor_preview",
+		};
+		const admission = await executionRouteFor({
+			startInput: state.startInput,
+			data: state.data,
+			settings: state.settings,
+			draft,
+			action,
+			concrete,
+			callID: actualCall.id ?? callKey(state.turnID, actualCall.tool),
+			index: state.session.candidateSequence,
+			signal: executionSignal,
+		});
+		if (!admission.ok || !active()) return;
+		const { route } = admission;
+		const sequence = ++state.session.candidateSequence;
+		const forecast: PredictionForecast = {
+			tool: actualCall.tool,
+			execution: route.isolation,
+			decisionBatchesUntilCall: 0,
+			actorPhase: actorPhaseFor(state.session),
+		};
+		const scheduled = state.session.scheduler.evaluate([forecast]);
+		const work = new CandidateExecution<WorldBranch<Output>>(
+			route.reuse === "exclusive_branch" ? "exclusive" : "shared",
+		);
+		const candidate: Candidate = {
+			id: `actor_${sequence}_${action.hash.slice(0, 12)}`,
+			origin: "actor_preview",
+			key: action,
+			route,
+			work,
+			actorAdopted: false,
+			owner: {
+				startInput: state.startInput,
+				data: state.data,
+				settings: state.settings,
+				draft,
+				index: sequence - 1,
+			},
+			createdAt: Date.now(),
+			attemptStartedAt,
+			predictionLatencyMs: 0,
+			draftTokens: 0,
+			totalDraftTokens: state.session.tokenTotal,
+			expectedDurationMs: scheduled.expectedDurationMs,
+			expectedDecisionSeq: state.decisionSequence,
+			criticalPathMs: scheduled.criticalPathMs,
+			priorityMs: scheduled.priorityMs,
+			background: false,
+			estimatedBytes: 0,
+			projectionCoverage: [],
+			validationMs: 0,
+			validationBytes: 0,
+			validationFiles: 0,
+			projectionMs: 0,
+		};
+		jobs.insert(state.sessionID, candidate);
+		record.state = { status: "candidate", candidateID: candidate.id, origin: "preview" };
+		startQueuedCandidates(state.session, candidate, true);
+	};
+
+	const abandonActorPreview = (
+		state: Turn,
+		record: ActorPreviewRecord | undefined,
+		failure: ResolutionCause,
+	): void => {
+		if (!record) return;
+		const current = record.state;
+		record.state = { status: "cancelled" };
+		if (current.status !== "candidate" || current.origin !== "preview") return;
+		const candidate = candidateByID(state.sessionID, current.candidateID);
+		if (!candidate) return;
+		discardCandidate(state.session, candidate, failure, false);
 	};
 
 	const consume = async (input: ConsumeInput, signal?: AbortSignal): Promise<Output | undefined> => {
 		const actorArrivedAt = performance.now();
 		const state = turns.get(turnKey(input.sessionID, input.turnID));
 		if (!state || state.lifecycle !== "active" || signal?.aborted || masterEnabled === false) return undefined;
+		const actualCall = adapter.actual(input) as ActualToolCall;
+		let preview = actualCall.id ? state.actorPreviews.get(actualCall.id) : undefined;
+		if (actualCall.id) state.actorPreviews.delete(actualCall.id);
+		if (preview?.state.status === "pending") {
+			preview.state = { status: "cancelled" };
+			preview = undefined;
+		} else if (preview?.state.status === "candidate" && preview.state.origin === "preview") {
+			const candidate = candidateByID(state.sessionID, preview.state.candidateID);
+			if (candidate?.work.execution.status !== "succeeded") {
+				abandonActorPreview(state, preview, cause("control", "actor_preview_incomplete"));
+				preview = undefined;
+			}
+		}
+		const previewCandidateID = preview?.state.status === "candidate" ? preview.state.candidateID : undefined;
 		expireSourceHorizon(state.session, state.decisionSequence, cause("control", "actor_action_arrived"));
 		closeActorPhase(state, actorArrivedAt);
 		if (state.actorArrivedAt === undefined) {
@@ -1595,7 +1762,6 @@ export function makeStructuralSpeculativeActionRuntime<
 		}
 		const candidatesAtArrival = allCandidates(state.sessionID);
 		const sequence = ++state.session.sequence;
-		const actualCall = adapter.actual(input) as ActualToolCall;
 		const identity: ActorActionIdentity = {
 			id: actualCall.id ?? JSON.stringify([input.turnID, sequence]),
 			sequence,
@@ -1615,6 +1781,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		await admission.ready;
 		try {
 			if (!actualKey) {
+				abandonActorPreview(state, preview, cause("matching", "action_not_keyable"));
 				actorAction.deferToFallback();
 				preemptForActor(state.session, { class: "global", units: 1 }, state.settings);
 				state.session.effects.enqueue(() => dispatchReady(state.session));
@@ -1630,11 +1797,16 @@ export function makeStructuralSpeculativeActionRuntime<
 				if (!opportunity) return [];
 				return [{ node, opportunity }];
 			});
-			await Promise.all(matchingPredictions.map(({ node }) => promoteForActor(state.session, node)));
+			if (!previewCandidateID) {
+				await Promise.all(matchingPredictions.map(({ node }) => promoteForActor(state.session, node)));
+			}
 			const candidates = uniqueCandidates([...candidatesAtArrival, ...allCandidates(state.sessionID)]).filter(
 				(candidate) => candidateWorld(candidate) === undefined,
 			);
-			const ranked = rankCandidates(actualKey, candidates);
+			const ranked = [...rankCandidates(actualKey, candidates)].sort(
+				(left, right) =>
+					Number(right.candidate.id === previewCandidateID) - Number(left.candidate.id === previewCandidateID),
+			);
 			const matchingCandidates = ranked.map(({ candidate }) => candidate);
 			let selected:
 				| {
@@ -1786,7 +1958,8 @@ export function makeStructuralSpeculativeActionRuntime<
 					removeCandidate(state.session, candidate);
 				} else {
 					candidate.work.release(reservationOwner);
-					results.recordActorHit(state.sessionID, candidate, cacheLimits(state.settings));
+					if (candidate.origin === "actor_preview") removeCandidate(state.session, candidate);
+					else results.recordActorHit(state.sessionID, candidate, cacheLimits(state.settings));
 				}
 				selected = {
 					candidate,
@@ -1799,6 +1972,23 @@ export function makeStructuralSpeculativeActionRuntime<
 			}
 
 			if (selected) {
+				if (selected.candidate.origin === "actor_preview") {
+					actorAction.settlePreview(
+						selected.candidate.id,
+						selected.toolExecution,
+						matchingPredictions.map(({ opportunity }) => opportunity.identity),
+					);
+					forgetActorAction(state.session, actualCall.id, actorAction);
+					confirmPredictions(state.session, matchingPredictions, identity, {
+						status: "rejected",
+						candidateID: selected.candidate.id,
+						cause: cause("control", "actor_preview_provider"),
+					});
+					reconcileAdoptedCandidate(state.session, actualKey, selected.candidate);
+					queueActorSettlement(state, input, actualCall, actorAction, selected.output, selected.candidate);
+					state.session.effects.enqueue(() => dispatchReady(state.session));
+					return selected.output;
+				}
 				actorAction.adopt(
 					selected.candidate.id,
 					selected.match,
@@ -1829,6 +2019,7 @@ export function makeStructuralSpeculativeActionRuntime<
 				return selected.output;
 			}
 
+			abandonActorPreview(state, preview, rejection);
 			actorAction.deferToFallback(
 				matchingPredictions.map(({ opportunity }) => opportunity.identity),
 				executionBlockedAttemptLead(state.session, matchingPredictions, actorArrivedAt),
@@ -2168,6 +2359,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		]) {
 			const candidate = lookup.entry;
 			if (
+				candidate.origin !== "prediction" ||
 				!activeExecution(candidate) ||
 				!sameSpeculativeExecutionRoute(candidate.route, route) ||
 				candidateWorld(candidate) !== parent
@@ -2240,7 +2432,20 @@ export function makeStructuralSpeculativeActionRuntime<
 				? [...nodes, additional]
 				: nodes;
 		const actorPhase = actorPhaseFor(session);
-		return unique.map((node) => forecastFor(node, candidate.route, session.decisionSequence, actorPhase));
+		if (unique.length) {
+			return unique.map((node) => forecastFor(node, candidate.route, session.decisionSequence, actorPhase));
+		}
+		return [
+			{
+				tool: candidate.key.tool,
+				execution: candidate.route.isolation,
+				expectedDurationMs: candidate.expectedDurationMs,
+				decisionBatchesUntilCall: Math.max(0, candidate.expectedDecisionSeq - session.decisionSequence),
+				...(actorPhase ? { actorPhase } : {}),
+				criticalPathMs: candidate.criticalPathMs,
+				background: candidate.background,
+			},
+		];
 	};
 
 	const installWatcher = (session: Session, candidate: Candidate): void => {
@@ -2446,7 +2651,11 @@ export function makeStructuralSpeculativeActionRuntime<
 	};
 
 	const trimResults = (session: Session, settings: SpeculativeActionSettings): void => {
-		for (const candidate of results.trim(session.id, cacheLimits(settings))) {
+		for (const candidate of results.trim(
+			session.id,
+			cacheLimits(settings),
+			(entry) => entry.origin === "prediction" && reservationAvailable(entry.work.reservation),
+		)) {
 			removeCandidate(session, candidate);
 		}
 	};
@@ -2492,6 +2701,10 @@ export function makeStructuralSpeculativeActionRuntime<
 		settlePredictionFrontier(state);
 		state.lifecycle = "closing";
 		state.generation.expire(cause("control", terminal ? "terminal_turn" : "turn_finished"));
+		for (const preview of state.actorPreviews.values()) {
+			abandonActorPreview(state, preview, cause("control", terminal ? "terminal_turn" : "turn_finished"));
+		}
+		state.actorPreviews.clear();
 		if (terminal) {
 			releaseAllSourceSlots(state.session, cause("control", "terminal_turn"));
 			await waitForSourceTasks(state.session);
@@ -2574,6 +2787,8 @@ export function makeStructuralSpeculativeActionRuntime<
 			if (!state) continue;
 			state.lifecycle = "finished";
 			state.generation.expire(failure);
+			for (const preview of state.actorPreviews.values()) abandonActorPreview(state, preview, failure);
+			state.actorPreviews.clear();
 			turns.delete(key);
 		}
 		session.turns.clear();

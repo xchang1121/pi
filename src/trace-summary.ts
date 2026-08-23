@@ -19,6 +19,7 @@ export interface SpeculativeTraceSummary {
 	readonly candidateTerminalCauses: Readonly<Record<string, number>>;
 	readonly actorActions: number;
 	readonly speculativeHits: number;
+	readonly actorPreviews: number;
 	readonly actorFallbacks: number;
 	readonly hitRate: number;
 	readonly actorCandidateRejections: Readonly<Record<string, number>>;
@@ -82,6 +83,7 @@ export function emptySpeculativeTraceSummary(cache: SpeculativeCacheSnapshot = E
 		candidateTerminalCauses: {},
 		actorActions: 0,
 		speculativeHits: 0,
+		actorPreviews: 0,
 		actorFallbacks: 0,
 		hitRate: 0,
 		actorCandidateRejections: {},
@@ -147,7 +149,9 @@ export function reduceSpeculativeTrace<SessionID>(
 			next.totalDraftTokens = Math.max(next.totalDraftTokens, metric(event.candidate.totalDraftTokens));
 			if (event.state.status === "running") next.candidateStarted++;
 			else {
-				next.speculativeExecutionMs += metric(event.state.executionMs);
+				if (event.candidate.origin === "prediction") {
+					next.speculativeExecutionMs += metric(event.state.executionMs);
+				}
 				if (event.state.status === "succeeded") next.candidateSucceeded++;
 				else {
 					if (event.state.status === "failed") next.candidateFailed++;
@@ -167,14 +171,18 @@ export function reduceSpeculativeTrace<SessionID>(
 				next.attemptLeadMs += metric(event.settlement.provider.timing.attemptLeadMs);
 				next.hitLatencyMs += metric(event.settlement.provider.timing.hitLatencyMs);
 			} else {
-				next.actorFallbacks++;
 				next.actorExecutionMs += metric(event.settlement.provider.durationMs);
-				const timing = event.settlement.provider.executionBlockedTiming;
-				if (timing) {
-					next.executionBlockedActorActions++;
-					next.executionBlockedAttemptLeadMs += metric(timing.attemptLeadMs);
-					next.executionBlockedPotentialHiddenLatencyMs += metric(timing.executionAheadMs);
-					next.executionBlockedPotentialHitLatencyMs += metric(timing.hitLatencyMs);
+				if (event.settlement.provider.origin === "preview") {
+					next.actorPreviews++;
+				} else {
+					next.actorFallbacks++;
+					const timing = event.settlement.provider.executionBlockedTiming;
+					if (timing) {
+						next.executionBlockedActorActions++;
+						next.executionBlockedAttemptLeadMs += metric(timing.attemptLeadMs);
+						next.executionBlockedPotentialHiddenLatencyMs += metric(timing.executionAheadMs);
+						next.executionBlockedPotentialHitLatencyMs += metric(timing.hitLatencyMs);
+					}
 				}
 			}
 			break;

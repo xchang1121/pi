@@ -8,6 +8,7 @@ import {
 	type FauxContentBlock,
 	type FauxResponseStep,
 	fauxAssistantMessage,
+	fauxText,
 	fauxThinking,
 	fauxToolCall,
 	type Message,
@@ -102,6 +103,56 @@ describe("faux LLM speculative action end to end", () => {
 		);
 		expect(speculative.executions.read).toBe(1);
 		expect(speculative.toolLatencyMs[0]).toBeLessThan(40);
+	});
+
+	it("overlaps an isolated Actor call with its remaining stream without speculative credit", async () => {
+		const cwd = await workspace();
+		const actorTurns = [
+			turn([fauxToolCall("read", { path: "notes.txt" }), fauxText("stream tail ".repeat(8))]),
+			turn("done"),
+		];
+		const run = (sessionID: string, actorPreview?: "call") =>
+			runAgent({
+				cwd,
+				sessionID,
+				tools: [delayedRead(cwd, 25)],
+				actorTurns,
+				actorTokensPerSecond: 500,
+				draftTurns: [],
+				settings: {
+					enabled: true,
+					drafterEnabled: false,
+					candidateLimit: 1,
+					maxConcurrentActions: 1,
+					predictionTimeoutMs: 1_000,
+					patternAware: { enabled: false },
+					tools: ["read"],
+				},
+				...(actorPreview ? { actorPreview } : {}),
+			});
+
+		const baseline = await run("actor-preview-baseline");
+		const treatment = await run("actor-preview-treatment", "call");
+
+		expect(baseline.summary).toMatchObject({
+			actorActions: 1,
+			speculativeHits: 0,
+			actorPreviews: 0,
+			actorFallbacks: 1,
+		});
+		expect(treatment.summary).toMatchObject({
+			actorActions: 1,
+			speculativeHits: 0,
+			actorPreviews: 1,
+			actorFallbacks: 0,
+			speculativeExecutionMs: 0,
+		});
+		expect(treatment.executions.read).toBe(1);
+		expect(treatment.summary.hiddenLatencyMs - baseline.summary.hiddenLatencyMs).toBeGreaterThan(12);
+		expect(treatment.summary.serializedMs - treatment.summary.endToEndMs).toBeCloseTo(
+			treatment.summary.hiddenLatencyMs,
+		);
+		expect((baseline.toolLatencyMs[0] ?? 0) - (treatment.toolLatencyMs[0] ?? 0)).toBeGreaterThan(12);
 	});
 
 	it("uses streamed Actor tool identity to hide queued-candidate latency", async () => {

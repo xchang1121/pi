@@ -106,6 +106,30 @@ export class ActorAction {
 		return true;
 	}
 
+	settlePreview(
+		candidateID: string,
+		toolExecution: TimelineInterval,
+		matchedPredictions: readonly PredictionIdentity[] = [],
+	): ActorActionSettlement | undefined {
+		if (this.stateValue.status !== "matching") return undefined;
+		const interval = normalizeInterval(toolExecution);
+		return this.finish({
+			actorAction: this.identity,
+			tool: this.tool,
+			...(this.actionKey ? { actionKeyHash: this.actionKey.hash } : {}),
+			matchedPredictions: freezePredictions(matchedPredictions),
+			rejections: Object.freeze([...this.rejections]),
+			provider: Object.freeze({
+				kind: "actor",
+				origin: "preview",
+				candidateID,
+				durationMs: Math.max(0, interval.completedAt - interval.startedAt),
+				isError: false,
+				toolExecution: interval,
+			}),
+		});
+	}
+
 	settleActor(
 		durationMs: number,
 		isError: boolean,
@@ -126,6 +150,7 @@ export class ActorAction {
 			rejections: Object.freeze([...this.rejections]),
 			provider: Object.freeze({
 				kind: "actor",
+				origin: "fallback",
 				durationMs: duration,
 				isError,
 				toolExecution: Object.freeze({ startedAt: Math.max(0, completed - duration), completedAt: completed }),

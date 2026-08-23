@@ -262,7 +262,7 @@ export interface SpeculativeActionRuntime<SessionID, Output, StartInput, Consume
 		input: { readonly sessionID: SessionID; readonly turnID: string; readonly tool: string },
 		signal?: AbortSignal,
 	) => Promise<void>;
-	/** Provisional streamed Actor intent: prioritize matching work without claiming or committing it. */
+	/** Complete streamed Actor intent: prioritize matching work or start an isolated preview; never commit it. */
 	readonly previewActorCall: (input: ConsumeInput, signal?: AbortSignal) => Promise<void>;
 	readonly consume: (input: ConsumeInput, signal?: AbortSignal) => Promise<Output | undefined>;
 	readonly actual: (input: ConsumeInput & { readonly durationMs: number; readonly output?: Output }) => Promise<void>;

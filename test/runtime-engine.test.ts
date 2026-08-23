@@ -1234,6 +1234,64 @@ describe("structural speculative runtime", () => {
 		});
 	});
 
+	it("discards an unconsumed Actor preview and never starts one without an isolation route", async () => {
+		let committed = 0;
+		let disposed = 0;
+		const fixture = harness({
+			source: { id: "disabled", enabled: () => false, propose: () => undefined },
+			execute: (tool, input, signal) =>
+				input.content === "slow"
+					? new Promise<never>((_resolve, reject) =>
+							signal.addEventListener("abort", () => reject(signal.reason), { once: true }),
+						)
+					: world(`${tool}:${String(input.path)}`, {
+							checkpoint: { backend: "test", id: "preview", lineage: "preview", depth: 0 },
+							resources: ["."],
+							onCommit: () => committed++,
+							onDispose: () => disposed++,
+						}),
+		});
+		await fixture.runtime.startTurn({ sessionID: "session", turnID: "aborted-preview" });
+		const writeCall: Call = {
+			sessionID: "session",
+			turnID: "aborted-preview",
+			id: "write-preview",
+			tool: "write",
+			input: { path: "preview.txt", content: "preview" },
+		};
+		await fixture.runtime.previewActorCall(writeCall);
+		await waitFor(() => fixture.executions() === 1);
+		await fixture.runtime.previewActorCall({
+			...writeCall,
+			id: "bash-preview",
+			tool: "bash",
+			input: { command: "echo preview" },
+		});
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		expect(fixture.executions()).toBe(1);
+		expect(committed).toBe(0);
+
+		await fixture.runtime.finishTurn({ ...writeCall, terminal: false });
+		expect(committed).toBe(0);
+		expect(disposed).toBe(1);
+		expect(fixture.runtime.inspect("session").exclusiveCandidates).toBe(0);
+
+		await fixture.runtime.startTurn({ sessionID: "session", turnID: "incomplete-preview" });
+		const slowCall: Call = {
+			...writeCall,
+			turnID: "incomplete-preview",
+			id: "slow-preview",
+			input: { path: "slow.txt", content: "slow" },
+		};
+		await fixture.runtime.previewActorCall(slowCall);
+		await waitFor(() => fixture.executions() === 2);
+		const arrivedAt = performance.now();
+		expect(await fixture.runtime.consume(slowCall)).toBeUndefined();
+		expect(performance.now() - arrivedAt).toBeLessThan(40);
+		await fixture.runtime.actual({ ...slowCall, durationMs: 0, output: "actor" });
+		await fixture.runtime.finishTurn({ ...slowCall, terminal: true });
+	});
+
 	it("uses streamed tool identity only to order complete queued predictions", async () => {
 		let releaseBusy!: () => void;
 		const busy = new Promise<void>((resolve) => {
@@ -1327,7 +1385,11 @@ describe("structural speculative runtime", () => {
 		expect(fixture.events.some((event) => event.type === "candidate" && event.candidate.tool === "bash")).toBe(false);
 		const actorEvent = fixture.events.find((event) => event.type === "actor_action");
 		expect(actorEvent?.type === "actor_action" && actorEvent.settlement.provider.kind === "actor").toBe(true);
-		if (actorEvent?.type === "actor_action" && actorEvent.settlement.provider.kind === "actor") {
+		if (
+			actorEvent?.type === "actor_action" &&
+			actorEvent.settlement.provider.kind === "actor" &&
+			actorEvent.settlement.provider.origin === "fallback"
+		) {
 			const timing = actorEvent.settlement.provider.executionBlockedTiming;
 			expect(timing).toBeDefined();
 			expect(timing?.executionAheadMs).toBeLessThanOrEqual(2);
