@@ -38,7 +38,11 @@ import {
 } from "./common.ts";
 import { PATTERN_AWARE_DEFAULTS, type PatternAwareSettings, patternAwareSettings } from "./pattern-aware.ts";
 import { PI_BASH_TAIL_LINES_PROJECTION_RULE } from "./pi-bash-projection.ts";
-import { PI_READ_RANGE_PROJECTION_RULE, withPiProjectionCoverage } from "./pi-read-projection.ts";
+import {
+	canPreviewIncompletePiCall,
+	PI_READ_RANGE_PROJECTION_RULE,
+	withPiProjectionCoverage,
+} from "./pi-read-projection.ts";
 import { resolvePiToolInvocation } from "./pi-tool-invocation.ts";
 import type { SpeculativeActionEvent } from "./runtime.ts";
 import {
@@ -191,7 +195,7 @@ export function createSpeculativeActionExtension(
 	return (pi) => {
 		let controller: SpeculativeActionController | undefined;
 		const wrapperSources = new Map<string, string>();
-		const actorStream = new ActorStreamPreviewTracker();
+		const actorStream = new ActorStreamPreviewTracker(canPreviewIncompletePiCall);
 
 		pi.on("session_start", async (_event, ctx) => {
 			await controller?.dispose();

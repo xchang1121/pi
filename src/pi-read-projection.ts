@@ -16,6 +16,11 @@ import {
 import { buildActionKey, READ_DEFAULT_LIMIT, readActionRange } from "./action-semantics.ts";
 import type { ToolSettlement } from "./tool-settlement.ts";
 
+/** An incomplete Actor stream may start only the existing lossless read-range projection. */
+export function canPreviewIncompletePiCall(tool: string, input: Readonly<Record<string, unknown>>): boolean {
+	return tool === "read" && typeof input.path === "string";
+}
+
 /** Production Pi read projection. Other tools remain exact-only. */
 export const PI_READ_RANGE_PROJECTION_RULE: ActionProjectionRule<ToolSettlement> = {
 	...READ_RANGE_ACTION_KEY_PROJECTOR,

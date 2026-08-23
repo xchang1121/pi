@@ -41,6 +41,7 @@
 
 ### Changed
 
+- Actor stream previews now start lossless covering reads when a complete path field is decoded; final K(a), realized coverage, and freshness remain authoritative.
 - Read projection now reuses Pi coding-agent's public truncation contract and compact, in-memory coverage descriptors; projected single-flight reuse also requires explicit opt-in.
 - World commit now serializes overlapping targets, uses staged atomic replacement, preserves file modes, and removes newly created directories during rollback.
 - Drafter candidates now reuse exact and containing-read cache entries, deduplicate in-flight work, and replace stale resource entries before execution.

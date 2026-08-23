@@ -20,7 +20,11 @@ import { createSpeculativeActionHost, type SpeculativeAgentSettingsInput } from 
 import { ActorStreamPreviewTracker } from "../src/actor-stream-preview.ts";
 import { DEFAULTS } from "../src/common.ts";
 import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
-import { PI_READ_RANGE_PROJECTION_RULE, withPiProjectionCoverage } from "../src/pi-read-projection.ts";
+import {
+	canPreviewIncompletePiCall,
+	PI_READ_RANGE_PROJECTION_RULE,
+	withPiProjectionCoverage,
+} from "../src/pi-read-projection.ts";
 import type { SpeculativeActionEvent } from "../src/runtime.ts";
 import { summarizeSpeculativeTrace } from "../src/trace-summary.ts";
 import { createWorkspaceSandbox } from "../src/workspace-sandbox.ts";
@@ -299,7 +303,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 	let currentTurnID: string | undefined;
 	let lastTurnID: string | undefined;
 	let turnSequence = 0;
-	const actorStream = new ActorStreamPreviewTracker();
+	const actorStream = new ActorStreamPreviewTracker(canPreviewIncompletePiCall);
 	const toolIntentMs: number[] = [];
 	const actorTools = tools.map(
 		(base): AgentTool => ({
