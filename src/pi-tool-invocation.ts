@@ -18,15 +18,26 @@ export function resolvePiToolInvocation(
 	const record = input as Record<string, unknown>;
 	if (typeof record.command !== "string") return undefined;
 	const shell = getShellConfig(options.shellPath);
+	const executor = "pi.bash.local.v2";
+	const commandTransport = shell.commandTransport ?? "argv";
 	return {
-		executor: "pi.bash.local.v2",
+		executor,
+		identity: {
+			executor,
+			cwd: options.cwd,
+			environment: options.environment,
+			shell: shell.shell,
+			shellArgs: [...shell.args],
+			commandTransport,
+			...(options.shellCommandPrefix ? { commandPrefix: options.shellCommandPrefix } : {}),
+		},
 		process: {
 			command: options.shellCommandPrefix ? `${options.shellCommandPrefix}\n${record.command}` : record.command,
 			cwd: options.cwd,
 			environment: options.environment,
 			shell: shell.shell,
 			shellArgs: [...shell.args],
-			commandTransport: shell.commandTransport ?? "argv",
+			commandTransport,
 			...(typeof record.timeout === "number" ? { timeout: record.timeout } : {}),
 		},
 	};

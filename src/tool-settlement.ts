@@ -20,5 +20,7 @@ export interface ToolProcessInvocation {
 /** Versioned identity of the concrete tool executor. */
 export interface ToolInvocation {
 	readonly executor: string;
+	/** Input-invariant executor identity used by K(a); the exact invocation remains in `process`. */
+	readonly identity?: unknown;
 	readonly process?: ToolProcessInvocation;
 }

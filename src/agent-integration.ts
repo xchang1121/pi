@@ -672,7 +672,7 @@ export function createSpeculativeActionHost(
 				schemaHash,
 				invocation
 					? {
-							fingerprint: stableHash(invocation),
+							fingerprint: stableHash(invocation.identity ?? invocation),
 							context: invocation,
 						}
 					: undefined,

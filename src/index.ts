@@ -20,6 +20,9 @@ export {
 	actionKeyMismatchReason,
 	actionKeyProjectionPartitions,
 	actionKeyProjects,
+	BASH_TAIL_LINES_ACTION_KEY_PROJECTOR,
+	type BashTailLinesView,
+	bashTailLinesView,
 	buildActionKey,
 	buildPiActionKey,
 	type CanonicalAction,
@@ -134,6 +137,7 @@ export {
 	patternAwareSettings,
 	projectPatternAwareObservation,
 } from "./pattern-aware.ts";
+export { PI_BASH_TAIL_LINES_PROJECTION_RULE } from "./pi-bash-projection.ts";
 export {
 	PI_READ_RANGE_PROJECTION_RULE,
 	withPiProjectionCoverage,
