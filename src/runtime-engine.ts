@@ -631,6 +631,7 @@ interface TurnState<SessionID, Output, StartInput, StateData> {
 	readonly generation: SourceGeneration;
 	readonly decisionSequence: number;
 	readonly actorActions: ActorAction[];
+	readonly actorToolHints: Set<string>;
 	actorDecisionStartedAt: number;
 	actorArrivedAt?: number;
 	actorPhaseCompletedAt?: number;
@@ -779,6 +780,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			generation,
 			decisionSequence: session.decisionSequence + 1,
 			actorActions: [],
+			actorToolHints: new Set(),
 			actorDecisionStartedAt: startedAt,
 			lifecycle: "active",
 		};
@@ -1217,8 +1219,8 @@ export function makeStructuralSpeculativeActionRuntime<
 		}
 	};
 
-	const actorPhaseFor = (session: Session, now = performance.now()): PredictionForecast["actorPhase"] => {
-		const actorTurn = [...session.turns]
+	const pendingActorTurn = (session: Session): Turn | undefined =>
+		[...session.turns]
 			.map((key) => turns.get(key))
 			.find(
 				(turn) =>
@@ -1226,6 +1228,9 @@ export function makeStructuralSpeculativeActionRuntime<
 					turn.actorArrivedAt === undefined &&
 					turn.decisionSequence === session.decisionSequence + 1,
 			);
+
+	const actorPhaseFor = (session: Session, now = performance.now()): PredictionForecast["actorPhase"] => {
+		const actorTurn = pendingActorTurn(session);
 		return actorTurn
 			? { kind: "decision", elapsedMs: Math.max(0, now - actorTurn.actorDecisionStartedAt) }
 			: session.lastActorArrivedAt === undefined
@@ -1391,9 +1396,14 @@ export function makeStructuralSpeculativeActionRuntime<
 	};
 
 	const startQueuedCandidates = (session: Session, preferred?: Candidate, authoritative = false): void => {
+		const actorToolHints = pendingActorTurn(session)?.actorToolHints;
 		const queued = jobs
 			.values(session.id)
-			.filter((candidate) => candidate.work.execution.status === "queued")
+			.filter(
+				(candidate) =>
+					candidate.work.execution.status === "queued" &&
+					(!actorToolHints?.size || actorToolHints.has(candidate.key.tool)),
+			)
 			.sort(
 				(left, right) =>
 					Number(right === preferred) - Number(left === preferred) ||
@@ -1517,6 +1527,23 @@ export function makeStructuralSpeculativeActionRuntime<
 			if (settled) queueCandidateEvent(session, candidate);
 			dispatchReady(session);
 		}
+	};
+
+	const previewActorTool = async (
+		input: { readonly sessionID: SessionID; readonly turnID: string; readonly tool: string },
+		signal?: AbortSignal,
+	): Promise<void> => {
+		const state = turns.get(turnKey(input.sessionID, input.turnID));
+		if (!state || state.lifecycle !== "active" || signal?.aborted || masterEnabled === false) return;
+		if (!state.candidateNames.includes(input.tool)) return;
+		state.actorToolHints.add(input.tool);
+		await Promise.all(
+			nearestPredictions(state.session, state.decisionSequence, (node) => node.action.tool === input.tool).map(
+				(node) => promoteForActor(state.session, node),
+			),
+		);
+		if (signal?.aborted || state.lifecycle !== "active" || turns.get(state.key) !== state) return;
+		startQueuedCandidates(state.session);
 	};
 
 	const actorActionKey = async (input: ConsumeInput, call: ActualToolCall): Promise<ActionKey | undefined> => {
@@ -2300,30 +2327,43 @@ export function makeStructuralSpeculativeActionRuntime<
 			);
 	};
 
-	const predictionMatches = (
+	const nearestPredictions = (
 		session: Session,
-		action: ActionKey,
 		decisionSequence: number,
-	): readonly { readonly node: PlanRuntimeNode; readonly relation: ActionKeyMatch }[] => {
-		const groups = new Map<string, Array<{ readonly node: PlanRuntimeNode; readonly relation: ActionKeyMatch }>>();
+		matches: (node: PlanRuntimeNode) => boolean,
+	): readonly PlanRuntimeNode[] => {
+		const groups = new Map<string, PlanRuntimeNode[]>();
 		for (const node of session.plan.matchable(decisionSequence)) {
 			if (!node.actionKey || node.action.type !== "tool_call") continue;
-			const relation = actionKeyMatch(node.actionKey, action, projectors);
-			if (!relation) continue;
+			if (!matches(node)) continue;
 			const group = groups.get(node.proposalID) ?? [];
-			group.push({ node, relation });
+			group.push(node);
 			groups.set(node.proposalID, group);
 		}
 		return [...groups.values()].flatMap((group) => {
-			const due = group.filter(({ node }) => node.expectedDecisionSeq <= decisionSequence);
+			const due = group.filter((node) => node.expectedDecisionSeq <= decisionSequence);
 			const ranked = (due.length ? due : group).sort((left, right) =>
 				due.length
-					? right.node.expectedDecisionSeq - left.node.expectedDecisionSeq
-					: left.node.expectedDecisionSeq - right.node.expectedDecisionSeq,
+					? right.expectedDecisionSeq - left.expectedDecisionSeq
+					: left.expectedDecisionSeq - right.expectedDecisionSeq,
 			);
 			return ranked[0] ? [ranked[0]] : [];
 		});
 	};
+
+	const predictionMatches = (
+		session: Session,
+		action: ActionKey,
+		decisionSequence: number,
+	): readonly { readonly node: PlanRuntimeNode; readonly relation: ActionKeyMatch }[] =>
+		nearestPredictions(
+			session,
+			decisionSequence,
+			(node) => actionKeyMatch(node.actionKey!, action, projectors) !== undefined,
+		).flatMap((node) => {
+			const relation = actionKeyMatch(node.actionKey!, action, projectors);
+			return relation ? [{ node, relation }] : [];
+		});
 
 	const promoteForActor = async (session: Session, node: PlanRuntimeNode): Promise<void> => {
 		if (!node.prediction) return;
@@ -2708,6 +2748,7 @@ export function makeStructuralSpeculativeActionRuntime<
 
 	return {
 		startTurn,
+		previewActorTool,
 		previewActorCall,
 		consume,
 		actual,

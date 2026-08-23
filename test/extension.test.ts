@@ -82,20 +82,31 @@ describe("zero-modification Pi extension", () => {
 		expect(fixture.host.actual).not.toHaveBeenCalled();
 	});
 
-	it("previews complete streamed arguments before the tool call ends", async () => {
+	it("previews the streamed tool before its complete call without claiming either", async () => {
 		const fixture = await createFixture();
 		await fixture.emit("session_start", {}, fixture.context);
 		await fixture.emit("context", { messages: [] }, fixture.context);
 		const partial = {
 			content: [{ type: "toolCall", id: "actor-read", name: "read", arguments: {} }],
 		};
-		for (const delta of ['{"path":', '"notes.txt"}']) {
-			await fixture.emit(
-				"message_update",
-				{ assistantMessageEvent: { type: "toolcall_delta", contentIndex: 0, delta, partial } },
-				fixture.context,
-			);
-		}
+		await fixture.emit(
+			"message_update",
+			{ assistantMessageEvent: { type: "toolcall_start", contentIndex: 0, partial } },
+			fixture.context,
+		);
+		expect(fixture.host.previewActorTool).toHaveBeenCalledWith({ turnID: "turn_1", tool: "read" }, undefined);
+		await fixture.emit(
+			"message_update",
+			{ assistantMessageEvent: { type: "toolcall_delta", contentIndex: 0, delta: '{"path":', partial } },
+			fixture.context,
+		);
+		expect(fixture.host.previewActorTool).toHaveBeenCalledOnce();
+		expect(fixture.host.previewActorCall).not.toHaveBeenCalled();
+		await fixture.emit(
+			"message_update",
+			{ assistantMessageEvent: { type: "toolcall_delta", contentIndex: 0, delta: '"notes.txt"}', partial } },
+			fixture.context,
+		);
 		await vi.waitFor(() => expect(fixture.host.previewActorCall).toHaveBeenCalledOnce());
 		await fixture.emit(
 			"message_update",
@@ -460,6 +471,7 @@ function mockHost(consume: SpeculativeActionHost["consume"] = async () => undefi
 			}),
 		} as unknown as SpeculativeActionHost["runtime"],
 		startTurn: vi.fn(),
+		previewActorTool: vi.fn(),
 		previewActorCall: vi.fn(),
 		consume: vi.fn(consume),
 		actual: vi.fn(),

@@ -108,6 +108,7 @@ interface SpeculativeActionController {
 	readonly attachUI: (ui: ExtensionUIContext) => void;
 	readonly detachUI: () => void;
 	readonly startTurn: (messages: AgentMessage[], context: ExtensionContext) => Promise<void>;
+	readonly previewActorTool: (tool: string, signal?: AbortSignal) => void;
 	readonly previewActorCall: (tool: string, callID: string, input: unknown, signal?: AbortSignal) => void;
 	readonly finishTurn: (terminal?: boolean) => Promise<void>;
 	readonly execute: (
@@ -188,7 +189,7 @@ export function createSpeculativeActionExtension(
 	return (pi) => {
 		let controller: SpeculativeActionController | undefined;
 		const wrapperSources = new Map<string, string>();
-		const streamedCalls = new Map<number, { arguments: string; previewed: boolean }>();
+		const streamedCalls = new Map<number, { arguments: string; toolPreviewed: boolean; callPreviewed: boolean }>();
 
 		pi.on("session_start", async (_event, ctx) => {
 			await controller?.dispose();
@@ -201,19 +202,27 @@ export function createSpeculativeActionExtension(
 		});
 		pi.on("message_update", (event, ctx) => {
 			const update = event.assistantMessageEvent;
-			if (update.type === "toolcall_delta") {
+			if (update.type === "toolcall_start" || update.type === "toolcall_delta") {
 				const call = update.partial.content[update.contentIndex];
 				if (call?.type !== "toolCall") return;
-				const state = streamedCalls.get(update.contentIndex) ?? { arguments: "", previewed: false };
-				state.arguments += update.delta;
+				const state = streamedCalls.get(update.contentIndex) ?? {
+					arguments: "",
+					toolPreviewed: false,
+					callPreviewed: false,
+				};
+				if (update.type === "toolcall_delta") state.arguments += update.delta;
 				streamedCalls.set(update.contentIndex, state);
-				const input = completeJsonObject(state.arguments);
-				if (input && !state.previewed && call.name && call.id && controller) {
-					state.previewed = true;
+				if (!state.toolPreviewed && call.name && controller?.registeredTools().has(call.name)) {
+					state.toolPreviewed = true;
+					controller.previewActorTool(call.name, ctx.signal);
+				}
+				const input = update.type === "toolcall_delta" ? completeJsonObject(state.arguments) : undefined;
+				if (input && !state.callPreviewed && call.name && call.id && controller) {
+					state.callPreviewed = true;
 					controller.previewActorCall(call.name, call.id, input, ctx.signal);
 				}
 			} else if (update.type === "toolcall_end") {
-				if (!streamedCalls.get(update.contentIndex)?.previewed)
+				if (!streamedCalls.get(update.contentIndex)?.callPreviewed)
 					controller?.previewActorCall(
 						update.toolCall.name,
 						update.toolCall.id,
@@ -403,6 +412,11 @@ async function installController(
 			void recoverSpeculation(() =>
 				host.previewActorCall({ turnID, id: callID, tool, args: input, tools: turnTools }, signal),
 			);
+		},
+		previewActorTool: (tool, signal) => {
+			const turnID = currentTurnID;
+			if (!turnID || !baseDefinitions.has(tool)) return;
+			void recoverSpeculation(() => host.previewActorTool({ turnID, tool }, signal));
 		},
 		finishTurn: async (terminal = false) => {
 			const turnID = currentTurnID ?? (terminal ? lastTurnID : undefined);

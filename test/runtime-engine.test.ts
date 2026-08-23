@@ -1234,6 +1234,55 @@ describe("structural speculative runtime", () => {
 		});
 	});
 
+	it("uses streamed tool identity only to order complete queued predictions", async () => {
+		let releaseBusy!: () => void;
+		const busy = new Promise<void>((resolve) => {
+			releaseBusy = resolve;
+		});
+		const started: string[] = [];
+		const source: Source = {
+			id: "source",
+			enabled: () => true,
+			propose: () => ({
+				id: "tool-hint",
+				source: "source",
+				revision: 0,
+				actions: [
+					{ id: "busy", type: "tool_call" as const, tool: "bash", input: { command: "busy" } },
+					{ id: "wrong", type: "tool_call" as const, tool: "bash", input: { command: "wrong" } },
+					{ id: "target", type: "tool_call" as const, tool: "read", input: { path: "target.ts" } },
+					{ id: "wrong-read", type: "tool_call" as const, tool: "read", input: { path: "wrong.ts" } },
+				],
+			}),
+		};
+		const fixture = harness({
+			source,
+			settings: () => ({ ...settings, maxConcurrentActions: 1 }),
+			resolveExecution: () => RESOURCE_ROUTE,
+			execute: async (_tool, input) => {
+				const action = String(input.path ?? input.command);
+				started.push(action);
+				if (input.command === "busy") await busy;
+				return action;
+			},
+		});
+		await fixture.runtime.startTurn({ sessionID: "session", turnID: "tool-hint" });
+		await waitFor(() => started.length === 1);
+		await waitFor(() => fixture.runtime.inspect().sharedCandidates === 4);
+		expect(started).toEqual(["busy"]);
+
+		await fixture.runtime.previewActorTool({ sessionID: "session", turnID: "tool-hint", tool: "read" });
+		releaseBusy();
+		await waitFor(() => started.length >= 2);
+		expect(started.slice(0, 2)).toEqual(["busy", "target.ts"]);
+		expect(started).not.toContain("wrong");
+		expect(fixture.events.some((event) => event.type === "actor_action")).toBe(false);
+
+		const actorCall = call("tool-hint", { path: "target.ts" });
+		expect(await fixture.runtime.consume(actorCall)).toBe("target.ts");
+		await fixture.runtime.finishTurn({ ...actorCall, terminal: true });
+	});
+
 	it("records an exact match when isolation is unavailable without starting speculative execution", async () => {
 		const settlements: PredictionSettlement[] = [];
 		const source: Source = {

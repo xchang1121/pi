@@ -104,6 +104,52 @@ describe("faux LLM speculative action end to end", () => {
 		expect(speculative.toolLatencyMs[0]).toBeLessThan(40);
 	});
 
+	it("uses streamed Actor tool identity to hide queued-candidate latency", async () => {
+		const cwd = await workspace();
+		const target = "x".repeat(800);
+		const grep = patternTools(cwd, 90, "notes.txt").find((tool) => tool.name === "grep")!;
+		const run = (sessionID: string, actorPreview: "call" | "tool") =>
+			runAgent({
+				cwd,
+				sessionID,
+				tools: [delayedStep("find", findSchema, 150), delayedStep("ls", lsSchema, 5_000), grep],
+				actorTurns: [turn(fauxToolCall("grep", { pattern: target, path: "." }), 30), turn("done")],
+				actorTokensPerSecond: 1_000,
+				draftTurns: [
+					turn(fauxToolCall("find", { pattern: "wrong-one" })),
+					turn(fauxToolCall("ls", { path: "." }), 10),
+					turn(fauxToolCall("grep", { pattern: target, path: "." }), 20),
+					turn("no tool"),
+					turn("no tool"),
+					turn("no tool"),
+				],
+				draftTokensPerSecond: 100_000,
+				draftTokenSize: 128,
+				actorPreview,
+				settings: {
+					enabled: true,
+					drafterEnabled: true,
+					drafterMaxDepth: 0,
+					candidateLimit: 3,
+					maxConcurrentActions: 1,
+					predictionTimeoutMs: 1_000,
+					patternAware: { enabled: false },
+					tools: ["find", "ls", "grep"],
+				},
+			});
+		const baseline = await run("actor-call-preview", "call");
+		const treatment = await run("actor-tool-preview", "tool");
+		expect(baseline.summary).toMatchObject({ actorActions: 1, speculativeHits: 1 });
+		expect(treatment.summary).toMatchObject({ actorActions: 1, speculativeHits: 1 });
+		expect(baseline.toolLatencyMs[0] - treatment.toolLatencyMs[0]).toBeGreaterThan(60);
+		expect(
+			treatment.summary.serializedMs -
+				treatment.summary.endToEndMs -
+				(baseline.summary.serializedMs - baseline.summary.endToEndMs),
+		).toBeGreaterThan(60);
+		expect(treatment.summary.executionAheadMs).toBeGreaterThan(baseline.summary.executionAheadMs);
+	});
+
 	it("continues after joining compatible work already in flight", async () => {
 		const cwd = await workspace();
 		await writeFile(path.join(cwd, "target.txt"), "target", "utf8");
@@ -700,8 +746,10 @@ type RunAgentInput = {
 	readonly draftTurns: readonly ScriptedTurn[];
 	readonly draftResponses?: readonly FauxResponseStep[];
 	readonly draftTokensPerSecond?: number;
+	readonly draftTokenSize?: number;
 	readonly settings: SpeculativeAgentSettingsInput;
 	readonly patternStore?: PatternAwareStore;
+	readonly actorPreview?: "call" | "tool";
 };
 
 function turn(content: ScriptedTurn["content"], delayMs = 0): ScriptedTurn {
@@ -738,7 +786,7 @@ async function runAgent(input: RunAgentInput) {
 		provider: `drafter-${input.sessionID}`,
 		models: [{ id: "draft", reasoning: false }],
 		tokensPerSecond: input.draftTokensPerSecond ?? 4_000,
-		tokenSize: { min: 1, max: 1 },
+		tokenSize: { min: input.draftTokenSize ?? 1, max: input.draftTokenSize ?? 1 },
 	});
 	actor.setResponses(scriptedResponses(input.actorTurns));
 	drafter.setResponses(input.draftResponses ? [...input.draftResponses] : scriptedResponses(input.draftTurns));
@@ -834,7 +882,27 @@ async function runAgent(input: RunAgentInput) {
 		timestamp: Date.now(),
 	};
 	agent.subscribe(async (event, signal) => {
-		if (event.type === "message_update") streamEvents.push(event.assistantMessageEvent.type);
+		if (event.type === "message_update") {
+			const update = event.assistantMessageEvent;
+			streamEvents.push(update.type);
+			if (input.actorPreview === "tool" && currentTurnID && update.type === "toolcall_start") {
+				const call = update.partial.content[update.contentIndex];
+				if (call?.type === "toolCall")
+					await host.previewActorTool({ turnID: currentTurnID, tool: call.name }, signal);
+			}
+			if (input.actorPreview && currentTurnID && update.type === "toolcall_end") {
+				await host.previewActorCall(
+					{
+						turnID: currentTurnID,
+						id: update.toolCall.id,
+						tool: update.toolCall.name,
+						args: update.toolCall.arguments,
+						tools: measuredTools,
+					},
+					signal,
+				);
+			}
+		}
 		if (event.type === "turn_start") {
 			currentTurnID = `turn-${++turnSequence}`;
 			lastTurnID = currentTurnID;

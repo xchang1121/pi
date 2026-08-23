@@ -257,6 +257,11 @@ export interface SpeculativeRuntimeInspection {
 
 export interface SpeculativeActionRuntime<SessionID, Output, StartInput, ConsumeInput, FinishInput> {
 	readonly startTurn: (input: StartInput, signal?: AbortSignal) => Promise<void>;
+	/** Streamed Actor tool identity: prioritize complete predictions for that tool without matching them. */
+	readonly previewActorTool: (
+		input: { readonly sessionID: SessionID; readonly turnID: string; readonly tool: string },
+		signal?: AbortSignal,
+	) => Promise<void>;
 	/** Provisional streamed Actor intent: prioritize matching work without claiming or committing it. */
 	readonly previewActorCall: (input: ConsumeInput, signal?: AbortSignal) => Promise<void>;
 	readonly consume: (input: ConsumeInput, signal?: AbortSignal) => Promise<Output | undefined>;
