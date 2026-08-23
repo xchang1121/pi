@@ -27,6 +27,7 @@ import {
 	UNBOUNDED_ACTION_TOOLS,
 	WORKSPACE_MUTATION_ACTION_TOOLS,
 } from "./action-semantics.ts";
+import { ActorStreamPreviewTracker } from "./actor-stream-preview.ts";
 import type { SpeculativeAgentExecutionWorld } from "./agent-execution-world.ts";
 import { createSpeculativeActionHost } from "./agent-integration.ts";
 import {
@@ -189,7 +190,7 @@ export function createSpeculativeActionExtension(
 	return (pi) => {
 		let controller: SpeculativeActionController | undefined;
 		const wrapperSources = new Map<string, string>();
-		const streamedCalls = new Map<number, { arguments: string; toolPreviewed: boolean; callPreviewed: boolean }>();
+		const actorStream = new ActorStreamPreviewTracker();
 
 		pi.on("session_start", async (_event, ctx) => {
 			await controller?.dispose();
@@ -197,39 +198,17 @@ export function createSpeculativeActionExtension(
 			controller.attachUI(ctx.ui);
 		});
 		pi.on("context", async (event, ctx) => {
-			streamedCalls.clear();
+			actorStream.clear();
 			await controller?.startTurn(event.messages, ctx);
 		});
 		pi.on("message_update", (event, ctx) => {
-			const update = event.assistantMessageEvent;
-			if (update.type === "toolcall_start" || update.type === "toolcall_delta") {
-				const call = update.partial.content[update.contentIndex];
-				if (call?.type !== "toolCall") return;
-				const state = streamedCalls.get(update.contentIndex) ?? {
-					arguments: "",
-					toolPreviewed: false,
-					callPreviewed: false,
-				};
-				if (update.type === "toolcall_delta") state.arguments += update.delta;
-				streamedCalls.set(update.contentIndex, state);
-				if (!state.toolPreviewed && call.name && controller?.registeredTools().has(call.name)) {
-					state.toolPreviewed = true;
-					controller.previewActorTool(call.name, ctx.signal);
+			for (const preview of actorStream.observe(event.assistantMessageEvent)) {
+				if (preview.type === "tool") {
+					if (controller?.registeredTools().has(preview.tool))
+						controller.previewActorTool(preview.tool, ctx.signal);
+				} else {
+					controller?.previewActorCall(preview.call.name, preview.call.id, preview.call.arguments, ctx.signal);
 				}
-				const input = update.type === "toolcall_delta" ? completeJsonObject(state.arguments) : undefined;
-				if (input && !state.callPreviewed && call.name && call.id && controller) {
-					state.callPreviewed = true;
-					controller.previewActorCall(call.name, call.id, input, ctx.signal);
-				}
-			} else if (update.type === "toolcall_end") {
-				if (!streamedCalls.get(update.contentIndex)?.callPreviewed)
-					controller?.previewActorCall(
-						update.toolCall.name,
-						update.toolCall.id,
-						update.toolCall.arguments,
-						ctx.signal,
-					);
-				streamedCalls.delete(update.contentIndex);
 			}
 		});
 		pi.on("turn_end", async () => {
@@ -252,17 +231,6 @@ export function createSpeculativeActionExtension(
 		};
 		pi.registerCommand("speculative-action", command);
 	};
-}
-
-function completeJsonObject(value: string): Record<string, unknown> | undefined {
-	try {
-		const parsed: unknown = JSON.parse(value);
-		return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
-			? (parsed as Record<string, unknown>)
-			: undefined;
-	} catch {
-		return undefined;
-	}
 }
 
 const speculativeActionExtension = createSpeculativeActionExtension();

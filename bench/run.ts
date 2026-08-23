@@ -17,6 +17,7 @@ import {
 	createWriteTool,
 } from "@earendil-works/pi-coding-agent";
 import { createSpeculativeActionHost, type SpeculativeAgentSettingsInput } from "../src/agent-integration.ts";
+import { ActorStreamPreviewTracker } from "../src/actor-stream-preview.ts";
 import { DEFAULTS } from "../src/common.ts";
 import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import { PI_READ_RANGE_PROJECTION_RULE, withPiProjectionCoverage } from "../src/pi-read-projection.ts";
@@ -298,6 +299,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 	let currentTurnID: string | undefined;
 	let lastTurnID: string | undefined;
 	let turnSequence = 0;
+	const actorStream = new ActorStreamPreviewTracker();
 	const toolIntentMs: number[] = [];
 	const actorTools = tools.map(
 		(base): AgentTool => ({
@@ -372,7 +374,27 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 		timestamp: Date.now(),
 	};
 	agent.subscribe(async (event, signal) => {
+		if (event.type === "message_update") {
+			for (const preview of actorStream.observe(event.assistantMessageEvent)) {
+				if (!currentTurnID) continue;
+				if (preview.type === "tool") {
+					await host.previewActorTool({ turnID: currentTurnID, tool: preview.tool }, signal);
+				} else {
+					await host.previewActorCall(
+						{
+							turnID: currentTurnID,
+							id: preview.call.id,
+							tool: preview.call.name,
+							args: preview.call.arguments,
+							tools,
+						},
+						signal,
+					);
+				}
+			}
+		}
 		if (event.type === "turn_start") {
+			actorStream.clear();
 			currentTurnID = `turn-${++turnSequence}`;
 			lastTurnID = currentTurnID;
 			await host.startTurn(
