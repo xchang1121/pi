@@ -384,10 +384,9 @@ export function createSpeculativeActionHost(
 		dependsOn?: PlanAction["dependsOn"],
 	): PlanAction => ({
 		id,
-		type: candidate.type,
+		type: "tool_call",
 		tool: candidate.tool,
 		input: candidate.input,
-		missing: candidate.missing,
 		diagnostic: candidate.diagnostic,
 		horizon: candidate.horizon,
 		latestHorizon: candidate.latestHorizon,
@@ -728,13 +727,10 @@ export function createSpeculativeActionHost(
 		},
 		rejectCandidateOutput: ({ output }) => (output.isError ? "tool_error_result" : undefined),
 		projectionRules,
-		prepareCandidate: async ({ candidate, route, signal }) => {
-			if (!route) await prepareExecutionWorlds([candidate.tool], signal);
-		},
 		onTurnStarted: ({ startInput, settings, signal }) => {
 			authoritativeBatches.delete(authoritativeBatchKey(startInput.sessionID, startInput.turnID));
 			void prepareExecutionWorlds(settings.tools, signal).catch(() => {
-				// Turn warm-up is best-effort; concrete candidate preparation retries it.
+				// Turn warm-up is best-effort; route resolution remains authoritative.
 			});
 			if (!sourcePatternSettings(settings).enabled) return;
 			queuePatternAnalysis(async () => {

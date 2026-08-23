@@ -82,7 +82,7 @@ describe("PlanRuntime", () => {
 		expect(clamped.get("plan", "clamped")).toMatchObject({ expectedDecisionSeq: 7, latestDecisionSeq: 7 });
 	});
 
-	it("binds one canonical action identity to an opportunity", () => {
+	it("binds one canonical action identity and rejects uncloneable input", () => {
 		const plan = new PlanRuntime();
 		const input = { path: "keyed.ts" };
 		plan.apply(proposal([action("keyed", { input })]), 0);
@@ -102,6 +102,11 @@ describe("PlanRuntime", () => {
 		expect(plan.get("plan", "keyed")?.actionKey).toBe(key);
 		expect(plan.get("plan", "keyed")?.action.input).toEqual({ path: "keyed.ts" });
 		expect(Object.isFrozen(plan.get("plan", "keyed")?.action.input)).toBe(true);
+		const invalid = new PlanRuntime();
+		expect(invalid.apply(proposal([action("uncloneable", { input: { callback: () => undefined } })]), 0)).toEqual({
+			accepted: false,
+			reason: "invalid_action",
+		});
 	});
 
 	it("keeps an execution-blocked node matchable without making it launchable", () => {
@@ -201,51 +206,6 @@ describe("PlanRuntime", () => {
 			earliestDecisionSeq: 8,
 			expectedDecisionSeq: 8,
 			latestDecisionSeq: 8,
-		});
-	});
-
-	it("keeps preparation work outside Actor prediction settlement", () => {
-		const plan = new PlanRuntime();
-		plan.apply(
-			proposal([
-				{ ...action("prepare"), type: "preparation_hint" },
-				action("after", { dependsOn: [{ actionID: "prepare", condition: "execution_succeeded" }] }),
-			]),
-			0,
-		);
-		const [hint] = plan.takeReady(0);
-		expect(hint).toMatchObject({ action: { type: "preparation_hint" } });
-		expect("prediction" in hint!).toBe(false);
-		expect(plan.pending().map((node) => node.action.id)).toEqual(["after"]);
-
-		const execution = new CandidateExecution<void>("shared");
-		plan.attachExecution("plan", "prepare", "hint", execution);
-		execution.start(1);
-		execution.succeed(undefined, 2, 1);
-
-		expect(plan.get("plan", "prepare")).toMatchObject({ execution: { status: "succeeded" }, readiness: "settled" });
-		expect(plan.get("plan", "after")).toMatchObject({
-			earliestDecisionSeq: 1,
-			expectedDecisionSeq: 1,
-			latestDecisionSeq: 1,
-		});
-		expect(plan.matchable(1).map((node) => node.action.id)).toEqual(["after"]);
-		expect(plan.launchable().map((node) => node.action.id)).toEqual(["after"]);
-		expect(plan.unobserve("plan", "prepare", cause("control", "should_not_exist"))).toBeUndefined();
-
-		const invalid = new PlanRuntime();
-		expect(
-			invalid.apply(
-				proposal([
-					{ ...action("hint"), type: "preparation_hint" },
-					action("impossible", { dependsOn: [{ actionID: "hint", condition: "actor_adopted" }] }),
-				]),
-				0,
-			),
-		).toEqual({ accepted: false, reason: "invalid_dependency" });
-		expect(invalid.apply(proposal([action("uncloneable", { input: { callback: () => undefined } })]), 0)).toEqual({
-			accepted: false,
-			reason: "invalid_action",
 		});
 	});
 

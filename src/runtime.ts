@@ -31,10 +31,9 @@ export interface SpeculativeActionSettings {
 }
 
 export interface SpeculativeDraftCandidate {
-	readonly type: "tool_call" | "preparation_hint";
+	readonly type: "tool_call";
 	readonly tool: string;
 	readonly input: unknown;
-	readonly missing?: readonly (readonly (string | number)[])[];
 	readonly diagnostic?: string;
 	readonly source?: string;
 	readonly proposalID?: string;
@@ -214,15 +213,6 @@ export interface SpeculativeActionRuntimeAdapter<
 		readonly signal: AbortSignal;
 		readonly parentWorld?: WorldBranch<Output>;
 	}) => MaybePromise<WorldBranch<Output>>;
-	readonly prepareCandidate?: (input: {
-		readonly startInput: StartInput;
-		readonly data: StateData;
-		readonly settings: SpeculativeActionSettings;
-		readonly candidate: SpeculativeDraftCandidate;
-		readonly action?: ActionKey;
-		readonly route?: SpeculativeExecutionRoute;
-		readonly signal: AbortSignal;
-	}) => MaybePromise<void>;
 	readonly projectionRules?: readonly ActionProjectionRule<Output>[];
 	readonly rejectCandidateOutput?: (input: {
 		readonly output: Output;

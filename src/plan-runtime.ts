@@ -55,23 +55,16 @@ interface PlanRuntimeNodeBase {
 	readonly readiness: PlanNodeReadiness;
 }
 
-export type PlanRuntimeNode =
-	| (PlanRuntimeNodeBase & {
-			readonly action: PlanAction & { readonly type: "tool_call" };
-			readonly prediction: PredictionIdentity;
-			readonly predictionState: PredictionOpportunityState;
-	  })
-	| (PlanRuntimeNodeBase & {
-			readonly action: PlanAction & { readonly type: "preparation_hint" };
-			readonly prediction?: never;
-			readonly predictionState?: never;
-	  });
+export type PlanRuntimeNode = PlanRuntimeNodeBase & {
+	readonly prediction: PredictionIdentity;
+	readonly predictionState: PredictionOpportunityState;
+};
 
-export type PredictionPlanRuntimeNode = Extract<PlanRuntimeNode, { readonly prediction: PredictionIdentity }>;
+export type PredictionPlanRuntimeNode = PlanRuntimeNode;
 
 export interface RetiredPlanNode {
 	readonly node: PlanRuntimeNode;
-	readonly opportunity?: PredictionOpportunity;
+	readonly opportunity: PredictionOpportunity;
 }
 
 export type PlanRuntimePromotion =
@@ -197,7 +190,7 @@ type MutableNode = {
 	latestDecisionSeq: number;
 	criticalPathMs: number;
 	execution: MutableNodeExecution;
-	opportunity?: PredictionOpportunity;
+	opportunity: PredictionOpportunity;
 };
 
 /** Owns plan materialization and prediction opportunities; execution is attached, never embedded. */
@@ -268,7 +261,7 @@ export class PlanRuntime {
 			if (
 				node.execution.status !== "attached" ||
 				node.execution.candidateID !== candidateID ||
-				node.opportunity?.state.status !== "pending" ||
+				node.opportunity.state.status !== "pending" ||
 				!executionSettled(executionProjection(node.execution))
 			) {
 				continue;
@@ -309,7 +302,7 @@ export class PlanRuntime {
 		const value = this.mutable(proposalID, actionID);
 		if (!value || !this.isMatchable(value.plan, value.node, actorDecisionSequence(actorAction))) return undefined;
 		const opportunity = value.node.opportunity;
-		return opportunity?.claim(actorAction, relation) ? opportunity : undefined;
+		return opportunity.claim(actorAction, relation) ? opportunity : undefined;
 	}
 
 	confirm(
@@ -326,12 +319,12 @@ export class PlanRuntime {
 
 	miss(proposalID: string, actionID: string, actorAction: ActorActionIdentity): PredictionSettlement | undefined {
 		const value = this.mutable(proposalID, actionID);
-		return value?.node.opportunity?.miss(actorAction);
+		return value?.node.opportunity.miss(actorAction);
 	}
 
 	unobserve(proposalID: string, actionID: string, cause: ResolutionCause): PredictionSettlement | undefined {
 		const value = this.mutable(proposalID, actionID);
-		return value?.node.opportunity?.unobserve(cause);
+		return value?.node.opportunity.unobserve(cause);
 	}
 
 	get(proposalID: string, actionID: string): PlanRuntimeNode | undefined {
@@ -449,7 +442,7 @@ export class PlanRuntime {
 				if (node) {
 					retired.push({
 						node: this.snapshot(current, node),
-						...(node.opportunity ? { opportunity: node.opportunity } : {}),
+						opportunity: node.opportunity,
 					});
 				}
 			}
@@ -516,20 +509,15 @@ export class PlanRuntime {
 			execution: executionProjection(node.execution),
 			readiness: this.readiness(plan, node),
 		};
-		return node.opportunity
-			? (Object.freeze({
-					...base,
-					prediction: node.opportunity.identity,
-					predictionState: node.opportunity.state,
-				}) as PlanRuntimeNode)
-			: (Object.freeze(base) as PlanRuntimeNode);
+		return Object.freeze({
+			...base,
+			prediction: node.opportunity.identity,
+			predictionState: node.opportunity.state,
+		});
 	}
 
 	private readiness(plan: MutablePlan, node: MutableNode): PlanNodeReadiness {
-		const execution = executionProjection(node.execution);
-		if (node.opportunity?.state.status === "settled" || (!node.opportunity && executionSettled(execution))) {
-			return "settled";
-		}
+		if (node.opportunity.state.status === "settled") return "settled";
 		if (this.dependenciesImpossible(plan, node)) return "blocked";
 		return node.execution.status === "deferred" && this.dependenciesSatisfied(plan, node) ? "ready" : "waiting";
 	}
@@ -550,7 +538,7 @@ export class PlanRuntime {
 
 	private isMatchable(plan: MutablePlan, node: MutableNode, decisionSequence: number): boolean {
 		return (
-			node.opportunity?.state.status === "pending" &&
+			node.opportunity.state.status === "pending" &&
 			node.earliestDecisionSeq <= decisionSequence &&
 			this.dependenciesSatisfied(plan, node)
 		);
@@ -565,16 +553,13 @@ export class PlanRuntime {
 				if (cached !== undefined) return cached;
 				if (visiting.has(node.action.id)) return node.anchorDecisionSeq + relativeHorizon(node.action) + 1;
 				visiting.add(node.action.id);
-				const settlement = node.opportunity?.settlement;
+				const settlement = node.opportunity.settlement;
 				let value = predictionMatched(settlement)
 					? actorDecisionSequence(settlement.actorAction)
 					: node.anchorDecisionSeq + relativeHorizon(node.action) + 1;
 				for (const dependency of node.action.dependsOn ?? []) {
 					const parent = plan.nodes.get(dependency.actionID);
-					if (parent) {
-						const actorDecisionDistance = parent.action.type === "preparation_hint" ? 0 : 1;
-						value = Math.max(value, calculate(parent) + actorDecisionDistance);
-					}
+					if (parent) value = Math.max(value, calculate(parent) + 1);
 				}
 				visiting.delete(node.action.id);
 				memo.set(node.action.id, value);
@@ -635,7 +620,7 @@ function newNode(
 		latestDecisionSeq: anchorDecisionSeq + latestHorizon(action) + 1,
 		criticalPathMs: Math.max(1, finiteMetric(action.expectedDurationMs)),
 		execution: { status: "deferred" },
-		...(action.type === "tool_call" ? { opportunity: new PredictionOpportunity(identity) } : {}),
+		opportunity: new PredictionOpportunity(identity),
 	};
 }
 
@@ -643,7 +628,7 @@ function dependencySatisfied(node: MutableNode, condition: PlanActionDependencyC
 	const execution = executionProjection(node.execution);
 	switch (canonicalCondition(condition)) {
 		case "actor_adopted":
-			return predictionAdopted(node.opportunity?.settlement);
+			return predictionAdopted(node.opportunity.settlement);
 		case "execution_succeeded":
 			return execution.status === "succeeded";
 		case "execution_settled":
@@ -655,9 +640,7 @@ function dependencyImpossible(node: MutableNode, condition: PlanActionDependency
 	const execution = executionProjection(node.execution);
 	switch (canonicalCondition(condition)) {
 		case "actor_adopted":
-			return executionSettled(execution) && !node.opportunity
-				? true
-				: node.opportunity?.settlement !== undefined && !predictionAdopted(node.opportunity.settlement);
+			return node.opportunity.settlement !== undefined && !predictionAdopted(node.opportunity.settlement);
 		case "execution_succeeded":
 			return execution.status === "failed" || execution.status === "cancelled";
 		case "execution_settled":
@@ -713,16 +696,12 @@ function executionProjection(execution: MutableNodeExecution): PlanNodeExecution
 	};
 }
 
-function isPredictionNode(node: PlanRuntimeNode): node is PredictionPlanRuntimeNode {
-	return node.action.type === "tool_call";
-}
-
 function isPendingPrediction(node: PlanRuntimeNode): node is PredictionPlanRuntimeNode {
-	return isPredictionNode(node) && node.predictionState.status === "pending";
+	return node.predictionState.status === "pending";
 }
 
 function isUnsettledPrediction(node: PlanRuntimeNode): node is PredictionPlanRuntimeNode {
-	return isPredictionNode(node) && node.predictionState.status !== "settled";
+	return node.predictionState.status !== "settled";
 }
 
 function compareMutableNodes(
@@ -755,11 +734,7 @@ function validateActions(
 	const result: PlanAction[] = [];
 	const ids = new Set<string>();
 	for (const source of actions) {
-		if (
-			!validToken(source.id) ||
-			!validToken(source.tool) ||
-			(source.type !== "tool_call" && source.type !== "preparation_hint")
-		) {
+		if (!validToken(source.id) || !validToken(source.tool) || source.type !== "tool_call") {
 			return { ok: false, reason: "invalid_action" };
 		}
 		if (ids.has(source.id)) return { ok: false, reason: "duplicate_action" };
@@ -781,14 +756,10 @@ function validateActions(
 		} catch {
 			return { ok: false, reason: "invalid_action" };
 		}
-		const missing = source.missing
-			? Object.freeze(source.missing.map((path) => Object.freeze([...path])))
-			: undefined;
 		result.push(
 			Object.freeze({
 				...source,
 				input,
-				...(missing ? { missing } : {}),
 				...(dependsOn ? { dependsOn } : {}),
 			}),
 		);
@@ -800,11 +771,7 @@ function dependenciesAreValid(actions: ReadonlyMap<string, PlanAction>): boolean
 	for (const action of actions.values()) {
 		for (const dependency of action.dependsOn ?? []) {
 			const parent = actions.get(dependency.actionID);
-			if (
-				dependency.actionID === action.id ||
-				!parent ||
-				(canonicalCondition(dependency.condition) === "actor_adopted" && parent.type !== "tool_call")
-			) {
+			if (dependency.actionID === action.id || !parent) {
 				return false;
 			}
 		}
@@ -827,10 +794,8 @@ function dependenciesAreValid(actions: ReadonlyMap<string, PlanAction>): boolean
 
 function samePlanActionExecution(left: PlanAction, right: PlanAction): boolean {
 	return (
-		left.type === right.type &&
 		left.tool === right.tool &&
 		isDeepStrictEqual(left.input, right.input) &&
-		isDeepStrictEqual(left.missing ?? [], right.missing ?? []) &&
 		isDeepStrictEqual(normalizedDependencies(left), normalizedDependencies(right))
 	);
 }
@@ -853,7 +818,6 @@ function planNodeID(source: string, proposalID: string, actionID: string, revisi
 }
 
 function horizon(action: PlanAction): number {
-	if (action.type === "preparation_hint") return 0;
 	return sequence(action.horizon ?? 0);
 }
 

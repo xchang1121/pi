@@ -158,11 +158,10 @@ export type PatternAwareFeedback = {
 };
 
 export type PatternAwareCandidate = {
-	readonly type: "tool_call" | "preparation_hint";
+	readonly type: "tool_call";
 	readonly source: "pattern_aware";
 	readonly tool: string;
 	readonly input: Record<string, unknown>;
-	readonly missing: ReadonlyArray<PatternAwarePath>;
 	readonly patternID: string;
 	/** Canonical action identity; plan support adds the parent path while K(a) remains the execution identity. */
 	readonly actionIdentity: string;
@@ -609,9 +608,7 @@ export class PatternAwareStore {
 			string,
 			Array<{
 				readonly pattern: MutablePattern;
-				readonly type: "tool_call" | "preparation_hint";
 				readonly input: Record<string, unknown>;
-				readonly missing: ReadonlyArray<PatternAwarePath>;
 				readonly variantProbability: number;
 			}>
 		>();
@@ -633,29 +630,23 @@ export class PatternAwareStore {
 			if (!matchesSuffix(predictiveHistory, pattern.context)) continue;
 			const context = predictiveHistory.slice(-pattern.context.length);
 			for (const applied of applyBindingsPartialWeightedVariants(pattern.bindings, context)) {
-				const type = applied.missing.length ? "preparation_hint" : "tool_call";
-				const action =
-					type === "tool_call"
-						? this.resolveActionKey(
-								pattern.targetTool,
-								applied.input,
-								pattern.targetSchemaHash ?? schemaHashes[pattern.targetTool],
-							)
-						: undefined;
+				if (applied.missing.length) continue;
+				const action = this.resolveActionKey(
+					pattern.targetTool,
+					applied.input,
+					pattern.targetSchemaHash ?? schemaHashes[pattern.targetTool],
+				);
 				const identity = action
-					? stableStringify({ type, actionKey: action.key })
+					? stableStringify({ type: "tool_call", actionKey: action.key })
 					: stableStringify({
-							type,
+							type: "tool_call",
 							tool: pattern.targetTool,
 							input: applied.input,
-							missing: applied.missing,
 						});
 				const group = groups.get(identity) ?? [];
 				group.push({
 					pattern,
-					type,
 					input: applied.input,
-					missing: applied.missing,
 					variantProbability: applied.probability,
 				});
 				groups.set(identity, group);
@@ -717,10 +708,9 @@ export class PatternAwareStore {
 			return {
 				background: false,
 				actionIdentity: hash(identity),
-				type: representative.type,
+				type: "tool_call" as const,
 				tool: representative.pattern.targetTool,
 				input: representative.input,
-				missing: representative.missing,
 				patternID: representative.pattern.id,
 				supportingPatternIDs: [...new Set(ordered.map((item) => item.pattern.id))],
 				context: representative.pattern.context,
@@ -770,7 +760,6 @@ export class PatternAwareStore {
 			right.expectedLatencyBenefitMs - left.expectedLatencyBenefitMs ||
 			right.empiricalProbability - left.empiricalProbability ||
 			right.conditionalProbability - left.conditionalProbability ||
-			Number(right.type === "tool_call") - Number(left.type === "tool_call") ||
 			left.horizon - right.horizon ||
 			left.patternID.localeCompare(right.patternID) ||
 			stableStringify(left.input).localeCompare(stableStringify(right.input));
@@ -791,11 +780,10 @@ export class PatternAwareStore {
 				pathProbability: prediction.empiricalProbability,
 			};
 			result.push({
-				type: prediction.type,
+				type: "tool_call",
 				source: "pattern_aware",
 				tool: prediction.tool,
 				input: prediction.input,
-				missing: prediction.missing,
 				patternID: prediction.patternID,
 				actionIdentity: prediction.actionIdentity,
 				supportingPatternIDs: prediction.supportingPatternIDs,
@@ -818,7 +806,6 @@ export class PatternAwareStore {
 						context: prediction.context,
 						tool: prediction.tool,
 						input: prediction.input,
-						missing: prediction.missing,
 						empiricalProbability: prediction.empiricalProbability,
 						conditionalProbability: prediction.conditionalProbability,
 						adoptionProbability: prediction.adoptionProbability,
@@ -905,7 +892,6 @@ export class PatternAwareStore {
 				type: "tool_call" as const,
 				tool: item.action.tool,
 				input: structuredClone(item.input),
-				missing: [] as PatternAwarePath[],
 				patternID,
 				supportingPatternIDs: [] as string[],
 				context: [] as PatternAwareEventSignature[],
@@ -1766,24 +1752,6 @@ export function applyBindings(
 	context: ReadonlyArray<PatternAwareEvent>,
 ): Record<string, unknown> | undefined {
 	return applyBindingsVariants(bindings, context, 1)[0];
-}
-
-export function applyBindingsPartial(
-	bindings: Readonly<Record<string, PatternAwareBinding>>,
-	context: ReadonlyArray<PatternAwareEvent>,
-): { readonly input: Record<string, unknown>; readonly missing: ReadonlyArray<PatternAwarePath> } {
-	return applyBindingsPartialVariants(bindings, context, 1)[0] ?? { input: {}, missing: [] };
-}
-
-export function applyBindingsPartialVariants(
-	bindings: Readonly<Record<string, PatternAwareBinding>>,
-	context: ReadonlyArray<PatternAwareEvent>,
-	limit = MAX_BINDING_VARIANTS,
-): ReadonlyArray<{ readonly input: Record<string, unknown>; readonly missing: ReadonlyArray<PatternAwarePath> }> {
-	return applyBindingsPartialWeightedVariants(bindings, context, limit).map(({ input, missing }) => ({
-		input,
-		missing,
-	}));
 }
 
 function applyBindingsPartialWeightedVariants(

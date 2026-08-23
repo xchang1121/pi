@@ -886,17 +886,13 @@ describe("PatternAware", () => {
 		expect(candidate?.empiricalProbability).toBeLessThan(1);
 	});
 
-	test("emits preparation hints when control flow matches before all bound payloads are available", () => {
+	test("does not predict an action before all bound payloads are available", () => {
 		const store = new PatternAwareStore(settings());
 		trainGrepRead(store, "one", "src/a.ts");
 		trainGrepRead(store, "two", "src/b.ts");
 
 		store.observe(input({ sessionID: "probe", tool: "grep", input: { pattern: "TODO" } }));
-		const hint = store.predict("probe").find((item) => item.tool === "read");
-
-		expect(hint?.type).toBe("preparation_hint");
-		expect(hint?.input).toEqual({});
-		expect(hint?.missing).toEqual([["filePath"]]);
+		expect(store.predict("probe").find((item) => item.tool === "read")).toBeUndefined();
 	});
 
 	test("learns indexed field fallbacks across historical samples", () => {

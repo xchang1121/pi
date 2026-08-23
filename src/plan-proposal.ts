@@ -9,10 +9,9 @@ export interface PlanActionDependency {
 export interface PlanAction {
 	/** Stable within one proposal across revisions. */
 	readonly id: string;
-	readonly type: "tool_call" | "preparation_hint";
+	readonly type: "tool_call";
 	readonly tool: string;
 	readonly input: unknown;
-	readonly missing?: readonly (readonly (string | number)[])[];
 	readonly diagnostic?: string;
 	/** Expected Actor tool batches before this action; used to schedule execution. */
 	readonly horizon?: number;

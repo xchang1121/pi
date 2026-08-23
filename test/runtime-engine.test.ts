@@ -197,47 +197,6 @@ describe("structural speculative runtime", () => {
 		}
 	});
 
-	it("keeps preparation outside prediction settlement while launching its child for the same decision", async () => {
-		const issued = vi.fn();
-		const settled = vi.fn();
-		const source: Source = {
-			id: "source",
-			enabled: () => true,
-			propose: () => ({
-				id: "preparation",
-				source: "source",
-				revision: 0,
-				actions: [
-					{
-						id: "warm",
-						type: "preparation_hint",
-						tool: "read",
-						input: { path: "README.md" },
-						feedback: "warm",
-					},
-					{
-						id: "after-warm",
-						type: "tool_call",
-						tool: "read",
-						input: { path: "README.md" },
-						dependsOn: [{ actionID: "warm", condition: "execution_succeeded" }],
-					},
-				],
-			}),
-			onIssued: issued,
-			onSettled: settled,
-		};
-		const fixture = harness({ source });
-		await fixture.runtime.startTurn({ sessionID: "session", turnID: "prepare" });
-		await waitFor(() => fixture.runtime.inspect().sharedCandidates === 1);
-		expect(await fixture.runtime.consume(call("prepare"))).toBe("speculative");
-		await fixture.runtime.finishTurn({ ...call("prepare"), terminal: true });
-
-		expect(issued).toHaveBeenCalledTimes(1);
-		expect(settled).toHaveBeenCalledTimes(1);
-		expect(fixture.events.filter((event) => event.type === "prediction")).toHaveLength(1);
-	});
-
 	it("settles matched and adopted as orthogonal facts exactly once", async () => {
 		const settlements: PredictionSettlement[] = [];
 		const actionKey = vi.fn((tool: string, args: unknown) => buildPiActionKey(tool, args, "/workspace"));

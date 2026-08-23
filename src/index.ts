@@ -108,8 +108,6 @@ export {
 export {
 	acquirePatternAwareStore,
 	applyBindings,
-	applyBindingsPartial,
-	applyBindingsPartialVariants,
 	applyBindingsVariants,
 	asPatternAwareRuntimeContext,
 	inferBindings,

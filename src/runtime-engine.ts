@@ -104,10 +104,7 @@ function immediateOnly(update: PlanUpdate): PlanUpdate {
 		return {
 			...update,
 			actions: update.actions.filter(
-				(action) =>
-					action.type === "tool_call" &&
-					finiteMetric(action.horizon) === 0 &&
-					(action.dependsOn?.length ?? 0) === 0,
+				(action) => finiteMetric(action.horizon) === 0 && (action.dependsOn?.length ?? 0) === 0,
 			),
 		};
 	}
@@ -159,10 +156,9 @@ function forecastFor(
 
 function planActionDraft(node: PlanRuntimeNode): SpeculativeDraftCandidate {
 	return {
-		type: node.action.type,
+		type: "tool_call",
 		tool: node.action.tool,
 		input: node.action.input,
-		...(node.action.missing ? { missing: node.action.missing } : {}),
 		...(node.action.diagnostic ? { diagnostic: node.action.diagnostic } : {}),
 		source: node.source,
 		proposalID: node.proposalID,
@@ -522,7 +518,7 @@ interface ActualToolCall {
 
 interface PlanActionContext<StartInput, StateData> {
 	readonly identity: PlanActionIdentity;
-	readonly opportunity?: PredictionOpportunity;
+	readonly opportunity: PredictionOpportunity;
 	feedback: unknown;
 	readonly startInput: StartInput;
 	readonly data: StateData;
@@ -1035,13 +1031,13 @@ export function makeStructuralSpeculativeActionRuntime<
 		const materializations: Promise<void>[] = [];
 		for (const action of applied.upserted) {
 			const node = session.plan.get(applied.plan.id, action.id);
-			if (!node || (node.predictionState && node.predictionState.status !== "pending")) continue;
+			if (!node || node.predictionState.status !== "pending") continue;
 			const issued = !session.actionContexts.has(node.identity.id);
 			if (issued) {
 				scope.slot?.owners.add(node.identity.id);
 				session.actionContexts.set(node.identity.id, {
 					identity: node.identity,
-					...(node.prediction ? { opportunity: session.plan.opportunity(node.proposalID, node.action.id) } : {}),
+					opportunity: session.plan.opportunity(node.proposalID, node.action.id)!,
 					feedback: action.feedback,
 					startInput: scope.startInput,
 					data: scope.data,
@@ -1057,7 +1053,7 @@ export function makeStructuralSpeculativeActionRuntime<
 					continuationSlots: new Set(),
 					continuationTail: Promise.resolve(),
 				});
-				if (node.prediction && source.onIssued) {
+				if (source.onIssued) {
 					session.effects.enqueue(() =>
 						source.onIssued!({
 							proposalID: node.identity.proposalID,
@@ -1070,10 +1066,6 @@ export function makeStructuralSpeculativeActionRuntime<
 				const context = session.actionContexts.get(node.identity.id)!;
 				context.feedback = action.feedback;
 				context.draft = planActionDraft(node);
-			}
-			if (action.type === "preparation_hint") {
-				void runPreparationHint(session, node);
-				continue;
 			}
 			materializations.push(materializeAction(session, node));
 		}
@@ -1139,7 +1131,7 @@ export function makeStructuralSpeculativeActionRuntime<
 	};
 
 	const materializeAction = async (session: Session, node: PlanRuntimeNode): Promise<void> => {
-		if (!node.prediction || node.actionKey || node.execution.status !== "deferred") return;
+		if (node.actionKey || node.execution.status !== "deferred") return;
 		const context = session.actionContexts.get(node.identity.id);
 		if (!context) return;
 		const concrete = asConcreteInput(node.action.input);
@@ -1206,42 +1198,6 @@ export function makeStructuralSpeculativeActionRuntime<
 				releaseSourceSlot(session, slot, cause("control", "parent_prediction_not_adopted"));
 	};
 
-	const runPreparationHint = async (session: Session, node: PlanRuntimeNode): Promise<void> => {
-		if (node.action.type !== "preparation_hint") return;
-		const promoted = session.plan.promote(node.proposalID, node.action.id);
-		if (promoted.status !== "scheduled") return;
-		const context = session.actionContexts.get(node.identity.id);
-		const work = new CandidateExecution<void>("shared");
-		const workID = `hint:${node.identity.id}`;
-		session.plan.attachExecution(node.proposalID, node.action.id, workID, work);
-		const startedAt = performance.now();
-		work.start(startedAt);
-		if (!context || !adapter.prepareCandidate) {
-			work.succeed(undefined, performance.now(), 0);
-			releaseActionContext(session, node.identity.id);
-			dispatchReady(session);
-			return;
-		}
-		try {
-			await adapter.prepareCandidate({
-				startInput: context.startInput,
-				data: context.data,
-				settings: context.settings,
-				candidate: context.draft,
-				signal: context.admissionSignal,
-			});
-			const completedAt = performance.now();
-			work.succeed(undefined, completedAt, completedAt - startedAt);
-		} catch (error) {
-			const failure = cause("execution", "preparation_failed", errorDetail(error));
-			const completedAt = performance.now();
-			work.fail(failure, completedAt, completedAt - startedAt);
-		} finally {
-			releaseActionContext(session, node.identity.id);
-			dispatchReady(session);
-		}
-	};
-
 	const failUnlaunchable = (session: Session, node: PlanRuntimeNode, failure: ResolutionCause): void => {
 		const work = new CandidateExecution<never>("shared");
 		work.fail(failure, performance.now(), 0);
@@ -1257,8 +1213,7 @@ export function makeStructuralSpeculativeActionRuntime<
 				work.fail(failure, performance.now(), 0);
 				session.plan.attachExecution(node.proposalID, node.action.id, `blocked:${node.identity.id}`, work);
 			}
-			if (node.prediction) settleUnobserved(session, node, failure);
-			else releaseActionContext(session, node.identity.id);
+			settleUnobserved(session, node, failure);
 		}
 	};
 
@@ -1288,7 +1243,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		const actorPhase = actorPhaseFor(session, now);
 		const immediate: PlanRuntimeNode[] = [];
 		for (const node of session.plan.launchable()) {
-			if (!node.prediction || !node.actionKey || node.action.type !== "tool_call") continue;
+			if (!node.actionKey) continue;
 			const existingTimer = session.launchTimers.get(node.prediction.id);
 			if (
 				existingTimer &&
@@ -1323,7 +1278,7 @@ export function makeStructuralSpeculativeActionRuntime<
 	};
 
 	const launchNode = async (session: Session, node: PlanRuntimeNode): Promise<void> => {
-		if (!node.prediction || !node.actionKey || node.predictionState.status === "settled") {
+		if (!node.actionKey || node.predictionState.status === "settled") {
 			session.plan.defer(node.proposalID, node.action.id);
 			return;
 		}
@@ -1499,17 +1454,6 @@ export function makeStructuralSpeculativeActionRuntime<
 	const executeCandidate = async (session: Session, candidate: Candidate, startedAt: number): Promise<void> => {
 		let branch: WorldBranch<Output> | undefined;
 		try {
-			if (adapter.prepareCandidate) {
-				await adapter.prepareCandidate({
-					startInput: candidate.owner.startInput,
-					data: candidate.owner.data,
-					settings: candidate.owner.settings,
-					candidate: candidate.owner.draft,
-					action: candidate.key,
-					route: candidate.route,
-					signal: candidate.work.controller.signal,
-				});
-			}
 			const parent = candidateWorld(candidate);
 			branch = await adapter.executeCandidate({
 				startInput: candidate.owner.startInput,
@@ -1546,7 +1490,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			queueCandidateContinuations(
 				session,
 				nodesForCandidate(session, candidate.id).filter((node) => {
-					const status = session.plan.get(node.proposalID, node.action.id)?.predictionState?.status;
+					const status = session.plan.get(node.proposalID, node.action.id)?.predictionState.status;
 					return status === "pending" || status === "matching";
 				}),
 				candidate,
@@ -2193,7 +2137,6 @@ export function makeStructuralSpeculativeActionRuntime<
 	};
 
 	const predictionSettled = (session: Session, node: PlanRuntimeNode, settlement: PredictionSettlement): void => {
-		if (!node.prediction) return;
 		const context = session.actionContexts.get(node.identity.id);
 		if (!context) return;
 		const source = sourcesByID.get(context.identity.source);
@@ -2229,9 +2172,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			const candidate = candidateByID(session.id, node.execution.candidateID);
 			if (
 				candidate?.work.reservation.kind === "exclusive" &&
-				!nodesForCandidate(session, candidate.id).some(
-					(item) => item.predictionState && item.predictionState.status !== "settled",
-				)
+				!nodesForCandidate(session, candidate.id).some((item) => item.predictionState.status !== "settled")
 			) {
 				discardCandidate(session, candidate, cause("retention", "prediction_horizon_settled"));
 			}
@@ -2264,9 +2205,8 @@ export function makeStructuralSpeculativeActionRuntime<
 		trigger: "execution_succeeded" | "actor_adopted",
 		adoptedAction?: AdoptedAction,
 	): void => {
-		if (!node.prediction) return;
 		const current = session.plan.get(node.proposalID, node.action.id);
-		if (current?.identity.id !== node.identity.id || !current.prediction) return;
+		if (current?.identity.id !== node.identity.id) return;
 		const context = session.actionContexts.get(node.identity.id);
 		const source = context ? sourcesByID.get(context.identity.source) : undefined;
 		if (!context || !source?.continue) return;
@@ -2352,8 +2292,8 @@ export function makeStructuralSpeculativeActionRuntime<
 		const timer = session.launchTimers.get(retired.node.identity.id);
 		if (timer) clearTimeout(timer);
 		session.launchTimers.delete(retired.node.identity.id);
-		if (retired.opportunity?.state.status === "matching") return;
-		const finalized = retired.opportunity?.unobserve(failure);
+		if (retired.opportunity.state.status === "matching") return;
+		const finalized = retired.opportunity.unobserve(failure);
 		if (finalized) predictionSettled(session, retired.node, finalized);
 		else releaseActionContext(session, retired.node.identity.id);
 	};
@@ -2440,7 +2380,7 @@ export function makeStructuralSpeculativeActionRuntime<
 	): readonly PredictionForecast[] => {
 		const nodes = nodesForCandidate(session, candidate.id);
 		const unique =
-			additional?.prediction && !nodes.some((node) => node.prediction?.id === additional.prediction.id)
+			additional && !nodes.some((node) => node.prediction.id === additional.prediction.id)
 				? [...nodes, additional]
 				: nodes;
 		const actorPhase = actorPhaseFor(session);
@@ -2551,7 +2491,7 @@ export function makeStructuralSpeculativeActionRuntime<
 	): readonly PlanRuntimeNode[] => {
 		const groups = new Map<string, PlanRuntimeNode[]>();
 		for (const node of session.plan.matchable(decisionSequence)) {
-			if (!node.actionKey || node.action.type !== "tool_call") continue;
+			if (!node.actionKey) continue;
 			if (!matches(node)) continue;
 			const group = groups.get(node.proposalID) ?? [];
 			group.push(node);
@@ -2583,7 +2523,6 @@ export function makeStructuralSpeculativeActionRuntime<
 		});
 
 	const promoteForActor = async (session: Session, node: PlanRuntimeNode): Promise<void> => {
-		if (!node.prediction) return;
 		const timer = session.launchTimers.get(node.prediction.id);
 		if (timer) clearTimeout(timer);
 		session.launchTimers.delete(node.prediction.id);
@@ -2702,7 +2641,7 @@ export function makeStructuralSpeculativeActionRuntime<
 
 	const pruneActionContexts = (session: Session): void => {
 		for (const [id, context] of session.actionContexts) {
-			if (context.opportunity?.state.status !== "matching") releaseActionContext(session, id);
+			if (context.opportunity.state.status !== "matching") releaseActionContext(session, id);
 		}
 	};
 
