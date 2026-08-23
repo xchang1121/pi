@@ -312,7 +312,7 @@ class PredictiveContextTrie {
 	insert(pattern: Pick<MutablePattern, "id" | "context">) {
 		let frontier = [this.root];
 		for (let index = pattern.context.length - 1; index >= 0; index--) {
-			const token = signatureToken(pattern.context[index]!);
+			const token = trieToken(pattern.context[index]!);
 			const next: TrieNode[] = [];
 			for (const node of frontier) {
 				const child = node.children.get(token) ?? { children: new Map(), patterns: new Set() };
@@ -328,7 +328,7 @@ class PredictiveContextTrie {
 		const result = new Set<string>();
 		let frontier = [this.root];
 		for (let index = history.length - 1; index >= 0 && frontier.length > 0; index--) {
-			const token = signatureToken(signature(history[index]!));
+			const token = trieToken(signature(history[index]!));
 			const next = new Set<TrieNode>();
 			for (const node of frontier) {
 				const child = node.children.get(token);
@@ -2575,6 +2575,10 @@ function signatureToken(value: PatternAwareEventSignature) {
 		outcome: value.outcome,
 		...(value.operation ? { operation: value.operation } : {}),
 	});
+}
+
+function trieToken(value: PatternAwareEventSignature) {
+	return JSON.stringify([value.tool, value.outcome, value.operation ?? null]);
 }
 
 function semanticOutputShape(value: unknown) {
