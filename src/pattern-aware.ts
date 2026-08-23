@@ -301,10 +301,11 @@ const MAX_PATH_SOURCES = 24;
 // Bound crash-loss while amortizing full-state serialization across active tool loops.
 // Terminal/dispose paths still flush immediately.
 const PERSIST_CHECKPOINT_INTERVAL_MS = 30_000;
-const PERSISTENCE_VERSION = 17;
+const PERSISTENCE_VERSION = 18;
 const MIN_MIGRATABLE_PERSISTENCE_VERSION = 13;
 const INDEXED_POOL_PERSISTENCE_VERSION = 16;
 const COMPATIBLE_PATTERN_VERSION = 17;
+const BATCH_CONTROL_OPPORTUNITY_VERSION = 18;
 
 class PredictiveContextTrie {
 	private readonly root: TrieNode = { children: new Map(), patterns: new Set() };
@@ -345,7 +346,7 @@ class PredictiveContextTrie {
 export class PatternAwareStore {
 	private readonly patterns = new Map<string, MutablePattern>();
 	private readonly pools = new Map<string, PatternPool>();
-	private readonly controlOpportunitiesByContext = new Map<string, number>();
+	private readonly controlOpportunitiesByContext = new Map<string, Map<string, number>>();
 	private readonly pending = new Map<string, PendingValidation[]>();
 	private readonly history = new Map<string, PatternAwareEvent[]>();
 	private readonly recurrentActions = new Map<string, Map<string, RecurrentAction>>();
@@ -421,7 +422,7 @@ export class PatternAwareStore {
 					...(compatible && pool.patternIDs?.length ? { patternIDs: pool.patternIDs } : {}),
 				};
 				this.pools.set(key, restored);
-				this.addControlOpportunities(restored, restored.samples.length);
+				this.addControlOpportunities(restored, restored.samples, 1);
 				for (const patternID of restored.patternIDs ?? []) {
 					if (this.patterns.get(patternID)?.dependencies.length === 0) {
 						this.patternSupportSessions.set(patternID, new Set(samples.map((sample) => sample.target.sessionID)));
@@ -432,6 +433,7 @@ export class PatternAwareStore {
 				this.clock = Math.max(this.clock, sample.target.sequence, ...sample.context.map((event) => event.sequence));
 			}
 		}
+		if (parsed.version < BATCH_CONTROL_OPPORTUNITY_VERSION) this.migrateBatchControlOpportunities();
 		this.sequenceModel.restore(parsed.sequenceCounts);
 		this.sequenceModel.trim(this.settings.maxPatterns);
 		this.indexDirty = true;
@@ -1123,13 +1125,15 @@ export class PatternAwareStore {
 			gap,
 			samples: [],
 		};
-		const previousSampleCount = pool.samples.length;
 		// Internal contexts are immutable; preserving identity lets binding inference reuse its WeakMap cache.
-		pool.samples.push({ context, target, gap });
+		const sample = { context, target, gap };
+		pool.samples.push(sample);
 		const sampleLimit = patternPoolSampleLimit(this.settings);
-		if (pool.samples.length > sampleLimit) pool.samples.splice(0, pool.samples.length - sampleLimit);
+		const removed =
+			pool.samples.length > sampleLimit ? pool.samples.splice(0, pool.samples.length - sampleLimit) : [];
 		this.pools.set(poolKey, pool);
-		this.addControlOpportunities(pool, pool.samples.length - previousSampleCount);
+		this.addControlOpportunities(pool, removed, -1);
+		this.addControlOpportunities(pool, [sample], 1);
 		const firstRecurrenceProbe = gap === 0 && context.length === 1 && pool.samples.length === 1;
 		const probationary =
 			firstRecurrenceProbe ||
@@ -1193,8 +1197,6 @@ export class PatternAwareStore {
 				existing.dependencies = dependencies;
 				existing.occurrences = support.length;
 				existing.replayMatches = support.length;
-				existing.historicalOpportunities = Math.max(existing.historicalOpportunities, historicalOpportunities);
-				existing.historicalMatches = Math.max(existing.historicalMatches, support.length);
 				existing.gapCounts = sampleGapCounts(support);
 				existing.gapLastSeen = sampleGapLastSeen(support);
 				existing.averageDurationMs = averageTargetDuration(support);
@@ -1213,7 +1215,7 @@ export class PatternAwareStore {
 				occurrences: support.length,
 				replayMatches: support.length,
 				historicalOpportunities,
-				historicalMatches: support.length,
+				historicalMatches: controlOpportunityCount(support),
 				feedback: emptyPatternFeedback(lastSeenSequence),
 				averageDurationMs: averageTargetDuration(support),
 				lastSeenSequence,
@@ -1224,18 +1226,46 @@ export class PatternAwareStore {
 	}
 
 	private controlOpportunities(pool: PatternPool) {
-		return Math.max(
-			pool.samples.length,
-			this.controlOpportunitiesByContext.get(patternControlKey(pool.context, pool.gap)) ?? 0,
-		);
+		return Math.max(1, this.controlOpportunitiesByContext.get(patternControlKey(pool.context, pool.gap))?.size ?? 0);
 	}
 
-	private addControlOpportunities(pool: PatternPool, count: number) {
-		if (count === 0) return;
+	private addControlOpportunities(pool: PatternPool, samples: ReadonlyArray<PatternSample>, delta: 1 | -1) {
+		if (!samples.length) return;
 		const key = patternControlKey(pool.context, pool.gap);
-		const next = (this.controlOpportunitiesByContext.get(key) ?? 0) + count;
-		if (next > 0) this.controlOpportunitiesByContext.set(key, next);
+		const references = this.controlOpportunitiesByContext.get(key) ?? new Map<string, number>();
+		for (const sample of samples) {
+			const opportunity = controlOpportunityID(sample.target);
+			const count = (references.get(opportunity) ?? 0) + delta;
+			if (count > 0) references.set(opportunity, count);
+			else references.delete(opportunity);
+		}
+		if (references.size) this.controlOpportunitiesByContext.set(key, references);
 		else this.controlOpportunitiesByContext.delete(key);
+	}
+
+	private migrateBatchControlOpportunities() {
+		const oldCounts = new Map<string, number>();
+		for (const pool of this.pools.values()) {
+			const key = patternControlKey(pool.context, pool.gap);
+			oldCounts.set(key, (oldCounts.get(key) ?? 0) + pool.samples.length);
+		}
+		for (const pool of this.pools.values()) {
+			const key = patternControlKey(pool.context, pool.gap);
+			const duplicateOpportunities = Math.max(0, (oldCounts.get(key) ?? 0) - this.controlOpportunities(pool));
+			for (const patternID of pool.patternIDs ?? []) {
+				const pattern = this.patterns.get(patternID);
+				if (!pattern) continue;
+				const support = pool.samples.filter((sample) =>
+					this.bindingsCoverSample(pattern.bindings, pattern.targetTool, pattern.targetSchemaHash, sample),
+				);
+				const duplicateMatches = support.length - controlOpportunityCount(support);
+				pattern.historicalMatches = Math.max(0, pattern.historicalMatches - duplicateMatches);
+				pattern.historicalOpportunities = Math.max(
+					pattern.historicalMatches,
+					pattern.historicalOpportunities - duplicateOpportunities,
+				);
+			}
+		}
 	}
 
 	private retirePoolPatterns(pool: PatternPool, retained: ReadonlySet<string>) {
@@ -1332,7 +1362,7 @@ export class PatternAwareStore {
 			.slice(0, this.pools.size - limit);
 		for (const pool of evicted) {
 			this.pools.delete(pool.key);
-			this.addControlOpportunities(pool, -pool.samples.length);
+			this.addControlOpportunities(pool, pool.samples, -1);
 		}
 	}
 
@@ -2892,6 +2922,16 @@ function patternPoolKey(
 
 function patternControlKey(context: ReadonlyArray<PatternAwareEventSignature>, gap: number) {
 	return stableStringify({ context, gap });
+}
+
+function controlOpportunityID(event: PatternAwareEvent) {
+	return event.batchID !== undefined
+		? stableStringify({ sessionID: event.sessionID, batchID: event.batchID })
+		: persistedEventIdentity(event);
+}
+
+function controlOpportunityCount(samples: ReadonlyArray<PatternSample>) {
+	return new Set(samples.map((sample) => controlOpportunityID(sample.target))).size;
 }
 
 function samplesByGap(samples: ReadonlyArray<PatternSample>) {

@@ -49,6 +49,7 @@
 - Renamed read-only execution telemetry and settings to `resource_cached`/`resourceCached`.
 - Pattern-aware and drafter predictions now deduplicate onto shared jobs, learned actions can be admitted immediately after authoritative results, and in-flight work is preempted by explicit utility and per-session cache budgets.
 - PatternAware persistence now stores shared events once and references them from inference pools, preserving cross-process mapper evidence without repeatedly serializing tool payloads.
+- PatternAware now calibrates each co-occurring target against one provider decision opportunity, preserving marginal confidence for parallel tool batches and migrating persisted counters.
 - PatternAware now learns executable tool payloads separately from K(a), retains multiple replayable argument mappings for one control context, and ranks each branch against all observed target-tool alternatives for that context.
 - PatternAware now launches at the first quartile of its learned future-gap distribution while retaining the largest observed gap as the miss deadline, increasing useful lead time without widening the match window.
 - Actor lookup cascades across authorization, freshness, execution, compatibility, projection, and world-commit failures before falling back to real execution.

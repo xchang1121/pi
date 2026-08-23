@@ -213,6 +213,68 @@ describe("PatternAware", () => {
 		).toBe(false);
 	});
 
+	test("calibrates co-occurring batch members as marginal events", async () => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "pi-pattern-batch-probability-"));
+		temporary.push(directory);
+		const file = path.join(directory, "patterns.json");
+		const probabilities = (store: PatternAwareStore, sessionID: string) => {
+			store.observeBatch([
+				input({ sessionID, turnID: `${sessionID}:context`, tool: "inspect", input: { scope: "src" } }),
+			]);
+			return new Map(
+				store.predict(sessionID).map((candidate) => [candidate.tool, candidate.conditionalProbability]),
+			);
+		};
+
+		const persisted = new PatternAwareStore(settings({ maxContextLength: 1, maxFutureGap: 0 }), file);
+		await persisted.load();
+		for (let index = 0; index < 8; index++)
+			observeBatchTransition(persisted, `co-${index}`, [
+				{ tool: "find", input: { pattern: "*.ts" } },
+				{ tool: "grep", input: { pattern: "TODO" } },
+			]);
+		await persisted.flush();
+		const live = probabilities(persisted, "live");
+		expect(live.get("find")).toBeGreaterThan(0.9);
+		expect(live.get("grep")).toBeGreaterThan(0.9);
+		const legacy = JSON.parse(await fs.readFile(file, "utf8"));
+		legacy.version = 17;
+		for (const pattern of legacy.patterns) pattern.historicalOpportunities *= 2;
+		await fs.writeFile(file, JSON.stringify(legacy), "utf8");
+
+		const restored = new PatternAwareStore(settings({ maxContextLength: 1, maxFutureGap: 0 }), file);
+		await restored.load();
+		const migrated = probabilities(restored, "restored");
+		expect(migrated.get("find")).toBeGreaterThan(0.9);
+		expect(migrated.get("grep")).toBeGreaterThan(0.9);
+
+		const alternatives = new PatternAwareStore(settings({ maxContextLength: 1, maxFutureGap: 0 }));
+		for (let index = 0; index < 8; index++) {
+			observeBatchTransition(alternatives, `alternative-${index}`, [
+				index % 2 === 0
+					? { tool: "find", input: { pattern: "*.ts" } }
+					: { tool: "grep", input: { pattern: "TODO" } },
+			]);
+		}
+		const alternativeProbabilities = probabilities(alternatives, "alternative-probe");
+		expect(alternativeProbabilities.get("find")).toBeCloseTo(0.5);
+		expect(alternativeProbabilities.get("grep")).toBeCloseTo(0.5);
+	});
+
+	test("counts repeated same-tool batch members once while sample windows slide", () => {
+		const store = new PatternAwareStore(settings({ maxContextLength: 1, maxFutureGap: 0 }));
+		for (let index = 0; index < 16; index++)
+			observeBatchTransition(
+				store,
+				`same-tool-${index}`,
+				["one.ts", "two.ts"].map((filePath) => ({ tool: "read", input: { filePath } })),
+			);
+		store.observeBatch([input({ sessionID: "probe", turnID: "probe:context", tool: "inspect", input: {} })]);
+		const reads = store.predict("probe").filter((candidate) => candidate.tool === "read");
+		expect(reads).toHaveLength(2);
+		expect(reads.every((candidate) => candidate.conditionalProbability > 0.9)).toBe(true);
+	});
+
 	test("learns future gaps instead of expiring at the next unrelated event", () => {
 		const store = new PatternAwareStore(settings({ maxFutureGap: 3 }));
 		trainGappedRead(store, "one", "src/a.ts");
@@ -475,7 +537,7 @@ describe("PatternAware", () => {
 		const raw = await fs.readFile(file, "utf8");
 		expect(raw).not.toContain('"history"');
 		const persisted = JSON.parse(raw);
-		expect(persisted.version).toBe(17);
+		expect(persisted.version).toBe(18);
 		expect(persisted.events.length).toBeGreaterThan(0);
 		expect(
 			persisted.pools.every((pool: { samples: Array<{ context: number[]; target: number }> }) =>
@@ -701,7 +763,7 @@ describe("PatternAware", () => {
 		await first.flush();
 
 		const persisted = JSON.parse(await fs.readFile(file, "utf8"));
-		expect(persisted.version).toBe(17);
+		expect(persisted.version).toBe(18);
 		expect(persisted.sequenceCounts.length).toBeGreaterThan(0);
 		const restored = new PatternAwareStore(configured, file);
 		await restored.load();
@@ -2041,6 +2103,16 @@ describe("PatternAware", () => {
 		expect(imported.predict("probe").some((item) => item.tool === "read" && item.type === "tool_call")).toBe(true);
 	});
 });
+
+function observeBatchTransition(
+	store: PatternAwareStore,
+	sessionID: string,
+	targets: ReadonlyArray<{ readonly tool: string; readonly input: Record<string, unknown> }>,
+) {
+	store.observeBatch([input({ sessionID, turnID: `${sessionID}:context`, tool: "inspect", input: { scope: "src" } })]);
+	store.observeBatch(targets.map((target) => input({ sessionID, turnID: `${sessionID}:targets`, ...target })));
+	store.finishSession(sessionID);
+}
 
 function trainGrepRead(store: PatternAwareStore, sessionID: string, filePath: string, schemaHash?: string) {
 	store.observe(input({ sessionID, tool: "grep", input: { pattern: "TODO" }, outputPaths: [filePath] }));
