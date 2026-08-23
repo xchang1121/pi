@@ -1185,6 +1185,47 @@ describe("structural speculative runtime", () => {
 		await fixture.runtime.finishTurn({ ...call("turn-3"), terminal: true });
 	});
 
+	it("shares only an unchanged K(a) computation still in flight from Actor preview", async () => {
+		for (const [label, formalPath, settlePreview, callsBeforeRelease] of [
+			["unchanged", "preview.ts", false, 1],
+			["changed", "formal.ts", false, 2],
+			["already-settled", "preview.ts", true, 2],
+		] as const) {
+			let release!: () => void;
+			const gate = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			let actionKeys = 0;
+			const fixture = harness({
+				source: { id: "disabled", enabled: () => false, propose: () => undefined },
+				actionKey: async (tool, input) => {
+					actionKeys++;
+					if (actionKeys === 1) await gate;
+					return buildPiActionKey(tool, input, "/workspace");
+				},
+			});
+			const turnID = `in-flight-key:${label}`;
+			await fixture.runtime.startTurn({ sessionID: "session", turnID });
+			const previewCall = call(turnID, { path: "preview.ts" });
+			const preview = fixture.runtime.previewActorCall(previewCall);
+			await waitFor(() => actionKeys === 1);
+			if (settlePreview) {
+				release();
+				await preview;
+			}
+			const actorCall = { ...previewCall, input: { path: formalPath } };
+			const consumed = fixture.runtime.consume(actorCall);
+			if (callsBeforeRelease === 1) await new Promise((resolve) => setTimeout(resolve, 10));
+			else await waitFor(() => actionKeys === callsBeforeRelease);
+			expect(actionKeys, label).toBe(callsBeforeRelease);
+			if (!settlePreview) release();
+			await preview;
+			if ((await consumed) === undefined)
+				await fixture.runtime.actual({ ...actorCall, durationMs: 1, output: "actor" });
+			await fixture.runtime.finishTurn({ ...actorCall, terminal: true });
+		}
+	});
+
 	it("promotes a streamed Actor intent without claiming or committing its prediction", async () => {
 		const settlements: PredictionSettlement[] = [];
 		const source: Source = {
