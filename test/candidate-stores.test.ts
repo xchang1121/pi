@@ -49,6 +49,8 @@ describe("ActionStore", () => {
 			).inserted,
 		).toBe(true);
 		expect(store.lookup("session", root.key).map((item) => item.entry.id)).toEqual(["derived", "root"]);
+		expect(store.touch("session", root)).toBe(true);
+		expect(store.lookup("session", root.key).map((item) => item.entry.id)).toEqual(["root", "derived"]);
 		expect(store.delete("session", root)).toBe(true);
 		expect(store.getExact("session", derived.key)).toBe(derived);
 	});
