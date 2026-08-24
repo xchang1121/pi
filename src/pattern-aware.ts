@@ -3034,15 +3034,22 @@ function encodePath(segments: PatternAwarePath) {
 	return JSON.stringify(segments);
 }
 
-function decodePath(value: string): Array<string | number> {
+function decodePath(value: string): PatternAwarePath {
 	return parsePath(value) ?? [];
 }
 
-function parsePath(value: string): Array<string | number> | undefined {
+const parsedPaths = new Map<string, PatternAwarePath | null>();
+
+function parsePath(value: string): PatternAwarePath | undefined {
+	const cached = parsedPaths.get(value);
+	if (cached !== undefined) return cached ?? undefined;
 	try {
 		const parsed: unknown = JSON.parse(value);
-		return isPatternAwarePath(parsed) ? [...parsed] : undefined;
+		const result = isPatternAwarePath(parsed) ? parsed : null;
+		parsedPaths.set(value, result);
+		return result ?? undefined;
 	} catch {
+		parsedPaths.set(value, null);
 		return undefined;
 	}
 }
