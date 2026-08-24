@@ -1,4 +1,5 @@
 import path from "node:path";
+import { stableStringify } from "./stable-json.ts";
 
 /** Observable effects of an action, independent of any concrete isolation backend. */
 export type ActionEffect = "observation" | "workspace_mutation" | "unbounded";
@@ -745,21 +746,6 @@ function normalizeNonNegativeInteger(value: unknown, fallback: number): number {
 
 function validOptionalInteger(value: unknown, minimum: number): boolean {
 	return value === undefined || (typeof value === "number" && Number.isSafeInteger(value) && value >= minimum);
-}
-
-function stableStringify(value: unknown): string {
-	return JSON.stringify(stable(value));
-}
-
-function stable(value: unknown): unknown {
-	if (Array.isArray(value)) return value.map(stable);
-	if (!value || typeof value !== "object") return value;
-	return Object.fromEntries(
-		Object.entries(value as Record<string, unknown>)
-			.filter(([, item]) => item !== undefined)
-			.sort(([left], [right]) => left.localeCompare(right))
-			.map(([key, item]) => [key, stable(item)]),
-	);
 }
 
 function fastHash(value: string): string {

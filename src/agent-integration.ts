@@ -48,6 +48,7 @@ import type {
 	SpeculativePlanSource,
 } from "./runtime.ts";
 import { candidateExecutionMs, candidateToolNames, makeSpeculativeActionRuntime } from "./runtime.ts";
+import { stableStringify } from "./stable-json.ts";
 import type { ToolInvocation, ToolSettlement } from "./tool-settlement.ts";
 
 export interface SpeculativeAgentSettingsInput {
@@ -830,20 +831,7 @@ function definitionSchemaHashes(
 }
 
 function stableHash(value: unknown): string {
-	return createHash("sha256")
-		.update(JSON.stringify(stableValue(value)))
-		.digest("hex")
-		.slice(0, 32);
-}
-
-function stableValue(value: unknown): unknown {
-	if (Array.isArray(value)) return value.map(stableValue);
-	if (!value || typeof value !== "object") return value;
-	return Object.fromEntries(
-		Object.entries(value as Record<string, unknown>)
-			.sort(([left], [right]) => left.localeCompare(right))
-			.map(([key, item]) => [key, stableValue(item)]),
-	);
+	return createHash("sha256").update(stableStringify(value)).digest("hex").slice(0, 32);
 }
 
 function extractOutputPaths(

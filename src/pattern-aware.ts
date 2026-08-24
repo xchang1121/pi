@@ -5,6 +5,7 @@ import path from "node:path";
 import { type ActionKey, type ActionKeyProjector, actionKeyCovers } from "./action-semantics.ts";
 import { PpmCountTrie, type PpmCountTrieRow } from "./ppm-count-trie.ts";
 import type { PredictionSettlement, ResolutionStage } from "./settlement.ts";
+import { stableStringify } from "./stable-json.ts";
 
 export type PatternAwareSettings = {
 	readonly enabled: boolean;
@@ -3066,20 +3067,6 @@ function sameValue(left: unknown, right: unknown) {
 	if (left === right) return true;
 	if (left === null || right === null || typeof left !== "object" || typeof right !== "object") return false;
 	return stableStringify(left) === stableStringify(right);
-}
-
-function stableStringify(value: unknown) {
-	return JSON.stringify(stable(value));
-}
-
-function stable(value: unknown): unknown {
-	if (Array.isArray(value)) return value.map(stable);
-	if (!value || typeof value !== "object") return value;
-	return Object.fromEntries(
-		Object.entries(value as Record<string, unknown>)
-			.sort(([left], [right]) => left.localeCompare(right))
-			.map(([key, item]) => [key, stable(item)]),
-	);
 }
 
 function uniqueStrings(values: ReadonlyArray<string>) {
