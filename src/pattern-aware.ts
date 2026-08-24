@@ -1793,6 +1793,15 @@ function applyBindingsPartialWeightedVariants(
 			for (const variant of variants) variant.missing.push(targetPath);
 			continue;
 		}
+		if (values.length === 1) {
+			for (const variant of variants) {
+				const input = withPath(variant.input, targetPath, values[0]!.value);
+				variant.input = input ?? variant.input;
+				variant.probability *= values[0]!.probability;
+				if (!input) variant.missing.push(targetPath);
+			}
+			continue;
+		}
 		const next: Array<{ input: Record<string, unknown>; missing: PatternAwarePath[]; probability: number }> = [];
 		for (const variant of variants) {
 			for (const value of values) {
