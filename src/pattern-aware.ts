@@ -2113,7 +2113,18 @@ function structuredOutput(value: unknown): unknown {
 			return !!content && typeof content.type === "string";
 		})
 	) {
-		return record.details;
+		if (record.details !== undefined) return record.details;
+		const values = uniqueStrings(
+			record.content.flatMap((item) => {
+				const content = asRecord(item);
+				if (content?.type !== "text" || typeof content.text !== "string") return [];
+				return content.text
+					.split(/\r?\n/)
+					.map((line) => line.trim())
+					.filter((line) => line.length >= 3 && !/\s/.test(line));
+			}),
+		).sort();
+		return values.length ? { values } : undefined;
 	}
 	return value;
 }

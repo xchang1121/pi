@@ -589,6 +589,53 @@ describe("faux LLM speculative action end to end", () => {
 		expect(fastActor.executions).toEqual({ grep: 1, read: 2 });
 	});
 
+	it("learns a dynamic action argument from atomic tool output", async () => {
+		const cwd = await workspace();
+		const files = ["./a.txt", "./b.txt", "./c.txt", "./d.txt", "./target.txt"];
+		await Promise.all(files.map((file) => writeFile(path.join(cwd, file), file, "utf8")));
+		const patternSettings = { ...PATTERN_AWARE_DEFAULTS, maxFutureGap: 0, minOccurrences: 2 };
+		const store = patternStore(cwd, patternSettings);
+		for (const [index, file] of files.slice(0, 4).entries()) {
+			const sessionID = `atomic-training-${index}`;
+			store.observe({
+				sessionID,
+				turnID: `${sessionID}:bash`,
+				tool: "bash",
+				input: { command: `discover ${file}` },
+				output: { values: [file] },
+				outcome: "success",
+				durationMs: 1,
+			});
+			store.observe({
+				sessionID,
+				turnID: `${sessionID}:read`,
+				tool: "read",
+				input: { path: file },
+				outcome: "success",
+				durationMs: 120,
+			});
+			store.finishSession(sessionID);
+		}
+		const result = await runAgent({
+			cwd,
+			sessionID: "atomic-output-evaluation",
+			tools: [atomicOutputBash(), delayedRead(cwd, 120)],
+			actorTurns: [
+				turn(fauxToolCall("bash", { command: "discover ./target.txt" })),
+				turn(fauxToolCall("read", { path: "./target.txt" }), 220),
+				turn("done"),
+			],
+			actorTokensPerSecond: 4_000,
+			draftTurns: [],
+			settings: { ...patternAwareSettings(patternSettings), tools: ["bash", "read"] },
+			patternStore: store,
+		});
+		expect(result.summary).toMatchObject({ actorActions: 2, speculativeHits: 1, actorFallbacks: 1 });
+		expect(result.executions).toEqual({ bash: 1, read: 1 });
+		expect(result.summary.executionAheadMs).toBeGreaterThanOrEqual(100);
+		expect(result.toolLatencyMs.at(-1)).toBeLessThan(40);
+	});
+
 	it("isolates learned patterns when unrelated repositories reuse one checkout path", async () => {
 		const cwd = await workspace();
 		await Promise.all([
@@ -1092,6 +1139,19 @@ function fallbackBash(cwd: string): AgentTool<typeof bashSchema> {
 			await writeFile(path.join(cwd, "generated.txt"), "actor", "utf8");
 			return textResult("actor");
 		},
+	};
+}
+
+function atomicOutputBash(): AgentTool<typeof bashSchema> {
+	return {
+		name: "bash",
+		label: "bash",
+		description: "Discover a workspace path",
+		parameters: bashSchema,
+		execute: async (_callID, args) => ({
+			content: [{ type: "text", text: args.command.split(/\s+/).at(-1) ?? "" }],
+			details: undefined,
+		}),
 	};
 }
 

@@ -2023,6 +2023,12 @@ describe("PatternAware", () => {
 				details: undefined,
 			}),
 		).toEqual({});
+		expect(
+			projectPatternAwareObservation({
+				content: [{ type: "text", text: "tests/value.test.ts::case\nexplanatory display text\nabc1234" }],
+				details: undefined,
+			}),
+		).toEqual({ output: { values: ["abc1234", "tests/value.test.ts::case"] } });
 	});
 
 	test("records compact LLM turn metadata in the analyzer event stream", () => {
