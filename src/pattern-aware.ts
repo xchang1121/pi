@@ -1641,23 +1641,30 @@ function inferBindingsFromSamples(
 			continue;
 		}
 		const targetIsPath = isPathField(String(targetPath.at(-1) ?? ""));
-		const direct = samples.flatMap((sample, index) =>
-			candidateBindings(sample.context, targets[index], false, targetIsPath),
+		const direct = uniqueBindings(
+			samples.flatMap((sample, index) => candidateBindings(sample.context, targets[index], false, targetIsPath)),
 		);
-		const candidates = uniqueBindings([
-			...direct,
-			...samples.flatMap((sample, index) =>
-				typeof targets[index] === "string"
-					? candidateBindings(sample.context, targets[index], true, targetIsPath)
-					: [],
-			),
-		]);
+		const completeDirect = direct.find((candidate) =>
+			samples.every((sample, index) => bindingMatches(candidate, sample.context, targets[index])),
+		);
+		const candidates = completeDirect
+			? []
+			: uniqueBindings([
+					...direct,
+					...samples.flatMap((sample, index) =>
+						typeof targets[index] === "string"
+							? candidateBindings(sample.context, targets[index], true, targetIsPath)
+							: [],
+					),
+				]);
 		const fallbackSources = uniqueBindings(
 			direct.filter((binding) => binding.type === "event" || binding.type === "transform"),
 		);
-		if (fallbackSources.length > 1) candidates.push({ type: "coalesce", sources: fallbackSources });
-		let selected: PatternAwareBinding | undefined;
-		let selectedReplay = -1;
+		if (!completeDirect && fallbackSources.length > 1) {
+			candidates.push({ type: "coalesce", sources: fallbackSources });
+		}
+		let selected = completeDirect;
+		let selectedReplay = completeDirect ? samples.length : -1;
 		for (const candidate of candidates) {
 			const replay = samples.reduce(
 				(matches, sample, index) => matches + Number(bindingMatches(candidate, sample.context, targets[index])),
