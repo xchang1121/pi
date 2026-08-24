@@ -415,7 +415,6 @@ export function createSpeculativeActionHost(
 		proposalCount: (settings) => clampCandidateLimit(settings.candidateLimit ?? DEFAULTS.candidateLimit),
 		propose: async ({
 			startInput: input,
-			candidateNames,
 			proposalIndex,
 			proposalCount,
 			signal,
@@ -439,14 +438,9 @@ export function createSpeculativeActionHost(
 								signal,
 							})
 						: input.actorOptions;
-					const enabledTools = new Set(candidateNames);
 					return {
 						model,
-						context: {
-							systemPrompt: input.context.systemPrompt,
-							messages: input.context.messages,
-							tools: (input.context.tools ?? []).filter((tool) => enabledTools.has(tool.name)),
-						},
+						context: input.context,
 						options: configuredDraftOptions ?? {},
 					};
 				})();

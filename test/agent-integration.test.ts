@@ -598,6 +598,13 @@ describe("speculative action host", () => {
 				activeRequests--;
 				return result;
 			}
+			if (index === 5) {
+				activeRequests--;
+				return assistant(
+					[{ type: "toolCall", id: "actor-only", name: "actor_only", arguments: { path: "notes.txt" } }],
+					"toolUse",
+				);
+			}
 			activeRequests--;
 			const selected = index % 2 === 0 ? "notes.txt" : "other.txt";
 			return assistant(
@@ -618,6 +625,13 @@ describe("speculative action host", () => {
 				return { content: [{ type: "text", text: args.path }], details: {} };
 			},
 		};
+		const actorOnly = vi.fn();
+		const actorOnlyTool: AgentTool<typeof readSchema> = {
+			...tool,
+			name: "actor_only",
+			label: "actor_only",
+			execute: actorOnly,
+		};
 		const host = createSpeculativeActionHost("session", {
 			cwd,
 			getSettings: () => ({
@@ -637,7 +651,11 @@ describe("speculative action host", () => {
 			},
 		});
 
-		const actorInput = startInput(tool);
+		const actorInput = {
+			...startInput(tool),
+			context: { systemPrompt: "system", messages: [], tools: [tool, actorOnlyTool] },
+			tools: [tool, actorOnlyTool],
+		};
 		await host.startTurn(actorInput);
 		await waitFor(
 			() => events.filter((event) => event.type === "candidate" && event.state.status === "succeeded").length === 2,
@@ -650,6 +668,7 @@ describe("speculative action host", () => {
 		expect(maxActiveRequests).toBe(11);
 		expect(getDraftOptions).toHaveBeenCalledTimes(1);
 		expect(new Set(requests.map((request) => request.options?.sessionId))).toEqual(new Set(["session:draft"]));
+		expect(requests[0]?.context).toBe(actorInput.context);
 		expect(requests.every((request) => request.context === requests[0]!.context)).toBe(true);
 		const temperatures = requests.map((request) => request.options?.temperature);
 		expect(temperatures.slice(0, 3)).toEqual([0, 0, 0.4]);
@@ -657,7 +676,7 @@ describe("speculative action host", () => {
 		for (const request of requests) {
 			expect(request.context.systemPrompt).toBe(actorInput.context.systemPrompt);
 			expect(request.context.messages).toBe(actorInput.context.messages);
-			expect(request.context.tools?.map((candidate) => candidate.name)).toEqual(["read"]);
+			expect(request.context.tools?.map((candidate) => candidate.name)).toEqual(["read", "actor_only"]);
 			expect(request.options).toMatchObject({
 				maxTokens: 96,
 				toolChoice: "required",
@@ -667,6 +686,7 @@ describe("speculative action host", () => {
 			});
 		}
 		expect(executed.sort()).toEqual(["notes.txt", "other.txt"]);
+		expect(actorOnly).not.toHaveBeenCalled();
 		await waitFor(
 			() => events.filter((event) => event.type === "candidate" && event.state.status === "running").length === 2,
 		);
