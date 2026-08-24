@@ -1882,7 +1882,7 @@ function inferCandidateBindings(
 						const transformed: PatternAwareBinding = { type: "transform", operation, source: direct };
 						const value = transform(operation, source);
 						if (value === target) result.push(transformed);
-						sources.push({ binding: transformed, value });
+						if (operation !== "basename") sources.push({ binding: transformed, value });
 						if (pathSources.length < MAX_PATH_SOURCES) pathSources.push({ binding: transformed, value });
 					}
 				}

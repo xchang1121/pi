@@ -102,6 +102,11 @@ describe("PatternAware", () => {
 			workdir: "services/beta",
 		});
 		expect(inputReads).toBe(readsAfterFirstApplication);
+		expect(
+			inferBindings([event({ tool: "read", input: { filePath: "/workspace/repo" } })], {
+				filePath: "repo/src/a.ts",
+			})['["filePath"]'],
+		).toEqual({ type: "constant", value: "repo/src/a.ts" });
 	});
 
 	test("does not treat an opaque shell command as a filesystem path template", () => {
