@@ -312,33 +312,25 @@ class PredictiveContextTrie {
 	private readonly root: TrieNode = { children: new Map(), patterns: new Set() };
 
 	insert(pattern: Pick<MutablePattern, "id" | "context">) {
-		let frontier = [this.root];
+		let node = this.root;
 		for (let index = pattern.context.length - 1; index >= 0; index--) {
 			const token = trieToken(pattern.context[index]!);
-			const next: TrieNode[] = [];
-			for (const node of frontier) {
-				const child = node.children.get(token) ?? { children: new Map(), patterns: new Set() };
-				node.children.set(token, child);
-				next.push(child);
-			}
-			frontier = next;
+			const child = node.children.get(token) ?? { children: new Map(), patterns: new Set() };
+			node.children.set(token, child);
+			node = child;
 		}
-		for (const node of frontier) node.patterns.add(pattern.id);
+		node.patterns.add(pattern.id);
 	}
 
 	matching(history: ReadonlyArray<PatternAwareEvent>) {
 		const result = new Set<string>();
-		let frontier = [this.root];
-		for (let index = history.length - 1; index >= 0 && frontier.length > 0; index--) {
+		let node = this.root;
+		for (let index = history.length - 1; index >= 0; index--) {
 			const token = trieToken(signature(history[index]!));
-			const next = new Set<TrieNode>();
-			for (const node of frontier) {
-				const child = node.children.get(token);
-				if (!child) continue;
-				next.add(child);
-				for (const patternID of child.patterns) result.add(patternID);
-			}
-			frontier = [...next];
+			const child = node.children.get(token);
+			if (!child) break;
+			for (const patternID of child.patterns) result.add(patternID);
+			node = child;
 		}
 		return result;
 	}
