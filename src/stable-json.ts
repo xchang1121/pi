@@ -11,14 +11,12 @@ function serialize(value: unknown): string | undefined {
 		return `[${items.join(",")}]`;
 	}
 	const record = value as Record<string, unknown>;
-	const integerKeys: string[] = [];
-	const namedKeys: string[] = [];
-	for (const key of Object.keys(record).sort((left, right) => left.localeCompare(right))) {
-		(isArrayIndex(key) ? integerKeys : namedKeys).push(key);
-	}
-	integerKeys.sort((left, right) => Number(left) - Number(right));
+	const keys = Object.keys(record);
+	let firstNamed = 0;
+	while (firstNamed < keys.length && isArrayIndex(keys[firstNamed]!)) firstNamed++;
+	keys.push(...keys.splice(firstNamed).sort((left, right) => left.localeCompare(right)));
 	const entries: string[] = [];
-	for (const key of [...integerKeys, ...namedKeys]) {
+	for (const key of keys) {
 		const item = serialize(record[key]);
 		if (item !== undefined) entries.push(`${JSON.stringify(key)}:${item}`);
 	}
