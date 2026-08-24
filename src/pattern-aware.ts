@@ -635,6 +635,14 @@ export class PatternAwareStore {
 			}
 		}
 		const ppmEstimates = new Map<string, PpmProbabilityEstimate | undefined>();
+		const estimatePpm = (tool: string) => {
+			if (!ppmEstimates.has(tool))
+				ppmEstimates.set(
+					tool,
+					this.sequenceModel.estimate(sequenceContext, tool, this.clock, settings.decayHalfLifeEvents),
+				);
+			return ppmEstimates.get(tool);
+		};
 		const predictions = [...groups.entries()].map(([identity, group]) => {
 			const ordered = [...group].sort(
 				(left, right) =>
@@ -648,12 +656,7 @@ export class PatternAwareStore {
 			const gapCoverage = groupGapCoverage(patterns, horizon, settings, this.clock);
 			const replayProbability = backoffProbability(patterns, this.clock, settings.decayHalfLifeEvents);
 			const targetTool = representative.pattern.targetTool;
-			if (!ppmEstimates.has(targetTool))
-				ppmEstimates.set(
-					targetTool,
-					this.sequenceModel.estimate(sequenceContext, targetTool, this.clock, settings.decayHalfLifeEvents),
-				);
-			const ppmEstimate = ppmEstimates.get(targetTool);
+			const ppmEstimate = estimatePpm(targetTool);
 			const totalWeight = ordered.reduce(
 				(total, item) =>
 					total +
@@ -720,7 +723,7 @@ export class PatternAwareStore {
 		for (const recurrent of this.recurrentPredictions(
 			activeSessionID,
 			schemaHashes,
-			sequenceContext,
+			estimatePpm,
 			continuation,
 			settings,
 		)) {
@@ -825,7 +828,7 @@ export class PatternAwareStore {
 	private recurrentPredictions(
 		sessionID: string | undefined,
 		schemaHashes: Readonly<Record<string, string>>,
-		sequenceContext: readonly string[],
+		estimatePpm: (tool: string) => PpmProbabilityEstimate | undefined,
 		continuation: PatternAwareContinuation,
 		settings: PatternAwareSettings,
 	) {
@@ -865,12 +868,7 @@ export class PatternAwareStore {
 			const conditionalProbability = clampProbability(mass / Math.max(mass, massByTool.get(item.action.tool) ?? 0));
 			const empiricalProbability = clampProbability(continuation.pathProbability * conditionalProbability);
 			const expectedDurationMs = item.totalDurationMs / Math.max(1, item.count);
-			const ppmEstimate = this.sequenceModel.estimate(
-				sequenceContext,
-				item.action.tool,
-				this.clock,
-				settings.decayHalfLifeEvents,
-			);
+			const ppmEstimate = estimatePpm(item.action.tool);
 			const expectedLatencyBenefitMs =
 				empiricalProbability * (ppmEstimate?.probability ?? 1) * Math.max(1, expectedDurationMs);
 			return {
