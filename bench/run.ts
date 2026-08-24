@@ -74,7 +74,7 @@ interface BenchmarkOptions {
 	readonly drafter: Model<Api>;
 	readonly drafterMaxDepth: number;
 	readonly candidateLimit: number;
-	readonly drafterMaxTokens: number;
+	readonly drafterMaxTokens?: number;
 	readonly drafterDeterministicCandidates: number;
 	readonly drafterTemperatureMin: number;
 	readonly drafterTemperatureMax: number;
@@ -106,7 +106,7 @@ const { values } = parseArgs({
 		drafter: { type: "string", default: "deepseek/deepseek-v4-flash" },
 		"drafter-max-depth": { type: "string", default: String(DEFAULTS.drafterMaxDepth) },
 		"candidate-limit": { type: "string", default: String(DEFAULTS.candidateLimit) },
-		"drafter-max-tokens": { type: "string", default: String(DEFAULTS.drafterMaxTokens) },
+		"drafter-max-tokens": { type: "string" },
 		"drafter-deterministic-candidates": {
 			type: "string",
 			default: String(DEFAULTS.drafterDeterministicCandidates),
@@ -141,7 +141,9 @@ const options: BenchmarkOptions = {
 	drafter: model(values.drafter ?? "deepseek/deepseek-v4-flash"),
 	drafterMaxDepth: nonNegativeInteger(values["drafter-max-depth"], "--drafter-max-depth"),
 	candidateLimit: positiveInteger(values["candidate-limit"], "--candidate-limit"),
-	drafterMaxTokens: positiveInteger(values["drafter-max-tokens"], "--drafter-max-tokens"),
+	...(values["drafter-max-tokens"] !== undefined
+		? { drafterMaxTokens: positiveInteger(values["drafter-max-tokens"], "--drafter-max-tokens") }
+		: {}),
 	drafterDeterministicCandidates: nonNegativeInteger(
 		values["drafter-deterministic-candidates"],
 		"--drafter-deterministic-candidates",
