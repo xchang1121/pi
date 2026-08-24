@@ -39,21 +39,28 @@ function equalSlot(left: unknown, right: unknown, arraySlot: boolean): boolean {
 function serialize(value: unknown): string | undefined {
 	if (!value || typeof value !== "object") return JSON.stringify(value);
 	if (Array.isArray(value)) {
-		const items: string[] = [];
-		for (let index = 0; index < value.length; index++) items.push(serialize(value[index]) ?? "null");
-		return `[${items.join(",")}]`;
+		let result = "[";
+		for (let index = 0; index < value.length; index++) {
+			if (index) result += ",";
+			result += serialize(value[index]) ?? "null";
+		}
+		return `${result}]`;
 	}
 	const record = value as Record<string, unknown>;
 	const keys = Object.keys(record);
 	let firstNamed = 0;
 	while (firstNamed < keys.length && isArrayIndex(keys[firstNamed]!)) firstNamed++;
 	keys.push(...keys.splice(firstNamed).sort((left, right) => left.localeCompare(right)));
-	const entries: string[] = [];
+	let result = "{";
+	let first = true;
 	for (const key of keys) {
 		const item = serialize(record[key]);
-		if (item !== undefined) entries.push(`${JSON.stringify(key)}:${item}`);
+		if (item === undefined) continue;
+		if (!first) result += ",";
+		result += `${JSON.stringify(key)}:${item}`;
+		first = false;
 	}
-	return `{${entries.join(",")}}`;
+	return `${result}}`;
 }
 
 function isArrayIndex(value: string) {
