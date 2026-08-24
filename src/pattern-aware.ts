@@ -2175,10 +2175,16 @@ function uniquePathSources(values: ReadonlyArray<{ readonly binding: PatternAwar
 	});
 }
 
+const bindingStructureKeys = new WeakMap<object, string>();
+
 function uniqueBindings(bindings: ReadonlyArray<PatternAwareBinding>) {
 	const seen = new Set<string>();
 	return bindings.filter((binding) => {
-		const key = stableStringify(bindingStructure(binding));
+		let key = bindingStructureKeys.get(binding);
+		if (key === undefined) {
+			key = stableStringify(bindingStructure(binding));
+			bindingStructureKeys.set(binding, key);
+		}
 		if (seen.has(key)) return false;
 		seen.add(key);
 		return true;
