@@ -483,13 +483,14 @@ export function createSpeculativeActionHost(
 				...previous.context,
 				messages: [...previous.context.messages, previous.message, drafterToolResult(previousCall, output)],
 			};
-			const message = await options.complete(previous.model, context, { ...previous.options, signal });
+			const continuationOptions = { ...previous.options, toolChoice: "auto" as const };
+			const message = await options.complete(previous.model, context, { ...continuationOptions, signal });
 			if (message.stopReason === "error" || message.stopReason === "aborted") {
 				throw new Error(message.errorMessage ?? `Drafter stopped with ${message.stopReason}`);
 			}
 			const call = message.content.find((item): item is AgentToolCall => item.type === "toolCall");
 			if (!call) return undefined;
-			const next = drafterFeedback(previous.model, context, previous.options, message, call, previous.depth + 1);
+			const next = drafterFeedback(previous.model, context, continuationOptions, message, call, previous.depth + 1);
 			return {
 				proposalID,
 				source: "drafter",

@@ -66,6 +66,7 @@
 
 ### Fixed
 
+- Output-informed Drafter continuations now permit a terminal response instead of forcing an unrelated tool call after the speculative branch has completed.
 - A newly captured exact-key result remains reachable when an older cache generation cannot be freshness-validated; bounded cache retention now owns both generations until one is proven stale or evicted.
 - Continuation work can be reused immediately, but its prediction is anchored to the first causally eligible Actor decision; same-batch reuse is no longer misattributed as a future-step match.
 - A continuation targeting the next Actor decision is no longer cancelled by a sibling tool call from the same parallel Actor response.
@@ -83,6 +84,5 @@
 
 ### Removed
 
-- Removed Drafter multi-step rollouts after paired real-task ablation showed request and execution growth without end-to-end benefit; Drafter now predicts only the next action, while PatternAware retains learned multi-step prediction.
 - Removed the bundled OCI, native process, and Windows AppContainer backends and their setup paths. The package no longer installs or launches Docker/Podman and no longer mutates OS sandbox state.
 - Removed process-backend routing and installation settings from the Pi extension; embedding runtimes can inject a runtime-wide `ExecutionWorld` instead.

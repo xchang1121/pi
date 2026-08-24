@@ -693,6 +693,49 @@ describe("speculative action host", () => {
 		await host.dispose();
 	});
 
+	it("lets output-informed Drafter branches terminate without forcing another tool", async () => {
+		const cwd = await temporaryWorkspace();
+		const requests: Array<Parameters<CreateComplete>[2]> = [];
+		const executed: string[] = [];
+		const complete: CreateComplete = async (_model, context, options) => {
+			requests.push(options);
+			const results = context.messages.filter((message) => message.role === "toolResult").length;
+			if (results < 2) return drafterCall({ path: results === 0 ? "notes.txt" : "target.txt" });
+			return (options as { toolChoice?: string }).toolChoice === "required"
+				? drafterCall({ path: "forced-after-terminal.txt" })
+				: assistant([{ type: "text", text: "done" }], "stop");
+		};
+		const tool: AgentTool<typeof readSchema> = {
+			name: "read",
+			label: "read",
+			description: "read",
+			parameters: readSchema,
+			execute: async (_id, input) => {
+				executed.push(input.path);
+				return { content: [{ type: "text", text: input.path }], details: {} };
+			},
+		};
+		const host = createSpeculativeActionHost("session", {
+			cwd,
+			getSettings: () => ({ ...settings(), drafterMaxDepth: 2 }),
+			draftModel: model("draft"),
+			complete,
+			preflight: () => true,
+		});
+
+		await host.startTurn(startInput(tool));
+		await waitFor(() => requests.length === 3);
+		await waitFor(() => !host.runtime.inspect("session").pendingPredictions);
+
+		expect(requests.map((options) => (options as { toolChoice?: string }).toolChoice)).toEqual([
+			"required",
+			"auto",
+			"auto",
+		]);
+		expect(executed).toEqual(["notes.txt", "target.txt"]);
+		await host.dispose();
+	});
+
 	it("uses the actor model by default and permits it as the explicit Drafter model", async () => {
 		const cwd = await temporaryWorkspace();
 		const usedModels: string[] = [];
