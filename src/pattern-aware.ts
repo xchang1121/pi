@@ -286,7 +286,7 @@ type TrieNode = {
 export const PATTERN_AWARE_DEFAULTS: PatternAwareSettings = {
 	enabled: true,
 	multiStepEnabled: true,
-	maxContextLength: 6,
+	maxContextLength: 3,
 	beamWidth: 4,
 	maxPredictionDepth: 6,
 	maxFutureGap: 8,
@@ -399,7 +399,12 @@ export class PatternAwareStore {
 		if (parsed.version >= COMPATIBLE_PATTERN_VERSION) {
 			for (const item of parsed.patterns) {
 				const pattern = mutablePattern(item);
-				if (!pattern || pattern.context.some((event) => event.tool === "$llm")) continue;
+				if (
+					!pattern ||
+					pattern.context.length > this.settings.maxContextLength ||
+					pattern.context.some((event) => event.tool === "$llm")
+				)
+					continue;
 				this.patterns.set(pattern.id, pattern);
 				this.clock = Math.max(this.clock, pattern.lastSeenSequence);
 			}
@@ -409,7 +414,12 @@ export class PatternAwareStore {
 				? mutableIndexedPools(parsed.events, parsed.pools)
 				: parsed.pools.flatMap((item) => mutablePool(item) ?? []);
 		for (const pool of restoredPools) {
-			if (!pool || pool.context.some((event) => event.tool === "$llm")) continue;
+			if (
+				!pool ||
+				pool.context.length > this.settings.maxContextLength ||
+				pool.context.some((event) => event.tool === "$llm")
+			)
+				continue;
 			for (const [gap, samples] of samplesByGap(pool.samples)) {
 				const key = patternPoolKey(pool.context, pool.targetTool, pool.targetSchemaHash, gap);
 				const compatible = parsed.version >= COMPATIBLE_PATTERN_VERSION && pool.gap === gap;
@@ -2446,6 +2456,7 @@ function leaves(value: unknown, prefix: Array<string | number> = []): Array<[Arr
 
 function structurallyEligible(pattern: MutablePattern, settings: PatternAwareSettings) {
 	return (
+		pattern.context.length <= settings.maxContextLength &&
 		(pattern.occurrences >= settings.minOccurrences ||
 			(pattern.occurrences === 1 &&
 				pattern.context.length === 1 &&

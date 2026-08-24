@@ -678,6 +678,30 @@ describe("PatternAware", () => {
 		expect(store.snapshot()).toEqual([]);
 	});
 
+	test("enforces the configured context bound for restored and registered patterns", async () => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "pi-pattern-context-bound-"));
+		temporary.push(directory);
+		const file = path.join(directory, "patterns.json");
+		const long = validatedGapPattern(
+			{ "0": 2 },
+			{
+				context: [
+					{ tool: "grep", outcome: "success" },
+					{ tool: "read", outcome: "success" },
+				],
+			},
+		);
+		await fs.writeFile(
+			file,
+			JSON.stringify({ version: 18, patterns: [long], events: [], pools: [], sequenceCounts: [] }),
+		);
+
+		const store = new PatternAwareStore(settings({ maxContextLength: 1 }), file);
+		await store.load();
+		expect(store.snapshot()).toEqual([]);
+		expect(store.registerValidatedPattern(long)).toBe(false);
+	});
+
 	test.each([13, 14])("migrates v%s evidence by gap without loading its mixed mapper patterns", async (version) => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "pi-pattern-gap-migration-"));
 		temporary.push(directory);
