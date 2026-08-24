@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { type ActionKey, type ActionKeyProjector, actionKeyCovers } from "./action-semantics.ts";
-import { PpmCountTrie, type PpmCountTrieRow } from "./ppm-count-trie.ts";
+import { PpmCountTrie, type PpmCountTrieRow, type PpmProbabilityEstimate } from "./ppm-count-trie.ts";
 import type { PredictionSettlement, ResolutionStage } from "./settlement.ts";
 import { stableStringify } from "./stable-json.ts";
 
@@ -634,6 +634,7 @@ export class PatternAwareStore {
 				groups.set(identity, group);
 			}
 		}
+		const ppmEstimates = new Map<string, PpmProbabilityEstimate | undefined>();
 		const predictions = [...groups.entries()].map(([identity, group]) => {
 			const ordered = [...group].sort(
 				(left, right) =>
@@ -646,12 +647,13 @@ export class PatternAwareStore {
 			const latestHorizon = Math.max(horizon, learnedGroupHorizon(patterns, settings, this.clock, 1));
 			const gapCoverage = groupGapCoverage(patterns, horizon, settings, this.clock);
 			const replayProbability = backoffProbability(patterns, this.clock, settings.decayHalfLifeEvents);
-			const ppmEstimate = this.sequenceModel.estimate(
-				sequenceContext,
-				representative.pattern.targetTool,
-				this.clock,
-				settings.decayHalfLifeEvents,
-			);
+			const targetTool = representative.pattern.targetTool;
+			if (!ppmEstimates.has(targetTool))
+				ppmEstimates.set(
+					targetTool,
+					this.sequenceModel.estimate(sequenceContext, targetTool, this.clock, settings.decayHalfLifeEvents),
+				);
+			const ppmEstimate = ppmEstimates.get(targetTool);
 			const totalWeight = ordered.reduce(
 				(total, item) =>
 					total +
