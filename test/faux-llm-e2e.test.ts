@@ -770,7 +770,7 @@ describe("faux LLM speculative action end to end", () => {
 		};
 		for (let index = 0; index < 32; index++) observe("read", { path: "old.txt" });
 		for (let index = 0; index < 256; index++) {
-			store.observeTurn({ sessionID, turnID: `gap-${index}`, phase: index % 2 ? "finish" : "start" });
+			store.observeTurn();
 		}
 		observe("read", { path: "old.txt" });
 		for (let index = 0; index < 3; index++) observe("find", { pattern: "target" });

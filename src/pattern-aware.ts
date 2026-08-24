@@ -471,10 +471,9 @@ export class PatternAwareStore {
 			}),
 		);
 		const history = this.history.get(first.sessionID) ?? [];
-		const actions = events.filter(isActionEvent);
-		if (actions.length) this.resolvePendingBatch(first.sessionID, actions);
-		const prior = actionHistory(history);
-		for (const event of actions) {
+		this.resolvePendingBatch(first.sessionID, events);
+		const prior = history;
+		for (const event of events) {
 			if (event.learnTarget !== false) {
 				this.sequenceModel.observe(
 					prior.map((item) => signatureToken(signature(item))),
@@ -488,7 +487,7 @@ export class PatternAwareStore {
 		}
 		history.push(...events);
 		this.history.set(first.sessionID, history);
-		if (actions.length) this.startPending(first.sessionID, actionHistory(history));
+		this.startPending(first.sessionID, history);
 		this.trimSessionHistory(history);
 		this.trimPools();
 		this.trimPatterns();
@@ -496,30 +495,8 @@ export class PatternAwareStore {
 		this.persist();
 	}
 
-	observeTurn(input: {
-		readonly sessionID: string;
-		readonly turnID: string;
-		readonly phase: "start" | "finish";
-		readonly durationMs?: number;
-		readonly terminal?: boolean;
-		readonly agent?: string;
-		readonly model?: string;
-	}) {
-		this.observe({
-			sessionID: input.sessionID,
-			turnID: input.turnID,
-			tool: "$llm",
-			input: {
-				phase: input.phase,
-				...(input.agent ? { agent: input.agent } : {}),
-				...(input.model ? { model: input.model } : {}),
-				...(input.terminal !== undefined ? { terminal: input.terminal } : {}),
-			},
-			outcome: "success",
-			durationMs: Math.max(0, input.durationMs ?? 0),
-			operation: `turn_${input.phase}`,
-			learnTarget: false,
-		});
+	observeTurn() {
+		if (this.settings.enabled) this.clock++;
 	}
 
 	finishSession(sessionID: string) {
@@ -556,7 +533,7 @@ export class PatternAwareStore {
 		predictionSettings: PatternAwareSettings = this.settings,
 	) {
 		if (!predictionSettings.enabled) return [];
-		const history = actionHistory(this.history.get(sessionID) ?? []);
+		const history = this.history.get(sessionID) ?? [];
 		return this.predictHistory(
 			history,
 			schemaHashes,
@@ -582,7 +559,7 @@ export class PatternAwareStore {
 			sequence: (continuation.history.at(-1)?.sequence ?? this.clock) + 1,
 			learnTarget: false,
 		};
-		const history = actionHistory([...continuation.history, event]);
+		const history = [...continuation.history, event];
 		this.trimSessionHistory(history);
 		return this.predictHistory(
 			history,
@@ -603,7 +580,7 @@ export class PatternAwareStore {
 		settings: PatternAwareSettings,
 	) {
 		if (continuation.visitedPatternIDs.length >= settings.maxPredictionDepth) return [];
-		const predictiveHistory = actionHistory(history);
+		const predictiveHistory = history;
 		const activeSessionID = predictiveHistory.at(-1)?.sessionID;
 		const sequenceContext = predictiveHistory.map((event) => signatureToken(signature(event)));
 		const result: PatternAwareCandidate[] = [];
@@ -1349,9 +1326,8 @@ export class PatternAwareStore {
 	private trimSessionHistory(history: PatternAwareEvent[]) {
 		const limit = this.settings.maxContextLength + this.settings.maxFutureGap + 1;
 		const batches = indexedActionBatches(history);
-		const controls = history.flatMap((event, index) => (isActionEvent(event) ? [] : [index]));
-		if (batches.length <= limit && controls.length <= limit) return;
-		const keep = new Set([...batches.slice(-limit).flat(), ...controls.slice(-limit)]);
+		if (batches.length <= limit) return;
+		const keep = new Set(batches.slice(-limit).flat());
 		history.splice(0, history.length, ...history.filter((_, index) => keep.has(index)));
 	}
 
@@ -2562,10 +2538,6 @@ function persistedEventIdentity(event: PatternAwareEvent) {
 	});
 }
 
-function actionHistory(history: ReadonlyArray<PatternAwareEvent>) {
-	return history.filter(isActionEvent);
-}
-
 function actionBatches(history: ReadonlyArray<PatternAwareEvent>) {
 	return indexedActionBatches(history).map((batch) => batch.map((index) => history[index]!));
 }
@@ -2574,7 +2546,6 @@ function indexedActionBatches(history: ReadonlyArray<PatternAwareEvent>) {
 	const batches: number[][] = [];
 	let activeBatchID: string | undefined;
 	for (const [index, event] of history.entries()) {
-		if (!isActionEvent(event)) continue;
 		if (event.batchID && event.batchID === activeBatchID) {
 			batches.at(-1)!.push(index);
 			continue;
@@ -2583,10 +2554,6 @@ function indexedActionBatches(history: ReadonlyArray<PatternAwareEvent>) {
 		activeBatchID = event.batchID;
 	}
 	return batches;
-}
-
-function isActionEvent(event: PatternAwareEvent) {
-	return event.tool !== "$llm";
 }
 
 function signature(event: PatternAwareEvent): PatternAwareEventSignature {

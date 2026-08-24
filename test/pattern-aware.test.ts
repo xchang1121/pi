@@ -433,11 +433,7 @@ describe("PatternAware", () => {
 		expect(afterFailures).toBeDefined();
 
 		for (let index = 0; index < 8; index++) {
-			store.observeTurn({
-				sessionID: "probe",
-				turnID: `turn-${index}`,
-				phase: index % 2 === 0 ? "start" : "finish",
-			});
+			store.observeTurn();
 		}
 		for (let index = 0; index < 2; index++) {
 			store.issued("drift");
@@ -1724,11 +1720,11 @@ describe("PatternAware", () => {
 			["one", "src/a.ts"],
 			["two", "src/b.ts"],
 		] as const) {
-			store.observeTurn({ sessionID, turnID: `${sessionID}:turn`, phase: "start" });
+			store.observeTurn();
 			trainGrepRead(store, sessionID, filePath);
 		}
 
-		store.observeTurn({ sessionID: "probe", turnID: "probe:turn", phase: "start" });
+		store.observeTurn();
 		store.observe(input({ sessionID: "probe", tool: "grep", input: {}, outputPaths: ["src/c.ts"] }));
 		const candidate = store.predict("probe").find((item) => item.tool === "read");
 
@@ -1935,10 +1931,10 @@ describe("PatternAware", () => {
 			["one", "src/a.ts", "tests/a.test.ts"],
 			["two", "src/b.ts", "tests/b.test.ts"],
 		] as const) {
-			store.observeTurn({ sessionID, turnID: `${sessionID}:grep`, phase: "start" });
+			store.observeTurn();
 			store.observe(input({ sessionID, tool: "grep", input: {}, outputPaths: [sourcePath] }));
-			store.observeTurn({ sessionID, turnID: `${sessionID}:grep`, phase: "finish" });
-			store.observeTurn({ sessionID, turnID: `${sessionID}:read`, phase: "start" });
+			store.observeTurn();
+			store.observeTurn();
 			store.observe(
 				input({
 					sessionID,
@@ -1947,8 +1943,8 @@ describe("PatternAware", () => {
 					output: { nextPath: testPath },
 				}),
 			);
-			store.observeTurn({ sessionID, turnID: `${sessionID}:read`, phase: "finish" });
-			store.observeTurn({ sessionID, turnID: `${sessionID}:lsp`, phase: "start" });
+			store.observeTurn();
+			store.observeTurn();
 			store.observe(
 				input({
 					sessionID,
@@ -1958,7 +1954,7 @@ describe("PatternAware", () => {
 			);
 		}
 
-		store.observeTurn({ sessionID: "probe", turnID: "probe:grep", phase: "start" });
+		store.observeTurn();
 		store.observe(input({ sessionID: "probe", tool: "grep", input: {}, outputPaths: ["src/c.ts"] }));
 		const read = store.predict("probe").find((item) => item.tool === "read");
 		const lsp = store
@@ -1976,12 +1972,6 @@ describe("PatternAware", () => {
 		expect(read?.depth).toBe(1);
 		expect(lsp?.depth).toBe(2);
 		expect(lsp?.input).toEqual({ operation: "diagnostics", filePath: "tests/c.test.ts" });
-		expect(
-			store
-				.snapshot()
-				.flatMap((pattern) => pattern.context)
-				.some((event) => event.tool === "$llm"),
-		).toBe(false);
 	});
 
 	test("projects supported structured tool outputs without parsing display text", () => {
@@ -2029,30 +2019,6 @@ describe("PatternAware", () => {
 				details: undefined,
 			}),
 		).toEqual({ output: { values: ["abc1234", "tests/value.test.ts::case"] } });
-	});
-
-	test("records compact LLM turn metadata in the analyzer event stream", () => {
-		const store = new PatternAwareStore(settings());
-		store.observeTurn({
-			sessionID: "session",
-			turnID: "turn",
-			phase: "start",
-			agent: "build",
-			model: "deepseek/deepseek-v4-pro",
-		});
-
-		expect(store.recent("session")).toContainEqual(
-			expect.objectContaining({
-				tool: "$llm",
-				operation: "turn_start",
-				input: expect.objectContaining({ agent: "build" }),
-			}),
-		);
-		expect(store.recent("session").some((event) => event.tool !== "$llm")).toBe(false);
-
-		store.observe(input({ sessionID: "session", tool: "read", input: { filePath: "src/index.ts" } }));
-
-		expect(store.recent("session").some((event) => event.tool !== "$llm")).toBe(true);
 	});
 
 	test("keeps waiting through a different invocation of the target tool while the gap remains", () => {

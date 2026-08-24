@@ -728,15 +728,10 @@ export function createSpeculativeActionHost(
 			if (!sourcePatternSettings(settings).enabled) return;
 			queuePatternAnalysis(async () => {
 				const store = await resolvePatternStore(settings);
-				store.observeTurn({
-					sessionID: startInput.sessionID,
-					turnID: startInput.turnID,
-					phase: "start",
-					model: `${startInput.actorModel.provider}/${startInput.actorModel.id}`,
-				});
+				store.observeTurn();
 			});
 		},
-		onTurnFinished: ({ startInput, settings, terminal, durationMs }) => {
+		onTurnFinished: ({ startInput, settings, terminal }) => {
 			drafterBatches.delete(JSON.stringify([startInput.sessionID, startInput.turnID]));
 			const key = authoritativeBatchKey(startInput.sessionID, startInput.turnID);
 			const batch = authoritativeBatches.get(key);
@@ -748,13 +743,7 @@ export function createSpeculativeActionHost(
 			queuePatternAnalysis(async () => {
 				const store = await resolvePatternStore(settings);
 				if (events.length) store.observeBatch(events);
-				store.observeTurn({
-					sessionID: startInput.sessionID,
-					turnID: startInput.turnID,
-					phase: "finish",
-					terminal,
-					durationMs,
-				});
+				store.observeTurn();
 				if (terminal) store.finishSession(startInput.sessionID);
 			});
 		},
