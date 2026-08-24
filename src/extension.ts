@@ -52,6 +52,7 @@ import {
 } from "./settings-store.ts";
 import type { ToolSettlement } from "./tool-settlement.ts";
 import { emptySpeculativeTraceSummary, reduceSpeculativeTrace, type SpeculativeTraceSummary } from "./trace-summary.ts";
+import { resolvePatternWorkspaceIdentity } from "./workspace-identity.ts";
 import { createWorkspaceSandbox } from "./workspace-sandbox.ts";
 
 const STATUS_KEY = "speculative-action";
@@ -261,7 +262,10 @@ async function installController(
 	let currentSettings = normalizeSpeculativeActionSettings(settingsStore.effective());
 	const settings = () => currentSettings;
 	const executionWorlds = [...new Set(dependencies.createExecutionWorlds?.() ?? [createWorkspaceSandbox()])];
-	const piToolSettings = await loadPiToolSettings(context.cwd);
+	const [piToolSettings, patternWorkspaceIdentity] = await Promise.all([
+		loadPiToolSettings(context.cwd),
+		resolvePatternWorkspaceIdentity(context.cwd),
+	]);
 	const availableTools = new Map(pi.getAllTools().map((tool) => [tool.name, tool]));
 	const toolConflicts = new Map<string, string>();
 	// Pi exposes metadata, but not another extension's execute function. Only stock tools and our own
@@ -321,6 +325,7 @@ async function installController(
 		],
 		executionWorlds,
 		patternStateDirectory: getAgentDir(),
+		patternWorkspaceIdentity,
 		onEvent: (event) => {
 			currentMetrics = reduceSpeculativeTrace(currentMetrics, event);
 			recentEvents.push(formatSpeculativeActionEvent(event));

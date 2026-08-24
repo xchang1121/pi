@@ -589,6 +589,53 @@ describe("faux LLM speculative action end to end", () => {
 		expect(fastActor.executions).toEqual({ grep: 1, read: 2 });
 	});
 
+	it("isolates learned patterns when unrelated repositories reuse one checkout path", async () => {
+		const cwd = await workspace();
+		await Promise.all([
+			writeFile(path.join(cwd, "old.txt"), "old", "utf8"),
+			writeFile(path.join(cwd, "target.txt"), "target", "utf8"),
+		]);
+		const patternSettings: PatternAwareSettings = {
+			...PATTERN_AWARE_DEFAULTS,
+			beamWidth: 1,
+			maxContextLength: 1,
+			maxFutureGap: 0,
+			minOccurrences: 2,
+		};
+		const settings = { ...patternAwareSettings(patternSettings), maxConcurrentActions: 1 };
+		const pollutedStore = patternStore(cwd, patternSettings);
+
+		for (let index = 0; index < 6; index++) {
+			trainPattern(pollutedStore, `repository-training-${index}`, [
+				["grep", { pattern: "target" }, 5],
+				["read", { path: "old.txt" }, 400],
+			]);
+		}
+
+		const evaluate = (sessionID: string, patternStore: PatternAwareStore) =>
+			runAgent({
+				cwd,
+				sessionID,
+				tools: serializedPatternTools(cwd, 400),
+				actorTurns: [
+					turn(fauxToolCall("grep", { pattern: "target" })),
+					turn(fauxToolCall("read", { path: "target.txt" }), 50),
+					turn("done"),
+				],
+				actorTokensPerSecond: 4_000,
+				draftTurns: [],
+				settings,
+				patternStore,
+			});
+		const polluted = await evaluate("repository-polluted", pollutedStore);
+		const isolated = await evaluate("repository-isolated", patternStore(cwd, patternSettings));
+
+		expect(polluted.executions.read).toBeGreaterThan(isolated.executions.read ?? 0);
+		expect(isolated.executions).toEqual({ grep: 1, read: 1 });
+		expect(polluted.toolLatencyMs.at(-1) ?? 0).toBeGreaterThan((isolated.toolLatencyMs.at(-1) ?? 0) + 120);
+		expect(polluted.summary.endToEndMs).toBeGreaterThan(isolated.summary.endToEndMs + 120);
+	});
+
 	it("uses the configured recurrence beam to hide a lower-ranked first reuse", async () => {
 		const cwd = await workspace();
 		await Promise.all([
@@ -1059,6 +1106,35 @@ function patternTools(cwd: string, durationMs: number, matchFile: string): Agent
 			await delay(durationMs, signal);
 			return textResult(`${matchFile}:1:${args.pattern}`);
 		},
+	};
+	return [grep, read];
+}
+
+function serializedPatternTools(cwd: string, durationMs: number): AgentTool[] {
+	let previousRead = Promise.resolve();
+	const read: AgentTool<typeof readSchema> = {
+		...delayedRead(cwd, 0),
+		execute: async (_callID, args) => {
+			const waitForPrevious = previousRead;
+			let release = () => {};
+			previousRead = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			await waitForPrevious;
+			try {
+				await delay(durationMs);
+				return textResult(await readFile(path.join(cwd, args.path), "utf8"));
+			} finally {
+				release();
+			}
+		},
+	};
+	const grep: AgentTool<typeof grepSchema> = {
+		name: "grep",
+		label: "grep",
+		description: "Find a pattern in a workspace file",
+		parameters: grepSchema,
+		execute: async () => textResult("target.txt:1:TODO"),
 	};
 	return [grep, read];
 }
