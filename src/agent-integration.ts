@@ -14,7 +14,6 @@ import type { ActionProjectionRule } from "./action-key-projection.ts";
 import { type ActionKey, type ActionSemanticsRegistry, PI_ACTION_SEMANTICS } from "./action-semantics.ts";
 import { createResourceSnapshotExecutionWorld, type SpeculativeAgentExecutionWorld } from "./agent-execution-world.ts";
 import {
-	buildSingleToolCallPrompt,
 	clampCandidateLimit,
 	DEFAULTS,
 	drafterRequestTemperature,
@@ -444,9 +443,7 @@ export function createSpeculativeActionHost(
 					return {
 						model,
 						context: {
-							systemPrompt: [input.context.systemPrompt, buildSingleToolCallPrompt()]
-								.filter(Boolean)
-								.join("\n\n"),
+							systemPrompt: input.context.systemPrompt,
 							messages: input.context.messages,
 							tools: (input.context.tools ?? []).filter((tool) => enabledTools.has(tool.name)),
 						},

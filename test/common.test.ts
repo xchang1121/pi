@@ -13,7 +13,6 @@ import {
 	inferredActionEffect,
 } from "../src/action-semantics.ts";
 import {
-	buildSingleToolCallPrompt,
 	clampCandidateLimit,
 	DEFAULTS,
 	drafterRequestTemperature,
@@ -23,16 +22,6 @@ import {
 import { candidateToolNames } from "../src/runtime.ts";
 
 describe("speculative action common", () => {
-	it("keeps each draft in the actor role while requiring one tool call", () => {
-		const prompt = buildSingleToolCallPrompt();
-
-		expect(prompt).toContain("Continue the conversation as the assistant");
-		expect(prompt).toContain("provider tool-call channel only");
-		expect(prompt).toContain("exactly one tool call");
-		expect(prompt).not.toMatch(/drafter|predict|speculat|likely next/i);
-		expect(DEFAULTS.drafterEnabled).toBe(true);
-	});
-
 	it("normalizes configured request counts without hidden upper bounds", () => {
 		expect(clampCandidateLimit(0)).toBe(1);
 		expect(clampCandidateLimit(4.9)).toBe(4);

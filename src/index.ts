@@ -62,7 +62,6 @@ export {
 	type SpeculativeAgentSettingsInput,
 } from "./agent-integration.ts";
 export {
-	buildSingleToolCallPrompt,
 	clampCandidateLimit,
 	DEFAULTS,
 	type DrafterToolDefinition,

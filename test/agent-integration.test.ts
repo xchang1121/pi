@@ -637,7 +637,8 @@ describe("speculative action host", () => {
 			},
 		});
 
-		await host.startTurn(startInput(tool));
+		const actorInput = startInput(tool);
+		await host.startTurn(actorInput);
 		await waitFor(
 			() => events.filter((event) => event.type === "candidate" && event.state.status === "succeeded").length === 2,
 		);
@@ -654,8 +655,8 @@ describe("speculative action host", () => {
 		expect(temperatures.slice(0, 3)).toEqual([0, 0, 0.4]);
 		expect(temperatures.at(-1)).toBeCloseTo(1.6);
 		for (const request of requests) {
-			expect(request.context.systemPrompt).toContain("Continue the conversation as the assistant");
-			expect(request.context.systemPrompt).not.toMatch(/drafter|predict|speculat|likely next/i);
+			expect(request.context.systemPrompt).toBe(actorInput.context.systemPrompt);
+			expect(request.context.messages).toBe(actorInput.context.messages);
 			expect(request.context.tools?.map((candidate) => candidate.name)).toEqual(["read"]);
 			expect(request.options).toMatchObject({
 				maxTokens: 96,
