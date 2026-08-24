@@ -970,7 +970,8 @@ export class PatternAwareStore {
 		if (!action) return;
 		const actions = this.recurrentActions.get(event.sessionID) ?? new Map<string, RecurrentAction>();
 		const existing = actions.get(action.key);
-		const durationMs = Number.isFinite(event.durationMs) ? Math.max(0, event.durationMs) : 0;
+		const durationMs =
+			event.outcome === "success" && Number.isFinite(event.durationMs) ? Math.max(0, event.durationMs) : 0;
 		if (existing) {
 			existing.count = Math.min(Number.MAX_SAFE_INTEGER, existing.count + 1);
 			existing.totalDurationMs = Math.min(Number.MAX_VALUE / 2, existing.totalDurationMs + durationMs);
@@ -2951,7 +2952,10 @@ function sampleGapLastSeen(samples: ReadonlyArray<PatternSample>) {
 
 function averageTargetDuration(samples: ReadonlyArray<PatternSample>) {
 	return (
-		samples.reduce((total, sample) => total + Math.max(0, sample.target.durationMs), 0) / Math.max(1, samples.length)
+		samples.reduce(
+			(total, sample) => total + (sample.target.outcome === "success" ? Math.max(0, sample.target.durationMs) : 0),
+			0,
+		) / Math.max(1, samples.length)
 	);
 }
 

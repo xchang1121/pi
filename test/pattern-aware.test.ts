@@ -1589,7 +1589,7 @@ describe("PatternAware", () => {
 		);
 		const sessionID = "long-recurrence";
 		const command = { command: "npm test -- src/slow.test.ts" };
-		store.observe(input({ sessionID, tool: "bash", input: command, durationMs: 500 }));
+		store.observe(input({ sessionID, tool: "bash", input: command, outcome: "failure", durationMs: 500 }));
 		for (let index = 0; index < 3; index++) {
 			store.observe(input({ sessionID, tool: "read", input: { path: `src/before-${index}.ts` } }));
 		}
@@ -1607,7 +1607,7 @@ describe("PatternAware", () => {
 			input: command,
 			horizon: 0,
 			latestHorizon: 0,
-			expectedDurationMs: 600,
+			expectedDurationMs: 350,
 		});
 		expect(JSON.parse(recurrent!.diagnostic)).toMatchObject({ context: [], mapperConfidence: 1 });
 		const learnedPatternIDs = new Set(store.snapshot().map((pattern) => pattern.id));
@@ -1795,7 +1795,7 @@ describe("PatternAware", () => {
 		expect(new Set(bash?.continuation.visitedPatternIDs).size).toBe(3);
 	});
 
-	test("does not count tool-level PPM twice when valuing concrete patterns", () => {
+	test("does not count tool-level PPM or failed target latency when valuing concrete patterns", () => {
 		const store = new PatternAwareStore(settings({ beamWidth: 1, maxContextLength: 1, maxFutureGap: 0 }));
 		for (let index = 0; index < 8; index++) {
 			store.observe(input({ sessionID: `fast-${index}`, tool: "grep", input: {}, durationMs: 1 }));
@@ -1806,7 +1806,13 @@ describe("PatternAware", () => {
 		for (let index = 0; index < 4; index++) {
 			store.observe(input({ sessionID: `slow-${index}`, tool: "grep", input: {}, durationMs: 1 }));
 			store.observe(
-				input({ sessionID: `slow-${index}`, tool: "bash", input: { command: "npm test" }, durationMs: 100 }),
+				input({
+					sessionID: `slow-${index}`,
+					tool: "bash",
+					input: { command: "npm test" },
+					outcome: index === 0 ? "failure" : "success",
+					durationMs: index === 0 ? 10_000 : 100,
+				}),
 			);
 		}
 
@@ -1815,7 +1821,7 @@ describe("PatternAware", () => {
 		const diagnostic = JSON.parse(candidates[0]!.diagnostic);
 
 		expect(candidates.map((candidate) => candidate.tool)).toEqual(["bash", "read"]);
-		expect(candidates[0]).toMatchObject({ tool: "bash", expectedDurationMs: 100 });
+		expect(candidates[0]).toMatchObject({ tool: "bash", expectedDurationMs: 75 });
 		expect(diagnostic).toMatchObject({ beamRank: 1, beamWidth: 1, ppmOrder: 1 });
 		expect(candidates.map((candidate) => JSON.parse(candidate.diagnostic).beamRank)).toEqual([1, 1]);
 		expect(diagnostic.ppmProbability).toBeGreaterThan(0);
