@@ -753,10 +753,8 @@ export class PatternAwareStore {
 			left.horizon - right.horizon ||
 			left.patternID.localeCompare(right.patternID) ||
 			stableStringify(left.input).localeCompare(stableStringify(right.input));
-		const backgroundLast = (left: (typeof predictions)[number], right: (typeof predictions)[number]) =>
-			Number(left.background) - Number(right.background) || comparePredictions(left, right);
 		const selected = perToolBeam(
-			predictions.sort(backgroundLast),
+			predictions.sort(comparePredictions),
 			settings.beamWidth,
 			(prediction) => prediction.tool,
 		);
