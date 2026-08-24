@@ -1861,7 +1861,7 @@ function candidateBindings(
 	includeComposites = true,
 	targetIsPath = false,
 ): PatternAwareBinding[] {
-	const cacheKey = `${Number(includeComposites)}:${Number(targetIsPath)}:${stableStringify(target)}`;
+	const cacheKey = `${Number(includeComposites)}:${Number(targetIsPath)}:${typeof target}:${typeof target === "string" ? target : stableStringify(target)}`;
 	const cache = candidateBindingCache.get(context) ?? new Map<string, ReadonlyArray<PatternAwareBinding>>();
 	candidateBindingCache.set(context, cache);
 	const cached = cache.get(cacheKey);
