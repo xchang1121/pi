@@ -1744,13 +1744,13 @@ describe("PatternAware", () => {
 		);
 	});
 
-	test("merges exact backoff and keeps background probes from evicting contextual evidence", () => {
+	test("merges exact backoff and keeps contradicted patterns from evicting contextual evidence", () => {
 		const store = new PatternAwareStore(
 			settings({ beamWidth: 2, minOccurrences: 2 }),
 			undefined,
 			piActionSemantics(),
 		);
-		const commands = [{ command: "npm test" }, { command: "npm run lint" }];
+		const commands = [{ command: "npm test" }, { command: "npm run lint" }, { command: "slow probe" }];
 		for (const [index, command] of commands.entries()) {
 			expect(
 				store.registerValidatedPattern(
@@ -1761,6 +1761,12 @@ describe("PatternAware", () => {
 							context: [{ tool: "grep", outcome: "success" }],
 							targetTool: "bash",
 							bindings: { '["command"]': { type: "constant", value: command.command } },
+							...(index === 2
+								? {
+										averageDurationMs: 10_000,
+										feedback: patternFeedback({ observed: 3, recentMismatchedWeight: 3 }),
+									}
+								: {}),
 						},
 					),
 				),
@@ -1769,11 +1775,10 @@ describe("PatternAware", () => {
 		for (let index = 0; index < 2; index++) {
 			store.observe(input({ sessionID: "merged", tool: "bash", input: commands[0], durationMs: 100 }));
 		}
-		store.observe(input({ sessionID: "merged", tool: "bash", input: { command: "slow probe" }, durationMs: 10_000 }));
 		store.observe(input({ sessionID: "merged", tool: "grep", input: { pattern: "trigger" } }));
 		const matches = store.predict("merged").filter((candidate) => candidate.tool === "bash");
 
-		expect(matches.map((candidate) => candidate.input)).toEqual(commands);
+		expect(matches.map((candidate) => candidate.input)).toEqual(commands.slice(0, 2));
 		expect(matches.some((candidate) => candidate.background)).toBe(false);
 		expect(matches[0]?.supportingPatternIDs).toContain("contextual-bash-0");
 		expect(matches.map((candidate) => JSON.parse(candidate.diagnostic).beamRank)).toEqual([1, 2]);

@@ -689,8 +689,12 @@ export class PatternAwareStore {
 				adoptionProbability *
 				mapperConfidence *
 				Math.max(1, Math.max(0, expectedDurationMs));
+			const background = patterns.every((pattern) => {
+				const feedback = feedbackEvidence(pattern, this.clock, settings.decayHalfLifeEvents);
+				return pattern.occurrences < settings.minOccurrences || feedback.mismatched > feedback.matched;
+			});
 			return {
-				background: patterns.every((pattern) => pattern.occurrences < settings.minOccurrences),
+				background,
 				actionIdentity: hash(identity),
 				type: "tool_call" as const,
 				tool: representative.pattern.targetTool,
