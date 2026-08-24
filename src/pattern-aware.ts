@@ -344,7 +344,7 @@ export class PatternAwareStore {
 	private readonly history = new Map<string, PatternAwareEvent[]>();
 	private readonly recurrentActions = new Map<string, Map<string, RecurrentAction>>();
 	private readonly observedActionKeys = new WeakMap<PatternAwareEvent, ActionKey | null>();
-	private readonly resolvedActionKeys = new Map<string, ActionKey>();
+	private readonly resolvedActionKeys = new Map<string, ActionKey | null>();
 	private readonly patternSupportSessions = new Map<string, ReadonlySet<string>>();
 	private trie = new PredictiveContextTrie();
 	private sequenceModel: PpmCountTrie;
@@ -1037,15 +1037,14 @@ export class PatternAwareStore {
 			return undefined;
 		}
 		const cached = this.resolvedActionKeys.get(cacheKey);
-		if (cached) return cached;
+		if (cached !== undefined) return cached ?? undefined;
 		let resolved: ActionKey | undefined;
 		try {
 			resolved = this.actionSemantics.actionKey(tool, input, schemaHash);
 		} catch {
 			return undefined;
 		}
-		if (!resolved) return undefined;
-		this.resolvedActionKeys.set(cacheKey, resolved);
+		this.resolvedActionKeys.set(cacheKey, resolved ?? null);
 		if (this.resolvedActionKeys.size > this.settings.maxPatterns) {
 			const oldest = this.resolvedActionKeys.keys().next().value;
 			if (oldest !== undefined) this.resolvedActionKeys.delete(oldest);

@@ -1448,7 +1448,7 @@ describe("PatternAware", () => {
 		expect(after?.historicalMatches).toBe(pattern.historicalMatches + 1);
 	});
 
-	test("memoizes repeated deterministic K(a) resolution", () => {
+	test("memoizes repeated deterministic K(a) resolution, including misses", () => {
 		const semantics = piActionSemantics();
 		let resolutions = 0;
 		const store = new PatternAwareStore(settings(), undefined, {
@@ -1462,6 +1462,12 @@ describe("PatternAware", () => {
 			validatedGapPattern(
 				{ "0": 10 },
 				{ id: "memoized-action-key", bindings: { '["path"]': { type: "constant", value: "src/index.ts" } } },
+			),
+		);
+		store.registerValidatedPattern(
+			validatedGapPattern(
+				{ "0": 10 },
+				{ id: "memoized-missing-key", bindings: { '["path"]': { type: "constant", value: "../outside.ts" } } },
 			),
 		);
 
