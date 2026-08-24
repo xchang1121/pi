@@ -1002,6 +1002,7 @@ export class PatternAwareStore {
 			const maxLength = Math.min(this.settings.maxContextLength, contextEnd);
 			for (let length = 1; length <= maxLength; length++) {
 				const context = batches.slice(contextEnd - length, contextEnd).flat();
+				if (context.length > this.settings.maxContextLength) break;
 				this.learnOccurrence(context, target, gap);
 			}
 		}

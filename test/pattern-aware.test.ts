@@ -702,7 +702,7 @@ describe("PatternAware", () => {
 		expect(store.snapshot()).toEqual([]);
 	});
 
-	test("enforces the configured context bound for restored and registered patterns", async () => {
+	test("enforces the configured context bound while learning, restoring, and registering patterns", async () => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "pi-pattern-context-bound-"));
 		temporary.push(directory);
 		const file = path.join(directory, "patterns.json");
@@ -724,6 +724,15 @@ describe("PatternAware", () => {
 		await store.load();
 		expect(store.snapshot()).toEqual([]);
 		expect(store.registerValidatedPattern(long)).toBe(false);
+		for (const sessionID of ["learn-a", "learn-b"]) {
+			store.observeBatch([
+				input({ sessionID, tool: "grep", input: { pattern: "TODO" } }),
+				input({ sessionID, tool: "read", input: { filePath: "src/a.ts" } }),
+			]);
+			store.observe(input({ sessionID, tool: "write", input: { filePath: "src/a.ts" } }));
+			store.finishSession(sessionID);
+		}
+		expect(store.snapshot()).toEqual([]);
 	});
 
 	test.each([13, 14])("migrates v%s evidence by gap without loading its mixed mapper patterns", async (version) => {
