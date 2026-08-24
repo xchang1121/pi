@@ -66,7 +66,6 @@ pi -e ./packages/speculative-action
   "candidateLimit": 8,
   "maxConcurrentActions": 8,
   "drafterMaxDepth": 1,
-  "drafterMaxTokens": 128,
   "tools": ["read", "grep", "find", "ls", "bash", "write", "edit"],
   "patternAware": {
     "enabled": true,
@@ -76,6 +75,8 @@ pi -e ./packages/speculative-action
 ```
 
 `drafterMaxDepth` 表示每个单动作 Drafter 初始请求之后，最多允许多少次利用已完成工具输出的后继请求。后继请求占用该投机源在下一次 Actor 决策上的既有 slot，不会增加每个决策的请求宽度；设为 `0` 即恢复单步 Drafter。
+
+`drafterMaxTokens` 是可选的硬上限。省略该项——或清空 TUI 输入框——会使用服务商默认输出上限，避免长命令和结构化工具参数被截断。
 
 旧的 `resourceCached` / `sandbox` / `predictionOnly` 三组对象仅作为迁移输入继续识别，读取后统一规范化为一个 `tools` 数组。
 

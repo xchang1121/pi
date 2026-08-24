@@ -55,7 +55,7 @@ export interface SpeculativeAgentSettingsInput {
 	readonly drafterEnabled?: boolean;
 	/** Output-informed successor actions retained after the first Drafter action. */
 	readonly drafterMaxDepth?: number;
-	/** Recommended maximum output budget for each one-action Drafter request. */
+	/** Optional hard output cap for each one-action Drafter request; omitted uses the provider default. */
 	readonly drafterMaxTokens?: number;
 	/** Number of leading Drafter requests sent at temperature zero. */
 	readonly drafterDeterministicCandidates?: number;
@@ -448,10 +448,11 @@ export function createSpeculativeActionHost(
 			}
 			const prepared = await batch;
 			const drafter = sourceDrafterSettings(settings);
+			const { maxTokens: _actorMaxTokens, ...requestOptions } = prepared.options;
 			const draftOptions: SimpleStreamOptions & { readonly toolChoice: "required" } = {
-				...prepared.options,
+				...requestOptions,
 				temperature: drafterRequestTemperature(proposalIndex, proposalCount, drafter),
-				maxTokens: drafter.drafterMaxTokens,
+				...(drafter.drafterMaxTokens ? { maxTokens: drafter.drafterMaxTokens } : {}),
 				toolChoice: "required",
 				reasoning: undefined,
 				deferred: false,

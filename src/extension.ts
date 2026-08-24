@@ -75,7 +75,7 @@ export interface EffectiveSpeculativeActionSettings {
 	readonly enabled: boolean;
 	readonly drafterEnabled: boolean;
 	readonly drafterMaxDepth: number;
-	readonly drafterMaxTokens: number;
+	readonly drafterMaxTokens?: number;
 	readonly drafterDeterministicCandidates: number;
 	readonly drafterTemperatureMin: number;
 	readonly drafterTemperatureMax: number;
@@ -169,7 +169,7 @@ export function formatSpeculativeActionStatus(input: {
 		`Drafter: ${settings.drafterEnabled ? "On" : "Off"}`,
 		`Draft model: ${settings.draftModel ?? "active model"}`,
 		`Drafter requests: ${settings.candidateLimit}`,
-		`Drafter request policy: rollout depth ${settings.drafterMaxDepth}; ${settings.drafterMaxTokens} tokens; ${settings.drafterDeterministicCandidates} deterministic; temperature ${formatNumber(settings.drafterTemperatureMin)}-${formatNumber(settings.drafterTemperatureMax)}`,
+		`Drafter request policy: rollout depth ${settings.drafterMaxDepth}; ${settings.drafterMaxTokens ?? "provider default"} tokens; ${settings.drafterDeterministicCandidates} deterministic; temperature ${formatNumber(settings.drafterTemperatureMin)}-${formatNumber(settings.drafterTemperatureMax)}`,
 		`Concurrent actions: ${settings.maxConcurrentActions}`,
 		`Resource cache: ${settings.resourceCacheMaxEntries}`,
 		`Resource cache memory: ${formatBytes(settings.resourceCacheMaxBytes)}`,
@@ -792,7 +792,7 @@ async function openDrafterSettings(ctx: ExtensionContext, controller: Speculativ
 			`Enabled: ${settings.drafterEnabled ? "On" : "Off"}`,
 			`Model › ${settings.draftModel ?? activeModelReference(ctx)}`,
 			`Rollout depth: ${settings.drafterMaxDepth}`,
-			`Output tokens: ${settings.drafterMaxTokens}`,
+			`Output tokens: ${settings.drafterMaxTokens ?? "provider default"}`,
 			`Deterministic requests: ${settings.drafterDeterministicCandidates}`,
 			`Temperature range: ${formatNumber(settings.drafterTemperatureMin)}-${formatNumber(settings.drafterTemperatureMax)}`,
 			`Prediction timeout: ${formatDuration(settings.predictionTimeoutMs)}`,
@@ -806,7 +806,13 @@ async function openDrafterSettings(ctx: ExtensionContext, controller: Speculativ
 			await editDrafterNonNegativeInteger(ctx, controller, settings, "drafterMaxDepth", "Drafter rollout depth");
 		}
 		if (choice.startsWith("Output tokens:")) {
-			await editPositiveInteger(ctx, controller, settings, "drafterMaxTokens", "Drafter output tokens");
+			await editPositiveInteger(
+				ctx,
+				controller,
+				settings,
+				"drafterMaxTokens",
+				"Drafter output tokens (blank for provider default)",
+			);
 		}
 		if (choice.startsWith("Deterministic requests:")) {
 			await editDrafterNonNegativeInteger(
@@ -1016,8 +1022,13 @@ async function editPositiveInteger(
 		| "drafterMaxTokens",
 	title: string,
 ): Promise<void> {
-	const value = await ctx.ui.input(title, String(settings[field]));
+	const value = await ctx.ui.input(title, String(settings[field] ?? ""));
 	if (value === undefined) return;
+	if (field === "drafterMaxTokens" && value.trim() === "") {
+		const { drafterMaxTokens: _removed, ...next } = settings;
+		controller.setSettings(next);
+		return;
+	}
 	const parsed = Number(value.trim());
 	if (!Number.isInteger(parsed) || parsed <= 0) {
 		ctx.ui.notify(`${title} must be a positive integer.`, "warning");

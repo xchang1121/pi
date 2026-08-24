@@ -66,7 +66,6 @@ Example:
   "candidateLimit": 8,
   "maxConcurrentActions": 8,
   "drafterMaxDepth": 1,
-  "drafterMaxTokens": 128,
   "tools": ["read", "grep", "find", "ls", "bash", "write", "edit"],
   "patternAware": {
     "enabled": true,
@@ -76,6 +75,8 @@ Example:
 ```
 
 `drafterMaxDepth` is the number of output-informed successor requests allowed after each initial one-action Drafter request. A successor occupies that source's existing slot for the next Actor decision rather than increasing per-decision request width; set it to `0` for single-step Drafter behavior.
+
+`drafterMaxTokens` is an optional hard cap. Omit it—or clear the TUI field—to use the provider's output limit, which avoids truncating long commands and structured tool arguments.
 
 The former `resourceCached` / `sandbox` / `predictionOnly` object is accepted only as a migration input and is normalized to the single `tools` list.
 

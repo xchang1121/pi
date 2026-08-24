@@ -345,7 +345,7 @@ describe("zero-modification Pi extension", () => {
 		expect(menus.get("Drafter")).toEqual(
 			expect.arrayContaining([
 				"Rollout depth: 1",
-				"Output tokens: 128",
+				"Output tokens: provider default",
 				"Deterministic requests: 1",
 				"Temperature range: 0.7-0.7",
 			]),

@@ -696,8 +696,10 @@ describe("speculative action host", () => {
 	it("uses the actor model by default and permits it as the explicit Drafter model", async () => {
 		const cwd = await temporaryWorkspace();
 		const usedModels: string[] = [];
-		const complete: CreateComplete = async (usedModel) => {
+		const hasMaxTokens: boolean[] = [];
+		const complete: CreateComplete = async (usedModel, _context, options) => {
 			usedModels.push(`${usedModel.provider}/${usedModel.id}`);
+			hasMaxTokens.push(Object.hasOwn(options ?? {}, "maxTokens"));
 			return assistant([{ type: "text", text: "no tool needed" }], "stop");
 		};
 		const tool: AgentTool<typeof readSchema> = {
@@ -717,13 +719,14 @@ describe("speculative action host", () => {
 				complete,
 				preflight: () => true,
 			});
-			await host.startTurn(startInput(tool));
+			await host.startTurn({ ...startInput(tool), actorOptions: { maxTokens: 2_048 } });
 			await waitFor(() => usedModels.length === expectedRequests);
 			await waitFor(() => !host.runtime.inspect("session").pendingPredictions);
 			await host.dispose();
 		}
 
 		expect(usedModels).toEqual(["openai/actor", "openai/actor"]);
+		expect(hasMaxTokens).toEqual([false, false]);
 	});
 
 	it("names equal actions under different parent paths independently", () => {

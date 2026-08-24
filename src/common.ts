@@ -21,7 +21,7 @@ export interface DrafterToolDefinition {
 
 export interface DrafterRequestSettings {
 	readonly drafterMaxDepth: number;
-	readonly drafterMaxTokens: number;
+	readonly drafterMaxTokens?: number;
 	readonly drafterDeterministicCandidates: number;
 	readonly drafterTemperatureMin: number;
 	readonly drafterTemperatureMax: number;
@@ -29,7 +29,6 @@ export interface DrafterRequestSettings {
 
 const DRAFTER_DEFAULTS: DrafterRequestSettings = {
 	drafterMaxDepth: 1,
-	drafterMaxTokens: 128,
 	drafterDeterministicCandidates: 1,
 	drafterTemperatureMin: 0.7,
 	drafterTemperatureMax: 0.7,
@@ -74,9 +73,10 @@ export function normalizeDrafterRequestSettings(value: unknown): DrafterRequestS
 	const input = value && typeof value === "object" ? (value as Record<string, unknown>) : {};
 	const lower = nonNegativeNumber(input.drafterTemperatureMin, DEFAULTS.drafterTemperatureMin);
 	const upper = nonNegativeNumber(input.drafterTemperatureMax, DEFAULTS.drafterTemperatureMax);
+	const maxTokens = optionalPositiveInteger(input.drafterMaxTokens);
 	return {
 		drafterMaxDepth: nonNegativeInteger(input.drafterMaxDepth, DEFAULTS.drafterMaxDepth),
-		drafterMaxTokens: positiveInteger(input.drafterMaxTokens, DEFAULTS.drafterMaxTokens),
+		...(maxTokens ? { drafterMaxTokens: maxTokens } : {}),
 		drafterDeterministicCandidates: nonNegativeInteger(
 			input.drafterDeterministicCandidates,
 			DEFAULTS.drafterDeterministicCandidates,
@@ -123,8 +123,8 @@ export function usageTokenCount(
 		.reduce((sum, value) => sum + value, 0);
 }
 
-function positiveInteger(value: unknown, fallback: number): number {
-	return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
+function optionalPositiveInteger(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : undefined;
 }
 
 function nonNegativeInteger(value: unknown, fallback: number): number {
