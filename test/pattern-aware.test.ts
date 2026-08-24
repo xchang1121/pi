@@ -1744,36 +1744,39 @@ describe("PatternAware", () => {
 		);
 	});
 
-	test("merges exact backoff with contextual evidence before applying the per-tool beam", () => {
+	test("merges exact backoff and keeps background probes from evicting contextual evidence", () => {
 		const store = new PatternAwareStore(
-			settings({ beamWidth: 1, minOccurrences: 2 }),
+			settings({ beamWidth: 2, minOccurrences: 2 }),
 			undefined,
 			piActionSemantics(),
 		);
-		const command = { command: "npm test" };
-		expect(
-			store.registerValidatedPattern(
-				validatedGapPattern(
-					{ "0": 2 },
-					{
-						id: "contextual-bash",
-						context: [{ tool: "grep", outcome: "success" }],
-						targetTool: "bash",
-						bindings: { '["command"]': { type: "constant", value: command.command } },
-					},
+		const commands = [{ command: "npm test" }, { command: "npm run lint" }];
+		for (const [index, command] of commands.entries()) {
+			expect(
+				store.registerValidatedPattern(
+					validatedGapPattern(
+						{ "0": 2 },
+						{
+							id: `contextual-bash-${index}`,
+							context: [{ tool: "grep", outcome: "success" }],
+							targetTool: "bash",
+							bindings: { '["command"]': { type: "constant", value: command.command } },
+						},
+					),
 				),
-			),
-		).toBe(true);
-		for (let index = 0; index < 2; index++) {
-			store.observe(input({ sessionID: "merged", tool: "bash", input: command, durationMs: 100 }));
+			).toBe(true);
 		}
+		for (let index = 0; index < 2; index++) {
+			store.observe(input({ sessionID: "merged", tool: "bash", input: commands[0], durationMs: 100 }));
+		}
+		store.observe(input({ sessionID: "merged", tool: "bash", input: { command: "slow probe" }, durationMs: 10_000 }));
 		store.observe(input({ sessionID: "merged", tool: "grep", input: { pattern: "trigger" } }));
 		const matches = store.predict("merged").filter((candidate) => candidate.tool === "bash");
 
-		expect(matches).toHaveLength(1);
-		expect(matches[0]?.input).toEqual(command);
-		expect(matches[0]?.supportingPatternIDs).toContain("contextual-bash");
-		expect(JSON.parse(matches[0]!.diagnostic).beamRank).toBe(1);
+		expect(matches.map((candidate) => candidate.input)).toEqual(commands);
+		expect(matches.some((candidate) => candidate.background)).toBe(false);
+		expect(matches[0]?.supportingPatternIDs).toContain("contextual-bash-0");
+		expect(matches.map((candidate) => JSON.parse(candidate.diagnostic).beamRank)).toEqual([1, 2]);
 	});
 
 	test("backs off across matching suffix contexts", () => {

@@ -741,6 +741,7 @@ export class PatternAwareStore {
 			};
 		}
 		const comparePredictions = (left: (typeof predictions)[number], right: (typeof predictions)[number]) =>
+			Number(left.background) - Number(right.background) ||
 			right.expectedLatencyBenefitMs - left.expectedLatencyBenefitMs ||
 			right.empiricalProbability - left.empiricalProbability ||
 			right.conditionalProbability - left.conditionalProbability ||
