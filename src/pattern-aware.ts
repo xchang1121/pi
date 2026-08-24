@@ -1927,7 +1927,7 @@ function inferCandidateBindings(
 				joinMatches.set(left.value, matchesByRight);
 				let matches = matchesByRight.get(right.value);
 				if (matches === undefined) {
-					matches = path.join(left.value, right.value).replaceAll("\\", "/") === normalizedTarget;
+					matches = joinPath(left.value, right.value) === normalizedTarget;
 					matchesByRight.set(right.value, matches);
 				}
 				if (!matches) continue;
@@ -2308,9 +2308,7 @@ function evaluateBindingUncached(binding: PatternAwareBinding, context: Readonly
 		const right = evaluateBinding(binding.right, context);
 		const values = bindingValuesFromResult(left).flatMap((leftValue) =>
 			bindingValuesFromResult(right).flatMap((rightValue) =>
-				typeof leftValue === "string" && typeof rightValue === "string"
-					? [normalizePath(path.join(leftValue, rightValue))]
-					: [],
+				typeof leftValue === "string" && typeof rightValue === "string" ? [joinPath(leftValue, rightValue)] : [],
 			),
 		);
 		return values.length > 1 ? multiValue(values) : (values[0] ?? MISSING);
@@ -2376,6 +2374,14 @@ function transform(operation: "dirname" | "basename" | "normalize_path", value: 
 	if (operation === "dirname") return path.dirname(value);
 	if (operation === "basename") return path.basename(value);
 	return path.normalize(value).replaceAll("\\", "/");
+}
+
+function joinPath(left: string, right: string) {
+	const root = normalizePath(left);
+	const output = normalizePath(right);
+	if (output === root || output.startsWith(`${root}/`)) return output;
+	if (path.posix.basename(root) === output) return root;
+	return normalizePath(path.join(root, output));
 }
 
 function getPath(value: unknown, segments: PatternAwarePath): unknown {

@@ -43,6 +43,23 @@ describe("PatternAware", () => {
 		expect(bindings['["offset"]']).toEqual({ type: "constant", value: 1 });
 	});
 
+	test("keeps learned path joins idempotent when search outputs are already anchored", () => {
+		const bindings = {
+			'["path"]': {
+				type: "join" as const,
+				operation: "join_path" as const,
+				left: { type: "event" as const, relativeEvent: -1, field: "input" as const, path: ["path"] },
+				right: { type: "event" as const, relativeEvent: -1, field: "outputPaths" as const, path: [0] },
+			},
+		};
+		const replay = (root: string, output: string) =>
+			applyBindings(bindings, [event({ tool: "grep", input: { path: root }, outputPaths: [output] })]);
+
+		expect(replay("src/file.ts", "file.ts")).toEqual({ path: "src/file.ts" });
+		expect(replay("src", "src/file.ts")).toEqual({ path: "src/file.ts" });
+		expect(replay("src", "nested/file.ts")).toEqual({ path: "src/nested/file.ts" });
+	});
+
 	test("merges bindings that share nested object and array paths", () => {
 		const context = [event({ sessionID: "one", tool: "seed", input: { oldText: "before" } })];
 		const target = {
