@@ -1837,15 +1837,15 @@ const candidateBindingCache = new WeakMap<
 function candidateBindings(
 	context: ReadonlyArray<PatternAwareEvent>,
 	target: unknown,
-	includePathTemplates = true,
+	includeComposites = true,
 	targetIsPath = false,
 ): PatternAwareBinding[] {
-	const cacheKey = `${Number(includePathTemplates)}:${Number(targetIsPath)}:${stableStringify(target)}`;
+	const cacheKey = `${Number(includeComposites)}:${Number(targetIsPath)}:${stableStringify(target)}`;
 	const cache = candidateBindingCache.get(context) ?? new Map<string, ReadonlyArray<PatternAwareBinding>>();
 	candidateBindingCache.set(context, cache);
 	const cached = cache.get(cacheKey);
 	if (cached) return [...cached];
-	const result = inferCandidateBindings(context, target, includePathTemplates, targetIsPath);
+	const result = inferCandidateBindings(context, target, includeComposites, targetIsPath);
 	cache.set(cacheKey, result);
 	return result;
 }
@@ -1853,10 +1853,10 @@ function candidateBindings(
 function inferCandidateBindings(
 	context: ReadonlyArray<PatternAwareEvent>,
 	target: unknown,
-	includePathTemplates: boolean,
+	includeComposites: boolean,
 	targetIsPath: boolean,
 ): PatternAwareBinding[] {
-	if (!includePathTemplates) return indexedBindings(context, target, targetIsPath);
+	if (!includeComposites) return indexedBindings(context, target, targetIsPath);
 	const result: PatternAwareBinding[] = [];
 	const pathSources: Array<{ readonly binding: PatternAwareBinding; readonly value: string }> = [];
 	for (let index = context.length - 1; index >= 0; index--) {
@@ -1886,7 +1886,7 @@ function inferCandidateBindings(
 						if (pathSources.length < MAX_PATH_SOURCES) pathSources.push({ binding: transformed, value });
 					}
 				}
-				if (targetIsPath && !pathSource) continue;
+				if (targetIsPath) continue;
 				for (const { binding, value } of sources) {
 					if (value.length < 3) continue;
 					const offset = target.indexOf(value);

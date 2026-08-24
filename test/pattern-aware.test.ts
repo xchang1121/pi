@@ -1298,14 +1298,14 @@ describe("PatternAware", () => {
 			["test-a", "src/c.ts", "src/c.ts.test"],
 			["test-b", "src/d.ts", "src/d.ts.test"],
 		] as const) {
-			store.observe(input({ sessionID, tool: "read", input: { filePath: source } }));
-			store.observe(input({ sessionID, tool: "read", input: { filePath: target } }));
+			store.observe(input({ sessionID, tool: "inspect", input: { value: source } }));
+			store.observe(input({ sessionID, tool: "inspect", input: { value: target } }));
 			store.finishSession(sessionID);
 		}
 
-		store.observe(input({ sessionID: "probe", tool: "read", input: { filePath: "src/e.ts" } }));
+		store.observe(input({ sessionID: "probe", tool: "inspect", input: { value: "src/e.ts" } }));
 		expect(store.predict("probe").map((candidate) => candidate.input)).toEqual(
-			expect.arrayContaining([{ filePath: "src/e.ts" }, { filePath: "src/e.ts.test" }]),
+			expect.arrayContaining([{ value: "src/e.ts" }, { value: "src/e.ts.test" }]),
 		);
 	});
 
@@ -1888,29 +1888,33 @@ describe("PatternAware", () => {
 			for (const sessionID of ["one", "two"]) {
 				for (let depth = 0; depth < length; depth++) {
 					store.observe(
-						input({ sessionID, tool: "read", input: { path: `src/${sessionID}.ts${".test".repeat(depth)}` } }),
+						input({
+							sessionID,
+							tool: "inspect",
+							input: { value: `src/${sessionID}.ts${".test".repeat(depth)}` },
+						}),
 					);
 				}
 			}
 			return store;
 		};
 		const unfold = (store: PatternAwareStore, sessionID: string) => {
-			store.observe(input({ sessionID, tool: "read", input: { path: "src/probe.ts" } }));
+			store.observe(input({ sessionID, tool: "inspect", input: { value: "src/probe.ts" } }));
 			const candidates = [];
 			let candidate = store.predict(sessionID)[0];
 			while (candidate) {
 				candidates.push(candidate);
 				candidate = store.continue(
 					candidate.continuation,
-					input({ sessionID, tool: "read", input: candidate.input, learnTarget: false }),
+					input({ sessionID, tool: "inspect", input: candidate.input, learnTarget: false }),
 				)[0];
 			}
 			return candidates;
 		};
 
-		expect(unfold(train(2), "shallow").map((candidate) => candidate.input.path)).toEqual(["src/probe.ts.test"]);
+		expect(unfold(train(2), "shallow").map((candidate) => candidate.input.value)).toEqual(["src/probe.ts.test"]);
 		const motif = unfold(train(4), "motif");
-		expect(motif.map((candidate) => candidate.input.path)).toEqual(
+		expect(motif.map((candidate) => candidate.input.value)).toEqual(
 			[1, 2, 3].map((depth) => `src/probe.ts${".test".repeat(depth)}`),
 		);
 		expect(new Set(motif.map((candidate) => candidate.patternID)).size).toBe(3);
