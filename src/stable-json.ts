@@ -3,6 +3,39 @@ export function stableStringify(value: unknown): string {
 	return serialize(value) as string;
 }
 
+/** Structural equality with stableStringify's object/array semantics, without allocating strings. */
+export function stableEqual(left: unknown, right: unknown): boolean {
+	if (left === right) return true;
+	if (!isObject(left) || !isObject(right)) return false;
+	return equalObject(left, right);
+}
+
+function equalObject(left: object, right: object): boolean {
+	const leftArray = Array.isArray(left);
+	const rightArray = Array.isArray(right);
+	if (leftArray || rightArray) {
+		if (!leftArray || !rightArray || left.length !== right.length) return false;
+		for (let index = 0; index < left.length; index++) {
+			if (!equalSlot(left[index], right[index], true)) return false;
+		}
+		return true;
+	}
+	const leftRecord = left as Record<string, unknown>;
+	const rightRecord = right as Record<string, unknown>;
+	for (const key of new Set([...Object.keys(leftRecord), ...Object.keys(rightRecord)])) {
+		if (!equalSlot(leftRecord[key], rightRecord[key], false)) return false;
+	}
+	return true;
+}
+
+function equalSlot(left: unknown, right: unknown, arraySlot: boolean): boolean {
+	if (isObject(left) || isObject(right)) return isObject(left) && isObject(right) && equalObject(left, right);
+	return (
+		(JSON.stringify(left) ?? (arraySlot ? "null" : undefined)) ===
+		(JSON.stringify(right) ?? (arraySlot ? "null" : undefined))
+	);
+}
+
 function serialize(value: unknown): string | undefined {
 	if (!value || typeof value !== "object") return JSON.stringify(value);
 	if (Array.isArray(value)) {
@@ -26,4 +59,8 @@ function serialize(value: unknown): string | undefined {
 function isArrayIndex(value: string) {
 	const index = Number(value);
 	return Number.isInteger(index) && index >= 0 && index < 0xffff_ffff && String(index) === value;
+}
+
+function isObject(value: unknown): value is object {
+	return value !== null && typeof value === "object";
 }

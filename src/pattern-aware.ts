@@ -5,7 +5,7 @@ import path from "node:path";
 import { type ActionKey, type ActionKeyProjector, actionKeyCovers } from "./action-semantics.ts";
 import { PpmCountTrie, type PpmCountTrieRow, type PpmProbabilityEstimate } from "./ppm-count-trie.ts";
 import type { PredictionSettlement, ResolutionStage } from "./settlement.ts";
-import { stableStringify } from "./stable-json.ts";
+import { stableEqual as sameValue, stableStringify } from "./stable-json.ts";
 
 export type PatternAwareSettings = {
 	readonly enabled: boolean;
@@ -3082,12 +3082,6 @@ function parsePath(value: string): PatternAwarePath | undefined {
 		parsedPaths.set(value, null);
 		return undefined;
 	}
-}
-
-function sameValue(left: unknown, right: unknown) {
-	if (left === right) return true;
-	if (left === null || right === null || typeof left !== "object" || typeof right !== "object") return false;
-	return stableStringify(left) === stableStringify(right);
 }
 
 function uniqueStrings(values: ReadonlyArray<string>) {
