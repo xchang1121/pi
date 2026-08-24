@@ -667,7 +667,7 @@ describe("speculative action host", () => {
 		expect(requests).toHaveLength(11);
 		expect(maxActiveRequests).toBe(11);
 		expect(getDraftOptions).toHaveBeenCalledTimes(1);
-		expect(new Set(requests.map((request) => request.options?.sessionId))).toEqual(new Set(["session:draft"]));
+		expect(new Set(requests.map((request) => request.options?.sessionId))).toEqual(new Set(["session"]));
 		expect(requests[0]?.context).toBe(actorInput.context);
 		expect(requests.every((request) => request.context === requests[0]!.context)).toBe(true);
 		const temperatures = requests.map((request) => request.options?.temperature);
