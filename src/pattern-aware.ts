@@ -2574,14 +2574,20 @@ function indexedActionBatches(history: ReadonlyArray<PatternAwareEvent>) {
 	return batches;
 }
 
+const signatureCache = new WeakMap<PatternAwareEvent, PatternAwareEventSignature>();
+
 function signature(event: PatternAwareEvent): PatternAwareEventSignature {
+	const cached = signatureCache.get(event);
+	if (cached) return cached;
 	const outputShape = semanticOutputShape(event.output);
-	return {
+	const value = {
 		tool: event.tool,
 		outcome: event.outcome,
 		...(event.operation ? { operation: event.operation } : {}),
 		...(outputShape ? { outputShape } : {}),
 	};
+	signatureCache.set(event, value);
+	return value;
 }
 
 function sameSignatures(
