@@ -688,7 +688,7 @@ export class PatternAwareStore {
 				mapperConfidence *
 				Math.max(1, Math.max(0, expectedDurationMs));
 			return {
-				background: false,
+				background: patterns.every((pattern) => pattern.occurrences < settings.minOccurrences),
 				actionIdentity: hash(identity),
 				type: "tool_call" as const,
 				tool: representative.pattern.targetTool,

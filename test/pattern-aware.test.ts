@@ -53,7 +53,9 @@ describe("PatternAware", () => {
 			},
 		};
 		const replay = (root: string, output: string) =>
-			applyBindings(bindings, [event({ tool: "grep", input: { path: root }, outputPaths: [output] })]);
+			applyBindings(bindings, [
+				event({ sessionID: "join", tool: "grep", input: { path: root }, outputPaths: [output] }),
+			]);
 
 		expect(replay("src/file.ts", "file.ts")).toEqual({ path: "src/file.ts" });
 		expect(replay("src", "src/file.ts")).toEqual({ path: "src/file.ts" });
@@ -103,7 +105,7 @@ describe("PatternAware", () => {
 		});
 		expect(inputReads).toBe(readsAfterFirstApplication);
 		expect(
-			inferBindings([event({ tool: "read", input: { filePath: "/workspace/repo" } })], {
+			inferBindings([event({ sessionID: "path", tool: "read", input: { filePath: "/workspace/repo" } })], {
 				filePath: "repo/src/a.ts",
 			})['["filePath"]'],
 		).toEqual({ type: "constant", value: "repo/src/a.ts" });
@@ -886,6 +888,7 @@ describe("PatternAware", () => {
 		store.observe(input({ sessionID: "two", tool: "grep", input: {}, outputPaths: ["src/b.ts"] }));
 		const candidate = store.predict("two").find((item) => item.tool === "read")!;
 		expect(candidate.input).toEqual({ filePath: "src/b.ts" });
+		expect(candidate.background).toBe(true);
 		store.issued(candidate.patternID);
 		store.settled(candidate.patternID, adoptedSettlement());
 		expect(store.predict("two").filter((item) => item.tool === "read")).toHaveLength(0);
@@ -899,9 +902,9 @@ describe("PatternAware", () => {
 		expect(store.predict("three")).not.toContainEqual(expect.objectContaining({ tool: "read" }));
 		store.observe(input({ sessionID: "three", tool: "read", input: { filePath: "src/c.ts" } }));
 		store.observe(input({ sessionID: "four", tool: "grep", input: {}, outputPaths: ["src/d.ts"] }));
-		expect(store.predict("four")).toContainEqual(
-			expect.objectContaining({ tool: "read", input: { filePath: "src/d.ts" } }),
-		);
+		const promoted = store.predict("four");
+		expect(promoted).toContainEqual(expect.objectContaining({ tool: "read", input: { filePath: "src/d.ts" } }));
+		expect(promoted.find((item) => item.tool === "read")?.background).toBeUndefined();
 		expect(store.snapshot().find((item) => item.targetTool === "read")).toMatchObject({
 			occurrences: 3,
 			feedback: { issued: 1 },
@@ -1648,7 +1651,11 @@ describe("PatternAware", () => {
 		);
 		store.observe(input({ sessionID: "cold", tool: "bash", input: { command: "first" } }));
 		store.observe(input({ sessionID: "cold", tool: "bash", input: { command: "second" } }));
-		expect(store.predict("cold").some((candidate) => candidate.background)).toBe(false);
+		expect(
+			store
+				.predict("cold")
+				.some((candidate) => candidate.background && candidate.patternID.startsWith("action-backoff:")),
+		).toBe(false);
 
 		const sessionID = "sampled";
 		for (let index = 0; index < 2; index++) {

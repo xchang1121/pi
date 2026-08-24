@@ -50,9 +50,7 @@ describe("SpeculationScheduler", () => {
 			),
 		).toBe(150);
 		expect(scheduler.launchDelay(forecast({ decisionBatchesUntilCall: 3 }), 10)).toBe(170);
-		expect(
-			scheduler.launchDelay(forecast({ decisionBatchesUntilCall: 3, dependenciesResolved: true }), 10),
-		).toBe(0);
+		expect(scheduler.launchDelay(forecast({ decisionBatchesUntilCall: 3, dependenciesResolved: true }), 10)).toBe(0);
 		expect(scheduler.launchDelay(forecast({ decisionBatchesUntilCall: 1 }))).toBe(0);
 	});
 
@@ -104,7 +102,9 @@ describe("SpeculationScheduler", () => {
 		const background = {};
 		scheduler.admit(foreground, [forecast({ expectedLatencyBenefitMs: 1 })], 2);
 		scheduler.admit(background, [forecast({ background: true, expectedLatencyBenefitMs: 1_000 })], 2);
-		expect(scheduler.preemptFor({ class: "filesystem", units: 1 }, 2, (job) => job === background)).toEqual([background]);
+		expect(scheduler.preemptFor({ class: "filesystem", units: 1 }, 2, (job) => job === background)).toEqual([
+			background,
+		]);
 	});
 
 	it("preempts the latest and least critical work for an authoritative action", () => {
@@ -124,9 +124,9 @@ describe("SpeculationScheduler", () => {
 		scheduler.admit(joined, [forecast({ decisionBatchesUntilCall: 5 })], 2);
 		scheduler.admit(idle, [forecast({ decisionBatchesUntilCall: 1 })], 2);
 
-		expect(
-			scheduler.preemptFor({ class: "filesystem", units: 1 }, 2, (candidate) => candidate !== joined),
-		).toEqual([idle]);
+		expect(scheduler.preemptFor({ class: "filesystem", units: 1 }, 2, (candidate) => candidate !== joined)).toEqual([
+			idle,
+		]);
 		expect(scheduler.snapshot().map((entry) => entry.job)).toEqual([joined]);
 	});
 
