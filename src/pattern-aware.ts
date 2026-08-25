@@ -2620,10 +2620,10 @@ function sameSignatures(
 }
 
 function signatureToken(value: PatternAwareEventSignature) {
-	return stableStringify({
-		tool: value.tool,
-		outcome: value.outcome,
+	return JSON.stringify({
 		...(value.operation ? { operation: value.operation } : {}),
+		outcome: value.outcome,
+		tool: value.tool,
 	});
 }
 
