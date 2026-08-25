@@ -619,7 +619,7 @@ export class PatternAwareStore {
 					pattern.targetSchemaHash ?? schemaHashes[pattern.targetTool],
 				);
 				const identity = action
-					? stableStringify({ type: "tool_call", actionKey: action.key })
+					? JSON.stringify({ actionKey: action.key, type: "tool_call" })
 					: stableStringify({
 							type: "tool_call",
 							tool: pattern.targetTool,
@@ -873,7 +873,7 @@ export class PatternAwareStore {
 				empiricalProbability * (ppmEstimate?.probability ?? 1) * Math.max(1, expectedDurationMs);
 			return {
 				background: item.count < settings.minOccurrences,
-				actionIdentity: hash(stableStringify({ type: "tool_call", actionKey: item.action.key })),
+				actionIdentity: hash(JSON.stringify({ actionKey: item.action.key, type: "tool_call" })),
 				type: "tool_call" as const,
 				tool: item.action.tool,
 				input: structuredClone(item.input),
