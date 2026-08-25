@@ -4,7 +4,7 @@ This standalone package adds speculative tool execution to Pi without modifying 
 
 The repository is deliberately independent of the Pi monorepo: it has its own Git history, build configuration, tests, and dependency lock. Its only Pi dependencies are the published public extension APIs declared as peers. It does not import a Pi source checkout, use workspace path aliases, or require a matching `main` branch.
 
-The repository retains the legacy URL `xchang1121/pi`, but its reachable history is projected exclusively from speculative-action changes and contains no Pi monorepo parent or source tree.
+This is a standalone GitHub repository. Its reachable history contains only speculative-action changes and no Pi monorepo parent or source tree.
 
 ## Architecture
 

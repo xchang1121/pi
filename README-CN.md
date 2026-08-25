@@ -4,7 +4,7 @@
 
 本仓库刻意与 Pi monorepo 解耦：它拥有独立的 Git 历史、构建配置、测试和依赖锁。对 Pi 的依赖仅限于以 peer 形式声明的已发布公共扩展 API；不导入 Pi 源码工作树、不使用 workspace 路径别名，也不要求存在对应的 `main` 分支。
 
-仓库沿用历史 URL `xchang1121/pi`，但其所有可达历史都只投影 speculative-action 相关改动，不再包含 Pi monorepo 父提交或源码树。
+这是一个独立的 GitHub 仓库。其所有可达历史都只包含 speculative-action 相关改动，不包含 Pi monorepo 父提交或源码树。
 
 ## 架构
 
