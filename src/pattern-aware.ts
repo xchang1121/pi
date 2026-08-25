@@ -754,7 +754,7 @@ export class PatternAwareStore {
 			right.conditionalProbability - left.conditionalProbability ||
 			left.horizon - right.horizon ||
 			left.patternID.localeCompare(right.patternID) ||
-			stableStringify(left.input).localeCompare(stableStringify(right.input));
+			left.actionIdentity.localeCompare(right.actionIdentity);
 		const selected = perToolBeam(
 			predictions.sort(comparePredictions),
 			settings.beamWidth,
