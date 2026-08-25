@@ -21,6 +21,7 @@
 
 ### Added
 
+- Added a standalone repository boundary with its own TypeScript configuration, dependency lock, and Pi public-loader test; development no longer requires a Pi monorepo checkout.
 - Added a speculative tool runtime with a host adapter, conservative action keys, resource validation, lifecycle events, and running or ready result reuse.
 - Added canonical sandbox keys, an explicit sandbox host boundary, temporary `write`/`edit` execution, verified adoption, and opt-in bash process execution.
 - Added private Git worktree snapshots, multi-file bash change capture, transactional world commit with rollback, and normalized cache/actual telemetry.
@@ -41,6 +42,7 @@
 
 ### Changed
 
+- The Pi package manifest now loads `src/extension.ts` directly, so Git installation works without monorepo build artifacts; npm packing still builds the exported `dist` library.
 - Actor stream previews now start lossless covering reads when a complete path field is decoded; final K(a), realized coverage, and freshness remain authoritative.
 - Read projection now reuses Pi coding-agent's public truncation contract and compact, in-memory coverage descriptors; projected single-flight reuse also requires explicit opt-in.
 - World commit now serializes overlapping targets, uses staged atomic replacement, preserves file modes, and removes newly created directories during rollback.

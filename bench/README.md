@@ -10,7 +10,7 @@ The runner fetches only the selected base commit into a bare cache, creates a
 fresh detached workspace for every run, and never exposes the gold patch to the
 agent.
 
-Run one task from `packages/speculative-action`:
+Run one task from the standalone repository root:
 
 ```sh
 DEEPSEEK_API_KEY=... npm run bench:ablation -- \

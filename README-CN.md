@@ -1,6 +1,8 @@
 # Pi speculative action
 
-这个 package 在不修改 Pi 本体的前提下加入投机工具执行。Drafter 与 PatternAware 预测未来工具调用；只有存在可证明安全的隔离路线时才提前执行；Actor 发出等价动作后可以采纳对应结果。
+这个独立 package 在不修改 Pi 本体的前提下加入投机工具执行。Drafter 与 PatternAware 预测未来工具调用；只有存在可证明安全的隔离路线时才提前执行；Actor 发出等价动作后可以采纳对应结果。
+
+本仓库刻意与 Pi monorepo 解耦：它拥有独立的 Git 历史、构建配置、测试和依赖锁。对 Pi 的依赖仅限于以 peer 形式声明的已发布公共扩展 API；不导入 Pi 源码工作树、不使用 workspace 路径别名，也不要求存在对应的 `main` 分支。
 
 ## 架构
 
@@ -35,20 +37,22 @@ Runtime 分为四个相互独立的层次：
 
 `read` 支持由真实输出覆盖范围证明的无损区间投影；`grep`、`find` 和 `ls` 暂时只做精确 K(a) 匹配。
 
-## 在 Pi 中运行
+## 安装与运行
 
-在仓库根目录构建：
-
-```sh
-npm install
-npm run build -w @earendil-works/pi-speculative-action
-```
-
-加载 package：
+仓库根目录就是 Pi package 根目录。本地 checkout 可以直接加载或安装，不需要构建 Pi，也不会修改 Pi 本体：
 
 ```sh
-pi -e ./packages/speculative-action
+pi -e /absolute/path/to/pi-speculative-action
+pi install /absolute/path/to/pi-speculative-action
 ```
+
+仓库推送到独立 Git remote 后，也可以让 Pi 直接安装该仓库：
+
+```sh
+pi install https://github.com/OWNER/pi-speculative-action
+```
+
+`pi.extensions` 指向 `src/extension.ts`，由 Pi 的公共 TypeScript 扩展加载器直接加载。因此 Git 安装不依赖已提交的构建产物或 dev dependency。`dist` 只作为 npm 使用时的标准 JavaScript/类型入口，在 `npm pack` 或 `npm publish` 时生成。
 
 在 TUI 中打开 `/speculative-action`。菜单按投机源、调度/缓存、工具/执行分级；工具标签会说明本地后备机制。不存在隔离路线时始终回退 Actor。
 
@@ -114,9 +118,12 @@ executionBlockedPotentialHitLatencyMs    = actorDuration - potentialHidden
 ## 验证
 
 ```sh
-npm run build -w @earendil-works/pi-speculative-action
-npm test -w @earendil-works/pi-speculative-action
-npm run bench:check -w @earendil-works/pi-speculative-action
+npm install --ignore-scripts
+npm run check
+npm run build
+npm test
+npm run bench:check
+npm pack --dry-run
 ```
 
 单轨迹消融方法见 [bench/README.md](./bench/README.md)。

@@ -1,6 +1,8 @@
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { discoverAndLoadExtensions } from "@earendil-works/pi-coding-agent";
 import { describe, expect, test } from "vitest";
 import * as packageApi from "../src/index.ts";
 import {
@@ -16,7 +18,6 @@ import {
 } from "../src/index.ts";
 
 const packageRoot = fileURLToPath(new URL("..", import.meta.url));
-const workspaceRoot = path.resolve(packageRoot, "../..");
 
 describe("speculative action package boundary", () => {
 	test("exports runtime, learning, resource, and file-mutation entry points", () => {
@@ -55,17 +56,18 @@ describe("speculative action package boundary", () => {
 		expect(core.join("\n")).not.toMatch(/pattern-aware|@earendil-works\/pi-/);
 	});
 
-	test("publishes an installable Pi extension without coupling Pi core back to speculation", async () => {
+	test("declares a source-loadable Pi package with only public host peers", async () => {
 		const manifest = JSON.parse(await fs.readFile(path.join(packageRoot, "package.json"), "utf8")) as {
 			exports: Record<string, unknown>;
 			files: string[];
+			repository?: { url?: string; directory?: string };
 			scripts?: Record<string, string>;
 			pi?: { extensions?: string[] };
 			peerDependencies?: Record<string, string>;
 		};
 		expect(Object.keys(manifest.exports).sort()).toEqual([".", "./extension", "./package.json"]);
-		expect(manifest.files).toEqual(["dist", "README.md", "README-CN.md", "CHANGELOG.md"]);
-		expect(manifest.scripts?.build).toMatch(/^shx rm -rf dist && /);
+		expect(manifest.files).toEqual(["dist", "src", "README.md", "README-CN.md", "CHANGELOG.md", "LICENSE"]);
+		expect(manifest.scripts?.build).toBe("shx rm -rf dist && tsc -p tsconfig.build.json");
 		expect(Object.keys(manifest.scripts ?? {})).not.toEqual(
 			expect.arrayContaining(["build:native", "build:worker", "generate:native-manifest", "smoke:native"]),
 		);
@@ -74,29 +76,39 @@ describe("speculative action package boundary", () => {
 		for (const removed of ["container-sandbox.ts", "native-sandbox.ts", "oci-setup.ts"]) {
 			await expect(fs.stat(path.join(packageRoot, "src", removed))).rejects.toThrow();
 		}
-		expect(manifest.pi?.extensions).toEqual(["./dist/extension.js"]);
+		expect(manifest.pi?.extensions).toEqual(["./src/extension.ts"]);
 		expect(manifest.peerDependencies).toMatchObject({
 			"@earendil-works/pi-agent-core": "*",
 			"@earendil-works/pi-ai": "*",
 			"@earendil-works/pi-coding-agent": "*",
 		});
-
-		const agentManifest = JSON.parse(
-			await fs.readFile(path.join(workspaceRoot, "packages/agent/package.json"), "utf8"),
-		) as { dependencies?: Record<string, string> };
-		expect(agentManifest.dependencies).not.toHaveProperty("@earendil-works/pi-speculative-action");
-		const agentSources = await readTypeScript(path.join(workspaceRoot, "packages/agent/src"));
-		expect(agentSources).not.toContain("@earendil-works/pi-speculative-action");
+		expect(manifest.repository?.url ?? "").not.toContain("/pi.git");
+		expect(manifest.repository?.directory).toBeUndefined();
 	});
 
-	test("leaves the upstream coding-agent source and manifest unaware of speculation", async () => {
-		const codingSources = await readTypeScript(path.join(workspaceRoot, "packages/coding-agent/src"));
-		expect(codingSources).not.toContain("pi-speculative-action");
-		expect(codingSources).not.toContain("speculative-action");
-		const codingManifest = JSON.parse(
-			await fs.readFile(path.join(workspaceRoot, "packages/coding-agent/package.json"), "utf8"),
-		) as { dependencies?: Record<string, string> };
-		expect(codingManifest.dependencies).not.toHaveProperty("@earendil-works/pi-speculative-action");
+	test("does not resolve implementation or tests through a Pi source checkout", async () => {
+		const source = await readTypeScript(path.join(packageRoot, "src"));
+		const buildConfig = await fs.readFile(path.join(packageRoot, "tsconfig.build.json"), "utf8");
+		const testConfig = await fs.readFile(path.join(packageRoot, "vitest.config.ts"), "utf8");
+
+		expect(source).not.toMatch(/@earendil-works\/pi-[^"']+\/src(?:\/|["'])/);
+		expect(source).not.toMatch(/(?:^|["'])(?:\.\.\/){2,}/m);
+		expect(buildConfig).not.toMatch(/\.\.\/(?:agent|ai|coding-agent)|"paths"/);
+		expect(testConfig).not.toMatch(/\.\.\/(?:agent|ai|telemetry)|alias/);
+	});
+
+	test("loads from its own package manifest through Pi's public extension loader", async () => {
+		const temporaryRoot = await fs.mkdtemp(path.join(os.tmpdir(), "pi-speculative-package-"));
+		const cwd = path.join(temporaryRoot, "workspace");
+		const agentDir = path.join(temporaryRoot, "agent");
+		await Promise.all([fs.mkdir(cwd), fs.mkdir(agentDir)]);
+		try {
+			const loaded = await discoverAndLoadExtensions([packageRoot], cwd, agentDir);
+			expect(loaded.errors).toEqual([]);
+			expect(loaded.extensions).toHaveLength(1);
+		} finally {
+			await fs.rm(temporaryRoot, { recursive: true, force: true });
+		}
 	});
 });
 

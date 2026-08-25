@@ -1,6 +1,8 @@
 # Pi speculative action
 
-This package adds speculative tool execution to Pi without modifying Pi core. It predicts future tool calls with Drafter and PatternAware, executes only actions with a proven isolation route, and lets the Actor adopt a matching result.
+This standalone package adds speculative tool execution to Pi without modifying Pi core. It predicts future tool calls with Drafter and PatternAware, executes only actions with a proven isolation route, and lets the Actor adopt a matching result.
+
+The repository is deliberately independent of the Pi monorepo: it has its own Git history, build configuration, tests, and dependency lock. Its only Pi dependencies are the published public extension APIs declared as peers. It does not import a Pi source checkout, use workspace path aliases, or require a matching `main` branch.
 
 ## Architecture
 
@@ -35,20 +37,22 @@ This arrangement is intentional: a future OS-level agent runtime can provide one
 
 `read` supports lossless range projection backed by realized output coverage. `grep`, `find`, and `ls` remain exact-key-only.
 
-## Pi package use
+## Install and use
 
-Build the package from the repository root:
-
-```sh
-npm install
-npm run build -w @earendil-works/pi-speculative-action
-```
-
-Run Pi with the package directory:
+The repository root is the Pi package root. A local checkout can be loaded or installed directly, without building Pi or editing its source:
 
 ```sh
-pi -e ./packages/speculative-action
+pi -e /absolute/path/to/pi-speculative-action
+pi install /absolute/path/to/pi-speculative-action
 ```
+
+After the repository has a Git remote, Pi can install that repository directly:
+
+```sh
+pi install https://github.com/OWNER/pi-speculative-action
+```
+
+The `pi.extensions` manifest points to `src/extension.ts`, which Pi loads through its public TypeScript extension loader. Git installation therefore does not depend on checked-in build artifacts or dev dependencies. `dist` is only the conventional JavaScript/types entry point for npm consumers and is generated during `npm pack` or `npm publish`.
 
 Open `/speculative-action` in the TUI. The menu is grouped into prediction sources, scheduling/cache, and tools/execution. Tool labels describe the available local fallback; an unavailable isolation route always falls back to Actor execution.
 
@@ -114,9 +118,12 @@ These values never inflate actual speculative hits or actual hidden latency.
 ## Validation
 
 ```sh
-npm run build -w @earendil-works/pi-speculative-action
-npm test -w @earendil-works/pi-speculative-action
-npm run bench:check -w @earendil-works/pi-speculative-action
+npm install --ignore-scripts
+npm run check
+npm run build
+npm test
+npm run bench:check
+npm pack --dry-run
 ```
 
 See [bench/README.md](./bench/README.md) for the single-trajectory ablation methodology.
