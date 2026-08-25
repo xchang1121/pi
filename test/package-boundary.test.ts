@@ -60,7 +60,7 @@ describe("speculative action package boundary", () => {
 		const manifest = JSON.parse(await fs.readFile(path.join(packageRoot, "package.json"), "utf8")) as {
 			exports: Record<string, unknown>;
 			files: string[];
-			repository?: { url?: string; directory?: string };
+			repository?: { type?: string; url?: string; directory?: string };
 			scripts?: Record<string, string>;
 			pi?: { extensions?: string[] };
 			peerDependencies?: Record<string, string>;
@@ -82,8 +82,10 @@ describe("speculative action package boundary", () => {
 			"@earendil-works/pi-ai": "*",
 			"@earendil-works/pi-coding-agent": "*",
 		});
-		expect(manifest.repository?.url ?? "").not.toContain("/pi.git");
-		expect(manifest.repository?.directory).toBeUndefined();
+		expect(manifest.repository).toEqual({
+			type: "git",
+			url: "git+https://github.com/xchang1121/pi.git",
+		});
 	});
 
 	test("does not resolve implementation or tests through a Pi source checkout", async () => {

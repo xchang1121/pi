@@ -4,6 +4,8 @@ This standalone package adds speculative tool execution to Pi without modifying 
 
 The repository is deliberately independent of the Pi monorepo: it has its own Git history, build configuration, tests, and dependency lock. Its only Pi dependencies are the published public extension APIs declared as peers. It does not import a Pi source checkout, use workspace path aliases, or require a matching `main` branch.
 
+The repository retains the legacy URL `xchang1121/pi`, but its reachable history is projected exclusively from speculative-action changes and contains no Pi monorepo parent or source tree.
+
 ## Architecture
 
 The runtime has four independent layers:
@@ -46,10 +48,10 @@ pi -e /absolute/path/to/pi-speculative-action
 pi install /absolute/path/to/pi-speculative-action
 ```
 
-After the repository has a Git remote, Pi can install that repository directly:
+Pi can install the repository directly:
 
 ```sh
-pi install https://github.com/OWNER/pi-speculative-action
+pi install https://github.com/xchang1121/pi
 ```
 
 The `pi.extensions` manifest points to `src/extension.ts`, which Pi loads through its public TypeScript extension loader. Git installation therefore does not depend on checked-in build artifacts or dev dependencies. `dist` is only the conventional JavaScript/types entry point for npm consumers and is generated during `npm pack` or `npm publish`.

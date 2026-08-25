@@ -42,6 +42,7 @@
 
 ### Changed
 
+- Rewrote the repository as a standalone projection of the speculative-action history; the retained legacy `xchang1121/pi` remote no longer inherits or exposes the Pi monorepo tree.
 - The Pi package manifest now loads `src/extension.ts` directly, so Git installation works without monorepo build artifacts; npm packing still builds the exported `dist` library.
 - Actor stream previews now start lossless covering reads when a complete path field is decoded; final K(a), realized coverage, and freshness remain authoritative.
 - Read projection now reuses Pi coding-agent's public truncation contract and compact, in-memory coverage descriptors; projected single-flight reuse also requires explicit opt-in.

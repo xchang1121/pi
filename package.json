@@ -65,6 +65,14 @@
 	],
 	"author": "Earendil Works",
 	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/xchang1121/pi.git"
+	},
+	"bugs": {
+		"url": "https://github.com/xchang1121/pi/issues"
+	},
+	"homepage": "https://github.com/xchang1121/pi#readme",
 	"engines": {
 		"node": ">=22.19.0"
 	}
