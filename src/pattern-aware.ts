@@ -286,7 +286,7 @@ type TrieNode = {
 export const PATTERN_AWARE_DEFAULTS: PatternAwareSettings = {
 	enabled: true,
 	multiStepEnabled: true,
-	maxContextLength: 2,
+	maxContextLength: 4,
 	beamWidth: 4,
 	maxPredictionDepth: 6,
 	maxFutureGap: 8,
