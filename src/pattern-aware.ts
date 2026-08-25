@@ -289,7 +289,7 @@ export const PATTERN_AWARE_DEFAULTS: PatternAwareSettings = {
 	maxContextLength: 4,
 	beamWidth: 4,
 	maxPredictionDepth: 6,
-	maxFutureGap: 8,
+	maxFutureGap: 2,
 	futureGapCoverage: 0.25,
 	decayHalfLifeEvents: 2048,
 	minOccurrences: 2,
