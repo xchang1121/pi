@@ -4,6 +4,10 @@ This runner measures one speculative execution and reconstructs its serialized
 counterfactual from the same authoritative timeline. It never compares against
 a separately generated Actor trajectory.
 
+The recorded strict-match study used for the SPORK bridge and PatternAware
+integration decision is preserved in
+[SELF-SPECULATION-ABLATION-2026-08-25.md](./SELF-SPECULATION-ABLATION-2026-08-25.md).
+
 The checked-in suites select real GitHub issue-resolution tasks from
 [Claw-SWE-Bench Lite](https://huggingface.co/datasets/TokenRhythm/Claw-SWE-Bench).
 The runner fetches only the selected base commit into a bare cache, creates a
