@@ -4,9 +4,9 @@ This runner measures one speculative execution and reconstructs its serialized
 counterfactual from the same authoritative timeline. It never compares against
 a separately generated Actor trajectory.
 
-The recorded strict-match study used for the SPORK bridge and PatternAware
-integration decision is preserved in
-[SELF-SPECULATION-ABLATION-2026-08-25.md](./SELF-SPECULATION-ABLATION-2026-08-25.md).
+Ablation reports, preregistrations, and private recordings are intentionally
+kept outside this repository. The checked-in runner and suites remain the
+reproducible measurement surface.
 
 Analyze a private `pi-llm-tape` recording without replaying or exposing its
 prompts. Actor and Drafter requests are paired only when their complete message
