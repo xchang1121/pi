@@ -62,13 +62,20 @@ nine candidate bodies and six turn-local unique misses/duplicates.
 
 ## Decision
 
-Accept the analyzer and the action-level result. Product integration remains
-conditional on a separate target-token replay: a later non-exact candidate may
-still supply a useful accepted prefix to D3 even when it never recovers a full
-action hit. If full width two and first-valid-only produce identical target
-verification work on the recorded opportunities, add structured turn-scoped
-cancellation using the existing provider `AbortSignal`; otherwise retain the
-current width-two behavior.
+Accept the analyzer and product integration after the companion target-token
+replay in `xchang1121/self-speculation` commit `6d2a3de`. Reducing 18 width-two
+candidates to the 12 first-valid candidates leaves all 12 proposals, 198/144/54
+proposed/accepted/rejected tokens, 278 target steps, and 138 saved steps
+unchanged. The pinned real Transformers verifier likewise keeps 296 forwards
+and identical output.
+
+Pi implements the treatment as a generic Runtime policy over concurrent initial
+proposal slots. The first produced update atomically expires only same-source,
+same-decision proposal siblings with cause `proposal_race_lost`; continuation
+slots are excluded. The Drafter declares this policy only at width two. Before
+returning a produced update it verifies that the tool is enabled and its
+arguments satisfy the current schema, so error, empty, disabled, and invalid
+responses cannot cancel a valid peer. Widths above two retain all responses.
 
 ## Limitations
 
