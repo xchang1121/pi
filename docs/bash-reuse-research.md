@@ -79,6 +79,37 @@ Endpoint Security are implementation tracks, not claims of current support.
 Metadata alone is not a cross-process content proof. `mtime`, size, and inode shortcuts may be used only
 inside a live, gap-free change-journal lease whose exact content digest was already established.
 
+## Transaction-delta evidence sealing
+
+The outer private-Git world already computes exact regular-file before/after bytes in order to form
+the adoption transaction. Re-reading every regular file before and after the top-level Bash therefore
+duplicated work without adding an independent safety property. The retained design separates:
+
+```text
+process observer: inode kinds + metadata + directory entries + dynamic read/probe paths
+transaction driver: exact regular-file before/after bytes and modes
+evidence sealer: structural diff + transaction delta + hashes of observed unchanged inputs
+```
+
+The observer and transaction driver meet only through a generic post-capture callback. This avoids a
+Bash-specific shortcut and lets a future OverlayFS, Windows USN/Detours, or Endpoint Security driver
+provide the same typed delta. The Linux kernel's
+[OverlayFS documentation](https://www.kernel.org/doc/html/latest/filesystems/overlayfs.html) confirms
+that an upper layer explicitly represents copy-up data, metadata-only changes, whiteouts, and opaque
+directories. Those distinctions must become typed delta records; merely listing upper filenames is
+not sufficient.
+
+Git represents regular bytes, symlinks, and the executable bit, but not empty directories, full
+directory metadata, special inodes, or hard-link topology. The current transaction supports only
+regular files, so directory transitions/metadata and link count other than one fail closed. This is
+consistent with Riker's result that correctness requires modeling the full POSIX namespace rather
+than treating every path as an independent byte string. Monitor epoch v4 prevents certificates from
+the older, weaker effect model from crossing this boundary.
+
+On the qualified 128 MiB Pi Bash fixture, content-free structural snapshots plus transaction-delta
+sealing reduced complete-hit median latency by 17.5% and cold latency by 11.5%. The raw reports and
+method are in `bench/results/wsl2-transaction-delta-2026-09-01.md`.
+
 ## Partial execution reuse
 
 [CRIU](https://criu.org/Checkpoint/Restore) can restore memory, descriptors, namespaces, and process
@@ -92,13 +123,15 @@ Completed-result/effect replay remains the default because it has a much smaller
 1. Share one exact dynamic-pathset capture across historic strong keys (implemented and qualified).
 2. Load and integrity-check a certificate's complete artifact closure once before replay; replay only
    from the verified in-memory lease (implemented and qualified).
-3. Add live exact-digest leases backed by a gap-detecting change journal; fall back to hashing on every
+3. Seal top-level evidence from content-free structure snapshots plus the generic workspace
+   transaction delta, with unsupported inode semantics failing closed (implemented and qualified).
+4. Add live exact-digest leases backed by a gap-detecting change journal; fall back to hashing on every
    uncertainty signal.
-4. Replace whole-workspace before/after hashing with a complete kernel write journal or copy-on-write
-   upper layer, while retaining Git as the adoption transaction.
-5. Extract the Linux observer/isolation implementation behind the capability driver contract, then add
+5. Replace the remaining structure walks and nested-process content snapshots with a complete kernel
+   write journal or copy-on-write upper layer, while retaining the typed adoption transaction.
+6. Extract the Linux observer/isolation implementation behind the capability driver contract, then add
    a BuildXL-derived Windows driver and an entitled Endpoint Security macOS driver.
-6. Evaluate CRIU only for long-running, pre-effect process checkpoints under the stricter external-
+7. Evaluate CRIU only for long-running, pre-effect process checkpoints under the stricter external-
    resource profile.
 
 Every item requires correctness tests for negative lookups, directories, symlinks, concurrent mutation,
