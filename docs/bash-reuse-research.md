@@ -99,6 +99,12 @@ that an upper layer explicitly represents copy-up data, metadata-only changes, w
 directories. Those distinctions must become typed delta records; merely listing upper filenames is
 not sufficient.
 
+The joined observation is deliberately not a second replay bundle. Its write events contain only
+paths and write-before evidence; write-after bytes remain owned by the immutable transaction. The
+sealer checks the write-after inode shape, mode, link count, and length against the structural
+snapshot without hashing the output again. Input and write-before contents still receive exact
+SHA-256 evidence. This additional separation reduced the qualified 128 MiB hit by another 4.5%.
+
 Git represents regular bytes, symlinks, and the executable bit, but not empty directories, full
 directory metadata, special inodes, or hard-link topology. The current transaction supports only
 regular files, so directory transitions/metadata and link count other than one fail closed. This is
@@ -123,8 +129,9 @@ Completed-result/effect replay remains the default because it has a much smaller
 1. Share one exact dynamic-pathset capture across historic strong keys (implemented and qualified).
 2. Load and integrity-check a certificate's complete artifact closure once before replay; replay only
    from the verified in-memory lease (implemented and qualified).
-3. Seal top-level evidence from content-free structure snapshots plus the generic workspace
-   transaction delta, with unsupported inode semantics failing closed (implemented and qualified).
+3. Seal top-level input evidence from content-free structure snapshots plus the generic workspace
+   transaction delta, leaving write-after replay bytes solely in that transaction and failing closed
+   on unsupported inode semantics (implemented and qualified).
 4. Add live exact-digest leases backed by a gap-detecting change journal; fall back to hashing on every
    uncertainty signal.
 5. Replace the remaining structure walks and nested-process content snapshots with a complete kernel
