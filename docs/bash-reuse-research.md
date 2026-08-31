@@ -91,7 +91,7 @@ Completed-result/effect replay remains the default because it has a much smaller
 
 1. Share one exact dynamic-pathset capture across historic strong keys (implemented and qualified).
 2. Load and integrity-check a certificate's complete artifact closure once before replay; replay only
-   from the verified in-memory lease.
+   from the verified in-memory lease (implemented and qualified).
 3. Add live exact-digest leases backed by a gap-detecting change journal; fall back to hashing on every
    uncertainty signal.
 4. Replace whole-workspace before/after hashing with a complete kernel write journal or copy-on-write
