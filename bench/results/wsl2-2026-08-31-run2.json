@@ -1,0 +1,100 @@
+{
+  "schemaVersion": 1,
+  "measuredAt": "2026-08-31T12:09:02.327Z",
+  "host": {
+    "platform": "linux",
+    "arch": "x64",
+    "node": "v24.20.0",
+    "kernel": "Linux 6.18.33.2-microsoft-standard-WSL2 x86_64",
+    "sandlock": "sandlock 0.8.6",
+    "strace": "strace -- version 6.8"
+  },
+  "subject": "stock Pi createBashTool through linux_process_reuse WorldBranch",
+  "assertions": {
+    "differentParentCommands": true,
+    "orderedChildOutputEqual": true,
+    "regularFileEffectEqual": true,
+    "adoptionFreshnessValid": true,
+    "changedInputForcedMiss": true
+  },
+  "runs": [
+    {
+      "label": "cold",
+      "command": "printf 'parent-a\\n'; pi-reuse-helper input.txt artifact.txt; printf 'parent-a-done\\n'",
+      "forkMs": 1709.408392,
+      "validationMs": 12.710593999999674,
+      "commitMs": 4.774557999999615,
+      "totalMs": 1726.9205719999998,
+      "validation": "valid",
+      "output": "parent-a\nchild-out:alpha\nchild-err\nparent-a-done\n",
+      "artifact": "alpha\n",
+      "metricDelta": {
+        "requests": 1,
+        "hits": 0,
+        "misses": 1,
+        "bypasses": 0,
+        "published": 1,
+        "tainted": 0,
+        "validationMs": 0.5460100000000239,
+        "executionMs": 1056.4008440000002
+      }
+    },
+    {
+      "label": "cross_parent_hit",
+      "command": "printf 'parent-b\\n'; command pi-reuse-helper input.txt artifact.txt; printf 'parent-b-done\\n'",
+      "forkMs": 720.2371589999998,
+      "validationMs": 12.700830000000224,
+      "commitMs": 4.463208000000122,
+      "totalMs": 737.4127060000001,
+      "validation": "valid",
+      "output": "parent-b\nchild-out:alpha\nchild-err\nparent-b-done\n",
+      "artifact": "alpha\n",
+      "metricDelta": {
+        "requests": 1,
+        "hits": 1,
+        "misses": 0,
+        "bypasses": 0,
+        "published": 0,
+        "tainted": 0,
+        "validationMs": 6.225247999999738,
+        "executionMs": 0
+      }
+    },
+    {
+      "label": "dependency_invalidation",
+      "command": "printf 'parent-c\\n'; pi-reuse-helper input.txt artifact.txt; printf 'parent-c-done\\n'",
+      "forkMs": 1766.1544589999999,
+      "validationMs": 10.201788999999735,
+      "commitMs": 4.30548699999963,
+      "totalMs": 1780.672087,
+      "validation": "valid",
+      "output": "parent-c\nchild-out:beta\nchild-err\nparent-c-done\n",
+      "artifact": "beta\n",
+      "metricDelta": {
+        "requests": 1,
+        "hits": 0,
+        "misses": 1,
+        "bypasses": 0,
+        "published": 1,
+        "tainted": 0,
+        "validationMs": 4.024356000000807,
+        "executionMs": 1049.7034620000004
+      }
+    }
+  ],
+  "summary": {
+    "coldToCrossParentHitSpeedup": 2.3418644104567403,
+    "coldForkToCrossParentHitForkSpeedup": 2.3733965550644416,
+    "latencySavedMs": 989.5078659999997,
+    "metrics": {
+      "requests": 3,
+      "hits": 1,
+      "misses": 2,
+      "bypasses": 0,
+      "published": 2,
+      "tainted": 0,
+      "validationMs": 10.795614000000569,
+      "executionMs": 2106.1043060000006
+    }
+  }
+}
