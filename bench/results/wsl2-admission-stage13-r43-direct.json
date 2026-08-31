@@ -1,0 +1,61 @@
+{
+  "schemaVersion": 1,
+  "measuredAt": "2026-08-31T22:30:55.895Z",
+  "mode": "direct",
+  "host": {
+    "platform": "linux",
+    "arch": "x64",
+    "node": "v24.20.0",
+    "kernel": "Linux 6.18.33.2-microsoft-standard-WSL2 x86_64"
+  },
+  "subject": "stock Pi createBashTool running one process that creates two directories and a transformed artifact",
+  "fixture": {
+    "inputBytes": 33554432,
+    "transformRoundsPerByte": 43,
+    "measuredRuns": 3
+  },
+  "assertions": {
+    "allArtifactsEqual": true
+  },
+  "warmup": {
+    "label": "warmup",
+    "totalMs": 956.7755549999999,
+    "forkMs": 0,
+    "validationMs": 0,
+    "commitMs": 0,
+    "resources": [],
+    "metricDelta": {}
+  },
+  "runs": [
+    {
+      "label": "direct-1",
+      "totalMs": 967.1244489999999,
+      "forkMs": 0,
+      "validationMs": 0,
+      "commitMs": 0,
+      "resources": [],
+      "metricDelta": {}
+    },
+    {
+      "label": "direct-2",
+      "totalMs": 953.0818950000003,
+      "forkMs": 0,
+      "validationMs": 0,
+      "commitMs": 0,
+      "resources": [],
+      "metricDelta": {}
+    },
+    {
+      "label": "direct-3",
+      "totalMs": 952.2774159999999,
+      "forkMs": 0,
+      "validationMs": 0,
+      "commitMs": 0,
+      "resources": [],
+      "metricDelta": {}
+    }
+  ],
+  "summary": {
+    "medianMs": 953.0818950000003
+  }
+}

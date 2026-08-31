@@ -211,6 +211,63 @@ preserved in `bench/results/wsl2-topology-reuse-2026-09-01.md`; they require a c
 policy based on measured execution distributions and estimated validation/artifact/commit cost rather
 than unconditional adoption of every valid certificate.
 
+## Cost-aware adoption, not certificate rejection
+
+A certificate answers whether an effect is safe to reuse; it cannot answer whether waiting for or
+materializing that effect is faster than authoritative execution. Putting a duration threshold into
+the certificate layer would also reject a 900 ms replay that completed during Actor reasoning and now
+costs only 70 ms to adopt. The retained design therefore makes profitability a generic Runtime
+scheduler decision immediately before reservation and commit:
+
+```text
+Actor counterfactual       = q25(direct execution)
+speculative remaining      = max(0, q90(speculative-world execution) - elapsed)
+adoption overhead          = q75(validation + projection + commit)
+estimated critical saving = Actor - remaining - adoption
+```
+
+The three sample windows are never mixed. An exact action key is preferred; a wider
+`tool + executionFingerprint` class transfers evidence to a new but comparable command. The existing
+benefit gate's 25 ms minimum net saving is reused instead of creating a second threshold system. A
+candidate with a measured Actor estimate but no speculative sample uses its source remaining-time estimate
+plus a 25 ms uncertainty allowance; every wait is limited by both Actor slack and a 1.25x
+high-quantile or source remaining-time estimate. A
+deadline falls back without cancelling the learning run. Completed candidates skip execution wait
+entirely and are rejected only after measured adoption overhead itself exceeds direct execution.
+Time already spent on an earlier matching candidate is deducted before evaluating the next one, so
+several individually plausible candidates cannot each consume a fresh Actor-sized wait budget.
+Source-provided action durations still guide launch order, but cannot trigger a hard fallback: only
+an Actor observation from the current Runtime is a counterfactual. This prevents stale cross-session
+latency hints from being mistaken for evidence about the current machine and load.
+
+This follows the central result of [LATE](https://www.usenix.org/legacy/event/osdi08/tech/full_papers/zaharia/zaharia_html/):
+speculation should rank estimated time remaining, and excessive guesses can degrade the baseline. It
+also follows [GRASS](https://www.usenix.org/conference/nsdi14/technical-sessions/presentation/ananthanarayanan),
+which balances immediate gains against resource opportunity cost, and Google's
+[Tail at Scale](https://research.google/pubs/the-tail-at-scale/) argument for hedging with bounded
+additional resources rather than unconditional duplicate work. For retention, the older
+[GreedyDual-Size](https://www.usenix.org/legacy/publications/library/proceedings/usits97/cao.html)
+result and Google's
+[CacheSack](https://www.usenix.org/conference/atc22/presentation/yang-tzu-wei) both reinforce that hit
+rate alone is the wrong objective when objects have unequal fetch/materialization costs.
+
+Fresh WSL2 measurements locate a real crossover: zero-, 40-, and 43-round in-flight candidates fall
+back, while 48- and 96-round candidates join. A ready 40-round result is still profitable because its
+824 ms private execution has already been hidden. The fresh 48-round result disagrees materially with
+the earlier noise-boundary run, so both are preserved rather than turning the workload parameter into
+a fixed threshold. Full raw evidence and the negative results are in
+`bench/results/wsl2-cost-aware-admission-2026-09-01.md`.
+
+The next high-leverage cost reduction is deferred output materialization, not a weaker admission
+gate. Bazel's
+[Build without the Bytes](https://blog.bazel.build/2023/10/06/bwob-in-bazel-7.html) reports that eager
+output downloads can outweigh cache benefits, and its
+[Output Service](https://blog.bazel.build/2024/07/23/remote-output-service.html) keeps output metadata
+visible while materializing content on first read. Pi can apply the same shape through the generic
+transaction/artifact interface: validate a typed manifest, commit namespace visibility, and fetch CAS
+bytes only for effects the Actor or a later tool actually reads. That requires filesystem-backed
+fault handling and cannot be emulated by returning paths whose bytes are absent.
+
 ## Partial execution reuse
 
 [CRIU](https://criu.org/Checkpoint/Restore) can restore memory, descriptors, namespaces, and process
@@ -227,9 +284,9 @@ Completed-result/effect replay remains the default because it has a much smaller
 3. Seal top-level input evidence from content-free structure snapshots plus the generic workspace
    transaction delta, leaving write-after replay bytes solely in that transaction and failing closed
    on unsupported inode semantics (implemented and qualified).
-4. Add cost-aware completed-replay admission with conservative uncertainty margins; a valid cache hit
-   may still execute when estimated validation, artifact loading, branch setup, and commit cost exceed
-   the learned execution-time distribution.
+4. Add cost-aware running and completed candidate adoption with conservative uncertainty margins; a
+   valid cache hit may still execute when estimated remaining work and adoption cost exceed the
+   learned Actor distribution (implemented and qualified).
 5. Add live exact-digest leases backed by a gap-detecting change journal; fall back to hashing on every
    uncertainty signal.
 6. Replace nested-process whole-tree content snapshots with a bounded exact mutation frontier

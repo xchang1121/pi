@@ -1,0 +1,61 @@
+{
+  "schemaVersion": 1,
+  "measuredAt": "2026-08-31T22:54:52.796Z",
+  "host": {
+    "platform": "linux",
+    "arch": "x64",
+    "node": "v24.20.0",
+    "kernel": "Linux 6.18.33.2-microsoft-standard-WSL2 x86_64",
+    "sandlock": "sandlock 0.8.6",
+    "strace": "strace -- version 6.8"
+  },
+  "fixture": {
+    "inputBytes": 33554432,
+    "transformRoundsPerByte": 40,
+    "measuredRuns": 3
+  },
+  "samples": {
+    "direct": 3,
+    "replay": 3
+  },
+  "medians": {
+    "directMs": 775.046769,
+    "replayForkMs": 824.0699789999999,
+    "adoptionMs": 71.16163000000006,
+    "synchronousReplayMs": 891.169331,
+    "readyHitSavingMs": 703.885139,
+    "inFlightSavingAtMeasuredEstimateMs": -120.1848399999999
+  },
+  "decision": {
+    "inFlight": {
+      "allowed": false,
+      "reason": "fallback_faster",
+      "waitBudgetMs": 0,
+      "speculativeSamples": 3,
+      "actorSamples": 3,
+      "adoptionSamples": 3,
+      "expectedRemainingMs": 878.2984390000001,
+      "expectedAdoptionMs": 73.64726800000062,
+      "expectedActorMs": 771.9252580000002,
+      "expectedNetBenefitMs": -180.02044900000055
+    },
+    "ready": {
+      "allowed": true,
+      "reason": "ready",
+      "waitBudgetMs": 0,
+      "speculativeSamples": 3,
+      "actorSamples": 3,
+      "adoptionSamples": 3,
+      "expectedRemainingMs": 0,
+      "expectedAdoptionMs": 73.64726800000062,
+      "expectedActorMs": 771.9252580000002,
+      "expectedNetBenefitMs": 698.2779899999996
+    }
+  },
+  "assertions": {
+    "expected": true,
+    "policy": "fallback",
+    "expectedReady": true,
+    "readyPolicy": "join"
+  }
+}
