@@ -106,11 +106,11 @@ snapshot without hashing the output again. Input and write-before contents still
 SHA-256 evidence. This additional separation reduced the qualified 128 MiB hit by another 4.5%.
 
 Git represents regular bytes, symlinks, and the executable bit, but not empty directories, full
-directory metadata, special inodes, or hard-link topology. The current transaction supports only
-regular files, so directory transitions/metadata and link count other than one fail closed. This is
-consistent with Riker's result that correctness requires modeling the full POSIX namespace rather
-than treating every path as an independent byte string. Monitor epoch v4 prevents certificates from
-the older, weaker effect model from crossing this boundary.
+directory metadata, special inodes, or hard-link topology. The transaction qualified at this stage
+therefore supported only regular files; directory transitions/metadata and link count other than one
+failed closed. This is consistent with Riker's result that correctness requires modeling the full
+POSIX namespace rather than treating every path as an independent byte string. Monitor epoch v4
+prevents certificates from the older, weaker effect model from crossing this boundary.
 
 On the qualified 128 MiB Pi Bash fixture, content-free structural snapshots plus transaction-delta
 sealing reduced complete-hit median latency by 17.5% and cold latency by 11.5%. The raw reports and
@@ -149,11 +149,12 @@ driver is permanently non-reusable for that workspace.
 The driver is installed on `SandboxWorkspaceContext`, so the Linux process backend consumes one
 generic mutation interval rather than implementing a Bash-specific snapshot. Concurrent intervals
 contaminate one another and are not published; after they drain, the frontier resynchronizes from
-structure. Symlinks, special inodes, directory transitions, hard links, limits, and any partially
-captured frontier continue to fail closed. Monitor epoch v5 prevents older certificates from crossing
-the new observation boundary. Construction is deferred until the first interval begins, keeping
-replay-only branches off the observation path and taking the baseline after parent checkpoints have
-been materialized.
+structure. Symlinks, special inodes, directory metadata/type changes, hard links, limits, and any
+partially captured frontier continue to fail closed. Directory creation/removal is carried by the
+later typed namespace layer rather than by regular-file content capture. Monitor epoch v5 prevents
+older certificates from crossing the new observation boundary. Construction is deferred until the
+first interval begins, keeping replay-only branches off the observation path and taking the baseline
+after parent checkpoints have been materialized.
 
 Git's official [`diff-index` documentation](https://git-scm.com/docs/git-diff-index) distinguishes
 tentative working-tree changes from content held in an index, while
@@ -166,6 +167,49 @@ On the qualified real Pi Bash fixture, the fenced frontier reduced cold complete
 the nested miss backend by 13.5%; lazy initialization also made complete hits 1.0% faster. Raw
 measurements and the discarded-experiment result are in
 `bench/results/wsl2-workspace-frontier-2026-09-01.md`.
+
+## Typed directory topology and replay profitability
+
+Riker's event model separates namespace operations from file-content versions. The retained Pi
+implementation now follows that boundary for directory creation and removal:
+
+```text
+structure snapshots -> typed write/delete/mkdir/rmdir effects
+certificate journal -> exact mkdir entry digest + mode + uid + gid
+workspace commit     -> validate all baselines -> delete/rmdir -> mkdir/write -> verify directories
+rollback             -> reverse the same typed sequence and verify every original state
+```
+
+This is a workspace transaction feature, not a Bash adapter. The Linux process observer returns
+typed directory changes through the existing generic post-capture boundary; checkpoints, nested
+process publication, completed replay, outer adoption, locking, and rollback all consume the same
+`SandboxWorkspaceChange` union. A directory change also takes the workspace-root commit lock, so it
+cannot race a disjoint-looking file commit below the same namespace.
+
+Created directories can be represented even when empty. Removed directories are admitted only when
+the actual source directory's entry digest, mode, uid, and gid exactly match the private execution
+baseline; this prevents Git's directory-metadata approximation from becoming a proof. Pre-existing
+empty source directories remain outside the Git execution world's fidelity because Git cannot place
+them in a fresh worktree. Existing-directory metadata edits, symlinks, hard links, special inodes,
+renames that require identity preservation, and inode type changes still fail closed. Monitor/policy
+epoch v6 prevents certificates without the typed state from being reused.
+
+An unprivileged OverlayFS capability probe succeeded on the qualified WSL2 host inside a rootless
+user/mount namespace with `userxattr,index=off,metacopy=off,redirect_dir=nofollow`. That proves a
+lighter copy-on-write driver is feasible, not that its upper directory is already a transaction.
+Linux's [OverlayFS documentation](https://www.kernel.org/doc/html/latest/filesystems/overlayfs.html)
+requires correct handling of whiteouts, opaque directories, redirect xattrs, metacopy, and hard-link
+indexing. The probe is retained, but no naive upperdir merge enters production; the next driver must
+decode those records into the same typed change interface and validate unsupported features before
+export.
+
+Real-machine profitability is workload-dependent. Five interleaved stock Pi Bash pairs on a
+deterministic 32 MiB/96-round transform reduced median-of-medians from 2686.65 ms direct to 936.26 ms
+replayed (65.1%, 2.87x), with 15/15 hits and zero taints. A shorter 384.56 ms task regressed to
+937.24 ms under replay, while a roughly one-second task was within noise. Those negative points are
+preserved in `bench/results/wsl2-topology-reuse-2026-09-01.md`; they require a cost-aware admission
+policy based on measured execution distributions and estimated validation/artifact/commit cost rather
+than unconditional adoption of every valid certificate.
 
 ## Partial execution reuse
 
@@ -183,15 +227,20 @@ Completed-result/effect replay remains the default because it has a much smaller
 3. Seal top-level input evidence from content-free structure snapshots plus the generic workspace
    transaction delta, leaving write-after replay bytes solely in that transaction and failing closed
    on unsupported inode semantics (implemented and qualified).
-4. Add live exact-digest leases backed by a gap-detecting change journal; fall back to hashing on every
+4. Add cost-aware completed-replay admission with conservative uncertainty margins; a valid cache hit
+   may still execute when estimated validation, artifact loading, branch setup, and commit cost exceed
+   the learned execution-time distribution.
+5. Add live exact-digest leases backed by a gap-detecting change journal; fall back to hashing on every
    uncertainty signal.
-5. Replace nested-process whole-tree content snapshots with a bounded exact mutation frontier
+6. Replace nested-process whole-tree content snapshots with a bounded exact mutation frontier
    selected by content-free inode change tokens (implemented and qualified).
-6. Add a complete kernel write journal or typed copy-on-write upper layer to eliminate the remaining
-   structure walks and extend safe replay beyond regular-file/directory-parent effects.
-7. Extract the Linux observer/isolation implementation behind the capability driver contract, then add
+7. Carry typed directory creation/removal through certificates, checkpoints, commit, verification, and
+   rollback (implemented and qualified); retain fail-closed boundaries for metadata/link/type semantics.
+8. Add a complete kernel write journal or typed copy-on-write upper layer to eliminate the remaining
+   structure walks and extend safe replay beyond regular-file and directory topology effects.
+9. Extract the Linux observer/isolation implementation behind the capability driver contract, then add
    a BuildXL-derived Windows driver and an entitled Endpoint Security macOS driver.
-8. Evaluate CRIU only for long-running, pre-effect process checkpoints under the stricter external-
+10. Evaluate CRIU only for long-running, pre-effect process checkpoints under the stricter external-
    resource profile.
 
 Every item requires correctness tests for negative lookups, directories, symlinks, concurrent mutation,
