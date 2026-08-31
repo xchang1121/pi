@@ -1,0 +1,139 @@
+{
+  "schemaVersion": 1,
+  "measuredAt": "2026-08-31T20:38:08.489Z",
+  "host": {
+    "platform": "linux",
+    "arch": "x64",
+    "node": "v24.20.0",
+    "kernel": "Linux 6.18.33.2-microsoft-standard-WSL2 x86_64",
+    "sandlock": "sandlock 0.8.6",
+    "strace": "strace -- version 6.8"
+  },
+  "subject": "stock Pi createBashTool replaying one verified 128 MiB regular-file effect",
+  "fixture": {
+    "inputBytes": 134217728,
+    "helperDelayMs": 300,
+    "hitRuns": 3
+  },
+  "assertions": {
+    "coldPublished": true,
+    "allDifferentParentHits": true,
+    "allArtifactsEqual": true,
+    "verifiedClosureLoaded": true
+  },
+  "cold": {
+    "label": "cold",
+    "totalMs": 2607.539874,
+    "forkMs": 2377.500217,
+    "validationMs": 136.11391900000035,
+    "commitMs": 93.90930500000013,
+    "metricDelta": {
+      "requests": 1,
+      "hits": 0,
+      "misses": 1,
+      "bypasses": 0,
+      "published": 1,
+      "tainted": 0,
+      "validationMs": 0.5584170000001905,
+      "validationCandidates": 0,
+      "validationPathsets": 0,
+      "validationFilesRead": 0,
+      "validationBytesRead": 0,
+      "validationArtifactsLoaded": 0,
+      "validationArtifactBytesRead": 0,
+      "executionMs": 1475.4539510000004
+    }
+  },
+  "hits": [
+    {
+      "label": "hit-1",
+      "totalMs": 1472.9947849999999,
+      "forkMs": 1266.8670919999995,
+      "validationMs": 129.86693699999978,
+      "commitMs": 76.24754499999926,
+      "metricDelta": {
+        "requests": 1,
+        "hits": 1,
+        "misses": 0,
+        "bypasses": 0,
+        "published": 0,
+        "tainted": 0,
+        "validationMs": 239.825965,
+        "validationCandidates": 1,
+        "validationPathsets": 1,
+        "validationFilesRead": 4,
+        "validationBytesRead": 136379499,
+        "validationArtifactsLoaded": 2,
+        "validationArtifactBytesRead": 134217735,
+        "executionMs": 0
+      }
+    },
+    {
+      "label": "hit-2",
+      "totalMs": 1671.0786119999993,
+      "forkMs": 1468.9255389999998,
+      "validationMs": 134.32179799999903,
+      "commitMs": 67.8184369999999,
+      "metricDelta": {
+        "requests": 1,
+        "hits": 1,
+        "misses": 0,
+        "bypasses": 0,
+        "published": 0,
+        "tainted": 0,
+        "validationMs": 246.79153899999983,
+        "validationCandidates": 1,
+        "validationPathsets": 1,
+        "validationFilesRead": 4,
+        "validationBytesRead": 136379499,
+        "validationArtifactsLoaded": 2,
+        "validationArtifactBytesRead": 134217735,
+        "executionMs": 0
+      }
+    },
+    {
+      "label": "hit-3",
+      "totalMs": 1506.6020879999996,
+      "forkMs": 1295.2217489999985,
+      "validationMs": 126.5918529999999,
+      "commitMs": 84.77385900000081,
+      "metricDelta": {
+        "requests": 1,
+        "hits": 1,
+        "misses": 0,
+        "bypasses": 0,
+        "published": 0,
+        "tainted": 0,
+        "validationMs": 253.49805299999935,
+        "validationCandidates": 1,
+        "validationPathsets": 1,
+        "validationFilesRead": 4,
+        "validationBytesRead": 136379499,
+        "validationArtifactsLoaded": 2,
+        "validationArtifactBytesRead": 134217735,
+        "executionMs": 0
+      }
+    }
+  ],
+  "summary": {
+    "hitMedianMs": 1506.6020879999996,
+    "validationMedianMs": 246.79153899999983,
+    "coldToHitMedianSpeedup": 1.7307422409466358,
+    "metrics": {
+      "requests": 4,
+      "hits": 3,
+      "misses": 1,
+      "bypasses": 0,
+      "published": 1,
+      "tainted": 0,
+      "validationMs": 740.6739739999994,
+      "validationCandidates": 3,
+      "validationPathsets": 3,
+      "validationFilesRead": 12,
+      "validationBytesRead": 409138497,
+      "validationArtifactsLoaded": 6,
+      "validationArtifactBytesRead": 402653205,
+      "executionMs": 1475.4539510000004
+    }
+  }
+}

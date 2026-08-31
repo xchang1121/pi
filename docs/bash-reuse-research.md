@@ -116,6 +116,57 @@ On the qualified 128 MiB Pi Bash fixture, content-free structural snapshots plus
 sealing reduced complete-hit median latency by 17.5% and cold latency by 11.5%. The raw reports and
 method are in `bench/results/wsl2-transaction-delta-2026-09-01.md`.
 
+## Nested workspace-transaction frontier
+
+Nested cache misses formerly took two complete content snapshots even though the private Git world
+already supplied an immutable baseline. The retained workspace transaction driver now separates
+three notions that must not be conflated:
+
+```text
+change selector: dev + inode + ctime + mtime + mode + size + link count
+content authority: immutable baseline blob or prior exact mutation frontier
+semantic proof: before/after inode structure joined with exact regular-file bytes
+```
+
+The change selector is only a read-elision device. A selected file is opened with `O_NOFOLLOW`,
+bounded, read exactly, and checked again through the same descriptor; a changed identity or metadata
+invalidates the interval. The precise byte state then advances a workspace-wide frontier. This also
+handles same-size overwrites and changes made by the parent shell between nested executions without
+reading every unchanged input again.
+
+Metadata by itself still is not accepted as a cross-process content proof. Before an operation can
+start, a private regular-file sentinel, explicitly verified to be on the same filesystem, must obtain
+a ctime strictly later than every inode in the proposed baseline. The structure is then rechecked,
+the selected content is captured, and the structure is checked once more. The endpoint uses the same
+ordering, so content reads occur inside—not before—the fenced stable region. Linux documents that a
+successful [`write(2)` updates ctime](https://pubs.opengroup.org/onlinepubs/9690949599/functions/write.html),
+while [`utimensat(2)`](https://man7.org/linux/man-pages/man2/utimensat.2.html) accepts caller values only
+for atime/mtime and moves ctime to the current time. This makes kernel-controlled ctime a bounded
+mutation-interval selector rather than a content proof. If the filesystem clock cannot advance within
+100 ms, either endpoint moves, or the sentinel is not a private same-filesystem regular file, the
+driver is permanently non-reusable for that workspace.
+
+The driver is installed on `SandboxWorkspaceContext`, so the Linux process backend consumes one
+generic mutation interval rather than implementing a Bash-specific snapshot. Concurrent intervals
+contaminate one another and are not published; after they drain, the frontier resynchronizes from
+structure. Symlinks, special inodes, directory transitions, hard links, limits, and any partially
+captured frontier continue to fail closed. Monitor epoch v5 prevents older certificates from crossing
+the new observation boundary. Construction is deferred until the first interval begins, keeping
+replay-only branches off the observation path and taking the baseline after parent checkpoints have
+been materialized.
+
+Git's official [`diff-index` documentation](https://git-scm.com/docs/git-diff-index) distinguishes
+tentative working-tree changes from content held in an index, while
+[`update-index`](https://git-scm.com/docs/git-update-index.html) documents that refresh is stat-based
+and does not calculate new object IDs. An evaluated alternate-index design therefore still needed to
+write/read changed objects for exact bytes and regressed cold latency by 8.6%; it was removed. The
+retained frontier uses Git only as immutable baseline content, never as the per-command change scan.
+
+On the qualified real Pi Bash fixture, the fenced frontier reduced cold complete latency by 7.4% and
+the nested miss backend by 13.5%; lazy initialization also made complete hits 1.0% faster. Raw
+measurements and the discarded-experiment result are in
+`bench/results/wsl2-workspace-frontier-2026-09-01.md`.
+
 ## Partial execution reuse
 
 [CRIU](https://criu.org/Checkpoint/Restore) can restore memory, descriptors, namespaces, and process
@@ -134,11 +185,13 @@ Completed-result/effect replay remains the default because it has a much smaller
    on unsupported inode semantics (implemented and qualified).
 4. Add live exact-digest leases backed by a gap-detecting change journal; fall back to hashing on every
    uncertainty signal.
-5. Replace the remaining structure walks and nested-process content snapshots with a complete kernel
-   write journal or copy-on-write upper layer, while retaining the typed adoption transaction.
-6. Extract the Linux observer/isolation implementation behind the capability driver contract, then add
+5. Replace nested-process whole-tree content snapshots with a bounded exact mutation frontier
+   selected by content-free inode change tokens (implemented and qualified).
+6. Add a complete kernel write journal or typed copy-on-write upper layer to eliminate the remaining
+   structure walks and extend safe replay beyond regular-file/directory-parent effects.
+7. Extract the Linux observer/isolation implementation behind the capability driver contract, then add
    a BuildXL-derived Windows driver and an entitled Endpoint Security macOS driver.
-7. Evaluate CRIU only for long-running, pre-effect process checkpoints under the stricter external-
+8. Evaluate CRIU only for long-running, pre-effect process checkpoints under the stricter external-
    resource profile.
 
 Every item requires correctness tests for negative lookups, directories, symlinks, concurrent mutation,
