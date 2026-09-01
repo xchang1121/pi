@@ -194,14 +194,12 @@ them in a fresh worktree. Existing-directory metadata edits, symlinks, hard link
 renames that require identity preservation, and inode type changes still fail closed. Monitor/policy
 epoch v6 prevents certificates without the typed state from being reused.
 
-An unprivileged OverlayFS capability probe succeeded on the qualified WSL2 host inside a rootless
-user/mount namespace with `userxattr,index=off,metacopy=off,redirect_dir=nofollow`. That proves a
-lighter copy-on-write driver is feasible, not that its upper directory is already a transaction.
-Linux's [OverlayFS documentation](https://www.kernel.org/doc/html/latest/filesystems/overlayfs.html)
-requires correct handling of whiteouts, opaque directories, redirect xattrs, metacopy, and hard-link
-indexing. The probe is retained, but no naive upperdir merge enters production; the next driver must
-decode those records into the same typed change interface and validate unsupported features before
-export.
+An unprivileged kernel OverlayFS capability probe first established that a lighter copy-on-write
+driver was feasible. It was not promoted on that evidence alone. Linux's
+[OverlayFS documentation](https://www.kernel.org/doc/html/latest/filesystems/overlayfs.html) requires
+correct handling of whiteouts, opaque directories, redirect xattrs, metacopy, and hard-link indexing;
+an upper directory is filesystem metadata, not an ordinary tree to copy into the Actor workspace.
+That constraint is now enforced by the host-visible driver described below.
 
 Real-machine profitability is workload-dependent. Five interleaved stock Pi Bash pairs on a
 deterministic 32 MiB/96-round transform reduced median-of-medians from 2686.65 ms direct to 936.26 ms
@@ -268,6 +266,55 @@ transaction/artifact interface: validate a typed manifest, commit namespace visi
 bytes only for effects the Actor or a later tool actually reads. That requires filesystem-backed
 fault handling and cannot be emulated by returning paths whose bytes are absent.
 
+## Host-visible copy-on-write workspace driver
+
+Two OverlayFS placements were evaluated. A private kernel mount in a helper namespace worked, and the
+parent could reach its merged view through `/proc/<pid>/root`. It was rejected because the production
+Bash world subsequently creates another PID/mount namespace and remounts `/proc`; correctness would
+then depend on a helper PID path remaining visible across namespace boundaries. A host-visible
+[`fuse-overlayfs`](https://github.com/containers/fuse-overlayfs) mount is inherited normally by the
+existing descendant namespace, needs no root privilege, and leaves no daemon running between
+branches. The package setup installs only a hash-pinned official static release.
+
+The selected driver preserves the generic execution-world boundary:
+
+```text
+Actor snapshot -> private Git object store -> one immutable lower worktree per content commit
+                                      fork -> unique FUSE upper/work + merged workspace
+                                      seal -> typed upper frontier + exact merged-view bytes
+                                     adopt -> existing validate/lock/apply/verify/rollback transaction
+```
+
+The upper and work directories are outside the speculative process's writable private root. The
+transaction fence is held as an unnamed Linux `O_TMPFILE` inode in the private upper backing
+filesystem rather than as a hidden path in the merged workspace, so directory enumeration by the
+speculative process cannot discover a runtime control entry. The probe also proves that this private
+clock orders file and directory ctimes projected through the FUSE merged view; the driver is rejected
+if lower, upper, and work are not on that tested backing domain. The runtime lifecycle probe must
+demonstrate lower-tree immutability, copy-up, creation, 0/0 character-device whiteouts,
+`.wh..wh..opq` opaque replacement, anonymous-inode and cross-view clock semantics,
+descendant-namespace visibility, and verified unmount. Driver identity includes the implementation
+epoch, architecture, kernel, and binary version.
+If normal unmount fails, the process is terminated, a second normal unmount is required, and mountinfo
+is checked again. A recovered failure demotes that option set to Git for later routes; an unresolved
+mount quarantines its pool outside the allocation index and deliberately retains upper/work/lower
+references instead of reclaiming live storage. Quarantine is not an active lease, so global disposal
+does not wait forever for a mount that requires OS/operator recovery.
+
+Sealing walks only the upper journal. Copy-ups and creations select exact resources; a whiteout or
+opaque marker expands only the affected immutable Git/checkpoint subtree. Final file bytes are read
+through the merged view and compared with the exact baseline before the already-existing atomic Actor
+transaction can be formed. Alternative marker encodings, device nodes, symlinks, hard links, limits,
+and unsupported inode/type transitions fail closed. Extended attributes, explicit timestamp updates,
+sparse-allocation operations, and mutating file ioctls are visible in the complete strace stream but
+are not represented by the transaction, so they taint the branch and make adoption indeterminate.
+
+Mounting alone was a regression: retaining the full-tree Git diff made the 32 MiB hit about 6.4%
+slower. The typed upper frontier reversed that result. Three independent real Pi Bash processes per
+driver produced nine 32 MiB hits; median total hit time improved 2.1% and fork time improved 3.4%,
+while the one-file workload remained within noise. Both the retained and rejected measurements are
+preserved in `bench/results/wsl2-overlayfs-workspace-driver-2026-09-01.md`.
+
 ## Partial execution reuse
 
 [CRIU](https://criu.org/Checkpoint/Restore) can restore memory, descriptors, namespaces, and process
@@ -294,7 +341,8 @@ Completed-result/effect replay remains the default because it has a much smaller
 7. Carry typed directory creation/removal through certificates, checkpoints, commit, verification, and
    rollback (implemented and qualified); retain fail-closed boundaries for metadata/link/type semantics.
 8. Add a complete kernel write journal or typed copy-on-write upper layer to eliminate the remaining
-   structure walks and extend safe replay beyond regular-file and directory topology effects.
+   structure walks (implemented and qualified with a capability-selected FUSE OverlayFS driver;
+   unsupported metadata semantics remain fail closed).
 9. Extract the Linux observer/isolation implementation behind the capability driver contract, then add
    a BuildXL-derived Windows driver and an entitled Endpoint Security macOS driver.
 10. Evaluate CRIU only for long-running, pre-effect process checkpoints under the stricter external-
