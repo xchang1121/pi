@@ -309,6 +309,22 @@ and unsupported inode/type transitions fail closed. Extended attributes, explici
 sparse-allocation operations, and mutating file ioctls are visible in the complete strace stream but
 are not represented by the transaction, so they taint the branch and make adoption indeterminate.
 
+The upper journal is also the storage driver's structure source. One complete immutable-lower
+snapshot is prewarmed and shared per content commit by every branch, outer Bash observer, and nested
+transaction; later captures refresh only typed upper entries and their ancestor directories in the merged view. The Linux process world
+qualifies this path only after the exact Git baseline reaches 512 entries, the observed crossover on
+this WSL2 host. Smaller trees retain the prepared Git-worktree path, and generic mutation fallbacks do
+not opt into FUSE because they lack the process world's complete semantic-error trace.
+
+Filesystem isolation is not assumed to imply perfect syscall equivalence. In particular,
+`fuse-overlayfs` supports only `redirect_dir=off`, so renaming a lower directory first returns
+`EXDEV`; `O_TMPFILE` on the merged mount is another unsupported case. The process may handle such an
+error and appear successful, but its result is not evidence of Actor-world equivalence. The observer
+therefore marks workspace-local `EXDEV`, `EOPNOTSUPP`, `ENOTSUP`, and `ENOSYS` outcomes incomplete and
+tainted. A real WSL test executes coreutils `mv`, observes its cross-device fallback, and proves that
+the enclosing branch cannot be adopted. Explicit-driver benchmarks remain useful diagnostics; `auto`
+is restricted to this trace-guarded process route.
+
 Mounting alone was a regression: retaining the full-tree Git diff made the 32 MiB hit about 6.4%
 slower. The typed upper frontier reversed that result. Three independent real Pi Bash processes per
 driver produced nine 32 MiB hits; median total hit time improved 2.1% and fork time improved 3.4%,
