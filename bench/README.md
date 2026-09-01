@@ -9,6 +9,9 @@ kept outside this repository. The checked-in runner and suites remain the
 reproducible measurement surface. Machine-qualification results for the Linux
 process substrate contain no prompts or model data and live under `results/`.
 
+The current-head structural-refactor acceptance is recorded in
+[`results/wsl2-structural-refactor-96b2778-2026-09-01.md`](./results/wsl2-structural-refactor-96b2778-2026-09-01.md).
+
 ## Linux/WSL process reuse qualification
 
 Run the production `createBashTool`, generic process outlet, Linux execution
