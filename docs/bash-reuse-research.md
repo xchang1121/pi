@@ -312,8 +312,8 @@ are not represented by the transaction, so they taint the branch and make adopti
 The upper journal is also the storage driver's structure source. One complete immutable-lower
 snapshot is prewarmed and shared per content commit by every branch, outer Bash observer, and nested
 transaction; later captures refresh only typed upper entries and their ancestor directories in the merged view. The Linux process world
-qualifies this path only after the exact Git baseline reaches 512 entries, the observed crossover on
-this WSL2 host. Smaller trees retain the prepared Git-worktree path, and generic mutation fallbacks do
+qualifies this path only after the exact Git baseline reaches 256 entries, the conservative boundary
+between repeated 100-file losses and 250/500-file wins on this WSL2 host. Smaller trees retain the prepared Git-worktree path, and generic mutation fallbacks do
 not opt into FUSE because they lack the process world's complete semantic-error trace.
 
 Filesystem isolation is not assumed to imply perfect syscall equivalence. In particular,
