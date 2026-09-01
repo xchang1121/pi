@@ -1,0 +1,129 @@
+{
+  "schemaVersion": 1,
+  "measuredAt": "2026-09-01T01:10:42.931Z",
+  "host": {
+    "platform": "linux",
+    "arch": "x64",
+    "node": "v24.20.0",
+    "kernel": "Linux 6.18.33.2-microsoft-standard-WSL2 x86_64",
+    "sandlock": "sandlock 0.8.6",
+    "strace": "strace -- version 6.8"
+  },
+  "subject": "stock Pi createBashTool through linux_process_reuse WorldBranch",
+  "workspaceDriver": "auto",
+  "workspaceFingerprint": "git-worktree:v1",
+  "assertions": {
+    "differentParentCommands": true,
+    "orderedChildOutputEqual": true,
+    "regularFileEffectEqual": true,
+    "adoptionFreshnessValid": true,
+    "changedInputForcedMiss": true
+  },
+  "runs": [
+    {
+      "label": "cold",
+      "command": "printf 'parent-a\\n'; pi-reuse-helper input.txt artifact.txt; printf 'parent-a-done\\n'",
+      "forkMs": 1669.353004,
+      "validationMs": 11.722854999999981,
+      "commitMs": 4.542076000000179,
+      "totalMs": 1685.644949,
+      "validation": "valid",
+      "output": "parent-a\nchild-out:alpha\nchild-err\nparent-a-done\n",
+      "artifact": "alpha\n",
+      "metricDelta": {
+        "requests": 1,
+        "hits": 0,
+        "misses": 1,
+        "bypasses": 0,
+        "published": 1,
+        "tainted": 0,
+        "validationMs": 0.49864499999989675,
+        "validationCandidates": 0,
+        "validationPathsets": 0,
+        "validationFilesRead": 0,
+        "validationBytesRead": 0,
+        "validationArtifactsLoaded": 0,
+        "validationArtifactBytesRead": 0,
+        "executionMs": 1061.1333260000001
+      }
+    },
+    {
+      "label": "cross_parent_hit",
+      "command": "printf 'parent-b\\n'; command pi-reuse-helper input.txt artifact.txt; printf 'parent-b-done\\n'",
+      "forkMs": 657.5943530000004,
+      "validationMs": 11.132366000000275,
+      "commitMs": 3.9042819999999665,
+      "totalMs": 672.6415470000002,
+      "validation": "valid",
+      "output": "parent-b\nchild-out:alpha\nchild-err\nparent-b-done\n",
+      "artifact": "alpha\n",
+      "metricDelta": {
+        "requests": 1,
+        "hits": 1,
+        "misses": 0,
+        "bypasses": 0,
+        "published": 0,
+        "tainted": 0,
+        "validationMs": 4.8297019999999975,
+        "validationCandidates": 1,
+        "validationPathsets": 1,
+        "validationFilesRead": 4,
+        "validationBytesRead": 2161777,
+        "validationArtifactsLoaded": 3,
+        "validationArtifactBytesRead": 32,
+        "executionMs": 0
+      }
+    },
+    {
+      "label": "dependency_invalidation",
+      "command": "printf 'parent-c\\n'; pi-reuse-helper input.txt artifact.txt; printf 'parent-c-done\\n'",
+      "forkMs": 1726.7843209999996,
+      "validationMs": 10.429267000000436,
+      "commitMs": 3.1664639999999054,
+      "totalMs": 1740.3985649999995,
+      "validation": "valid",
+      "output": "parent-c\nchild-out:beta\nchild-err\nparent-c-done\n",
+      "artifact": "beta\n",
+      "metricDelta": {
+        "requests": 1,
+        "hits": 0,
+        "misses": 1,
+        "bypasses": 0,
+        "published": 1,
+        "tainted": 0,
+        "validationMs": 3.9066210000000865,
+        "validationCandidates": 1,
+        "validationPathsets": 1,
+        "validationFilesRead": 4,
+        "validationBytesRead": 2161776,
+        "validationArtifactsLoaded": 0,
+        "validationArtifactBytesRead": 0,
+        "executionMs": 1056.4991409999998,
+        "lastError": "reuse_miss:dependency_changed:/tmp/pi-bash-reuse-bench-dYkbCC/workspace/input.txt"
+      }
+    }
+  ],
+  "summary": {
+    "routePreparationMs": 68.860547,
+    "coldToCrossParentHitSpeedup": 2.5060077786125805,
+    "coldForkToCrossParentHitForkSpeedup": 2.5385756376773494,
+    "latencySavedMs": 1013.0034019999998,
+    "metrics": {
+      "requests": 3,
+      "hits": 1,
+      "misses": 2,
+      "bypasses": 0,
+      "published": 2,
+      "tainted": 0,
+      "validationMs": 9.23496799999998,
+      "validationCandidates": 2,
+      "validationPathsets": 2,
+      "validationFilesRead": 8,
+      "validationBytesRead": 4323553,
+      "validationArtifactsLoaded": 3,
+      "validationArtifactBytesRead": 32,
+      "executionMs": 2117.632467,
+      "lastError": "reuse_miss:dependency_changed:/tmp/pi-bash-reuse-bench-dYkbCC/workspace/input.txt"
+    }
+  }
+}

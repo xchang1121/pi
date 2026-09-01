@@ -1,0 +1,162 @@
+{
+  "schemaVersion": 1,
+  "measuredAt": "2026-09-01T01:11:53.843Z",
+  "mode": "reuse",
+  "workspaceDriver": "overlayfs",
+  "workspaceFingerprint": "linux-overlayfs:v1:fuse-overlayfs-cow-v4:x64:6.18.33.2-microsoft-standard-WSL2:fusermount3 version: 3.14.0 fuse-overlayfs: version 1.18 FUSE library version 3.14.0 using FUSE kernel interface version 7.31",
+  "host": {
+    "platform": "linux",
+    "arch": "x64",
+    "node": "v24.20.0",
+    "kernel": "Linux 6.18.33.2-microsoft-standard-WSL2 x86_64",
+    "sandlock": "sandlock 0.8.6",
+    "strace": "strace -- version 6.8"
+  },
+  "subject": "stock Pi createBashTool running one process that creates two directories and a transformed artifact",
+  "fixture": {
+    "inputBytes": 33554432,
+    "transformRoundsPerByte": 0,
+    "sourceFiles": 500,
+    "measuredRuns": 3
+  },
+  "assertions": {
+    "allArtifactsEqual": true,
+    "warmupPublished": true,
+    "typedTopologyCaptured": true,
+    "allCrossParentHits": true
+  },
+  "warmup": {
+    "label": "warmup",
+    "totalMs": 1234.5292040000002,
+    "forkMs": 1150.4546429999998,
+    "validationMs": 52.537145999999666,
+    "commitMs": 31.52245300000004,
+    "resources": [
+      "generated",
+      "generated/nested",
+      "generated/nested/artifact.bin"
+    ],
+    "metricDelta": {
+      "requests": 1,
+      "hits": 0,
+      "misses": 1,
+      "bypasses": 0,
+      "published": 1,
+      "tainted": 0,
+      "validationMs": 0.5356969999998,
+      "validationCandidates": 0,
+      "validationPathsets": 0,
+      "validationFilesRead": 0,
+      "validationBytesRead": 0,
+      "validationArtifactsLoaded": 0,
+      "validationArtifactBytesRead": 0,
+      "executionMs": 408.9494199999999
+    }
+  },
+  "runs": [
+    {
+      "label": "reuse-1",
+      "totalMs": 964.4176169999996,
+      "forkMs": 873.0305829999998,
+      "validationMs": 56.80157500000041,
+      "commitMs": 34.5716510000002,
+      "resources": [
+        "generated",
+        "generated/nested",
+        "generated/nested/artifact.bin"
+      ],
+      "metricDelta": {
+        "requests": 1,
+        "hits": 1,
+        "misses": 0,
+        "bypasses": 0,
+        "published": 0,
+        "tainted": 0,
+        "validationMs": 85.73160099999996,
+        "validationCandidates": 1,
+        "validationPathsets": 1,
+        "validationFilesRead": 4,
+        "validationBytesRead": 35716243,
+        "validationArtifactsLoaded": 2,
+        "validationArtifactBytesRead": 33554451,
+        "executionMs": 0
+      }
+    },
+    {
+      "label": "reuse-2",
+      "totalMs": 1028.0483300000005,
+      "forkMs": 956.9653070000004,
+      "validationMs": 44.85233000000062,
+      "commitMs": 26.220384000000195,
+      "resources": [
+        "generated",
+        "generated/nested",
+        "generated/nested/artifact.bin"
+      ],
+      "metricDelta": {
+        "requests": 1,
+        "hits": 1,
+        "misses": 0,
+        "bypasses": 0,
+        "published": 0,
+        "tainted": 0,
+        "validationMs": 87.61244600000009,
+        "validationCandidates": 1,
+        "validationPathsets": 1,
+        "validationFilesRead": 4,
+        "validationBytesRead": 35716243,
+        "validationArtifactsLoaded": 2,
+        "validationArtifactBytesRead": 33554451,
+        "executionMs": 0
+      }
+    },
+    {
+      "label": "reuse-3",
+      "totalMs": 957.4596019999999,
+      "forkMs": 874.485874,
+      "validationMs": 45.37541500000043,
+      "commitMs": 37.58107699999982,
+      "resources": [
+        "generated",
+        "generated/nested",
+        "generated/nested/artifact.bin"
+      ],
+      "metricDelta": {
+        "requests": 1,
+        "hits": 1,
+        "misses": 0,
+        "bypasses": 0,
+        "published": 0,
+        "tainted": 0,
+        "validationMs": 82.86643100000038,
+        "validationCandidates": 1,
+        "validationPathsets": 1,
+        "validationFilesRead": 4,
+        "validationBytesRead": 35716243,
+        "validationArtifactsLoaded": 2,
+        "validationArtifactBytesRead": 33554451,
+        "executionMs": 0
+      }
+    }
+  ],
+  "summary": {
+    "routePreparationMs": 348.19198099999994,
+    "medianMs": 964.4176169999996,
+    "metrics": {
+      "requests": 4,
+      "hits": 3,
+      "misses": 1,
+      "bypasses": 0,
+      "published": 1,
+      "tainted": 0,
+      "validationMs": 256.7461750000002,
+      "validationCandidates": 3,
+      "validationPathsets": 3,
+      "validationFilesRead": 12,
+      "validationBytesRead": 107148729,
+      "validationArtifactsLoaded": 6,
+      "validationArtifactBytesRead": 100663353,
+      "executionMs": 408.9494199999999
+    }
+  }
+}

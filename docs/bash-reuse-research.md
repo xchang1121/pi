@@ -311,10 +311,12 @@ are not represented by the transaction, so they taint the branch and make adopti
 
 The upper journal is also the storage driver's structure source. One complete immutable-lower
 snapshot is prewarmed and shared per content commit by every branch, outer Bash observer, and nested
-transaction; later captures refresh only typed upper entries and their ancestor directories in the merged view. The Linux process world
-qualifies this path only after the exact Git baseline reaches 256 entries, the conservative boundary
-between repeated 100-file losses and 250/500-file wins on this WSL2 host. Smaller trees retain the prepared Git-worktree path, and generic mutation fallbacks do
-not opt into FUSE because they lack the process world's complete semantic-error trace.
+transaction; later captures refresh only typed upper entries and their ancestor directories in the
+merged view. The Linux process world qualifies this path only after the exact Git baseline reaches
+256 entries. This is a conservative boundary because small/100-file outcomes were host-sensitive and
+the FUSE path adds one-time route-preparation cost, while retained 500/1,000-file runs showed larger,
+repeatable gains. Smaller trees retain the prepared Git-worktree path, and generic mutation fallbacks
+do not opt into FUSE because they lack the process world's complete semantic-error trace.
 
 Filesystem isolation is not assumed to imply perfect syscall equivalence. In particular,
 `fuse-overlayfs` supports only `redirect_dir=off`, so renaming a lower directory first returns
@@ -326,10 +328,12 @@ the enclosing branch cannot be adopted. Explicit-driver benchmarks remain useful
 is restricted to this trace-guarded process route.
 
 Mounting alone was a regression: retaining the full-tree Git diff made the 32 MiB hit about 6.4%
-slower. The typed upper frontier reversed that result. Three independent real Pi Bash processes per
-driver produced nine 32 MiB hits; median total hit time improved 2.1% and fork time improved 3.4%,
-while the one-file workload remained within noise. Both the retained and rejected measurements are
-preserved in `bench/results/wsl2-overlayfs-workspace-driver-2026-09-01.md`.
+slower. Sharing the immutable-lower structure and refreshing only the typed upper frontier reversed
+that result. Three independent real Pi Bash processes per driver produced nine hits at each retained
+large-tree size: median total hit time improved 9.47% at 500 source files and 13.21% at 1,000, while
+publication warm-up improved 24.53% and 31.29%. The small `auto` workload stayed on Git and still
+obtained a 2.45x cold-to-hit speedup from Bash reuse. Main, boundary, production-selector, and rejected
+measurements are preserved in `bench/results/wsl2-overlayfs-workspace-driver-2026-09-01.md`.
 
 ## Partial execution reuse
 
