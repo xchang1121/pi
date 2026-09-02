@@ -17,8 +17,8 @@ process substrate contain no prompts or model data and live under `results/`.
 
 The current-head structural-refactor acceptance is recorded in
 [`results/wsl2-structural-refactor-96b2778-2026-09-01.md`](./results/wsl2-structural-refactor-96b2778-2026-09-01.md).
-The direct/strace/completed-replay dependency ablation is recorded in
-[`results/wsl2-dependency-ablation-97f4490-2026-09-03.md`](./results/wsl2-dependency-ablation-97f4490-2026-09-03.md).
+The direct/strace/child-replay dependency ablation is recorded in
+[`results/wsl2-dependency-ablation-2419f16-2026-09-03.md`](./results/wsl2-dependency-ablation-2419f16-2026-09-03.md).
 
 ## Linux/WSL process reuse qualification
 
