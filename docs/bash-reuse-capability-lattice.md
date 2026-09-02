@@ -25,6 +25,19 @@ process is needed only on a miss. Landlock, a correctly configured namespace san
 confinement provider belongs only to Fork. Consequently, lack of Landlock must not disable Replay or
 Actor-authorized execution, although observation alone does not create an interception boundary.
 
+Three mechanisms that are often called "tracing" must therefore remain separate:
+
+| Mechanism | Decision point | Can prevent the second child from starting? | Role here |
+| --- | --- | --- | --- |
+| completed `strace`/fanotify/eBPF log | after the event | No | dependency evidence and measurement |
+| eager launch followed by kill | after some Actor work has escaped | No | unsafe performance ablation only |
+| held `execve` (`ptrace` or seccomp user notification) | before the new image executes user code | Yes | online child replay boundary |
+
+Incr's streaming executor is the second case: it starts the real child while validating and kills it
+on a hit. That overlaps lookup with useful work, but an emitted byte or external side effect cannot be
+retracted. It is not an admissible strict Actor route. hS streams trace events for a different purpose:
+it detects conflicts early while effects are already contained in an OverlayFS/namespace transaction.
+
 The phase is part of route selection. Advertising one undifferentiated capability set for both
 authoritative capture and speculative execution is incorrect: it makes a strong Fork dependency a
 prerequisite for a weaker, already-authorized Observe operation.
@@ -109,7 +122,7 @@ These are cumulative capability combinations, not user-facing levels:
 | --- | --- | --- |
 | Certificate store + exact hashing/CAS | Replay compatible completed certificates before shell launch; the Pi host executor remains the miss path | New process execution before Actor authorization |
 | Above + `strace -f` | Audit an Actor-authorized execution and measure observation cost | No online child substitution; strict Bash certificates are commonly tainted by shell startup inputs |
-| Above + native pre-`execve` broker | Reuse completed or identical in-flight child units across different Actor Bash strings; Actor misses execute once and teach the store | Miss execution before Actor authorization |
+| Above + native held-`execve` broker | Reuse completed child units across different Actor Bash strings; misses continue exactly once | Miss execution before Actor authorization; learning additionally needs complete observation |
 | Above + exact workspace transaction | Learn and atomically replay typed Actor-authorized workspace effects | Unmodeled effects; early misses |
 | Above + qualified confinement and output gating | Execute cache misses ahead of the Actor, then adopt their transactions | Any operation not covered by the confinement proof |
 | Above + copy-on-write/journal acceleration | Reduce capture and materialization cost without changing correctness | No additional authority is inferred from faster storage |
@@ -142,7 +155,7 @@ workspace mount and executable/platform identity remain distinct from native Win
 | [Bazel remote cache](https://bazel.build/remote/caching) | Separate action result and content-addressed artifacts | Declared hermetic actions make identity easier than general Bash |
 | [Build without Bytes](https://blog.bazel.build/2023/10/06/bwob-in-bazel-7.html) | Lazy output materialization can dominate cache economics | Requires a filesystem-backed fault/materialization boundary |
 | [Incr](https://github.com/atlas-brown/incr) / [OSDI paper](https://yizhengx.github.io/p/incr:osdi:2026.pdf) | Unmodified Bash, command-level caching, `strace`, OverlayFS, streaming, introspection and compaction; average 34.2x reported on its workloads | `mtime`-only read validation, distribution-specific environment filtering, and killing an eagerly launched child after a hit are too weak for strict speculative proof |
-| [hS](https://atlas.cs.brown.edu/pdf/hs:osdi:2026.pdf) | Transactional speculative states, sequential commit, conflict restart, effect layering and a speculation-window ablation | Assumes non-malicious scripts and leaves mmap, several aliases/resources, and opacity outside scope |
+| [hS](https://atlas.cs.brown.edu/pdf/hs:osdi:2026.pdf) / [code](https://github.com/binpash/hs) | Sequential commit, streaming conflict restart, layered OverlayFS state, shell-state transfer and a speculation-window ablation | Its implementation needs `strace`, OverlayFS/`try`, mergerfs, namespaces and privileged cgroup/setup access; it reports 217 ms fixed command overhead and excludes mmap I/O, several aliases/resources, time-sensitive scripts and opacity |
 | [ProcessCache dissertation](https://repository.upenn.edu/bitstreams/94d981be-86c5-40e9-8d8a-2d4e625c5b9e/download) | `execve` units, ptrace event filtering, pre/postcondition state machines, close-on-exec-compatible skip stubs and result replay | Its prototype does not fully handle stdin, cross-unit pipes or networking; subtree condition composition remains unfinished |
 | [`try`](https://github.com/binpash/try) | Stackable user/mount-namespace OverlayFS effects and inspection/apply workflow | Explicitly a semisolate, not a security sandbox |
 | [TREC](https://www.usenix.org/legacy/publications/library/proceedings/usenix98/full_papers/vahdat/vahdat.pdf) | Transparent result caching from process lineage and syscall dependencies | Predates current namespace, async-I/O and adversarial surfaces |
@@ -204,8 +217,9 @@ dominate.
 1. Split world routing by operation so Observe has independent requirements from Fork.
 2. Split certificate semantic identity from producer guarantees and migrate the store epoch.
 3. Expose hit-only completed replay before any process fork; it must work without `strace` or Landlock.
-4. Qualify a native Actor exec broker without filesystem substitution: hits replay, misses execute
-   exactly once under observation, and failed capture never triggers re-execution.
+4. Qualify a native Actor exec broker without filesystem substitution: hits replay and misses execute
+   exactly once. Make observation an independent add-on so a hit-only broker does not pretend that a
+   continued miss produced a certificate.
 5. Add Actor-authorized effect capture through the existing generic workspace transaction, without
    claiming speculative authority.
 6. Admit alternative Fork providers through the same qualification contract.
@@ -222,3 +236,8 @@ Actor authority or the exact qualified confinement policy. Producer details rema
 process identity, so a certificate made while the full provider was installed remains useful when
 only the store and hashing layer is available later. The private certificate directory is part of the
 local trust boundary; imports require an authenticated producer, not edited self-describing fields.
+
+Current implementation status matters: whole-command Actor replay and nested replay inside a qualified
+Fork are implemented. Cross-parent nested replay in the real Actor process is not; it requires step 4's
+held-exec provider. The existing PATH interposition is confined to the disposable Fork and must not be
+described as an Actor interceptor.

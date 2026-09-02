@@ -57,6 +57,15 @@ historic certificates does not weaken a strong-key comparison.
   `com.apple.developer.endpoint-security.client` entitlement. macOS must therefore report this backend
   unavailable unless an entitled helper is installed; it must not silently fall back to incomplete
   FSEvents or library interposition.
+- [ProcessCache](https://repository.upenn.edu/bitstreams/94d981be-86c5-40e9-8d8a-2d4e625c5b9e/download)
+  demonstrates the missing online boundary directly: it makes the decision at `execve`, substitutes a
+  tiny exit image so close-on-exec semantics occur, and then replays effects and output. Plain `strace`
+  can discover the same event but cannot perform this substitution.
+- [hS](https://www.usenix.org/conference/osdi26/presentation/liargkovas) uses streamed `strace`
+  information to stop conflicting work early, not to turn a completed trace into a cache hit. Its
+  source runs each region through `try`/OverlayFS and transfers selected shell state; the published
+  setup also requires mergerfs, namespaces, cgroup privileges, and Python preprocessing. This is a
+  useful high-capability Fork reference, not a minimum-dependency Actor path.
 
 This leads to a platform-driver boundary with separately probed capabilities: process-tree capture,
 complete read/probe/enumeration observation, write containment, nondeterminism denial, and atomic
@@ -337,11 +346,20 @@ measurements are preserved in `bench/results/wsl2-overlayfs-workspace-driver-202
 
 ## Partial execution reuse
 
-Completed top-level process invocations and nested `execve` subtrees now share the same certificate,
-pathset validation, artifact closure, and typed workspace transaction. An exact repeated Bash can be
-replayed before its shell starts; a different parent Bash falls through to child-level matching.
-Keeping both granularities in one planner prevents a second Bash-text cache from diverging from the
-process proof model.
+Completed top-level process invocations and nested `execve` subtrees share the same certificate,
+pathset validation, artifact closure, and typed workspace transaction. Today an exact repeated Actor
+Bash can be replayed before its shell starts, while child-level matching is available only inside the
+qualified speculative Fork. A different real Actor Bash still executes normally: its children are not
+yet held at `execve`. Keeping both granularities in one planner prevents a second Bash-text cache from
+diverging from the process proof model, but does not itself provide that interception boundary.
+
+The next provider is consequently hit-only first. It holds an Actor child before the new executable's
+first instruction, asks the existing planner to validate a completed certificate, and either replays
+through the child's inherited output contract or continues the original syscall exactly once. Miss
+observation is a separate capability because a process may have only one `ptrace` tracer and because
+post-run evidence cannot retroactively make an uncontained execution reusable. Pipelines, redirected
+descriptors, privileged executables, trace-sensitive programs, and signal exits remain bypasses until
+their semantics are represented rather than inferred from command text.
 
 [CRIU](https://criu.org/Checkpoint/Restore) can restore memory, descriptors, namespaces, and process
 trees, but its documentation treats many mounts, files, sockets, and devices as external resources.
