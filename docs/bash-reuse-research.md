@@ -337,6 +337,12 @@ measurements are preserved in `bench/results/wsl2-overlayfs-workspace-driver-202
 
 ## Partial execution reuse
 
+Completed top-level process invocations and nested `execve` subtrees now share the same certificate,
+pathset validation, artifact closure, and typed workspace transaction. An exact repeated Bash can be
+replayed before its shell starts; a different parent Bash falls through to child-level matching.
+Keeping both granularities in one planner prevents a second Bash-text cache from diverging from the
+process proof model.
+
 [CRIU](https://criu.org/Checkpoint/Restore) can restore memory, descriptors, namespaces, and process
 trees, but its documentation treats many mounts, files, sockets, and devices as external resources.
 Checkpoint adoption is therefore reserved for a later, stricter profile: a stopped, namespace-contained
