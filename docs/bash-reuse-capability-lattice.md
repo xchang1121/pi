@@ -46,7 +46,7 @@ semantic identity     executable digest, argv, cwd, environment, stdin/FDs,
                       credentials, limits, signals, platform semantics
 dynamic dependencies  file contents and metadata, directories, negative lookups,
                       symlink resolution and every other admitted input
-result transaction    ordered stdout/stderr/exit plus typed, immutable filesystem effects
+result transaction    ordered stdout/stderr/exit plus exact before -> after workspace transitions
 producer guarantee    how observation, containment, trace completeness and output gating
                       were established
 ```
@@ -74,7 +74,8 @@ For a completed result:
 2. validate each distinct dynamic pathset once against the Actor-visible state;
 3. load and integrity-check the complete artifact closure before changing the workspace;
 4. reserve the certificate for this Actor action;
-5. atomically apply its typed effects, then return its ordered output and exit status; and
+5. compare every saved before-state again while transaction locks are held, apply the typed
+   after-states, then return ordered output and exit status; and
 6. roll back or fail the Actor call if commit cannot be completed exactly.
 
 For an exact in-flight duplicate, the Actor may join the existing future only when both executions
