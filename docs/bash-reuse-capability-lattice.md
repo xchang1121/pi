@@ -95,7 +95,7 @@ These are cumulative capability combinations, not user-facing levels:
 
 | Available mechanisms | Safe useful behavior | Deliberately unavailable |
 | --- | --- | --- |
-| Certificate store + exact hashing/CAS | Replay compatible completed Actor certificates before shell launch; the Pi host executor remains the miss path | New process execution before Actor authorization |
+| Certificate store + exact hashing/CAS | Replay compatible completed certificates before shell launch; the Pi host executor remains the miss path | New process execution before Actor authorization |
 | Above + `strace -f` | Observe an Actor-authorized top-level command and publish strict read-only certificates | Child substitution and speculative misses |
 | Above + exact workspace transaction | Learn and replay typed workspace effects | Unmodeled effects; early misses |
 | Above + user/mount namespace and pre-`execve` broker | Reuse completed or identical in-flight child subtrees across different Actor Bash strings; Actor misses execute and teach the store | Miss execution before Actor authorization |
@@ -197,7 +197,8 @@ command-name allowlist or claims safety from Bash text similarity.
 
 The hit-only path is attached to Pi's process outlet, not to the speculative-world probe. It validates
 the same persistent certificate and exact transition bundle used by the full Linux provider and then
-falls through to Pi on a miss. Its producer policy currently accepts only certificates observed under
-Actor authority by the matching observer epoch. The private certificate directory is therefore part
-of the local trust boundary; importing certificates requires an authenticated producer, not editing
-the self-describing proof fields.
+falls through to Pi on a miss. Its producer policy accepts the matching observer epoch under either
+Actor authority or the exact qualified confinement policy. Producer details remain outside semantic
+process identity, so a certificate made while the full provider was installed remains useful when
+only the store and hashing layer is available later. The private certificate directory is part of the
+local trust boundary; imports require an authenticated producer, not edited self-describing fields.
