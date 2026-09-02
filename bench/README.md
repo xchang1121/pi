@@ -21,6 +21,8 @@ The direct/strace/child-replay dependency ablation is recorded in
 [`results/wsl2-dependency-ablation-2419f16-2026-09-03.md`](./results/wsl2-dependency-ablation-2419f16-2026-09-03.md).
 The held-exec boundary and tracing-provider interaction are recorded in
 [`results/wsl2-exec-boundary-47b2ce6-2026-09-03.md`](./results/wsl2-exec-boundary-47b2ce6-2026-09-03.md).
+The completed-child, running-child join, and changed-input miss conversion probe is recorded in
+[`results/wsl2-held-child-conversion-6b7579d-2026-09-03.md`](./results/wsl2-held-child-conversion-6b7579d-2026-09-03.md).
 
 Measure the cost and semantic boundary of pass-through process tracing separately from provenance
 capture. The runner compares a fork/exec-event-only ptrace loop, ordinary process-filtered strace,
