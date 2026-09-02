@@ -18,8 +18,12 @@ share certificates and transactions, but carry different authority:
 | Fork | Execute before Actor authorization | All observation requirements plus complete containment and gated effects/output | Do not execute when containment is unavailable |
 
 `strace` belongs to Observe and Fork. It supplies evidence after events occur; it supplies no authority
-to perform an event. Landlock, a correctly configured namespace sandbox, or another confinement
-provider belongs only to Fork. Consequently, lack of Landlock must not disable Replay or Observe.
+to perform an event. A completed second trace can confirm that two executions happened to use the
+same resources, but that is too late to skip any of the second execution. An online reuse decision
+instead validates the first execution's certificate before the second `execve`; tracing the second
+process is needed only on a miss. Landlock, a correctly configured namespace sandbox, or another
+confinement provider belongs only to Fork. Consequently, lack of Landlock must not disable Replay or
+Actor-authorized execution, although observation alone does not create an interception boundary.
 
 The phase is part of route selection. Advertising one undifferentiated capability set for both
 authoritative capture and speculative execution is incorrect: it makes a strong Fork dependency a
@@ -86,8 +90,16 @@ cost, it starts the authoritative command instead and leaves the speculative run
 learning.
 
 Different parent Bash commands cannot join their already-running shell states. They can reuse at the
-next child `execve`: an Actor-side broker pauses the child before launch, validates an earlier child
-certificate, and either replays it or lets the Actor-authorized miss execute under observation.
+next child `execve`: an Actor-side broker pauses the child before its first user instruction, validates
+an earlier child certificate, and either replays it through a close-on-exec-compatible exit stub or
+lets the Actor-authorized miss execute under observation. This is an active `ptrace`/seccomp executor,
+not two completed `strace` logs compared afterward.
+
+Mounting wrapper files over every `PATH` directory is adequate inside a disposable speculative world,
+but not a transparent Actor interceptor: shell builtins can observe the substituted inode, link and
+directory metadata. Source rewriting and `DEBUG` traps likewise change Bash semantics and cannot cover
+every dynamic exec. The Actor tier therefore keeps the native shell filesystem and stops real exec
+events; an unavailable native broker removes this tier rather than silently selecting a weaker hook.
 
 ## Minimum dependency combinations
 
@@ -96,9 +108,9 @@ These are cumulative capability combinations, not user-facing levels:
 | Available mechanisms | Safe useful behavior | Deliberately unavailable |
 | --- | --- | --- |
 | Certificate store + exact hashing/CAS | Replay compatible completed certificates before shell launch; the Pi host executor remains the miss path | New process execution before Actor authorization |
-| Above + `strace -f` | Observe an Actor-authorized top-level command and publish strict read-only certificates | Child substitution and speculative misses |
-| Above + exact workspace transaction | Learn and replay typed workspace effects | Unmodeled effects; early misses |
-| Above + user/mount namespace and pre-`execve` broker | Reuse completed or identical in-flight child subtrees across different Actor Bash strings; Actor misses execute and teach the store | Miss execution before Actor authorization |
+| Above + `strace -f` | Audit an Actor-authorized execution and measure observation cost | No online child substitution; strict Bash certificates are commonly tainted by shell startup inputs |
+| Above + native pre-`execve` broker | Reuse completed or identical in-flight child units across different Actor Bash strings; Actor misses execute once and teach the store | Miss execution before Actor authorization |
+| Above + exact workspace transaction | Learn and atomically replay typed Actor-authorized workspace effects | Unmodeled effects; early misses |
 | Above + qualified confinement and output gating | Execute cache misses ahead of the Actor, then adopt their transactions | Any operation not covered by the confinement proof |
 | Above + copy-on-write/journal acceleration | Reduce capture and materialization cost without changing correctness | No additional authority is inferred from faster storage |
 
@@ -131,6 +143,7 @@ workspace mount and executable/platform identity remain distinct from native Win
 | [Build without Bytes](https://blog.bazel.build/2023/10/06/bwob-in-bazel-7.html) | Lazy output materialization can dominate cache economics | Requires a filesystem-backed fault/materialization boundary |
 | [Incr](https://github.com/atlas-brown/incr) / [OSDI paper](https://yizhengx.github.io/p/incr:osdi:2026.pdf) | Unmodified Bash, command-level caching, `strace`, OverlayFS, streaming, introspection and compaction; average 34.2x reported on its workloads | `mtime`-only read validation, distribution-specific environment filtering, and killing an eagerly launched child after a hit are too weak for strict speculative proof |
 | [hS](https://atlas.cs.brown.edu/pdf/hs:osdi:2026.pdf) | Transactional speculative states, sequential commit, conflict restart, effect layering and a speculation-window ablation | Assumes non-malicious scripts and leaves mmap, several aliases/resources, and opacity outside scope |
+| [ProcessCache dissertation](https://repository.upenn.edu/bitstreams/94d981be-86c5-40e9-8d8a-2d4e625c5b9e/download) | `execve` units, ptrace event filtering, pre/postcondition state machines, close-on-exec-compatible skip stubs and result replay | Its prototype does not fully handle stdin, cross-unit pipes or networking; subtree condition composition remains unfinished |
 | [`try`](https://github.com/binpash/try) | Stackable user/mount-namespace OverlayFS effects and inspection/apply workflow | Explicitly a semisolate, not a security sandbox |
 | [TREC](https://www.usenix.org/legacy/publications/library/proceedings/usenix98/full_papers/vahdat/vahdat.pdf) | Transparent result caching from process lineage and syscall dependencies | Predates current namespace, async-I/O and adversarial surfaces |
 | [shournal](https://github.com/tycho-kirchner/shournal) / [paper](https://pmc.ncbi.nlm.nih.gov/articles/PMC10901821/) | Low-overhead shell provenance and practical file tracking | Provenance and partial hashes are not complete replay certificates |
@@ -173,6 +186,13 @@ network/IPC attempts, interactive descriptors, unsupported ioctls, artifact corr
 timeouts and commit rollback. A performance result is discarded unless output, exit status and final
 workspace match the direct Actor run and every unsafe case fails closed.
 
+The Trace row is also a yield ablation. A real `/bin/bash -c` startup calls `getrandom` and observes
+process identity even for trivial commands. Bare strace observes but does not control these inputs, so
+strict top-level publication normally yields no reusable certificate. This negative result must remain
+visible: deleting those taints would manufacture hits rather than prove equivalence. The useful
+no-Landlock tier moves observation below the native exec broker, where each child has its own semantic
+identity and trace.
+
 The admission ablation sweeps concurrent speculation width rather than selecting a fixed threshold.
 It compares expected Actor service time against speculative remaining time plus measured validation
 and commit cost. This follows [LATE](https://www.usenix.org/legacy/event/osdi08/tech/full_papers/zaharia/zaharia_html/)
@@ -184,10 +204,10 @@ dominate.
 1. Split world routing by operation so Observe has independent requirements from Fork.
 2. Split certificate semantic identity from producer guarantees and migrate the store epoch.
 3. Expose hit-only completed replay before any process fork; it must work without `strace` or Landlock.
-4. Add Actor-authorized top-level observation, first for no-workspace-effect certificates and then via
-   the existing generic workspace transaction.
-5. Run the existing child broker in Actor mode: hits replay, misses execute normally and publish,
-   without claiming speculative authority.
+4. Qualify a native Actor exec broker without filesystem substitution: hits replay, misses execute
+   exactly once under observation, and failed capture never triggers re-execution.
+5. Add Actor-authorized effect capture through the existing generic workspace transaction, without
+   claiming speculative authority.
 6. Admit alternative Fork providers through the same qualification contract.
 7. Implement the ablation rows above and expose only plain-language TUI capabilities derived from
    successful probes.
