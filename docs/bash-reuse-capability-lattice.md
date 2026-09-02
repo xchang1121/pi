@@ -108,6 +108,11 @@ describes itself as a low-level toolkit, so binary presence alone is never quali
 policy must prove process-tree containment, write confinement, network/IPC denial, nondeterminism
 handling, and cleanup.
 
+Namespace setup must preserve Actor-visible process identity. The Linux provider maps the current UID
+and GID to themselves and retains only the namespace capabilities needed for private mounts; mapping
+the Actor user to namespace root would make otherwise ordinary commands such as `id -u` observably
+different before reuse is even considered.
+
 Windows can participate immediately in certificate replay when semantic/platform fingerprints match.
 A native Observe/Fork provider requires BuildXL-grade process propagation and filesystem/registry
 coverage; raw Detours hooks or filesystem watchers are not equivalent. WSL is a Linux provider whose
