@@ -25,13 +25,16 @@ process is needed only on a miss. Landlock, a correctly configured namespace san
 confinement provider belongs only to Fork. Consequently, lack of Landlock must not disable Replay or
 Actor-authorized execution, although observation alone does not create an interception boundary.
 
-Three mechanisms that are often called "tracing" must therefore remain separate:
+Mechanisms often grouped under "tracing" have materially different authority:
 
-| Mechanism | Decision point | Can prevent the second child from starting? | Role here |
+| Mechanism | Boundary | Can replace the second execution? | Qualification |
 | --- | --- | --- | --- |
-| completed `strace`/fanotify/eBPF log | after the event | No | dependency evidence and measurement |
-| eager launch followed by kill | after some Actor work has escaped | No | unsafe performance ablation only |
-| held `execve` (`ptrace` or seccomp user notification) | before the new image executes user code | Yes | online child replay boundary |
+| completed or streamed `strace` log | syscall events after they have started | No | evidence, conflict detection, and measurement only |
+| eager launch followed by kill | after Actor work may have escaped | No | unsafe performance ablation only |
+| `PTRACE_O_TRACEEXEC` | successful `execve`, after image replacement but before its first user instruction | Yes, by terminating the stopped image through an exit stub | ptrace itself suppresses set-ID/file-capability transitions and changes observable tracing/signal behavior; it is valid only in an explicitly matched ptraced execution domain |
+| seccomp user notification | syscall entry | Not by itself: a successful `execve` has no return continuation to spoof | a hit needs a cooperative stub or a separately safe process-rewrite mechanism; `CONTINUE` also has the kernel-documented TOCTOU race |
+| `FAN_OPEN_EXEC_PERM` | executable open permission | No; it can allow or deny the open | permission groups require `CAP_SYS_ADMIN`, expose no general result-substitution operation, and fanotify has documented coverage/overflow gaps |
+| eBPF/LSM hooks | kernel policy/audit hooks | No general user-space transaction substitution | privileged deployment and useful mainly as lower-overhead observation or denial |
 
 Incr's streaming executor is the second case: it starts the real child while validating and kills it
 on a hit. That overlaps lookup with useful work, but an emitted byte or external side effect cannot be
@@ -105,8 +108,10 @@ learning.
 Different parent Bash commands cannot join their already-running shell states. They can reuse at the
 next child `execve`: an Actor-side broker pauses the child before its first user instruction, validates
 an earlier child certificate, and either replays it through a close-on-exec-compatible exit stub or
-lets the Actor-authorized miss execute under observation. This is an active `ptrace`/seccomp executor,
-not two completed `strace` logs compared afterward.
+lets the Actor-authorized miss execute under observation. This requires an active executor, not two
+`strace` logs compared afterward. A ptrace implementation must key certificates by the ptraced process
+semantics and bypass the route when those semantics are not acceptable; a seccomp-only implementation
+cannot synthesize the non-returning success semantics of `execve`.
 
 Mounting wrapper files over every `PATH` directory is adequate inside a disposable speculative world,
 but not a transparent Actor interceptor: shell builtins can observe the substituted inode, link and
