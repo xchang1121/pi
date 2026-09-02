@@ -345,6 +345,11 @@ Completed-result/effect replay remains the default because it has a much smaller
 
 ## Ordered implementation backlog
 
+The phase/capability split, minimum dependency combinations, completed and in-flight conversion
+protocols, and required ablation matrix are maintained in
+[`bash-reuse-capability-lattice.md`](./bash-reuse-capability-lattice.md). That document is the current
+implementation contract; the list below records the earlier storage/certificate work that led to it.
+
 1. Share one exact dynamic-pathset capture across historic strong keys (implemented and qualified).
 2. Load and integrity-check a certificate's complete artifact closure once before replay; replay only
    from the verified in-memory lease (implemented and qualified).
