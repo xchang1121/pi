@@ -27,6 +27,12 @@ on the hit path. A changed input missed and continued the held Actor child exact
 The top-level Bash trace observed descriptor, PID and random inputs and therefore produced
 zero persistent whole-command hits. Those taints remain visible rather than being relaxed.
 
+A later coverage probe at `709a2ff` made the existing helper save its cwd as a directory FD,
+change to `/`, and return with `fchdir` before doing useful work. The production parser, sealing,
+cross-parent replay, and changed-input miss all remained valid: direct was 1007.91 ms, cold Fork
+was 2773.72 ms, and the cross-parent child hit was 1610.54 ms (**1.72x** versus cold). This proves
+the additional hit coverage without adding a command-specific policy or a second benchmark path.
+
 The Git/OverlayFS pair is a small-tree result and does not establish a storage winner;
 setup and host noise dominate. The automatic route correctly keeps Git below the qualified
 tree-size crossover. FUSE changes performance only, never proof authority.
