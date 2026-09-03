@@ -147,9 +147,9 @@ change: mounting alone is not the optimization; sharing the immutable-lower snap
 typed upper frontier removes repeated tree reconstruction work.
 
 The private kernel-mount experiment also succeeded technically: the parent could inspect the merged
-view through `/proc/<helper-pid>/root`. It remains only as `npm run bench:overlay-view`. The production
-Bash world creates a later PID/mount namespace and remounts `/proc`, so relying on that helper path
-would couple correctness to namespace layout. Host-visible FUSE avoids that hidden dependency while
+view through `/proc/<helper-pid>/root`. The production Bash world creates a later PID/mount namespace
+and remounts `/proc`, so relying on that helper path would couple correctness to namespace layout.
+The rejected standalone probe was removed; host-visible FUSE avoids the hidden dependency while
 remaining unprivileged and leaving no daemon between branches.
 
 Per-run JSON is intentionally omitted after review. Results are host- and fixture-specific. They qualify this WSL2
