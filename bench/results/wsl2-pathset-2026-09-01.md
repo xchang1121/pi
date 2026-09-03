@@ -30,11 +30,4 @@ hit across a different parent command, replayed output and the regular-file arti
 freshness validation succeeded. The shared-pathset runs additionally require exactly one pathset
 capture and reject reading the 32 MiB input twice.
 
-Raw reports:
-
-- `wsl2-pathset-ae68fb0-run1.json`
-- `wsl2-pathset-ae68fb0-run2.json`
-- `wsl2-pathset-ae68fb0-run3.json`
-- `wsl2-pathset-stage7-run1.json`
-- `wsl2-pathset-stage7-run2.json`
-- `wsl2-pathset-stage7-run3.json`
+Per-run JSON is intentionally omitted; this reviewed table is the retained evidence.

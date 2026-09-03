@@ -36,11 +36,4 @@ any mismatch between the structural observation and transaction delta make the e
 They are not approximated as ordinary file writes. The process monitor epoch was advanced so
 certificates produced before these stronger rules cannot be selected by the new backend.
 
-Raw reports:
-
-- `wsl2-transaction-delta-5ecfaf2-run1.json`
-- `wsl2-transaction-delta-5ecfaf2-run2.json`
-- `wsl2-transaction-delta-5ecfaf2-run3.json`
-- `wsl2-transaction-delta-stage9-run1.json`
-- `wsl2-transaction-delta-stage9-run2.json`
-- `wsl2-transaction-delta-stage9-run3.json`
+Per-run JSON is intentionally omitted; this reviewed table is the retained evidence.

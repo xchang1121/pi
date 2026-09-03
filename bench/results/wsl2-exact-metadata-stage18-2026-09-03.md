@@ -1,8 +1,7 @@
 # Exact metadata equivalence, WSL2
 
 The stage-18 run uses the stock Pi Bash outlet on WSL2 (Linux 6.18.33.2, x86-64) and the production
-Sandlock/strace/held-exec route. Raw measurements are in
-`wsl2-exact-metadata-stage18-run1.json`.
+Sandlock/strace/held-exec route. The reviewed measurements are retained below.
 
 | Case | Direct / Actor time | Result |
 | --- | ---: | --- |

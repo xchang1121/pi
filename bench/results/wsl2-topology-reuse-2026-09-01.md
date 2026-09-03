@@ -51,9 +51,5 @@ cost estimate (validation, artifact bytes, branch setup, and commit), with a con
 before a completed result is admitted. Directory support is retained for semantic coverage and the
 qualified expensive-task gain; the short-task regression is not treated as a win.
 
-Raw reports:
-
-- `wsl2-topology-direct-run1.json` through `wsl2-topology-direct-run5.json`
-- `wsl2-topology-reuse-run1.json` through `wsl2-topology-reuse-run5.json`
-- `wsl2-topology-short-direct-run1.json` and `wsl2-topology-short-reuse-run1.json`
-- `wsl2-topology-boundary-direct-run1.json` and `wsl2-topology-boundary-reuse-run1.json`
+Per-run JSON is intentionally omitted; the positive and negative aggregate results
+above are the retained evidence.

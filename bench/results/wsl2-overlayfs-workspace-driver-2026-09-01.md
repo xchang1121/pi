@@ -138,8 +138,8 @@ sealing. The contemporaneous comparison recorded during qualification was slower
 - small hit: 689.996 ms COW versus 685.957 ms Git;
 - 32 MiB hit median: 979.703 ms COW versus 920.609 ms Git, about 6.4% slower.
 
-The two unoptimized COW JSON reports are preserved. Their contemporaneous Git raw files were
-overwritten by later qualification runs before evidence was staged, so the exact percentages above
+The two unoptimized COW measurements are preserved in this reviewed report. Their contemporaneous
+Git measurements were overwritten by later qualification runs before evidence was staged, so the exact percentages above
 are retained as a historical observation rather than presented as a fully reproducible paired A/B.
 This provenance gap is itself recorded here instead of being hidden. The complete stage15 and stage17
 paired reports are the evidence used for admission. The negative run still explains the structural
@@ -152,21 +152,6 @@ Bash world creates a later PID/mount namespace and remounts `/proc`, so relying 
 would couple correctness to namespace layout. Host-visible FUSE avoids that hidden dependency while
 remaining unprivileged and leaving no daemon between branches.
 
-## Raw retained reports
-
-- Main A/B and small control:
-  `wsl2-workspace-driver-stage15-small-auto-run{1,2,3}.json`,
-  `wsl2-workspace-driver-stage15-topology-{500,1000}-{git,overlayfs}-run{1,2,3}.json`
-- Production-selector checks:
-  `wsl2-workspace-driver-stage15-topology-1000-auto-run1.json` and
-  `wsl2-workspace-driver-stage16-*-verification.json`
-- Boundary A/B:
-  `wsl2-workspace-driver-stage17-topology-{100,250}-{git,overlayfs}-run{1,2}.json`
-- Preserved regression:
-  `wsl2-workspace-driver-stage14-overlayfs-unoptimized-run1.json` and
-  `wsl2-workspace-driver-stage14-topology-overlayfs-unoptimized-run1.json`
-
-The JSON contains machine facts, timings, counters, driver fingerprints, and correctness assertions;
-it contains no prompts or model data. Results are host- and fixture-specific. They qualify this WSL2
+Per-run JSON is intentionally omitted after review. Results are host- and fixture-specific. They qualify this WSL2
 implementation and selector but do not replace workload-distribution measurements from a long-running
 agent deployment.

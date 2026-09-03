@@ -13,9 +13,8 @@ store, with `sandlock`, `strace`, and `unshare` each configured to a deliberatel
 nonexistent absolute path. Consequently a hit could not accidentally reuse a cached
 successful dependency probe from the producer backend.
 
-Raw results: [run 1](./wsl2-exec-boundary-72c8105-run1.json),
-[run 2](./wsl2-exec-boundary-72c8105-run2.json), and
-[run 3](./wsl2-exec-boundary-72c8105-run3.json).
+Per-run JSON is intentionally omitted; the reproduction command below regenerates
+the measurements locally.
 
 ## Conversion result
 

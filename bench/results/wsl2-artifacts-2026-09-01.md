@@ -30,11 +30,4 @@ reopening the backing CAS file, so deletion after planning cannot turn a partial
 a fallback execution. Output wire materialization and every file-effect buffer are also prepared
 before the transactional workspace commit begins.
 
-Raw reports:
-
-- `wsl2-artifacts-8019994-run1.json`
-- `wsl2-artifacts-8019994-run2.json`
-- `wsl2-artifacts-8019994-run3.json`
-- `wsl2-artifacts-stage8-run1.json`
-- `wsl2-artifacts-stage8-run2.json`
-- `wsl2-artifacts-stage8-run3.json`
+Per-run JSON is intentionally omitted; this reviewed table is the retained evidence.

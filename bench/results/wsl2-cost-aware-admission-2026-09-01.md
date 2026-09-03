@@ -27,8 +27,7 @@ low Actor quantile, high speculative and adoption quantiles, and the existing 25
 margin. Completed work has no execution wait and falls back only when measured adoption is slower
 than direct execution. Upper empirical selection makes q90 speculative and q75 adoption choose the
 largest of three samples, while lower empirical q25 Actor chooses the smallest direct observation;
-this is why the policy-net columns are more conservative than subtracting the displayed medians. The
-raw JSON retains every observation and the complete decision object.
+this is why the policy-net columns are more conservative than subtracting the displayed medians.
 
 ## What the boundary disproved
 
@@ -36,7 +35,7 @@ The 43-round point first failed an expected-fallback assertion: the initial anal
 window's lower-index interpolation, so three samples made its nominal q90/q75 equal the median and
 reported `+49.37 ms / join`. Review rejected that statistical interpretation. The retained policy
 uses upper empirical selection for costs and now reports `-15.35 ms / fallback`. The earlier decision
-is documented here rather than erased; none of its raw timings were discarded.
+is documented here rather than erased.
 
 The fresh 48-round run selected an in-flight join with 47.13 ms estimated benefit. The earlier typed-
 topology qualification measured the same nominal 48-round workload at only 20.61 ms faster than
@@ -66,13 +65,10 @@ unprofitable. If no measured Actor counterfactual exists at all, established reu
 preserved until the Runtime obtains one rather than manufacturing a duration threshold from a
 potentially stale source hint.
 
-The raw benchmark measures the three cost components independently, then invokes the exact
+The benchmark measures the three cost components independently, then invokes the exact
 production scheduler model. Runtime deadline, fallback, and non-cancellation behavior are covered by
 the Runtime integration test; this report does not claim that a synthetic Actor race was timed by the
 benchmark harness.
 
-Raw reports:
-
-- `wsl2-admission-stage13-r{0,40,43,48,96}-direct.json`
-- `wsl2-admission-stage13-r{0,40,43,48,96}-reuse.json`
-- `wsl2-admission-stage13-r{0,40,43,48,96}-decision.json`
+Per-run JSON is intentionally omitted; this reviewed report retains the decisions and
+aggregate measurements.

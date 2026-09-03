@@ -10,10 +10,10 @@ This runner measures one speculative execution and reconstructs its serialized
 counterfactual from the same authoritative timeline. It never compares against
 a separately generated Actor trajectory.
 
-Ablation reports, preregistrations, and private recordings are intentionally
-kept outside this repository. The checked-in runner and suites remain the
-reproducible measurement surface. Machine-qualification results for the Linux
-process substrate contain no prompts or model data and live under `results/`.
+Ablation preregistrations, private recordings, and raw JSON runs are intentionally
+kept outside this repository. The checked-in runners and reviewed Markdown summaries
+under `results/` remain the reproducible measurement surface without accumulating
+per-run snapshots.
 
 The current-head structural-refactor acceptance is recorded in
 [`results/wsl2-structural-refactor-96b2778-2026-09-01.md`](./results/wsl2-structural-refactor-96b2778-2026-09-01.md).
@@ -23,10 +23,9 @@ The held-exec boundary and tracing-provider interaction are recorded in
 [`results/wsl2-exec-boundary-47b2ce6-2026-09-03.md`](./results/wsl2-exec-boundary-47b2ce6-2026-09-03.md).
 The completed-child, running-child join, and changed-input miss conversion probe is recorded in
 [`results/wsl2-held-child-conversion-6b7579d-2026-09-03.md`](./results/wsl2-held-child-conversion-6b7579d-2026-09-03.md).
-The current minimum-dependency, completed/running-transfer, and Git/OverlayFS ablation is recorded in
-[`results/wsl2-capability-ablation-c0d4c96-2026-09-03.md`](./results/wsl2-capability-ablation-c0d4c96-2026-09-03.md),
-with the Runtime-owned in-flight raw result in
-[`results/wsl2-runtime-inflight-c0d4c96-2026-09-03.json`](./results/wsl2-runtime-inflight-c0d4c96-2026-09-03.json).
+The current minimum-dependency, completed/running-transfer, Runtime-owned in-flight,
+and Git/OverlayFS ablation is recorded in
+[`results/wsl2-capability-ablation-c0d4c96-2026-09-03.md`](./results/wsl2-capability-ablation-c0d4c96-2026-09-03.md).
 
 Measure the cost and semantic boundary of pass-through process tracing separately from provenance
 capture. The runner compares a fork/exec-event-only ptrace loop, ordinary process-filtered strace,

@@ -40,15 +40,4 @@ An earlier alternate-index prototype was rejected before qualification. Writing 
 then reading the changed blob back made its cold median 8.6% slower than its interleaved base. No
 part of that object-writing path remains in the retained implementation.
 
-Raw reports:
-
-- `wsl2-workspace-frontier-3671ec8-run1.json`
-- `wsl2-workspace-frontier-3671ec8-run2.json`
-- `wsl2-workspace-frontier-3671ec8-run3.json`
-- `wsl2-workspace-frontier-3671ec8-run4.json`
-- `wsl2-workspace-frontier-3671ec8-run5.json`
-- `wsl2-workspace-frontier-stage11-run1.json`
-- `wsl2-workspace-frontier-stage11-run2.json`
-- `wsl2-workspace-frontier-stage11-run3.json`
-- `wsl2-workspace-frontier-stage11-run4.json`
-- `wsl2-workspace-frontier-stage11-run5.json`
+Per-run JSON is intentionally omitted; this reviewed table is the retained evidence.

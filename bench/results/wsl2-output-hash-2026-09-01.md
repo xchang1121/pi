@@ -30,11 +30,4 @@ Input and write-before bytes are still SHA-256 sealed when required for freshnes
 hashing was removed; the exact bytes remain in the immutable `SandboxFileChange` transaction used by
 commit. Any structural/delta mismatch continues to make evidence incomplete.
 
-Raw reports:
-
-- `wsl2-output-hash-43a4518-run1.json`
-- `wsl2-output-hash-43a4518-run2.json`
-- `wsl2-output-hash-43a4518-run3.json`
-- `wsl2-output-hash-stage10-run1.json`
-- `wsl2-output-hash-stage10-run2.json`
-- `wsl2-output-hash-stage10-run3.json`
+Per-run JSON is intentionally omitted; this reviewed table is the retained evidence.
