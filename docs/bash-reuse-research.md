@@ -61,6 +61,11 @@ historic certificates does not weaken a strong-key comparison.
   demonstrates the missing online boundary directly: it makes the decision at `execve`, substitutes a
   tiny exit image so close-on-exec semantics occur, and then replays effects and output. Plain `strace`
   can discover the same event but cannot perform this substitution.
+- [AgentSH](https://github.com/canyonroad/agentsh) and the Linux
+  [`ptrace`](https://man7.org/linux/man-pages/man2/ptrace.2.html) contract provide a maintained reference
+  for `PTRACE_SEIZE`, automatic child stops, exec events, and `PTRACE_LISTEN` job-control handling. Pi's
+  helper uses those kernel semantics but retains its own authenticated two-phase result transaction;
+  no AgentSH source is embedded.
 - [hS](https://www.usenix.org/conference/osdi26/presentation/liargkovas) uses streamed `strace`
   information to stop conflicting work early, not to turn a completed trace into a cache hit. Its
   source runs each region through `try`/OverlayFS and transfers selected shell state; the published
@@ -347,19 +352,20 @@ measurements are preserved in `bench/results/wsl2-overlayfs-workspace-driver-202
 ## Partial execution reuse
 
 Completed top-level process invocations and nested `execve` subtrees share the same certificate,
-pathset validation, artifact closure, and typed workspace transaction. Today an exact repeated Actor
-Bash can be replayed before its shell starts, while child-level matching is available only inside the
-qualified speculative Fork. A different real Actor Bash still executes normally: its children are not
-yet held at `execve`. Keeping both granularities in one planner prevents a second Bash-text cache from
-diverging from the process proof model, but does not itself provide that interception boundary.
+pathset validation, artifact closure, and typed workspace transaction. An exact repeated Actor Bash
+can be replayed before its shell starts. On x86-64 Linux, a different real Actor Bash can now reuse a
+completed or still-running child: the native helper holds the successful child exec before its first
+instruction, and the existing planner either converts it to the sealed result or continues it once.
+There is still no second Bash-text cache.
 
-The next provider is consequently hit-only first. It holds an Actor child before the new executable's
-first instruction, asks the existing planner to validate a completed certificate, and either replays
-through the child's inherited output contract or continues the original syscall exactly once. Miss
-observation is a separate capability because a process may have only one `ptrace` tracer and because
-post-run evidence cannot retroactively make an uncontained execution reusable. Pipelines, redirected
-descriptors, privileged executables, trace-sensitive programs, and signal exits remain bypasses until
-their semantics are represented rather than inferred from command text.
+The helper deliberately observes exec/fork events only. Miss observation remains separate because a
+process may have only one ptrace tracer and post-run evidence cannot retroactively make an uncontained
+execution reusable. Its process key includes an explicit ptraced execution domain. The producer trace
+also marks security-context reads, confinement-sensitive syscalls, and policy-denied results; such a
+certificate can remain useful inside the identical Sandlock domain but cannot be adopted by the Actor.
+Pipelines, redirected or extra descriptors, privileged executables, trace-sensitive programs, and
+signal exits remain bypasses until their semantics are represented rather than inferred from command
+text.
 
 [CRIU](https://criu.org/Checkpoint/Restore) can restore memory, descriptors, namespaces, and process
 trees, but its documentation treats many mounts, files, sockets, and devices as external resources.

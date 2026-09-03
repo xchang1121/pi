@@ -108,10 +108,18 @@ learning.
 Different parent Bash commands cannot join their already-running shell states. They can reuse at the
 next child `execve`: an Actor-side broker pauses the child before its first user instruction, validates
 an earlier child certificate, and either replays it through a close-on-exec-compatible exit stub or
-lets the Actor-authorized miss execute under observation. This requires an active executor, not two
+lets the Actor-authorized miss continue exactly once. Observation of that miss is an independent
+capability. This requires an active executor, not two
 `strace` logs compared afterward. A ptrace implementation must key certificates by the ptraced process
 semantics and bypass the route when those semantics are not acceptable; a seccomp-only implementation
 cannot synthesize the non-returning success semantics of `execve`.
+
+The implemented x86-64 broker uses `PTRACE_SEIZE` with exec/fork tracing and `PTRACE_LISTEN` for group
+stops. On a hit it first loads a verified result closure, duplicates the stopped child's exact output
+descriptors, and installs an `exit_group(125)` image without releasing it. Only after the workspace
+transaction commits does an authenticated acknowledgement change that stub to the recorded exit code
+and release buffered output. Failure before arming continues the original child; failure after arming
+never runs it a second time. Completed and still-running producers enter this same conversion path.
 
 Mounting wrapper files over every `PATH` directory is adequate inside a disposable speculative world,
 but not a transparent Actor interceptor: shell builtins can observe the substituted inode, link and
@@ -208,8 +216,9 @@ The Trace row is also a yield ablation. A real `/bin/bash -c` startup calls `get
 process identity even for trivial commands. Bare strace observes but does not control these inputs, so
 strict top-level publication normally yields no reusable certificate. This negative result must remain
 visible: deleting those taints would manufacture hits rather than prove equivalence. The useful
-no-Landlock tier moves observation below the native exec broker, where each child has its own semantic
-identity and trace.
+no-Landlock tier instead consumes already-sealed certificates at the native exec boundary. It does not
+claim that a continued Actor miss was observed, so it learns no new certificate without a separate
+complete observer.
 
 The admission ablation sweeps concurrent speculation width rather than selecting a fixed threshold.
 It compares expected Actor service time against speculative remaining time plus measured validation
@@ -242,7 +251,9 @@ process identity, so a certificate made while the full provider was installed re
 only the store and hashing layer is available later. The private certificate directory is part of the
 local trust boundary; imports require an authenticated producer, not edited self-describing fields.
 
-Current implementation status matters: whole-command Actor replay and nested replay inside a qualified
-Fork are implemented. Cross-parent nested replay in the real Actor process is not; it requires step 4's
-held-exec provider. The existing PATH interposition is confined to the disposable Fork and must not be
-described as an Actor interceptor.
+Current implementation status matters: whole-command Actor replay, nested replay inside a qualified
+Fork, and x86-64 cross-parent child replay in the real Actor process are implemented. The Actor provider
+holds native exec events and never substitutes PATH entries; PATH interposition remains confined to the
+disposable Fork. Its hit path needs neither Landlock nor `strace`, but it consumes only previously sealed
+compatible certificates. Other architectures retain whole-command replay until their register/exit-stub
+transition is separately qualified.
