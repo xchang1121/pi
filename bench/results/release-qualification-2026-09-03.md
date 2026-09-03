@@ -30,3 +30,18 @@
   会增加参数面或层间耦合，因此保持局部实现。
 - 477 项测试覆盖不同的行为边界；重复扫描为 0.57%，主要是刻意内联的测试数据和失败断言，
   删除会降低单测独立可读性而不会减少生产复杂度。
+
+## PR #1 合入资格
+
+- 冲突没有保留 PR 新增的平行提交异常；ThinkThread 的可恢复冲突直接进入既有
+  `EffectTransaction`，未知或部分提交仍统一标记为 poisoned，禁止 Actor 二次执行。
+- execution world 增加通用工具作用域。ThinkThread 只提前执行不依赖外部进程的
+  `read`、`ls`、`write`、`edit`；`grep`、`find` 保留 Actor 执行和快照结果复用，Bash
+  保留原 Linux process world / Actor 路径。TUI 的 Fork 与 Observe 状态据此分开计算。
+- Agent POSIX SDK 固定到公开仓库 `v0.1.0` 的
+  `e7287acc187b4b17a9d2a0c8cad2f75f64ed538f`；修复 npm 11 跳过 optional peer 的源码构建，
+  Windows 与 WSL 2 使用同一安装和校验流程完成本地资格测试。
+- 合入树在 Windows 上 505 项通过、11 项明确跳过；WSL 2 原生文件系统 516/516 通过。
+  独立临时 HOME 中的完整 Profile 安装通过。
+- 合入后的真实跨父 Bash 冷执行约 2944 ms，复用约 1680 ms，约 1.75 倍；依赖变化仍会
+  强制 miss。80 个 TypeScript 模块无循环依赖，生产重复率保持 0.06%。
