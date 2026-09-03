@@ -23,6 +23,8 @@ The held-exec boundary and tracing-provider interaction are recorded in
 [`results/wsl2-exec-boundary-47b2ce6-2026-09-03.md`](./results/wsl2-exec-boundary-47b2ce6-2026-09-03.md).
 The completed-child, running-child join, and changed-input miss conversion probe is recorded in
 [`results/wsl2-held-child-conversion-6b7579d-2026-09-03.md`](./results/wsl2-held-child-conversion-6b7579d-2026-09-03.md).
+The production one-shot transfer of a still-running, non-persistable Bash result is recorded in
+[`results/wsl2-inflight-transfer-ebca98b-2026-09-03.json`](./results/wsl2-inflight-transfer-ebca98b-2026-09-03.json).
 
 Measure the cost and semantic boundary of pass-through process tracing separately from provenance
 capture. The runner compares a fork/exec-event-only ptrace loop, ordinary process-filtered strace,
@@ -42,7 +44,12 @@ against real Linux processes:
 ```sh
 npm run setup:linux
 npm run bench:linux-process -- --output bench/results/local.json
+npm run bench:linux-inflight -- --output bench/results/local-inflight.json
 ```
+
+The in-flight qualification starts two Actor consumers while one PID-observing speculative Bash is
+running. Exactly one must validate and claim that result; the other must execute normally, and the
+one-shot certificate must never enter persistent history.
 
 Pass `--workspace-driver git` or `--workspace-driver overlayfs` to the process
 and topology qualifications for a same-machine A/B. `auto` uses OverlayFS only
