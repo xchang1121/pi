@@ -1,97 +1,82 @@
-# WSL2 Bash reuse capability ablation
+# WSL2 Bash 复用能力消融记录
 
-Implementation: `c0d4c96`, with the live-child admission row rerun at `945497a`.
-Process/exec rows were measured at `4affb64`; the top-level in-flight row was rerun
-after the ownership refactor.
+实现版本：`c0d4c96`；其中运行中子进程准入一行在 `945497a` 上重新测量。
+进程/exec 各行在 `4affb64` 上测量；顶层运行中结果一行在所有权重构后重新测量。
 
-Host: Ubuntu 24.04 on WSL2, Linux 6.18.33.2, x86-64, Node 24.20.0,
-Sandlock 0.8.6, strace 6.8. Sources, tools and temporary workspaces were on WSL's
-native filesystem. Each row is an end-to-end production-path run; the tracing rows
-use 20 launches. These measurements qualify mechanisms, not a universal speedup.
+主机环境：WSL2 上的 Ubuntu 24.04、Linux 6.18.33.2、x86-64、Node 24.20.0、
+Sandlock 0.8.6、strace 6.8。源码、工具与临时工作区均位于 WSL 原生文件系统。
+每一行都是生产路径的端到端运行；跟踪相关行执行 20 次。本记录用于验证机制，不代表普遍加速比。
 
-## Dependency and yield
+## 依赖与收益
 
-| Available mechanism | Safe operation demonstrated | Result on this host |
+| 可用机制 | 已验证的安全操作 | 本机结果 |
 | --- | --- | ---: |
-| Pi process outlet only | Execute the Actor command normally | 1009.65 ms for the 1 s workload |
-| Completed store lookup, no matching proof | Fall through to the same outlet | 1014.62 ms; +4.97 ms (noise-scale) |
-| Ordinary `strace` observation | Record dependencies after execution, without authority to speculate | 1024.02 ms; +14.36 ms / 1.014x |
-| Store + native held-`execve` broker | Adopt a completed matching child before its first instruction | 27.84 versus 226.55 ms direct; **8.14x** |
-| Same broker + measured live admission | Join a matching running child only when its remaining work plus adoption is cheaper than Actor execution | 68.83 versus 213.01 ms direct after 400 ms lead; **3.09x**, 144.17 ms saved |
-| Full Sandlock + strace + Git transaction | Produce new proof and effects in advance | 2971.63 ms cold; cross-parent child hit 1897.94 ms / **1.57x** versus cold |
-| Full stack + FUSE OverlayFS | Same proof with a COW storage driver | 3090.93 ms cold; cross-parent hit 1714.24 ms / **1.80x** versus cold |
-| Full stack + Runtime-owned live top-level branch | Adopt one PID-tainted execution in the same turn | 2614.85 versus 4009.66 ms direct after 3 s lead; **1.53x**, 1394.81 ms saved |
+| 仅 Pi 进程出口 | 正常执行 Actor 命令 | 1009.65 ms（1 s 工作负载） |
+| 查询已完成结果存储，但无匹配证明 | 回退到同一执行出口 | 1014.62 ms；+4.97 ms（噪声量级） |
+| 普通 `strace` 观测 | 在执行后记录依赖，但无权提前执行 | 1024.02 ms；+14.36 ms / 1.014x |
+| 结果存储 + 原生 held-`execve` 代理 | 在匹配子进程执行第一条指令前接管其已完成结果 | 27.84 ms，对比直接执行 226.55 ms；**8.14x** |
+| 同一代理 + 实测运行中准入 | 仅当匹配的运行中子进程“剩余工作 + 接管”比 Actor 执行更便宜时加入 | 68.83 ms，对比直接执行 213.01 ms（提前 400 ms）；**3.09x**，节省 144.17 ms |
+| 完整 Sandlock + strace + Git 事务 | 提前生成新证明与副作用 | 冷执行 2971.63 ms；跨父 Bash 子进程命中 1897.94 ms，相对冷执行 **1.57x** |
+| 同一完整栈 + FUSE OverlayFS | 使用写时复制存储驱动生成同一证明 | 冷执行 3090.93 ms；跨父 Bash 命中 1714.24 ms，相对冷执行 **1.80x** |
+| 完整栈 + Runtime 管理的运行中顶层分支 | 在同一轮次内接管一次带 PID 污染的执行 | 2614.85 ms，对比直接执行 4009.66 ms（提前 3 s）；**1.53x**，节省 1394.81 ms |
 
-The completed-child consumer was rerun with deliberately missing Sandlock and strace
-binaries. It still hit, proving those producer dependencies are not accidentally required
-on the hit path. A changed input missed and continued the held Actor child exactly once.
-The top-level Bash trace observed descriptor, PID and random inputs and therefore produced
-zero persistent whole-command hits. Those taints remain visible rather than being relaxed.
+已完成子进程的消费路径还在故意缺失 Sandlock 和 strace 二进制的环境中重新运行并成功命中，
+证明命中路径没有意外依赖这些生产者设施。输入改变时会未命中，并且让暂停的 Actor 子进程恰好
+继续执行一次。顶层 Bash 跟踪观察到了描述符、PID 和随机输入，因此没有产生任何可持久复用的
+整条命令命中。这些污染标记继续对用户可见，而没有为了增加命中率而放宽。
 
-A later coverage probe at `709a2ff` made the existing helper save its cwd as a directory FD,
-change to `/`, and return with `fchdir` before doing useful work. The production parser, sealing,
-cross-parent replay, and changed-input miss all remained valid: direct was 1007.91 ms, cold Fork
-was 2773.72 ms, and the cross-parent child hit was 1610.54 ms (**1.72x** versus cold). This proves
-the additional hit coverage without adding a command-specific policy or a second benchmark path.
+随后在 `709a2ff` 上进行的覆盖探针，让已有 helper 把 cwd 保存为目录 FD、切换到 `/`，再通过
+`fchdir` 返回后执行有效工作。生产解析器、封存、跨父 Bash 重放和输入变化未命中仍全部有效：
+直接执行为 1007.91 ms，冷 Fork 为 2773.72 ms，跨父 Bash 子进程命中为 1610.54 ms（相对
+冷执行 **1.72x**）。这证明新增命中覆盖并未引入命令特定策略或第二条 benchmark 路径。
 
-The live-child rerun first forced a changed-input Actor miss on the same execution class. The native
-exec boundary reported that child's exact lifetime, so the shared scheduler could compare a lower
-Actor quantile with upper speculative-remaining and adoption estimates. Linux uses a zero-wait cold
-start: without an Actor counterfactual it resumes the held child and learns, rather than repeating the
-old unbounded wait. Duplicate speculative producers still coalesce off the Actor critical path. The
-learned lower-quantile estimate reported 134.30 ms saved for the 144.17 ms observed counterfactual;
-an earlier completed hit with no Actor sample reported the hit but zero invented time savings.
+运行中子进程的重新测量，先在同一执行类别上强制制造一次输入变化的 Actor 未命中。原生 exec
+边界会上报该子进程的精确存活时间，因此共享调度器可以比较 Actor 耗时的较低分位数与“投机
+剩余时间 + 接管成本”的较高分位数。Linux 采用零等待冷启动：没有 Actor 反事实样本时，它会恢复
+暂停的子进程并从中学习，而不会重现旧的无上限等待。重复的投机生产者仍会在 Actor 关键路径之外
+合并。学习到的较低分位估计认为可节省 134.30 ms，而实测反事实节省为 144.17 ms；更早的一次
+已完成命中由于没有 Actor 样本，只报告命中，没有虚构节省时间。
 
-The Git/OverlayFS pair is a small-tree result and does not establish a storage winner;
-setup and host noise dominate. The automatic route correctly keeps Git below the qualified
-tree-size crossover. FUSE changes performance only, never proof authority.
+Git/OverlayFS 这一对结果来自小目录树，不能据此判定哪种存储更优；setup 与主机噪声占据主导。
+自动路由会正确地把 Git 保留在已验证的目录树规模交叉点以下。FUSE 只改变性能，绝不改变证明权限。
 
-## Observation boundary
+## 观测边界
 
-For the syscall-heavy microbenchmark, direct execution was 5.81 ms, the exec-event-only
-Actor broker 5.63 ms, ordinary filtered strace 490.90 ms, and strace `--seccomp-bpf`
-8.08 ms. The fast strace mode remains an ablation only: higher-precedence seccomp decisions
-can hide the Sandlock denial that the producer proof must observe. Enabling it would improve
-numbers by weakening evidence.
+在 syscall 密集型微基准中，直接执行为 5.81 ms，仅监听 exec 事件的 Actor 代理为 5.63 ms，
+普通过滤 `strace` 为 490.90 ms，启用 `--seccomp-bpf` 的 strace 为 8.08 ms。快速 strace
+模式仍只作为消融项：优先级更高的 seccomp 决策可能隐藏生产者证明必须观察到的 Sandlock 拒绝。
+启用它确实会改善数字，但代价是削弱证据。
 
-## Safe conversion frontier
+## 安全转换边界
 
-One equivalence contract covers both lanes: semantic process identity, current dynamic dependencies,
-immutable output/artifact closure, exact workspace before-state, producer guarantee and consumer
-contract must all match. Ownership is deliberately singular: the generic Runtime owns top-level
-running/completed branches and their cost-aware admission; the Linux backend's
-`running -> completed -> claimed` transfer state belongs only to matching child `execve` units
-inside otherwise different parent Bash calls. A rejected top-level join can no longer be silently
-reintroduced by the direct process outlet.
+两条通道共用一份等价性契约：语义进程身份、当前动态依赖、不可变输出/产物闭包、精确工作区
+before-state、生产者保证与消费者契约必须全部匹配。所有权被刻意设计为唯一：通用 Runtime
+管理顶层运行中/已完成分支以及基于成本的准入；Linux 后端的 `running -> completed -> claimed`
+转移状态只属于不同父 Bash 调用内部能够匹配的子进程 `execve` 单元。被拒绝的顶层加入不能再被
+直接进程出口悄悄重新引入。
 
-- A clean sealed certificate is reusable across turns and across different parent Bash strings
-  when they reach the same child `execve`.
-- A volatile top-level branch (time, random, PID or descriptor observation) can represent the Actor's
-  exact predicted execution once for its Runtime prediction horizon, even when that horizon crosses a
-  model-turn boundary; it is never persisted. Volatile nested child transfer remains restricted to the
-  same session and turn.
-- A running candidate is not compared with a second running trace. One consumer waits for the
-  original execution to seal, then uses the same validation and atomic commit path as a late hit;
-  a second Actor call executes normally when the volatile branch has been claimed. Waiting is a
-  performance decision made from measured Actor, speculative-service, and adoption distributions;
-  it never substitutes for certificate validation.
-- Network, IPC, interactive descriptors, unmodeled kernel state, incomplete traces and observable
-  confinement differences remain ineligible unless a future resource broker supplies transactional
-  semantics for that resource.
+- 干净且已封存的证书可以跨轮次复用；当不同父 Bash 字符串抵达同一个子进程 `execve` 时，
+  还可以跨父 Bash 复用。
+- 易变的顶层分支（观察了时间、随机数、PID 或描述符）可以在其 Runtime 预测周期内，一次性表示
+  Actor 所预测的精确执行，即使该周期跨越模型轮次边界；它绝不会持久化。易变的嵌套子进程转移
+  仍限制在同一 session 和同一轮次。
+- 运行中候选不会再与第二份运行中跟踪比较。一个消费者等待原始执行封存，再使用与晚到命中相同的
+  验证与原子提交路径；当易变分支已经被认领时，第二次 Actor 调用会正常执行。是否等待是根据
+  Actor、投机服务和接管耗时分布作出的性能决策，绝不能替代证书验证。
+- 网络、IPC、交互式描述符、未建模的内核状态、不完整跟踪，以及可观测的隔离差异仍然不具备复用
+  资格，除非未来的资源代理能为相应资源提供事务语义。
 
-Speculator demonstrates why arbitrary mid-process adoption is a different dependency class: it
-modified the kernel to checkpoint processes, propagate causal dependencies through files and IPC,
-and gate external output. CRIU and DMTCP likewise have to capture or recreate memory, descriptors,
-pipes, sockets, terminals, timers and shared state. Adding either as the default would be heavier
-without making external effects automatically safe. For this plugin, sealed transaction transfer
-is therefore the maximum lightweight frontier; full process checkpointing is only sensible as an
-explicit, fully-contained, long-running profile.
+Speculator 说明了为什么任意进程中途接管属于完全不同的依赖等级：它修改内核以 checkpoint
+进程，通过文件和 IPC 传播因果依赖，并延迟外部输出。CRIU 与 DMTCP 同样必须捕获或重建内存、
+描述符、pipe、socket、终端、timer 与共享状态。把其中任一种设为默认方案都会更重，而且不会
+自动让外部副作用变安全。因此，对本插件而言，封存事务转移就是轻量方案的最大安全边界；只有在
+显式启用、完全隔离且执行时间很长的配置中，完整进程 checkpoint 才有意义。
 
-## Gates and reproduction
+## 正确性门槛与复现方法
 
-All runs required output, exit status and final file equality. They also passed changed-input,
-cross-turn running/completed, inherited-descriptor, exact-metadata and observable-confinement
-negative tests. Windows and WSL each passed all 464 unit/integration tests.
+所有运行都要求输出、退出状态和最终文件完全相同，同时通过了输入变化、跨轮次运行中/已完成、
+继承描述符、精确元数据和可观测隔离差异等负向测试。Windows 与 WSL 均通过全部 464 项
+单元/集成测试。
 
 ```sh
 npm run setup:linux
