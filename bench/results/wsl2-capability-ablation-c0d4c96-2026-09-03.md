@@ -1,7 +1,8 @@
 # WSL2 Bash reuse capability ablation
 
-Implementation: `c0d4c96`. Process/exec rows were measured at `4affb64`; the
-top-level in-flight row was rerun after the ownership refactor.
+Implementation: `c0d4c96`, with the live-child admission row rerun at `2b7db9e`.
+Process/exec rows were measured at `4affb64`; the top-level in-flight row was rerun
+after the ownership refactor.
 
 Host: Ubuntu 24.04 on WSL2, Linux 6.18.33.2, x86-64, Node 24.20.0,
 Sandlock 0.8.6, strace 6.8. Sources, tools and temporary workspaces were on WSL's
@@ -16,7 +17,7 @@ use 20 launches. These measurements qualify mechanisms, not a universal speedup.
 | Completed store lookup, no matching proof | Fall through to the same outlet | 1014.62 ms; +4.97 ms (noise-scale) |
 | Ordinary `strace` observation | Record dependencies after execution, without authority to speculate | 1024.02 ms; +14.36 ms / 1.014x |
 | Store + native held-`execve` broker | Adopt a completed matching child before its first instruction | 27.84 versus 226.55 ms direct; **8.14x** |
-| Same broker + live transfer registry | Join a matching running child, then seal/validate/commit once | 246.90 ms after 300 ms lead; 20.34 ms slower in this run |
+| Same broker + measured live admission | Join a matching running child only when its remaining work plus adoption is cheaper than Actor execution | 72.49 versus 194.79 ms direct after 400 ms lead; **2.69x**, 122.30 ms saved |
 | Full Sandlock + strace + Git transaction | Produce new proof and effects in advance | 2971.63 ms cold; cross-parent child hit 1897.94 ms / **1.57x** versus cold |
 | Full stack + FUSE OverlayFS | Same proof with a COW storage driver | 3090.93 ms cold; cross-parent hit 1714.24 ms / **1.80x** versus cold |
 | Full stack + Runtime-owned live top-level branch | Adopt one PID-tainted execution in the same turn | 2614.85 versus 4009.66 ms direct after 3 s lead; **1.53x**, 1394.81 ms saved |
@@ -32,6 +33,12 @@ change to `/`, and return with `fchdir` before doing useful work. The production
 cross-parent replay, and changed-input miss all remained valid: direct was 1007.91 ms, cold Fork
 was 2773.72 ms, and the cross-parent child hit was 1610.54 ms (**1.72x** versus cold). This proves
 the additional hit coverage without adding a command-specific policy or a second benchmark path.
+
+The live-child rerun first forced a changed-input Actor miss on the same execution class. The native
+exec boundary reported that child's exact lifetime, so the shared scheduler could compare a lower
+Actor quantile with upper speculative-remaining and adoption estimates. Linux uses a zero-wait cold
+start: without an Actor counterfactual it resumes the held child and learns, rather than repeating the
+old unbounded wait. Duplicate speculative producers still coalesce off the Actor critical path.
 
 The Git/OverlayFS pair is a small-tree result and does not establish a storage winner;
 setup and host noise dominate. The automatic route correctly keeps Git below the qualified
@@ -63,7 +70,9 @@ reintroduced by the direct process outlet.
   same session and turn.
 - A running candidate is not compared with a second running trace. One consumer waits for the
   original execution to seal, then uses the same validation and atomic commit path as a late hit;
-  a second Actor call executes normally when the volatile branch has been claimed.
+  a second Actor call executes normally when the volatile branch has been claimed. Waiting is a
+  performance decision made from measured Actor, speculative-service, and adoption distributions;
+  it never substitutes for certificate validation.
 - Network, IPC, interactive descriptors, unmodeled kernel state, incomplete traces and observable
   confinement differences remain ineligible unless a future resource broker supplies transactional
   semantics for that resource.

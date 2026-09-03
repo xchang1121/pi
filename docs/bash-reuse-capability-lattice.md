@@ -120,6 +120,14 @@ session and turn. Thus one-shot clock/random/PID observations may become the exa
 execution without entering persistent history. A direct process outlet never second-guesses a rejected
 top-level candidate.
 
+Semantic admission and wait admission are independent. A running child is first matched by exact
+process identity and authority scope. The shared scheduler then compares learned Actor service time
+against an upper estimate of speculative work remaining plus measured adoption cost. The native exec
+boundary reports the duration of Actor children that were allowed to continue; Linux therefore learns
+from a miss without placing an uncalibrated wait on the Actor critical path. A timeout simply resumes
+the Actor child. Once the producer seals, both a joined result and an already-completed result traverse
+the same dependency validation, artifact-closure verification, and atomic effect commit.
+
 Different parent Bash commands cannot join their already-running shell states. They can reuse at the
 next child `execve`: an Actor-side broker pauses the child before its first user instruction, validates
 an earlier child certificate, and either replays it through a close-on-exec-compatible exit stub or
