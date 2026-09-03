@@ -1,0 +1,157 @@
+{
+  "schemaVersion": 1,
+  "measuredAt": "2026-09-03T01:40:39.302Z",
+  "host": {
+    "platform": "linux",
+    "arch": "x64",
+    "node": "v24.20.0",
+    "kernel": "Linux 6.18.33.2-microsoft-standard-WSL2 x86_64"
+  },
+  "rounds": 20,
+  "measurements": {
+    "shellBuiltin": {
+      "direct": {
+        "minMs": 2.6631680000000415,
+        "medianMs": 4.557170000000042,
+        "p95Ms": 6.60331999999994,
+        "maxMs": 8.244554999999991
+      },
+      "execEventPtrace": {
+        "minMs": 2.720293999999967,
+        "medianMs": 4.663596000000098,
+        "p95Ms": 7.3392129999999725,
+        "maxMs": 8.123284000000012
+      },
+      "straceProcess": {
+        "minMs": 11.390028999999913,
+        "medianMs": 12.12756300000001,
+        "p95Ms": 15.817606999999953,
+        "maxMs": 19.30317500000001
+      },
+      "straceSeccompBpf": {
+        "minMs": 4.555571999999984,
+        "medianMs": 5.630165000000034,
+        "p95Ms": 7.30976899999996,
+        "maxMs": 7.486035000000129
+      }
+    },
+    "oneChild": {
+      "direct": {
+        "minMs": 2.6553980000001047,
+        "medianMs": 4.310096000000158,
+        "p95Ms": 6.376303000000007,
+        "maxMs": 6.40911600000004
+      },
+      "execEventPtrace": {
+        "minMs": 2.9354880000000776,
+        "medianMs": 4.437220999999909,
+        "p95Ms": 5.89373999999998,
+        "maxMs": 6.287368000000015
+      },
+      "straceProcess": {
+        "minMs": 13.249340999999959,
+        "medianMs": 13.99825399999986,
+        "p95Ms": 17.392923999999994,
+        "maxMs": 19.487255000000005
+      },
+      "straceSeccompBpf": {
+        "minMs": 4.784881000000041,
+        "medianMs": 5.73993100000007,
+        "p95Ms": 6.783190999999988,
+        "maxMs": 7.7488630000000285
+      }
+    },
+    "sleep100ms": {
+      "direct": {
+        "minMs": 102.97474800000009,
+        "medianMs": 105.96713,
+        "p95Ms": 107.24046099999987,
+        "maxMs": 113.50017900000012
+      },
+      "execEventPtrace": {
+        "minMs": 103.29130199999963,
+        "medianMs": 105.57911399999989,
+        "p95Ms": 107.36032200000022,
+        "maxMs": 111.97628200000008
+      },
+      "straceProcess": {
+        "minMs": 117.59819900000002,
+        "medianMs": 118.29278099999988,
+        "p95Ms": 123.30521700000008,
+        "maxMs": 124.64428600000019
+      },
+      "straceSeccompBpf": {
+        "minMs": 105.03538099999969,
+        "medianMs": 105.6495890000001,
+        "p95Ms": 106.83475200000021,
+        "maxMs": 110.38443899999993
+      }
+    },
+    "syscallHeavy": {
+      "direct": {
+        "minMs": 3.5868709999999737,
+        "medianMs": 4.665059999999812,
+        "p95Ms": 6.221213999999691,
+        "maxMs": 6.933897999999772
+      },
+      "execEventPtrace": {
+        "minMs": 4.0849309999998695,
+        "medianMs": 4.696402999999918,
+        "p95Ms": 5.949477000000115,
+        "maxMs": 6.602919000000384
+      },
+      "straceProcess": {
+        "minMs": 418.88314900000114,
+        "medianMs": 425.2975270000006,
+        "p95Ms": 455.08776600000056,
+        "maxMs": 477.9393620000001
+      },
+      "straceSeccompBpf": {
+        "minMs": 6.00434099999984,
+        "medianMs": 6.403408000000127,
+        "p95Ms": 7.970912999999655,
+        "maxMs": 11.400709000000006
+      }
+    }
+  },
+  "heldExecSubstitution": {
+    "exitCode": 42,
+    "durationMs": 4.063715999998749
+  },
+  "childConversion": {
+    "directMs": 206.17867300000034,
+    "completed": {
+      "actorMs": 22.034723999999187,
+      "hits": 1,
+      "avoidedProcessMs": 394.67198800000006,
+      "producerDependenciesDisabledAtReplay": [
+        "sandlock",
+        "strace",
+        "unshare"
+      ]
+    },
+    "joining": {
+      "actorMs": 117.4144899999992,
+      "leadMs": 300,
+      "hits": 1,
+      "joinedHits": 1
+    },
+    "changedInputMiss": {
+      "actorMs": 210.25848600000063,
+      "hits": 0,
+      "misses": 1
+    },
+    "confinementMismatch": {
+      "producer": "nnp:1",
+      "actor": "nnp:0",
+      "hits": 0,
+      "rejection": "actor_reuse_miss:certificate_tainted"
+    }
+  },
+  "semanticDifference": {
+    "direct": "TracerPid:\t0",
+    "ptrace": "TracerPid:\t37053",
+    "jobControlPreserved": true,
+    "detachedChildReturnMs": 4.19014099999913
+  }
+}
