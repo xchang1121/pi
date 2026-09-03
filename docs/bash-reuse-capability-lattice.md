@@ -106,12 +106,12 @@ For a completed result:
    after-states, then return ordered output and exit status; and
 6. roll back or fail the Actor call if commit cannot be completed exactly.
 
-For an exact in-flight duplicate, the Actor may join the existing future only when both executions
-share semantic identity, initial snapshot, containment semantics, output contract, and at-most-once
-ownership. Speculative output remains gated. When the future seals, the normal validation and commit
-protocol runs. If the Actor's expected direct time is less than remaining execution plus adoption
-cost, it starts the authoritative command instead and leaves the speculative run available for
-learning.
+One transfer record advances `running -> completed -> claimed`; both a waiter and a late Actor run the
+same validation/commit protocol. A transfer is joinable only inside its exact session/turn authority
+scope, with matching semantic identity, initial snapshot, containment and output contract. This lets
+one-shot clock/random/PID observations become the adopted Actor execution without laundering them into
+a later turn. A clean certificate separately enters persistent history and is reusable cross-turn.
+Speculative output remains gated, and the profitability gate may still choose authoritative execution.
 
 Different parent Bash commands cannot join their already-running shell states. They can reuse at the
 next child `execve`: an Actor-side broker pauses the child before its first user instruction, validates
