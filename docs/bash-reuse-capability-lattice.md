@@ -94,7 +94,11 @@ same bytes and still produce a different result.
 ## Completed and running conversion
 
 "Turning speculation into the Actor environment" should mean transferring ownership of a sealed
-result transaction, not transplanting a live process into the Actor namespace.
+result transaction, not transplanting a live process into the Actor namespace. There are three
+distinct horizons: clean sealed results may enter persistent history; volatile sealed or still-running
+results may be claimed once inside their exact authority scope; arbitrary instruction-level process
+state requires a complete checkpoint of every causally connected process and kernel object. The first
+two share one conversion protocol. The third is intentionally not a lightweight fallback.
 
 For a completed result:
 
@@ -178,12 +182,13 @@ workspace mount and executable/platform identity remain distinct from native Win
 | [Incr](https://github.com/atlas-brown/incr) / [OSDI paper](https://yizhengx.github.io/p/incr:osdi:2026.pdf) | Unmodified Bash, command-level caching, `strace`, OverlayFS, streaming, introspection and compaction; average 34.2x reported on its workloads | `mtime`-only read validation, distribution-specific environment filtering, and killing an eagerly launched child after a hit are too weak for strict speculative proof |
 | [hS](https://atlas.cs.brown.edu/pdf/hs:osdi:2026.pdf) / [code](https://github.com/binpash/hs) | Sequential commit, streaming conflict restart, layered OverlayFS state, shell-state transfer and a speculation-window ablation | Its implementation needs `strace`, OverlayFS/`try`, mergerfs, namespaces and privileged cgroup/setup access; it reports 217 ms fixed command overhead and excludes mmap I/O, several aliases/resources, time-sensitive scripts and opacity |
 | [ProcessCache dissertation](https://repository.upenn.edu/bitstreams/94d981be-86c5-40e9-8d8a-2d4e625c5b9e/download) | `execve` units, ptrace event filtering, pre/postcondition state machines, close-on-exec-compatible skip stubs and result replay | Its prototype does not fully handle stdin, cross-unit pipes or networking; subtree condition composition remains unfinished |
+| [Speculator](https://www.microsoft.com/en-us/research/publication/speculative-execution-in-a-distributed-file-system-2/) | Kernel-level causal propagation through processes, files and IPC plus delayed external output | Shows that arbitrary live-state conversion requires kernel-object tracking and rollback, not two matching syscall logs |
 | [`try`](https://github.com/binpash/try) | Stackable user/mount-namespace OverlayFS effects and inspection/apply workflow | Explicitly a semisolate, not a security sandbox |
 | [TREC](https://www.usenix.org/legacy/publications/library/proceedings/usenix98/full_papers/vahdat/vahdat.pdf) | Transparent result caching from process lineage and syscall dependencies | Predates current namespace, async-I/O and adversarial surfaces |
 | [shournal](https://github.com/tycho-kirchner/shournal) / [paper](https://pmc.ncbi.nlm.nih.gov/articles/PMC10901821/) | Low-overhead shell provenance and practical file tracking | Provenance and partial hashes are not complete replay certificates |
 | [seccomp user notification](https://docs.kernel.org/userspace-api/seccomp_filter.html) | A future pre-syscall broker can mediate selected operations | vDSO and incomplete syscall policies require explicit treatment |
 | [fanotify](https://man7.org/linux/man-pages/man7/fanotify.7.html) | Filesystem notification/permission events can reduce observation cost | Documented event and queue gaps prevent using it alone as completeness proof |
-| [CRIU](https://criu.org/Checkpoint/Restore) / [external resources](https://criu.org/External_resources) | Possible checkpoints for very long, fully contained executions | External sockets, files, mounts, devices and kernel state make this a strict optional profile, not the default |
+| [CRIU](https://criu.org/Checkpoint/Restore) / [DMTCP](https://arxiv.org/abs/cs/0701037) | Possible checkpoints for very long, fully contained executions; DMTCP virtualizes many user-space resource identities | Files, pipes, sockets, terminals, timers, shared memory and external endpoints must all be recreated or explicitly brokered, so this remains an optional high-dependency profile |
 
 Simple output caches such as [`bash-cache`](https://github.com/dimo414/bash-cache) and
 [`bkt`](https://github.com/dimo414/bkt) are useful negative controls: command text, arguments and TTL

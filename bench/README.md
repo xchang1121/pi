@@ -23,8 +23,10 @@ The held-exec boundary and tracing-provider interaction are recorded in
 [`results/wsl2-exec-boundary-47b2ce6-2026-09-03.md`](./results/wsl2-exec-boundary-47b2ce6-2026-09-03.md).
 The completed-child, running-child join, and changed-input miss conversion probe is recorded in
 [`results/wsl2-held-child-conversion-6b7579d-2026-09-03.md`](./results/wsl2-held-child-conversion-6b7579d-2026-09-03.md).
-The production one-shot transfer of a still-running, non-persistable Bash result is recorded in
-[`results/wsl2-inflight-transfer-ebca98b-2026-09-03.json`](./results/wsl2-inflight-transfer-ebca98b-2026-09-03.json).
+The current minimum-dependency, completed/running-transfer, and Git/OverlayFS ablation is recorded in
+[`results/wsl2-capability-ablation-4affb64-2026-09-03.md`](./results/wsl2-capability-ablation-4affb64-2026-09-03.md),
+with its corrected in-flight raw result in
+[`results/wsl2-inflight-transfer-4affb64-2026-09-03.json`](./results/wsl2-inflight-transfer-4affb64-2026-09-03.json).
 
 Measure the cost and semantic boundary of pass-through process tracing separately from provenance
 capture. The runner compares a fork/exec-event-only ptrace loop, ordinary process-filtered strace,

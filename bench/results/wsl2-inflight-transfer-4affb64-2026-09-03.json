@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "measuredAt": "2026-09-03T00:18:38.161Z",
+  "measuredAt": "2026-09-03T06:39:10.941Z",
   "host": {
     "platform": "linux",
     "arch": "x64",
@@ -17,19 +17,19 @@
     "outputEqual": true,
     "taintedResultNotPersisted": true
   },
-  "directMs": 2009.1423399999999,
-  "producerMs": 2950.290898,
-  "adoptingActorMs": 1238.9097710000005,
-  "fallbackActorMs": 3242.605656999999,
-  "speculationLeadMs": 1500,
-  "actorLatencySavedMs": 770.2325689999993,
-  "speedup": 1.6217019084273563,
+  "directMs": 4010.4969520000004,
+  "producerMs": 6038.220399,
+  "adoptingActorMs": 2726.0536389999997,
+  "fallbackActorMs": 6730.915245,
+  "speculationLeadMs": 3000,
+  "actorLatencySavedMs": 1284.4433130000007,
+  "speedup": 1.4711731620479684,
   "actorWholeCommandMetrics": {
     "requests": 2,
     "hits": 1,
     "misses": 1,
-    "replayMs": 0.130858000000444,
-    "avoidedProcessMs": 2661.4934379999995,
-    "hitOverheadMs": 1238.5697980000004
+    "replayMs": 0.13874700000087614,
+    "avoidedProcessMs": 5559.689076,
+    "hitOverheadMs": 2725.8155989999996
   }
 }
