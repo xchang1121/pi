@@ -358,6 +358,13 @@ completed or still-running child: the native helper holds the successful child e
 instruction, and the existing planner either converts it to the sealed result or continues it once.
 There is still no second Bash-text cache.
 
+The producer now preserves Actor process identity without a user/PID/mount namespace. Sandlock's
+virtual root maps the private workspace to the Actor's logical path, while exact exec-only mappings
+replace proved executable launches with the broker dispatcher. Normal opens, metadata, directory
+enumeration, writes, and `getcwd` keep their Actor-visible meaning; PATH aliases share the same
+canonical directory evidence but retain distinct exec mappings. This avoids both namespace identity
+drift and the unsound whole-directory overlay that could hide explicit input observations.
+
 The helper deliberately observes exec/fork events only. Miss observation remains separate because a
 process may have only one ptrace tracer and post-run evidence cannot retroactively make an uncontained
 execution reusable. Its process key includes an explicit ptraced execution domain. The producer trace

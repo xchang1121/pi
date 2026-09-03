@@ -154,10 +154,10 @@ describes itself as a low-level toolkit, so binary presence alone is never quali
 policy must prove process-tree containment, write confinement, network/IPC denial, nondeterminism
 handling, and cleanup.
 
-Namespace setup must preserve Actor-visible process identity. The Linux provider maps the current UID
-and GID to themselves and retains only the namespace capabilities needed for private mounts; mapping
-the Actor user to namespace root would make otherwise ordinary commands such as `id -u` observably
-different before reuse is even considered.
+Actor-visible process identity must be preserved. The current Linux provider therefore uses no user,
+PID, or mount namespace: Sandlock maps the private workspace at the syscall boundary and redirects only
+proved executable launches. Ordinary opens, metadata queries, directory reads, writes, cwd, UID/GID,
+and process identity remain native; a mismatch fails qualification before reuse is considered.
 
 Windows can participate immediately in certificate replay when semantic/platform fingerprints match.
 A native Observe/Fork provider requires BuildXL-grade process propagation and filesystem/registry
