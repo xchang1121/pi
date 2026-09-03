@@ -83,6 +83,14 @@ untrusted `mtime` match is not a content proof. Network, IPC, devices, interacti
 unmodeled `ioctl`, trace loss, escaped children, and nondeterministic inputs taint publication unless a
 provider denies, virtualizes, or captures them completely.
 
+Content equality is also not proof of `stat(2)` equality. Certificate v6 records the complete stat
+structure actually returned by the traced syscall—device and inode identity, mode/ownership/link and
+allocation fields, and nanosecond timestamps—and validates it with bigint precision in the Actor
+world. `statx`, filesystem-capacity queries, directory-entry inode streams, deleted objects, and
+anonymous descriptors remain fail-closed until equally complete evidence or virtualization exists.
+This distinction is necessary for commands such as `stat -c %i`: a Git/FUSE private copy can have the
+same bytes and still produce a different result.
+
 ## Completed and running conversion
 
 "Turning speculation into the Actor environment" should mean transferring ownership of a sealed

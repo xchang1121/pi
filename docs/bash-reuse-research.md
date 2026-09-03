@@ -367,6 +367,12 @@ Pipelines, redirected or extra descriptors, privileged executables, trace-sensit
 signal exits remain bypasses until their semantics are represented rather than inferred from command
 text.
 
+Completed transfer does not make descriptor metadata disappear. A program can call `fstat` on stdout
+and expose the pipe inode, so matching only descriptor type is insufficient even within one turn. The
+strict route now falls back on anonymous descriptor metadata. Recovering those hits requires a
+descriptor substrate shared with the future Actor invocation or syscall-level normalization to the
+Actor's real values; suppressing the observation would only manufacture equivalence.
+
 [CRIU](https://criu.org/Checkpoint/Restore) can restore memory, descriptors, namespaces, and process
 trees, but its documentation treats many mounts, files, sockets, and devices as external resources.
 Checkpoint adoption is therefore reserved for a later, stricter profile: a stopped, namespace-contained
