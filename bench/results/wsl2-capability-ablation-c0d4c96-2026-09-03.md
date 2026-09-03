@@ -1,6 +1,7 @@
 # WSL2 Bash reuse capability ablation
 
-Commit: `4affb64`
+Implementation: `c0d4c96`. Process/exec rows were measured at `4affb64`; the
+top-level in-flight row was rerun after the ownership refactor.
 
 Host: Ubuntu 24.04 on WSL2, Linux 6.18.33.2, x86-64, Node 24.20.0,
 Sandlock 0.8.6, strace 6.8. Sources, tools and temporary workspaces were on WSL's
@@ -18,7 +19,7 @@ use 20 launches. These measurements qualify mechanisms, not a universal speedup.
 | Same broker + live transfer registry | Join a matching running child, then seal/validate/commit once | 246.90 ms after 300 ms lead; 20.34 ms slower in this run |
 | Full Sandlock + strace + Git transaction | Produce new proof and effects in advance | 2971.63 ms cold; cross-parent child hit 1897.94 ms / **1.57x** versus cold |
 | Full stack + FUSE OverlayFS | Same proof with a COW storage driver | 3090.93 ms cold; cross-parent hit 1714.24 ms / **1.80x** versus cold |
-| Full stack + live top-level transfer | Claim one PID-tainted execution in the same turn | 2726.05 versus 4010.50 ms direct after 3 s lead; **1.47x**, 1284.44 ms saved |
+| Full stack + Runtime-owned live top-level branch | Adopt one PID-tainted execution in the same turn | 2614.85 versus 4009.66 ms direct after 3 s lead; **1.53x**, 1394.81 ms saved |
 
 The completed-child consumer was rerun with deliberately missing Sandlock and strace
 binaries. It still hit, proving those producer dependencies are not accidentally required
@@ -40,17 +41,21 @@ numbers by weakening evidence.
 
 ## Safe conversion frontier
 
-The implementation uses one transfer state machine for completed and running work:
-`running -> completed -> claimed`. It accepts a result only when semantic process identity,
-current dynamic dependencies, immutable output/artifact closure, exact workspace before-state,
-producer guarantee and consumer contract all match.
+One equivalence contract covers both lanes: semantic process identity, current dynamic dependencies,
+immutable output/artifact closure, exact workspace before-state, producer guarantee and consumer
+contract must all match. Ownership is deliberately singular: the generic Runtime owns top-level
+running/completed branches and their cost-aware admission; the Linux backend's
+`running -> completed -> claimed` transfer state belongs only to matching child `execve` units
+inside otherwise different parent Bash calls. A rejected top-level join can no longer be silently
+reintroduced by the direct process outlet.
 
 - A clean sealed certificate is reusable across turns and across different parent Bash strings
   when they reach the same child `execve`.
 - A volatile certificate (time, random, PID or descriptor observation) can represent the Actor's
   exact predicted execution once, but only in the same session and turn; it is never persisted.
 - A running candidate is not compared with a second running trace. One consumer waits for the
-  original execution to seal, then uses the same validation and atomic commit path as a late hit.
+  original execution to seal, then uses the same validation and atomic commit path as a late hit;
+  a second Actor call executes normally when the volatile branch has been claimed.
 - Network, IPC, interactive descriptors, unmodeled kernel state, incomplete traces and observable
   confinement differences remain ineligible unless a future resource broker supplies transactional
   semantics for that resource.

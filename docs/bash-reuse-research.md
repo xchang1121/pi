@@ -352,11 +352,11 @@ measurements are preserved in `bench/results/wsl2-overlayfs-workspace-driver-202
 ## Partial execution reuse
 
 Completed top-level process invocations and nested `execve` subtrees share the same certificate,
-pathset validation, artifact closure, and typed workspace transaction. An exact repeated Actor Bash
-can be replayed before its shell starts. On x86-64 Linux, a different real Actor Bash can now reuse a
-completed or still-running child: the native helper holds the successful child exec before its first
-instruction, and the existing planner either converts it to the sealed result or continues it once.
-There is still no second Bash-text cache.
+pathset validation, artifact closure, and typed workspace transaction. The generic Runtime alone owns
+same-turn top-level branches, while the backend persists clean results and transfers child units across
+different parent Bash actions. On x86-64 Linux the native helper holds a real Actor child before its
+first instruction; the planner converts it to a completed or still-running producer's sealed result,
+or continues it once. There is no second Bash-text cache or duplicate top-level scheduler.
 
 The producer now preserves Actor process identity without a user/PID/mount namespace. Sandlock's
 virtual root maps the private workspace to the Actor's logical path, while exact exec-only mappings

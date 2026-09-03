@@ -110,12 +110,13 @@ For a completed result:
    after-states, then return ordered output and exit status; and
 6. roll back or fail the Actor call if commit cannot be completed exactly.
 
-One transfer record advances `running -> completed -> claimed`; both a waiter and a late Actor run the
-same validation/commit protocol. A transfer is joinable only inside its exact session/turn authority
-scope, with matching semantic identity, initial snapshot, containment and output contract. This lets
+The generic Runtime exclusively owns top-level `running -> completed -> claimed` candidates, including
+profitability deadlines. The Linux backend uses the same lifecycle only for nested child units that the
+Runtime cannot identify across different parent Bash actions. Both lanes share validation and atomic
+commit, and volatile results are joinable only inside their exact session/turn authority. This lets
 one-shot clock/random/PID observations become the adopted Actor execution without laundering them into
-a later turn. A clean certificate separately enters persistent history and is reusable cross-turn.
-Speculative output remains gated, and the profitability gate may still choose authoritative execution.
+a later turn; clean certificates separately enter persistent history. A direct process outlet never
+second-guesses a rejected top-level candidate.
 
 Different parent Bash commands cannot join their already-running shell states. They can reuse at the
 next child `execve`: an Actor-side broker pauses the child before its first user instruction, validates

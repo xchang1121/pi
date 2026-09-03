@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 2,
+  "measuredAt": "2026-09-03T06:56:32.510Z",
+  "host": {
+    "platform": "linux",
+    "arch": "x64",
+    "node": "v24.20.0",
+    "kernel": "Linux 6.18.33.2-microsoft-standard-WSL2 x86_64",
+    "sandlock": "sandlock 0.8.6",
+    "strace": "strace -- version 6.8"
+  },
+  "subject": "Runtime-owned adoption of a still-running speculative Bash result",
+  "assertions": {
+    "validatedBeforeCommit": true,
+    "singleConsumerClaim": true,
+    "adoptingActorDidNotReexecute": true,
+    "fallbackExecutedOnce": true,
+    "taintedResultNotPersisted": true,
+    "runtimeOwnsTopLevelScheduling": true
+  },
+  "directMs": 4009.661849,
+  "producerMs": 5911.601404000001,
+  "adoptingActorMs": 2614.8504919999996,
+  "fallbackActorMs": 4007.8723409999984,
+  "speculationLeadMs": 3000,
+  "actorLatencySavedMs": 1394.8113570000005,
+  "speedup": 1.5334191615418755,
+  "actorWholeCommandMetrics": {
+    "requests": 1,
+    "hits": 0,
+    "misses": 1
+  }
+}

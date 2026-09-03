@@ -24,9 +24,9 @@ The held-exec boundary and tracing-provider interaction are recorded in
 The completed-child, running-child join, and changed-input miss conversion probe is recorded in
 [`results/wsl2-held-child-conversion-6b7579d-2026-09-03.md`](./results/wsl2-held-child-conversion-6b7579d-2026-09-03.md).
 The current minimum-dependency, completed/running-transfer, and Git/OverlayFS ablation is recorded in
-[`results/wsl2-capability-ablation-4affb64-2026-09-03.md`](./results/wsl2-capability-ablation-4affb64-2026-09-03.md),
-with its corrected in-flight raw result in
-[`results/wsl2-inflight-transfer-4affb64-2026-09-03.json`](./results/wsl2-inflight-transfer-4affb64-2026-09-03.json).
+[`results/wsl2-capability-ablation-c0d4c96-2026-09-03.md`](./results/wsl2-capability-ablation-c0d4c96-2026-09-03.md),
+with the Runtime-owned in-flight raw result in
+[`results/wsl2-runtime-inflight-c0d4c96-2026-09-03.json`](./results/wsl2-runtime-inflight-c0d4c96-2026-09-03.json).
 
 Measure the cost and semantic boundary of pass-through process tracing separately from provenance
 capture. The runner compares a fork/exec-event-only ptrace loop, ordinary process-filtered strace,
@@ -49,9 +49,10 @@ npm run bench:linux-process -- --output bench/results/local.json
 npm run bench:linux-inflight -- --output bench/results/local-inflight.json
 ```
 
-The in-flight qualification starts two Actor consumers while one PID-observing speculative Bash is
-running. Exactly one must validate and claim that result; the other must execute normally, and the
-one-shot certificate must never enter persistent history.
+The in-flight qualification lets one Actor arrive while a PID-observing speculative Bash is running,
+then repeats the same Actor action. The Runtime must validate and claim the branch exactly once; the
+second call must execute normally, and the one-shot result must never enter persistent history or a
+second top-level transfer registry.
 
 Pass `--workspace-driver git` or `--workspace-driver overlayfs` to the process
 and topology qualifications for a same-machine A/B. `auto` uses OverlayFS only
