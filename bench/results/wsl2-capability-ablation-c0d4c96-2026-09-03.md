@@ -51,8 +51,10 @@ reintroduced by the direct process outlet.
 
 - A clean sealed certificate is reusable across turns and across different parent Bash strings
   when they reach the same child `execve`.
-- A volatile certificate (time, random, PID or descriptor observation) can represent the Actor's
-  exact predicted execution once, but only in the same session and turn; it is never persisted.
+- A volatile top-level branch (time, random, PID or descriptor observation) can represent the Actor's
+  exact predicted execution once for its Runtime prediction horizon, even when that horizon crosses a
+  model-turn boundary; it is never persisted. Volatile nested child transfer remains restricted to the
+  same session and turn.
 - A running candidate is not compared with a second running trace. One consumer waits for the
   original execution to seal, then uses the same validation and atomic commit path as a late hit;
   a second Actor call executes normally when the volatile branch has been claimed.

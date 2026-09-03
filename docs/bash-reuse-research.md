@@ -93,6 +93,12 @@ Endpoint Security are implementation tracks, not claims of current support.
 Metadata alone is not a cross-process content proof. `mtime`, size, and inode shortcuts may be used only
 inside a live, gap-free change-journal lease whose exact content digest was already established.
 
+Directory-descriptor state is nevertheless recoverable without a command rule when the observer proves
+it structurally. Production tracing uses `strace -yy`; a successful `fchdir` is now accepted only when
+that transcript identifies an absolute, non-deleted directory. The directory becomes a normal dynamic
+dependency and the new cwd is inherited by traced descendants. Missing annotations and deleted or
+non-path descriptors remain incomplete evidence.
+
 ## Transaction-delta evidence sealing
 
 The outer private-Git world already computes exact regular-file before/after bytes in order to form
@@ -353,10 +359,12 @@ measurements are preserved in `bench/results/wsl2-overlayfs-workspace-driver-202
 
 Completed top-level process invocations and nested `execve` subtrees share the same certificate,
 pathset validation, artifact closure, and typed workspace transaction. The generic Runtime alone owns
-same-turn top-level branches, while the backend persists clean results and transfers child units across
-different parent Bash actions. On x86-64 Linux the native helper holds a real Actor child before its
-first instruction; the planner converts it to a completed or still-running producer's sealed result,
-or continues it once. There is no second Bash-text cache or duplicate top-level scheduler.
+top-level branches for their complete prediction horizons, while the backend persists clean results and
+transfers child units across different parent Bash actions. A top-level exclusive branch may span a
+model-turn boundary but has one Actor claimant; a volatile child transfer is limited to the exact
+session/turn scope. On x86-64 Linux the native helper holds a real Actor child before its first
+instruction; the planner converts it to a completed or still-running producer's sealed result, or
+continues it once. There is no second Bash-text cache or duplicate top-level scheduler.
 
 The producer now preserves Actor process identity without a user/PID/mount namespace. Sandlock's
 virtual root maps the private workspace to the Actor's logical path, while exact exec-only mappings
@@ -385,6 +393,16 @@ trees, but its documentation treats many mounts, files, sockets, and devices as 
 Checkpoint adoption is therefore reserved for a later, stricter profile: a stopped, namespace-contained
 process with no external descriptors and a filesystem snapshot committed atomically with the checkpoint.
 Completed-result/effect replay remains the default because it has a much smaller semantic surface.
+
+[Scribe](https://www.cs.columbia.edu/~orenl/papers/sigmetrics2010_scribe.pdf) is the closest proof that
+transparent replay can later go live, and also the clearest lower bound on doing so correctly: it starts
+from a consistent process/filesystem checkpoint, replays effects inside the kernel, and orders syscalls,
+signals, shared memory, threads, and processes through rendezvous and sync points.
+[R2](https://www.usenix.org/legacy/events/osdi08/tech/full_papers/guo/guo_html/index.html) obtains a smaller
+boundary only by explicitly modeling selected APIs and their data/order side effects.
+Neither supports treating similar running `strace` prefixes as transferable state. This confirms the
+current split: cheaply transfer a sealed result transaction by default; require an explicit checkpoint
+provider for an arbitrary live instruction state.
 
 ## Ordered implementation backlog
 

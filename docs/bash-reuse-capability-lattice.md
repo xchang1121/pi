@@ -113,10 +113,12 @@ For a completed result:
 The generic Runtime exclusively owns top-level `running -> completed -> claimed` candidates, including
 profitability deadlines. The Linux backend uses the same lifecycle only for nested child units that the
 Runtime cannot identify across different parent Bash actions. Both lanes share validation and atomic
-commit, and volatile results are joinable only inside their exact session/turn authority. This lets
-one-shot clock/random/PID observations become the adopted Actor execution without laundering them into
-a later turn; clean certificates separately enter persistent history. A direct process outlet never
-second-guesses a rejected top-level candidate.
+commit, but not the same authority lifetime. An exclusive top-level branch belongs to its Runtime
+prediction horizon and may intentionally survive a model-turn boundary until that horizon settles; it
+still has exactly one Actor claimant. A volatile nested child transfer is narrower and requires the same
+session and turn. Thus one-shot clock/random/PID observations may become the exact predicted Actor
+execution without entering persistent history. A direct process outlet never second-guesses a rejected
+top-level candidate.
 
 Different parent Bash commands cannot join their already-running shell states. They can reuse at the
 next child `execve`: an Actor-side broker pauses the child before its first user instruction, validates
@@ -184,6 +186,8 @@ workspace mount and executable/platform identity remain distinct from native Win
 | [hS](https://atlas.cs.brown.edu/pdf/hs:osdi:2026.pdf) / [code](https://github.com/binpash/hs) | Sequential commit, streaming conflict restart, layered OverlayFS state, shell-state transfer and a speculation-window ablation | Its implementation needs `strace`, OverlayFS/`try`, mergerfs, namespaces and privileged cgroup/setup access; it reports 217 ms fixed command overhead and excludes mmap I/O, several aliases/resources, time-sensitive scripts and opacity |
 | [ProcessCache dissertation](https://repository.upenn.edu/bitstreams/94d981be-86c5-40e9-8d8a-2d4e625c5b9e/download) | `execve` units, ptrace event filtering, pre/postcondition state machines, close-on-exec-compatible skip stubs and result replay | Its prototype does not fully handle stdin, cross-unit pipes or networking; subtree condition composition remains unfinished |
 | [Speculator](https://www.microsoft.com/en-us/research/publication/speculative-execution-in-a-distributed-file-system-2/) | Kernel-level causal propagation through processes, files and IPC plus delayed external output | Shows that arbitrary live-state conversion requires kernel-object tracking and rollback, not two matching syscall logs |
+| [Scribe](https://www.cs.columbia.edu/~orenl/papers/sigmetrics2010_scribe.pdf) | Consistent process/filesystem checkpoints, syscall rendezvous, shared-memory/signal sync points, and replay that can go live | Replaying only syscall return values is insufficient; in-kernel effects and every causally connected thread/process must cross the boundary |
+| [R2](https://www.usenix.org/legacy/events/osdi08/tech/full_papers/guo/guo_html/index.html) | Select a typed high-level record/replay interface and generate side-effect/order handling from annotations | Its 1,300-function Win32 model shows the cost of replacing complete OS semantics with per-API special cases |
 | [`try`](https://github.com/binpash/try) | Stackable user/mount-namespace OverlayFS effects and inspection/apply workflow | Explicitly a semisolate, not a security sandbox |
 | [TREC](https://www.usenix.org/legacy/publications/library/proceedings/usenix98/full_papers/vahdat/vahdat.pdf) | Transparent result caching from process lineage and syscall dependencies | Predates current namespace, async-I/O and adversarial surfaces |
 | [shournal](https://github.com/tycho-kirchner/shournal) / [paper](https://pmc.ncbi.nlm.nih.gov/articles/PMC10901821/) | Low-overhead shell provenance and practical file tracking | Provenance and partial hashes are not complete replay certificates |
