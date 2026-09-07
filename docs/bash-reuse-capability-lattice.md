@@ -380,6 +380,11 @@ Bash 同父/跨父冷执行复用为 1.80× / 1.82×；运行中接管两次为 
 现有 `stat` 指纹会丢失返回掩码、属性和挂载身份等可观测字段；内核还可能返回调用者未请求的字段。
 参见 [Linux statx 接口](https://man7.org/linux/man-pages/man2/statx.2.html)。本轮未修改思程保护边界。
 
-相对本轮 `65c8bfe`：生产源码 33,094 行，净减少 2 行；测试 15,035 行，净减少 295 行。
+截至 `65c445a`，相对本轮 `65c8bfe`：生产源码 33,094 行，净减少 2 行；测试 15,030 行，净减少 300 行。
+`95a2162` 补齐 Actor 观察输入的有界保留，`65c445a` 删除只承载记录的事务内部类；两步合计生产
+代码净增长为 0，仍由原协调器维护身份所有权与提交状态。Windows 502 passed / 16 skipped、
+WSL 517 passed / 1 skipped，以及两端 check、build、bench:check 和 Windows pack dry-run 通过。
+两端六种原版工具资格任务均通过输出及文件效果对照：read/ls 使用封存资源，write/edit 使用原
+工作区事务，grep/find 仍走 Actor。思程对照仅为本地 wire runner，不是 Runtime 验收。
 较早的 30,411 行绝对目标仍未达到。完整搜索、可移植共同 profile、原生 Windows/macOS 进程
 提供者仍需后续实现与资格验证，当前 goal 保持未完成；没有新增缓存层、配置开关或 CI。
