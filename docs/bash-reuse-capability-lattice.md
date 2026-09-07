@@ -178,7 +178,7 @@ watcher 仅提供失效提示，不能把“没有事件”等同于“内容没
 特殊文件、目录负查询、访问权限及路径大小写都是证据的一部分。
 
 复用输入和复用结果明确区分：同一内容可供另一个查询重新计算，不表示不同查询输出等价。
-已有 read-range / Bash-tail 投影在替代路径通过等价性测试前保留，不继续扩充语法规则库。
+read-range 投影仍保留；Bash-tail 文本投影因下述真实反例已撤回，不继续扩充语法规则库。
 
 ### 目标能力矩阵与资格边界
 
@@ -506,3 +506,18 @@ Linux Bash 冷/复用同父 1.93×、跨父 1.94×；运行中 Actor 4009 → 28
 bench:check、Windows pack dry-run 及完整 grep/find Runtime 资格通过。Linux Bash 冷/复用
 同父 1.77×、跨父 1.72×；另计运行中 Actor 4010 → 2913 ms（1.38×），未重复执行。当前源码
 33,077 行、测试 14,944 行；生产搜索 profile 与 TUI 接入仍未完成，思程保护路径保持无改动。
+
+旧 Bash-tail 规则在原生 Git Bash 和 WSL Bash 上均出现反例：同一环境通过 `BASH_FUNC_tail%%`
+提供函数时，`tail -n 3` 与 `tail -n 2` 可以分别输出参数本身；也可以前者成功、后者以 7 退出。
+旧规则仍给出无损投影。现删除该解析器、输出投影及四个相关导出，不用函数名或可执行文件白名单
+修补；命令精确采纳、read-range、封存输入重算和原生子进程证书保留。真实反例替换原语法样例，
+host 用 barrier 验证运行中/已完成候选都不能据此跳过 Actor。此步源码净减 223 行、测试净减
+167 行；当前分别为 32,854 / 14,777 行，思程保护路径仍无修改。
+
+Windows 485 passed / 17 skipped、WSL 501 passed / 1 skipped，check/build/bench:check、
+Windows pack dry-run 通过。Linux 同父/跨父冷执行复用比约 1.65× / 1.66×；Actor 运行中另计
+4010 → 2720 ms（1.47×）。额外 topology 任务本次安全拒绝，**不计通过**：stdout 预期为
+`pipe`、实际为 `socket`。[strace 6.8 源码](https://github.com/strace/strace/blob/v6.8/src/strace.c#L1569)
+表明 tracer 在启动 tracee 后会把自己的 stdin/stdout 替换为占位管道；独立有界复现也证实两者
+端点不同。因此对 tracer PID 的一次读取或延时重试都不是稳定继承证明，后续须单独修正输出通道
+所有权；没有放松端点校验或把重跑成功当成该问题已解决。
