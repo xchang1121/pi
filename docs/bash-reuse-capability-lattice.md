@@ -398,12 +398,15 @@ WASM；Actor 与投机使用同一显式配置，不替换原生默认工具。�
 异步输入，外层拥有唯一请求身份和退出边界。采用的是 [esbuild 的同步 worker 通信模式](https://github.com/evanw/esbuild/blob/main/lib/npm/node.ts)，
 不是让异步函数直接冒充 [wasi-sh 的同步文件系统接口](https://github.com/alganet/wasi-sh)。
 不开放 host 文件句柄或网络；目录条目证明不存在，未证明访问或预算失败不能被工具吞成成功。
-`ResourceReadView.stat()` 只从已保留内容提供大小，元数据视图不虚构文件长度；没有第二份捕获。
+`ResourceReadView.stat()` 使用实际捕获的元数据或已保留内容提供大小，不虚构文件长度；没有第二份捕获。
 
-搜索 fixture 含一个被忽略的 16 MiB 文件：每次约 66 个输入请求、1.18 MB 成功响应载荷，
-忽略内容没有传入客体；显式搜索大文件则被 8 MiB 配额拒绝。选择 `glob` 可以覆盖忽略规则，
-因此不在插件中重写忽略逻辑。注意：这里只完成按需传输，资源证据仍预先采集 `tree_content`；
-Runtime 验收前将该文件缩小。大工作区的按需捕获、完整 find 和生产配置接入仍未完成。
+搜索 fixture 含一个被忽略的 16 MiB 文件：每次约 67 个输入请求、1.18 MB 成功响应载荷，
+忽略内容没有传入客体；显式搜索大文件则被 8 MiB 配额拒绝。早期只完成按需传输，进入
+Runtime 验收前还需缩小该文件；本次改为真正按访问捕获，验收全程保留 16 MiB 文件。
+token 的依赖/指纹/身份平行数组合并为一个证据 Map，元数据、目录名和内容共用原有捕获器。
+封存后禁用加载器；两个新查询复用已有输入，`glob` 覆盖忽略规则后访问未捕获文件则单次
+Actor fallback，不能扩张旧候选的权限。挂起的输入请求不能封存或泄漏，释放后晚到读取失败。
+完整 find 和生产共同 profile / TUI 接入仍未完成，不把真实内核资格测试当作生产启用。
 
 v3 末次顺序测量：Windows 暖 Actor 36.8 ms、完成采纳 14.6 ms、后续精确命中 5.7 ms；
 WSL 为 43.5 / 10.1 / 7.0 ms。每个 worker 准备另需约 540 / 697 ms。整包 IPC 旧样本为
@@ -452,8 +455,23 @@ provider 的采纳成本不再串用；仍保留原有三个有界计时窗口�
 7.4 ms，少执行一次 Actor；不同查询仍重新计算，未改变输出或绕过验证。这不是原生等价或
 生产启用声明。两端 check/build/bench:check、Windows pack dry-run 通过；全量测试分别为
 Windows 504 passed / 16 skipped、WSL 519 passed / 1 skipped。当前源码 33,048 行、测试
-15,002 行；完整搜索的按需输入捕获与生产接入仍未完成。
+15,002 行；这是按需输入捕获之前的记录，生产接入仍未完成。
 
 Linux Bash 冷/复用同父 1.81×、跨父 1.84×，Actor 运行中接管另计为 4009 → 2670 ms
 （1.50×），效果与直接执行一致。新生成的 32 MiB 拓扑任务中，96 轮变换的完整/运行中采纳
 均通过收益准入；0 轮轻任务 Actor 中位数约 27 ms、完成采纳约 57 ms，正确拒绝两种复用。
+
+本次捕获重构还复现了宿主观察的祖先 ABA 缺口：Actor 通过临时 junction 读到 B，恢复原
+junction 后旧代码仍把结果绑定到 A。Windows 上移动并恢复同一个 junction 可保持 inode/
+ctime，因此 resource fallback 不再提供 Windows 宿主结果晋升；提前在捕获字节上计算的
+候选仍可跨轮次复用。POSIX 宿主观察额外捕获祖先绑定及目标链 change stamp，变化或证据
+缺失时只放弃缓存。watcher 的肯定事件用于反证执行窗口；未来复用重新比较内容/所读元数据，
+不再把自身读取造成的目录事件当成永久内容变化。新的链接反例并入原有表，删除固定时间等待
+和重复 fixture；思程源码、SDK、协议、profile、installer 相对 `ee97f0d` 仍无变更。
+
+此次 Windows / WSL 全量为 498 passed / 17 skipped 与 514 passed / 1 skipped，check、
+build、bench:check 及 Windows pack dry-run 通过。完整 grep 暖共同 profile Actor / 完成
+采纳约为 Windows 45.9 / 8.5 ms、WSL 41.0 / 10.3 ms；worker 准备成本另计约 625 / 716 ms。
+Linux Bash 冷/复用同父 1.93×、跨父 1.94×；运行中 Actor 4009 → 2823 ms（1.42×），未重执行。
+当前源码 33,090 行、测试 15,000 行，相对本轮 `65c8bfe` 净减 6 / 330 行；本提交测试净减
+2 行，早先 30,411 行绝对目标未达到。没有 macOS 或思程 ARM64 Runtime 真机结果。
