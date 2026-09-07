@@ -299,6 +299,20 @@ grep 上下文回读，只在独立 worker 中替换搜索能力；默认 Actor 
 访问集合，而不是继续补参数/输出转换。[原包实现](https://github.com/pithings/ripgrep-node)
 和 [WASI shim 的实现状态](https://github.com/bjorn3/browser_wasi_shim)也不能当作通用沙箱的安全承诺。
 
+共享内核实验进一步收缩了可移植路线：[`wasi-sh`](https://github.com/alganet/wasi-sh) 的同一
+文件系统/shim 可以同时运行 BusyBox ash 和真实 rg WASM，shell 写入的私有产物能直接交给 rg。
+这避免了为不同工具各建文件系统，但 ash 不是原生 Bash，`rg --files` 也不是 fd。
+仓库的 `bench/portable-kernel.mjs` 保留这一可复现边界，不进入生产依赖或默认工具出口。
+它还确定性证明：相同输入字节在不同创建时刻会得到不同的 `stat` 时间戳，普通管道也读取时钟，
+rg 使用时钟和随机数。因此，不能只对字节取哈希就认为整个虚拟执行结果可重放。
+共同 profile 必须明确这些输入的语义并纳入证据；没有这项证明时不发布可采纳候选。
+
+两端均验证实际模块的 64 MiB WASM 内存增长上限；这只是在独立 Node 子进程中的资格检查，
+不是生产沙箱承诺。[Node 的 worker 限制](https://nodejs.org/api/worker_threads.html)不覆盖
+全部外部内存，[V8 参数](https://nodejs.org/api/cli.html#useful-v8-options)也无稳定性保证。
+完整 host imports 配额、取消、原版 Pi 完整调用和事务采纳仍是后端准入条件，不能用内核微基准
+代替。可移植方案继续复用现有 token、candidate store 和事务，不增加第三套缓存；思程保护边界不变。
+
 本机验证（源码 `1cf5ee1`；下列时间为单个资格任务，不是普遍加速保证）：
 
 - Windows：check、508 passed / 16 skipped、build、bench:check、npm pack --dry-run 通过。
