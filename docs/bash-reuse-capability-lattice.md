@@ -585,3 +585,11 @@ Linux Bash 同父/跨父冷复用比约 1.97×/1.95×，另计运行中 Actor 40
 启动 worker 或加载搜索依赖。Windows/WSL 完整搜索资格、全量 481/17 skipped 与 497/1 skipped、
 check/build/bench:check 及 Windows pack dry-run 通过。此步源码 +61 行、benchmark 净减 27 行，
 常规测试不增长；相对本轮基线源码仍 +78 行，池所有权/TUI 和最终代码预算尚未完成。思程未修改。
+
+工作区全局单例及八个转发出口已删除，调用方显式持有原有 `WorkspaceSandboxService`；Bash
+产物重放的提交也归 backend 生命周期拥有并排空。重复 dispose 共享同一完成记录，已有竞争
+提交测试验证关闭后拒绝新提交、等待已准入提交，不再增加独立测试。源码 −65、测试 −7 行，
+相对本轮基线源码剩余 +13 行。Windows/WSL 全量仍为 481/17 skipped 与 497/1 skipped，
+check/build/bench:check、Windows pack dry-run、完整搜索及 Bash 同父/跨父和运行中回归通过。
+原版六工具与本地思程 wire runner 的对照通过，但这不是 ARM64 Runtime 验收；思程保护路径
+无改动。进程池与 TUI 共同搜索 profile 接入继续进行。
