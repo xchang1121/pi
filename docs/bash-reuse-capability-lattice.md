@@ -593,3 +593,10 @@ check/build/bench:check 及 Windows pack dry-run 通过。此步源码 +61 行�
 check/build/bench:check、Windows pack dry-run、完整搜索及 Bash 同父/跨父和运行中回归通过。
 原版六工具与本地思程 wire runner 的对照通过，但这不是 ARM64 Runtime 验收；思程保护路径
 无改动。进程池与 TUI 共同搜索 profile 接入继续进行。
+
+父进程现在统一拥有搜索准备、单次调用、输入归属和强制关闭；完整 grep/find 的 Actor 与 producer
+均使用正式入口，benchmark 删除其重复生命周期实现。运行中取消和 deadline 只有在 stdio close
+后才返回，晚到输入完成/失败被消费，falsy abort reason 也保持原值；独立 Actor 不等 producer。
+Windows/WSL 完整搜索资格和全量 481/17 skipped、497/1 skipped 通过，check/build/bench:check
+及 Windows pack dry-run 通过。源码 +76、benchmark −50、测试不增长；距本轮基线源码 +89 行，
+尚须压缩。默认原生行为、思程保护路径不变，生产池和 TUI 选择仍待完成。
