@@ -624,3 +624,7 @@ check/build/bench:check、Windows pack dry-run 通过；源码 +75（基线 +98�
 配置覆盖的空值语义归 `applyOverlay`/`diffRecord` 所有，删除外层转发、克隆包装及手写深比较；
 TUI 使用相同的结构比较，不再比较 JSON 键顺序。继承、tombstone、恢复发布和菜单行为回归通过，
 两端全量及 check/build/bench:check 通过，源码 −40、测试行数不变；基线净增收敛到 58 行。
+
+统计类型现从实际初始化结构推导，移除重复字段清单和 TUI 的整套零值缓存；初始容量使用已加载
+配置而非固定默认值。原 TUI 流程验证 37 条配置从启动即正确显示，实时/重放统计对照继续通过。
+源码 −69、测试行数不变；两端全量及 check/build/bench:check 通过，基线源码净减 11 行。
