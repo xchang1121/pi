@@ -10,6 +10,12 @@ Windows 499 passed / 13 skipped，WSL 511 passed / 1 skipped；生产净减 6 �
 本项只证明工作区内规则，不补足工作区外全局配置、可执行文件等隐式依赖的证明；这些仍须
 纳入真实 Runtime 资格检查，不能把本地 runner 一致性当成任意环境下安全复用的证明。
 
+新增实测入口 `npm run bench:thinkthread-tools`（见 `bench/README.md`），六工具夹具从测试迁到
+共用资格代码，不另写一套 mock benchmark；测试文件净减 130 行。入口先验证真实 SDK 连接，
+随后要求确实选中思程路线、走统一事务并比较提交前隔离和提交后完整夹具效果。Windows、
+普通 WSL、仅设置 `THINKTHREAD_FS` 的 WSL 均明确拒绝且未创建夹具；这只是失败关闭验证，
+**不是六工具真实思程资格通过**，更不是 Bash 在思程中的性能数据。
+
 当前结论：核心执行层级已修正，**真实思程 Runtime 资格尚未完成**。下文旧记录保留为历史，
 不能用早期 SDK mock、安装布局测试或原生 WSL benchmark 推断真实思程执行与采纳已经通过。
 
