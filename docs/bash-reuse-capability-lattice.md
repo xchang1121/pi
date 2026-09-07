@@ -606,3 +606,10 @@ host 与 TUI 的配置规范化已合并；原先仅 TUI 将 `predictionTimeoutM
 保留非法值拒绝、取消不修改、清空删除覆盖值及零等待验证。源码 −97、测试 −13 行；当前源码
 33,088、测试 14,692 行。Windows/WSL 全量 480/17 skipped、496/1 skipped，check/build/
 bench:check 通过，思程保护路径无改动。搜索池及 TUI 选择仍未完成。
+
+搜索进程池已用真实 IPC 替换资格任务的手工双进程：按 Actor/producer 各保留一个空闲执行器，
+忙碌调用独占新 reservation，不按相同查询串行 join；只有现有 Runtime 可以采纳结果。显式
+barrier 验证同查询双 producer 并发、Actor 独立执行、关闭取消 producer 并排空 Actor。
+Windows/WSL 完整搜索、全量 480/17 skipped 与 496/1 skipped、check/build/bench:check、
+Windows pack dry-run 通过。源码 +31 行（相对基线 +23），常规测试不增长；插件绑定/TUI 尚未启用。
+Bash 同父/跨父冷复用比约 1.87×/1.84×；运行中 Actor 4011 → 2758 ms（1.45×），未重执行。
