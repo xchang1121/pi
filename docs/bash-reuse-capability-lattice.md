@@ -613,3 +613,10 @@ barrier 验证同查询双 producer 并发、Actor 独立执行、关闭取消 p
 Windows/WSL 完整搜索、全量 480/17 skipped 与 496/1 skipped、check/build/bench:check、
 Windows pack dry-run 通过。源码 +31 行（相对基线 +23），常规测试不增长；插件绑定/TUI 尚未启用。
 Bash 同父/跨父冷复用比约 1.87×/1.84×；运行中 Actor 4011 → 2758 ms（1.45×），未重执行。
+
+共同搜索绑定现归 Pi invocation 模块拥有：同一 profile/cwd 身份、Actor 输入捕获、producer
+受控 filesystem 入口及虚拟路径的正/负证据转换。资格任务删除重复 broker，并直接使用正式绑定
+验证 Actor、完成采纳、跨轮次和封存输入重算。模块由同一文件描述符有界读取后校验摘要，错误
+摘要、超限和 Linux FIFO 在准备期拒绝。两端完整搜索和全量 480/17 skipped、496/1 skipped、
+check/build/bench:check、Windows pack dry-run 通过；源码 +75（基线 +98）、benchmark −14、
+常规测试不增长，思程未修改。默认插件尚未选择新 profile；下一步是 TUI 和惰性选择生命周期。
