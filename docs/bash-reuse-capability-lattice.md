@@ -428,15 +428,15 @@ Linux FIFO 在获取大小时即被拒绝，未请求内容且 worker 未超时�
 取消矩阵覆盖无后续 import 的无限循环及等待输入，晚到 resolve/reject 不交付旧调用；配额
 覆盖输出、管道、稀疏分配和累计输入。64 MiB WASM 上限不是整个进程 RSS 上界。
 
-复现前在独立目录显式安装 `wasi-sh@0.11.0 ripgrep@0.3.1 globby@16.2.4`（可用
-`npm install --prefix <独立目录> --ignore-scripts`），构建本仓后运行
+当前复现先在本仓 `npm ci`、`npm run build`，再在独立目录显式安装 `ripgrep@0.3.1`
+（`npm install --prefix <独立目录> --ignore-scripts ripgrep@0.3.1`），运行
 `node bench/portable-kernel.mjs <独立目录> --pi-tools`。WSL 的依赖应放在原生文件系统；
 本次从 `/mnt/c` 加载依赖的对照仅首次准备就约 2.18 s，不能混入原生存储测量。
 
 globby/Pi 是可信实现，客体不获得任意 JS、宿主文件句柄或网络接口。没有把
 [Node permission 的防误用机制](https://github.com/nodejs/node/blob/v24.x/doc/api/permissions.md)
 当作恶意代码沙箱。原生链接语义、全量配置矩阵、成本优化及生产共同 profile / TUI 接入仍待完成；
-本阶段不新增生产依赖或 CI，不修改思程保护边界，不宣称 macOS/ARM64 Runtime 真机验收。
+上述 v4 阶段没有新增生产依赖或 CI；后续内核提取的依赖变化见文末。思程保护边界和缺失平台限制不变。
 
 v4 两端完整 check/build/bench:check 和 Windows pack dry-run 通过；Windows 498 passed /
 17 skipped，WSL 514 passed / 1 skipped。生产源码、常规测试行数不变，find 复用同一组
@@ -544,3 +544,20 @@ Linux Bash 的输出/文件效果、输入改变 miss、运行中单次采纳回
 bench:check 与 Windows pack dry-run 通过，全量为 Windows 484 passed / 17 skipped、WSL
 500 passed / 1 skipped。此步源码 +10 行、测试净减 21 行，当前 32,909 / 14,744 行；思程保护
 路径无变更。生产搜索执行器及 TUI 选择尚未发布，不把新的绑定能力冒充整个目标已完成。
+
+固定搜索内核现由 `src/closed-search-kernel.mjs` 统一拥有：原 Pi 搜索解析器、封闭 filesystem、
+单次输入物化、不可吞掉的捕获失败、WASI 时钟/随机源与限额。完整资格任务直接调用构建后的
+同一实现，不再复制搜索及 WASI 适配。模块先复制字节再验证摘要，初始化期间修改调用方 Buffer
+不会改变已验证模块；错误摘要和同一 worker 并发/重复初始化均被拒绝。首次 await 前取得唯一所有权；
+初始化失败须退出该 worker。每次搜索重新建立输入，grep 新建 WASM 实例，
+不是第三套跨轮次缓存。globby 16.2.4 与 wasi-sh 0.11.0 已锁定为按需加载依赖。
+
+干净 WSL 安装发现 `ripgrep` npm 包会把 `rg` 加入 npm PATH，遮蔽原生工具并使既有外部配置
+反例失败。因此它没有进入本仓依赖；资格用字节仍由明确的独立目录提供，内核不加载其 CLI 或
+宿主 FS 适配。生产字节分发、惰性工作进程所有权及 TUI 共同 profile 选择仍待完成，默认 Actor
+和思程保护路径不变。两端完整 grep/find 的跨轮次、输入重算、运行中接管、独立 Actor、越界/
+变化拒绝和取消矩阵通过；Windows 484 passed / 17 skipped、WSL 500 passed / 1 skipped，
+check/build/bench:check 及 Windows pack dry-run 通过。源码此步 +179 行，benchmark 净减
+147 行，常规测试不增长；当前源码 33,088、测试 14,744 行，相对 `65c8bfe` 源码仍净减 8 行。
+Linux Bash 整体/跨父子进程复用、输入改变 miss、运行中单次采纳回归通过。这不满足早先
+30,411 行绝对目标，也不是缺失的 macOS/ARM64 Runtime 验收。
