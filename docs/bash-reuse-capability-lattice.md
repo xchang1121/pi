@@ -154,6 +154,9 @@ before-state 全部匹配，并且生产者保证可以被当前消费者接受�
 本轮不得用“统一进程化”换取 Windows 能力退化，也不恢复未经证明的 host-function 提前执行。
 目标是在这一基线上净精简；之前的 30,411 行绝对预算仍未达到，不重定义为已经完成。
 
+追加边界：从 `ee97f0d` 起保留 PR #1 的思程实现，不改 SDK、控制协议、profile 安装和持久化
+恢复逻辑。下面第一步中的公共工厂归一已经完成，不据此继续改动思程文件；公共出口仍做接入回归。
+
 ### 统一什么、不统一什么
 
 保留 ExecutionWorldRouter、EffectTransaction、WorkspaceSandboxService、
@@ -248,6 +251,12 @@ TUI 层级配置。write/edit 沿用 Git 事务，Linux Bash 沿用现有证书/
 这一步没有宣称消除了 write/edit 的 Git 准备成本；进一步取消这项依赖仍需证明权限、链接和
 文件身份语义。`resources` 操作绑定字段已由 `filesystem` 替换，嵌入宿主应同步更新。
 
+后续事务修正为记录实际 `write_contents` 操作，包括内容未变化的写入，不再仅由 Git diff 推断。
+采纳原位写入时检查真实文件权限、描述符身份和链接数，保留已有文件句柄语义；硬链接无法表示时
+交回 Actor。写入已开始或关闭描述符失败则 poisoned，不重放 Actor。目录创建逐项进入事务记录，
+中途失败也能回滚；存在外来内容时保留现场并终止。`afterCapture` 若返回变更，现在表示完整封存
+delta，Linux process 调用方显式合并文件和目录证据；思程不使用此接口，源码保持不动。
+
 `PI_OPERATION_TOOLS` 是已接通的操作绑定，不是所有具有类似 effect 的工具集合。
 自定义宿主创建 Linux world 时必须显式传入 `tools`；受控资源 world 未传绑定时仍只观察。
 目录范围区分即时 `entries`、递归 `tree_entries` 与 `tree_content`，删除了自动猜测忽略文件
@@ -270,21 +279,42 @@ TUI 层级配置。write/edit 沿用 Git 事务，Linux Bash 沿用现有证书/
 Windows 原生 sandbox 候选还须验证身份、文件效果和完整观察，不能仅凭隔离成功发布复用证书。
 本轮未合入未通过这些条件的后端，也未宣称恢复原生 Windows 的任意 Bash 或 grep/find 投机。
 
-本机验证（源码 `5691393`）：
+进一步实测 `just-bash@3.4.2/browser` 的 InMemoryFs：约 1.2 MiB、105 个文件的输入封存约
+29.5 ms，每次精确验证约 19–27 ms；原版 Pi grep 为 42–46 ms，虚拟 rg 内核为 70–105 ms。
+原版 find 为 23–26 ms，虚拟文件枚举为 5–9 ms，但忽略规则和输出顺序并不等价，且尚未包括
+完整 Pi 输出格式化。这不是已通过的工具加速比，未将该包加入生产依赖。虚拟运行时仍只适合
+显式共同 profile；其[威胁模型](https://github.com/vercel-labs/just-bash/blob/main/THREAT_MODEL.md)
+也把宿主 hooks 视为可信边界，不能用直接 host fs 适配器冒充不可变输入或原子采纳。
 
-- Windows：check、501 passed / 16 skipped、build、bench:check、npm pack --dry-run 通过。
-- WSL：check、516 passed / 1 skipped、build、bench:check 通过；linux-process、exec-boundary、
-  linux-artifacts、linux-topology、linux-inflight 真路径通过。并发 barrier 仍在完整测试中执行。
-- Bash 冷执行/复用：首次同父 1.90×、跨父 1.98×；后一次同父 1.78×、跨父 1.87×。
-  128 MiB 产物重放仅 1.08×，不把它藏在较好的小产物指标中。
-- 最后一次 Actor 运行中接管：基线 4,015 ms，Actor 到达后 2,665 ms，约 1.51×；提前量 3 秒。
+本机验证（源码 `8e858b7`；下列时间为单个资格任务，不是普遍加速保证）：
+
+- Windows：check、500 passed / 16 skipped、build、bench:check、npm pack --dry-run 通过。
+- WSL：check、515 passed / 1 skipped、build、bench:check 通过。公共事务修改后重跑了
+  linux-process、linux-inflight，清理后又跑了 linux-artifacts、linux-topology；并发 barrier
+  仍在完整测试中执行。exec-boundary 保留 `5691393` 的通过记录，不写成此提交上重新测量。
+- 最新 Bash 冷执行/复用：同父 1.92×、跨父 1.75×；输出、退出码、文件效果及输入变化 miss 一致。
+  128 MiB 产物的三次跨父命中均通过完整产物检查，不只测试小文件。
+- 最近一次 Actor 运行中接管：基线 4,011 ms，Actor 到达后 2,882 ms，约 1.39×；提前量 3 秒。
   保留历史 1.83× 的冷/复用定义，不把它当作每次运行的最低保证。
-- Windows 小文件 read：Actor 1.22 ms、ready adoption 1.31 ms；ls 为 0.47 / 1.05 ms。
-  恢复执行资格不等于总有收益，原有校准收益门控仍决定是否采纳。
+- 原位写入对照：Windows/WSL 的硬链接均安全回退且 Actor 只调用一次，打开中的描述符均看到
+  正确新内容；Linux 只读文件（含等内容写入）仍报 EACCES。部分写入/close 失败无第二次 Actor。
+  目录中途失败的新测试在旧实现上实际失败，新实现通过，非空回滚保留外来内容。
 - Capsule 源码 SDK 的 check、12 个测试、真实 tgz 构建和独立安装/import 通过，协议 2、
-  fingerprint 与当前接入一致。Profile installer 明确报 `tt binary is unavailable`；未伪造
-  CLI 来把缺少 Runtime 的安装记作通过。macOS 和思程 ARM64 Runtime 仍没有真机资格结果。
+  fingerprint 与接入一致，这是前一阶段的 SDK 资格记录。此阶段只重跑接入回归，未修改思程
+  源码。Installer 的 `tt binary is unavailable` 仍未解决，不能记作 Runtime 安装通过。
 
-相对本轮 `65c8bfe`：生产源码 33,096 行，净变化 0；测试 15,300 行，净减少 30 行。
+跨平台原版 Pi read 的真实图片任务：4096×3072 PNG（263,458 字节），由原版 Photon worker
+缩放到 2000×1500；mock 只提供预测工具调用，不替代图片计算。基线为三次原版调用的中位数。
+
+| 平台 | Actor 基线 | 已完成候选采纳 | 运行中采纳（提前 100 ms） |
+| --- | --- | --- | --- |
+| Windows | 1,532 ms | 6.16 ms | 1,404 ms |
+| WSL | 1,554 ms | 4.17 ms | 1,369 ms |
+
+两端均验证输出完全一致、生产者一次、命中时 Actor 零次、关闭新预测后的跨轮次命中，以及随后
+输入变化触发单次 Actor。已完成命中的计算成本已提前支付，不是“免费计算”或任意 read 的收益。
+小文件 read/ls 仍可能倒挂，已有校准收益门控决定采纳。macOS 和思程 ARM64 Runtime 没有真机结果。
+
+相对本轮 `65c8bfe`：生产源码 33,091 行，净减少 5 行；测试 15,276 行，净减少 54 行。
 较早的 30,411 行绝对目标仍未达到。本轮不是所有跨平台扩展的完成声明：完整搜索、可移植
 共同 profile、原生 Windows/macOS 进程提供者仍需后续实现与资格验证，当前 goal 保持未完成。
