@@ -495,3 +495,14 @@ build、bench:check 及 Windows pack dry-run 通过。完整 grep 暖共同 prof
 Linux Bash 冷/复用同父 1.93×、跨父 1.94×；运行中 Actor 4009 → 2823 ms（1.42×），未重执行。
 当前源码 33,090 行、测试 15,000 行，相对本轮 `65c8bfe` 净减 6 / 330 行；本提交测试净减
 2 行，早先 30,411 行绝对目标未达到。没有 macOS 或思程 ARM64 Runtime 真机结果。
+
+正式 Actor 调用现独立绑定执行身份，不再借用参数相同但尚未完成的 preview K(a)。确定性反例中，
+预览使用 `preview` 环境，正式调用已切换为 `actor`；旧实现错误保留前者。host 每次调用只解析
+一次身份，复用准入、原始 Actor 回调和结算共享该绑定，绑定成本仍包含在 Actor 到达后的计时内。
+没有绕过原执行回调或思程 fallback 生命周期，也未引入跨调用缓存。旧的微任务时序测试改为
+明确候选事件；重复的 host 隔离场景由原 runtime 测试覆盖，源码净减 13 行、测试净减 56 行。
+
+两端全量保持 Windows 498 passed / 17 skipped、WSL 514 passed / 1 skipped，check/build/
+bench:check、Windows pack dry-run 及完整 grep/find Runtime 资格通过。Linux Bash 冷/复用
+同父 1.77×、跨父 1.72×；另计运行中 Actor 4010 → 2913 ms（1.38×），未重复执行。当前源码
+33,077 行、测试 14,944 行；生产搜索 profile 与 TUI 接入仍未完成，思程保护路径保持无改动。
