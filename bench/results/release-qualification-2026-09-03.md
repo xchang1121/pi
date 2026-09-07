@@ -2,6 +2,31 @@
 
 ## 2026-09-07：执行层级与思程接入复审
 
+### 仍然阻断验收：执行依赖闭包与真实 Runtime
+
+在 `b4f2786` 的真实 WSL Pi 工具中再次确认：Actor 执行窗口正常 seal 后，保持工作区文件和
+环境变量值不变，仅修改工作区外配置，`grep`/`find` 的结果都会改变，但旧 token 的精确验证
+仍为 `expired=false`。这不是 watcher 可靠性问题，而是输入未进入依赖集：
+
+| 工具 | 修改的外部输入 | 实际输出变化 | 旧证据 |
+| --- | --- | --- | --- |
+| grep | `RIPGREP_CONFIG_PATH` 指向的文件，加入 `--glob` / `!value.ts` | 匹配 `value.ts:1: alpha` → 无匹配 | 未失效 |
+| find | `$XDG_CONFIG_HOME/fd/ignore`，加入 `value.ts` | 匹配 `value.ts` → 无匹配 | 未失效 |
+
+复现使用独立临时 workspace/config 兄弟目录，禁用 watcher；只改变短生命周期测试进程的环境，
+不修改用户配置。此结果证明现有静态查询证据仍可能错误复用，不构成真实思程执行通过的证据。
+
+重新 fetch 的公开 Capsule 仍为 `c7e4158`，仅有 aarch64 Runtime；本机 x86_64 没有 `tt`，用户
+也没有可用 ARM64 主机或 x86 Runtime。SDK 的 `FsDependency` 只能声明 fs-relative 路径；
+`security-model.md` 明确配置目录不进入 snapshot，额外只读映射也不等于不可变输入。
+`FsRunInvocationParamsV1.environment` 是环境增补，不能据此证明与 Actor 当前完整环境一致。
+Pi 的 `grep/find` 公开 operations 也没有提供原生 `spawn` 的统一拦截点；仅替换查询实现会改变
+Actor 工具语义。现有证书/CAS 不应复制，后续需让同一执行依赖证明覆盖实际工具进程与所有
+可见输入，或由 Runtime 提供等价的冻结/验证契约，再完成真实隔离、冲突与采纳测试。
+
+因此统一路由及 TUI 层级的本机验证已具备，但“全部工具安全等价”和“思程内 Bash 的收益不低于
+原生”均未达成。不得通过关闭忽略规则、放宽能力声明或将原生 fallback 算作思程命中来通过验收。
+
 追加：工作区查询依赖已统一。思程不再按工具名维护另一份 dependency scope；沿用 resource
 语义，并将 SDK 不支持的 `tree_query` 保守提升为 `tree_content`。补上 `.fdignore` 内容以及
 搜索子目录的父级忽略规则依赖。修复前两项确定性反例均错误地返回未过期；修复后在关闭
