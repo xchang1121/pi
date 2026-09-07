@@ -279,22 +279,34 @@ delta，Linux process 调用方显式合并文件和目录证据；思程不使�
 Windows 原生 sandbox 候选还须验证身份、文件效果和完整观察，不能仅凭隔离成功发布复用证书。
 本轮未合入未通过这些条件的后端，也未宣称恢复原生 Windows 的任意 Bash 或 grep/find 投机。
 
-进一步实测 `just-bash@3.4.2/browser` 的 InMemoryFs：约 1.2 MiB、105 个文件的输入封存约
-29.5 ms，每次精确验证约 19–27 ms；原版 Pi grep 为 42–46 ms，虚拟 rg 内核为 70–105 ms。
-原版 find 为 23–26 ms，虚拟文件枚举为 5–9 ms，但忽略规则和输出顺序并不等价，且尚未包括
-完整 Pi 输出格式化。这不是已通过的工具加速比，未将该包加入生产依赖。虚拟运行时仍只适合
-显式共同 profile；其[威胁模型](https://github.com/vercel-labs/just-bash/blob/main/THREAT_MODEL.md)
-也把宿主 hooks 视为可信边界，不能用直接 host fs 适配器冒充不可变输入或原子采纳。
+进一步完成了完整工具对照，而非只比较搜索内核。实验保留 Pi 0.84.1 的参数处理、格式化和
+grep 上下文回读，只在独立 worker 中替换搜索能力；默认 Actor 和生产依赖没有改变：
 
-本机验证（源码 `8e858b7`；下列时间为单个资格任务，不是普遍加速保证）：
+- `just-bash@3.4.2/browser` 不支持原版 argv 中的 `--color=never` 和 `--`，参数错误还会返回
+  退出码 1，被原版 Pi 当成“无匹配”。诊断性调整 argv 后，完整搜索约 31–93 ms，原生约
+  14–25 ms；二进制文件、错误文本和输出顺序仍不一致。这些调整未进入插件。
+- `ripgrep@0.3.1` 的 WASM（rg 15.1.0）配合 `@bjorn3/browser_wasi_shim@0.4.2`，直接编译
+  包内字节，只交付已封存的内存文件；不使用默认 wrapper 的 host fs、自动扩大 preopen 和
+  未验证的共享临时缓存。Windows 原生 rg 15.2.0、WSL rg 14.1.0 的完整工具对照中，上下文、
+  长行和正则错误样例一致，但多文件顺序/限额仍不同；Windows 的 NUL 文件内容及行号也不同。
+- 原版 find 的公开 glob 入口可以接通同一内存 WASM，但 `rg --files` 不等价于 `fd`：目录
+  结果、忽略规则优先级、大小写、完整路径 glob 和限额提示都有反例，不能透明恢复原生 find。
 
-- Windows：check、500 passed / 16 skipped、build、bench:check、npm pack --dry-run 通过。
-- WSL：check、515 passed / 1 skipped、build、bench:check 通过。公共事务修改后重跑了
-  linux-process、linux-inflight，清理后又跑了 linux-artifacts、linux-topology；并发 barrier
-  仍在完整测试中执行。exec-boundary 保留 `5691393` 的通过记录，不写成此提交上重新测量。
-- 最新 Bash 冷执行/复用：同父 1.92×、跨父 1.75×；输出、退出码、文件效果及输入变化 miss 一致。
-  128 MiB 产物的三次跨父命中均通过完整产物检查，不只测试小文件。
-- 最近一次 Actor 运行中接管：基线 4,011 ms，Actor 到达后 2,882 ms，约 1.39×；提前量 3 秒。
+约 1.2 MB、109 个文件的 WASM 完整 grep 实验：Windows 热执行约 2–29 ms，但输入封存
+另需约 22 ms、验证约 13–30 ms；WSL 热执行约 6–12 ms、验证约 30–38 ms。原型 worker
+启动另需约 0.66 / 1.20 秒，不把这些成本藏到测量外，也不认定为 WASM 的不可消除成本。
+这证明了受控入口的可行性，尚未证明可采纳性和稳定净收益；下一步需要共同执行身份和准确的
+访问集合，而不是继续补参数/输出转换。[原包实现](https://github.com/pithings/ripgrep-node)
+和 [WASI shim 的实现状态](https://github.com/bjorn3/browser_wasi_shim)也不能当作通用沙箱的安全承诺。
+
+本机验证（源码 `1cf5ee1`；下列时间为单个资格任务，不是普遍加速保证）：
+
+- Windows：check、508 passed / 16 skipped、build、bench:check、npm pack --dry-run 通过。
+- WSL：check、523 passed / 1 skipped、build、bench:check 通过；linux-process、linux-inflight、
+  exec-boundary、linux-artifacts、linux-topology 全部重跑通过，并发 barrier 仍在完整测试中执行。
+- Bash 冷执行/复用：同父 1.84×、跨父 1.65×；输出、退出码、文件效果及输入变化 miss 一致。
+  128 MiB 产物的三次命中均通过完整检查，冷/复用中位数约 1.22×。
+- Actor 运行中接管：基线 4,012 ms，Actor 到达后 2,885 ms，约 1.39×；提前量 3 秒。
   保留历史 1.83× 的冷/复用定义，不把它当作每次运行的最低保证。
 - 原位写入对照：Windows/WSL 的硬链接均安全回退且 Actor 只调用一次，打开中的描述符均看到
   正确新内容；Linux 只读文件（含等内容写入）仍报 EACCES。部分写入/close 失败无第二次 Actor。
@@ -303,13 +315,13 @@ Windows 原生 sandbox 候选还须验证身份、文件效果和完整观察，
   fingerprint 与接入一致，这是前一阶段的 SDK 资格记录。此阶段只重跑接入回归，未修改思程
   源码。Installer 的 `tt binary is unavailable` 仍未解决，不能记作 Runtime 安装通过。
 
-跨平台原版 Pi read 的真实图片任务：4096×3072 PNG（263,458 字节），由原版 Photon worker
+同版原版 Pi read 的真实图片任务：4096×3072 PNG（263,458 字节），由原版 Photon worker
 缩放到 2000×1500；mock 只提供预测工具调用，不替代图片计算。基线为三次原版调用的中位数。
 
 | 平台 | Actor 基线 | 已完成候选采纳 | 运行中采纳（提前 100 ms） |
 | --- | --- | --- | --- |
-| Windows | 1,532 ms | 6.16 ms | 1,404 ms |
-| WSL | 1,554 ms | 4.17 ms | 1,369 ms |
+| Windows | 1,551 ms | 6.23 ms | 1,481 ms |
+| WSL | 1,525 ms | 4.33 ms | 1,447 ms |
 
 两端均验证输出完全一致、生产者一次、命中时 Actor 零次、关闭新预测后的跨轮次命中，以及随后
 输入变化触发单次 Actor。已完成命中的计算成本已提前支付，不是“免费计算”或任意 read 的收益。
@@ -322,9 +334,18 @@ read 的不同起点、ls 的不同 limit 共用这一机制，不新增工具�
 旧输出兼容路径也修复了正文伪装续读提示的错误证据，保留合法范围复用；思程模块、SDK、协议、
 profile 和安装脚本相对保护边界 `ee97f0d` 无变更，不把共享入口回归当成 ARM64 Runtime 验收。
 
-最新 Windows：510 passed / 15 skipped；WSL：524 passed / 1 skipped；两端 check、build、
-bench:check 通过，Windows pack dry-run 通过。`a588904` 的真机图片任务仍通过已完成、运行中、
-跨轮次和输入变化检查；同次 Bash in-flight 基线 4,009 ms、到达后采纳 2,734 ms，约 1.47×。
-相对本轮 `65c8bfe`：生产源码 33,096 行，无净增长；测试 15,219 行，净减少 111 行。
+`b9f3ac7` 将重叠采集收敛到同一个输入视图：较弱的元数据不再清掉已捕获的文件内容或目录条目。
+`1cf5ee1` 由同一描述符直接拥有读取、哈希和保留缓冲区，删除 stream 生命周期及最终拼接副本；
+仍验证 EOF、文件大小和前后身份，短读继续读取，增长/缩短/替换则拒绝，不返回未填充的内存。
+相应测试合并了重复的“执行窗口”和“未来复用”场景，覆盖空文件、短读、多块内容及并发变化。
+
+同机组件微基准（各 10 次测量的中位数，比较 `b9f3ac7` 与 `1cf5ee1`）如下；不是 Actor 加速比：
+
+| 文件验证任务 | Windows 修改前 → 后 | WSL 修改前 → 后 |
+| --- | --- | --- |
+| 单个 16 MiB 文件 | 16.1 → 11.9 ms | 17.7 → 10.9 ms |
+| 100 个约 12 KiB 文件 | 16.2 → 12.2 ms | 30.0 → 26.3 ms |
+
+相对本轮 `65c8bfe`：生产源码 33,096 行，无净增长；测试 15,217 行，净减少 113 行。
 较早的 30,411 行绝对目标仍未达到。完整搜索、可移植共同 profile、原生 Windows/macOS 进程
 提供者仍需后续实现与资格验证，当前 goal 保持未完成；没有新增缓存层、配置开关或 CI。
