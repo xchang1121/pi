@@ -1,4 +1,66 @@
-# 发布资格与清理记录（2026-09-03）
+# 发布资格与清理记录（2026-09-03；2026-09-07 补充）
+
+## 2026-09-07：执行层级与思程接入复审
+
+当前结论：核心执行层级已修正，**真实思程 Runtime 资格尚未完成**。下文旧记录保留为历史，
+不能用早期 SDK mock、安装布局测试或原生 WSL benchmark 推断真实思程执行与采纳已经通过。
+
+架构仍保留五个状态所有者：Router 选择能力与执行路线；Runtime 管候选和调度；
+EffectTransaction 管验证/提交/poisoned；WorkspaceSandboxService 管工作区事务；
+ProcessExecutionCoordinator 管进程出口。普通候选缓存与 Bash certificate/CAS 沿用原实现，
+没有第三套缓存。81 个生产 TS 模块、309 条静态内部依赖，未发现循环。
+
+修正了以下边界：
+
+- 删除思程独立 Actor 结果捕获：快照内容相等不能证明执行窗口没有 A→B→A；复用现有
+  resource observation 的身份、change stamp 与窗口证明。测试确认变化时保留 Actor 输出但不缓存。
+- 层级开关只管新的提前执行，不阻断 Actor 结果复用；Router 同时负责选择和执行前的策略检查。
+  预热保留工具作用域，避免只启用读工具却初始化 Bash 后端。没有增加按工具分叉的出口。
+- 思程缓存的是 client/pool，不再把旧初始化成功当作永久可用；每次选路检查当前 attachment，
+  覆盖初始化后断连降级。跨 provider 的私有 checkpoint 仍由 Runtime 延后处理，不混用分支。
+- Apply 等待路由诊断；关闭后再启用、初始化失败后刷新、Runtime 断连后刷新均覆盖。
+  思程 turn 登记保持内存操作，不因中途打开层级而丢失回合。关闭插件不启动 native probe/helper。
+- SDK payload 上传与 durable run 重试分开：同一逻辑调用不重复上传；上传期间取消不再启动 runner。
+  恢复出的 cancelled 结果保留 TARGET ID，交回原分支清理，避免丢失快照所有权。
+
+### 逐工具证据范围
+
+| 工具 | 原生后备 | 思程路线 | 本机已验证 |
+| --- | --- | --- | --- |
+| read | Actor 执行后观察复用，不提前执行 host function | fs.run | 本地 runner 序列化输出与 Actor 一致 |
+| grep | 同上 | fs.run | 本地 rg 结果一致 |
+| find | 同上 | fs.run | 本地 fd 结果一致 |
+| ls | 同上 | fs.run | 本地目录输出一致 |
+| write | Git 工作区投机/提交 | fs.run + fs.apply | 本地 runner 与真实 Git 后备输出、夹具文件效果一致 |
+| edit | Git 工作区投机/提交 | fs.run + fs.apply | 同上 |
+| bash | Linux process world，能力不足则 Actor | 当前 fs.run provider 不接收；尝试原生后备 | 真实 WSL 投机、复用、采纳通过，未在思程中实测 |
+
+前六项比较调用了真实 Pi 实现并通过 runner wire 编解码，但**没有运行思程 fs.run**。
+read/grep/find/ls 的 Actor 观察不能称作“独立 fallback 提前投机”。SDK mock 对冲突、
+durable completion-unknown、取消清理的覆盖也不等同于真实 Runtime 资格。
+
+### 真机与包边界
+
+- Windows：495 passed / 13 skipped；check、build、bench:check、pack dry-run 通过。
+- WSL 2：507 passed / 1 skipped；check、build、bench:check 通过。原生进程与 in-flight benchmark 的输出、
+  文件效果、输入变更 miss、单次 Actor fallback 和单消费者采纳断言通过。
+- 原生 Bash 冷执行 / 跨父命令复用：3494.33 / 1869.02 ms = **1.870×**。
+  Actor 基线 / 到达后 in-flight 采纳：4009.00 / 2782.35 ms = **1.441×**，缩短 1226.65 ms。
+  这是两个不同口径的本次样本，不是所有任务的加速下界；历史 **1.83×** 口径保留。
+- Capsule `c7e4158` 的真实 Agent POSIX SDK：check、12 项上游测试和 tgz 构建通过。
+  安装器携带该 tgz 在前置检查明确失败：`the current ThinkThread tt binary is unavailable`，
+  尚未完成真实 Profile 安装/启动资格，未用替代 tt 命令冒充通过。
+- 本轮相对 `7184098` 生产源码净减 61 行、测试净减 64 行（不包含远端独立的 benchmark 提交）。
+  按 `rg --files src` 的全部文件物理行计数，当前仍有 33,154 行；原先 30,411 行的全仓目标未达成。
+
+公开 alpha2 Runtime 只有 aarch64 包，本机为 x86_64，用户也没有额外 ARM64 主机或 x86 Runtime。
+现有 Actor held-exec 又限定 x86-64，不能宣称思程中自动保有全部原子能力。公开 fs.run 继承
+Profile 网络授权、没有单次网络收窄，时间/随机数仍真实，且不暴露可接管的子进程资源。
+因此“统一调用出口”是可行的架构角色，但不自动证明任意 Bash 可安全提前执行、部分复用或无损采纳。
+后续真实验收必须在同一可运行思程环境中比较原生与思程路径、验证隔离/依赖/冲突与嵌套 helper，
+再报告两套计时；目前不能保证思程性能不低于原生，也不应通过放宽能力声明实现表面命中。
+
+## 2026-09-03 历史记录
 
 本轮从执行权限、文件证据、进程观察、事务提交、进程出口和指标口径六个边界关闭了
 审计问题；代码资格基线为前序 benchmark 清理提交。
