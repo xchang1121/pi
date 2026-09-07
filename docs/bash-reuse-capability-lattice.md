@@ -234,3 +234,51 @@ grep/find 的资格测试必须覆盖原版 Pi 的忽略文件、环境配置、
 fallback。平台相关路径显式 skip。真实 Bash 继续覆盖同父/跨父复用、并发 barrier 和发布竞态。
 收益分别报告 `cold / reuse` 与 `Actor baseline / Actor 到达后的 hit latency`；保留历史 1.83×
 口径，不把新执行器启动开销抬高的基线算成优化收益。首次未校准命中不声称因果加速。
+
+### 本轮落地与资格结果（2026-09-07）
+
+已实现工具工厂归一、token 持有封存输入、原版 read/ls 的跨平台受控操作、本地能力绑定清单和
+TUI 层级配置。write/edit 沿用 Git 事务，Linux Bash 沿用现有证书/CAS、子进程和运行中接管。
+进程 world 改为单 session 所有权，删除输出字符串的盲目路径替换；资源分支也只以 token
+所有权决定是否仍可验证/提交。没有新增常驻缓存、虚拟机依赖或 CI。
+
+`PI_OPERATION_TOOLS` 是已接通的操作绑定，不是所有具有类似 effect 的工具集合。
+自定义宿主创建 Linux world 时必须显式传入 `tools`；受控资源 world 未传绑定时仍只观察。
+目录范围区分即时 `entries`、递归 `tree_entries` 与 `tree_content`，删除了自动猜测忽略文件
+名称的 `tree_query`。TUI 的 Local safe fallback 包括这些受控操作，并不意味着只能在 Linux
+上运行原生进程。关闭预测仍不连带关闭 Actor 观察/历史重放。
+
+完整 Node/Pi runner 实验**没有通过准入**，因此阶段四没有继续扩大 shell 专用接口：
+
+| 工具 | 直接 runner | 隔离 runner | 结果 |
+| --- | --- | --- | --- |
+| grep（含上下文） | 614 ms | 33,626 ms | 输出一致；可变宿主模块、statx 证据和内部管道端点使验证 indeterminate |
+| find | 568 ms | 34,168 ms | 输出一致；同类证据缺口，禁止提交 |
+
+这是 WSL x86-64、Node 24.20.0、Pi 0.84.1 上完整 runner 的实验，不是原版 Actor 搜索的
+性能基线，也不代表所有进程封装都必然如此。没有放宽 mutable-host、metadata 或 broker
+验证来凑命中；尚无合格的新调用方时不提交“未来通用进程接口”。
+
+可移植增强仍有明确边界：just-bash/虚拟文件系统需要 Actor 与投机共同选择同一 profile；
+不能只替换投机一侧。ripgrep-node 的 WASI 适配直接使用 host fs，不能直接当安全沙箱。
+Windows 原生 sandbox 候选还须验证身份、文件效果和完整观察，不能仅凭隔离成功发布复用证书。
+本轮未合入未通过这些条件的后端，也未宣称恢复原生 Windows 的任意 Bash 或 grep/find 投机。
+
+本机验证（源码 `5691393`）：
+
+- Windows：check、501 passed / 16 skipped、build、bench:check、npm pack --dry-run 通过。
+- WSL：check、516 passed / 1 skipped、build、bench:check 通过；linux-process、exec-boundary、
+  linux-artifacts、linux-topology、linux-inflight 真路径通过。并发 barrier 仍在完整测试中执行。
+- Bash 冷执行/复用：首次同父 1.90×、跨父 1.98×；后一次同父 1.78×、跨父 1.87×。
+  128 MiB 产物重放仅 1.08×，不把它藏在较好的小产物指标中。
+- 最后一次 Actor 运行中接管：基线 4,015 ms，Actor 到达后 2,665 ms，约 1.51×；提前量 3 秒。
+  保留历史 1.83× 的冷/复用定义，不把它当作每次运行的最低保证。
+- Windows 小文件 read：Actor 1.22 ms、ready adoption 1.31 ms；ls 为 0.47 / 1.05 ms。
+  恢复执行资格不等于总有收益，原有校准收益门控仍决定是否采纳。
+- Capsule 源码 SDK 的 check、12 个测试、真实 tgz 构建和独立安装/import 通过，协议 2、
+  fingerprint 与当前接入一致。Profile installer 明确报 `tt binary is unavailable`；未伪造
+  CLI 来把缺少 Runtime 的安装记作通过。macOS 和思程 ARM64 Runtime 仍没有真机资格结果。
+
+相对本轮 `65c8bfe`：生产源码 33,096 行，净变化 0；测试 15,300 行，净减少 30 行。
+较早的 30,411 行绝对目标仍未达到。本轮不是所有跨平台扩展的完成声明：完整搜索、可移植
+共同 profile、原生 Windows/macOS 进程提供者仍需后续实现与资格验证，当前 goal 保持未完成。
