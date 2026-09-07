@@ -600,3 +600,9 @@ check/build/bench:check、Windows pack dry-run、完整搜索及 Bash 同父/跨
 Windows/WSL 完整搜索资格和全量 481/17 skipped、497/1 skipped 通过，check/build/bench:check
 及 Windows pack dry-run 通过。源码 +76、benchmark −50、测试不增长；距本轮基线源码 +89 行，
 尚须压缩。默认原生行为、思程保护路径不变，生产池和 TUI 选择仍待完成。
+
+host 与 TUI 的配置规范化已合并；原先仅 TUI 将 `predictionTimeoutMs: 0` 还原默认值的差异消除。
+三套字段编辑函数合并为按类型验证并发布不可变设置的同一入口；原菜单展示测试并入实际编辑流程，
+保留非法值拒绝、取消不修改、清空删除覆盖值及零等待验证。源码 −97、测试 −13 行；当前源码
+33,088、测试 14,692 行。Windows/WSL 全量 480/17 skipped、496/1 skipped，check/build/
+bench:check 通过，思程保护路径无改动。搜索池及 TUI 选择仍未完成。
