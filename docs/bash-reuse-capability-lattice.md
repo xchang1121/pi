@@ -577,3 +577,11 @@ Windows 与 WSL 的真实下载、替换及完整搜索资格均通过，默认 
 WSL 497 passed / 1 skipped，check/build/bench:check、pack dry-run、完整 grep/find 资格通过。
 Linux Bash 同父/跨父冷复用比约 1.97×/1.95×，另计运行中 Actor 4009 → 2651 ms（1.51×），
 未重复执行。此步源码 −23、测试 −41 行；思程保护路径无改动，生产搜索路线/TUI 仍待完成。
+
+固定内核增加独立 IPC 启动入口，输入邮箱由主线程拥有，计算线程只同步取得本次调用的响应。
+唤醒标记与请求序号分离，错误归属和超限帧直接拒绝；父连接断开时退出整个工作进程。正式入口
+仅接受 grep/find，资格专用 shell/暂停命令没有进入生产协议。现有资格任务的 Actor 搜索和
+输入等待取消改走此入口，producer 与无导入死循环使用同一通信实现的资格脚本；导入本身不
+启动 worker 或加载搜索依赖。Windows/WSL 完整搜索资格、全量 481/17 skipped 与 497/1 skipped、
+check/build/bench:check 及 Windows pack dry-run 通过。此步源码 +61 行、benchmark 净减 27 行，
+常规测试不增长；相对本轮基线源码仍 +78 行，池所有权/TUI 和最终代码预算尚未完成。思程未修改。
