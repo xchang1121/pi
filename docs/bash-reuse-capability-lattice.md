@@ -389,39 +389,59 @@ WSL 517 passed / 1 skipped，以及两端 check、build、bench:check 和 Window
 较早的 30,411 行绝对目标仍未达到。完整搜索、可移植共同 profile、原生 Windows/macOS 进程
 提供者仍需后续实现与资格验证，当前 goal 保持未完成；没有新增缓存层、配置开关或 CI。
 
-`portable-kernel.mjs --pi-tools` 使用原版 Pi grep 的参数、格式化和上下文回读，以及真实 rg
-WASM；Actor 与投机使用同一显式配置，不替换原生默认工具。父进程仍拥有证据、Runtime 与
-事务，独立子进程拥有工具生命周期。跨轮次命中、三个不同查询重算、运行中接管、过期及执行
-窗口变化拒绝均在 Windows/WSL 通过，Actor 与 producer 保持独立执行容量；不是 mock 搜索。
+### 可移植搜索资格（2026-09-08，v4）
 
-2026-09-08 的 v3 配置将整包 IPC 改为按访问传输：同一子进程中的客体线程用同步邮箱等待
-异步输入，外层拥有唯一请求身份和退出边界。采用的是 [esbuild 的同步 worker 通信模式](https://github.com/evanw/esbuild/blob/main/lib/npm/node.ts)，
-不是让异步函数直接冒充 [wasi-sh 的同步文件系统接口](https://github.com/alganet/wasi-sh)。
-不开放 host 文件句柄或网络；目录条目证明不存在，未证明访问或预算失败不能被工具吞成成功。
-`ResourceReadView.stat()` 使用实际捕获的元数据或已保留内容提供大小，不虚构文件长度；没有第二份捕获。
+`portable-kernel.mjs --pi-tools` 现在将完整 grep/find 放入同一组 Runtime 流程。grep 使用
+原版 Pi 的参数、格式化、上下文回读及真实 rg WASM；find 使用原版 Pi 公开的 `operations.glob`
+入口和 [globby](https://github.com/sindresorhus/globby) 的虚拟 FS / gitignore 支持，不自写忽略规则。
+同步邮箱沿用 [esbuild 的 worker 模式](https://github.com/evanw/esbuild/blob/main/lib/npm/node.ts)，
+把异步捕获接到 [wasi-sh 同步 FS](https://github.com/alganet/wasi-sh)。Actor 与 producer 都通过
+同一个 token-owned 输入边界；已删除资格脚本中 Actor 直接读宿主 FS 的路径。
 
-搜索 fixture 含一个被忽略的 16 MiB 文件：每次约 67 个输入请求、1.18 MB 成功响应载荷，
-忽略内容没有传入客体；显式搜索大文件则被 8 MiB 配额拒绝。早期只完成按需传输，进入
-Runtime 验收前还需缩小该文件；本次改为真正按访问捕获，验收全程保留 16 MiB 文件。
-token 的依赖/指纹/身份平行数组合并为一个证据 Map，元数据、目录名和内容共用原有捕获器。
-封存后禁用加载器；两个新查询复用已有输入，`glob` 覆盖忽略规则后访问未捕获文件则单次
-Actor fallback，不能扩张旧候选的权限。挂起的输入请求不能封存或泄漏，释放后晚到读取失败。
-完整 find 和生产共同 profile / TUI 接入仍未完成，不把真实内核资格测试当作生产启用。
+这是显式共同 profile，不是原生替换：身份记录 Pi/引擎版本、OS、Node、固定环境、虚拟元数据、
+预算和 find 的配置。find 大小写敏感、排序后限额、包含目录，仅使用受控工作区的忽略配置。
+现有输入视图将工作区内链接规范化为目标，不提供原生 lstat 语义；越界链接拒绝整个查询，
+不能用“忽略未知条目”伪造完整结果。Windows junction / POSIX symlink 的内外目标矩阵通过；
+Linux FIFO 在获取大小时即被拒绝，未请求内容且 worker 未超时。Windows 不冒充通过 FIFO 测试。
 
-v3 末次顺序测量：Windows 暖 Actor 36.8 ms、完成采纳 14.6 ms、后续精确命中 5.7 ms；
-WSL 为 43.5 / 10.1 / 7.0 ms。每个 worker 准备另需约 540 / 697 ms。整包 IPC 旧样本为
-Windows 21.2 / 4.4 ms、WSL 16.4 / 8.2 ms；按需通信目前有额外开销，不宣称冷执行加速，
-也不把共同 profile 的采纳比值当作原生加速。减少捕获范围与通信成本是继续接入前的门槛。
+真实对照保留了差异：原生 fd 与共同 find 的限额子集、提示文字不同；Windows 的路径 glob
+样例也不同。原生 rg 的多文件限额子集与共同 grep 不同。Actor/producer 同配置输出则一致。
+因此结果不能跨 profile 混用，也不能在默认模式下悄悄把 fd 改成 globby。
 
-取消矩阵覆盖实际进入后不再调用 import 的无限循环，以及等待输入的 guest：abort/deadline
-均先等进程及 stdio 关闭，晚到输入 resolve/reject 均不交付旧调用。配额覆盖输出、管道、
-稀疏分配和累计输入；缺少输入授权不会变成空搜索成功。线程内实测 WASM 内存增长上限仍为
-64 MiB，但 [Node 线程 heap 限额不包含外部分配](https://nodejs.org/api/worker_threads.html#new-workerfilename-options)，
-所以保留外部进程隔离；这不是整个 RSS 或任意 shell 的资源上界证明。
+父进程继续拥有证据、Runtime 和事务，不新增缓存。两工具共用完成/运行中采纳、关闭新预测后
+跨轮次复用、两个封存输入查询重算、扩大作用域后的单次 Actor 回退、过期/执行期间变化拒绝。
+不同查询的 Actor 能在 producer 暂停时完成，禁用/取消后先退出 worker，再单次恢复执行。
+16 MiB 忽略文件始终保留：grep 每次 82 个输入请求、约 1.18 MB 载荷；find 为 43 个请求、
+1,173 字节，均不传输忽略内容。目录名、元数据和内容由原捕获器按需保留，封存后禁止扩张。
 
-两端 check/build/bench:check、Windows pack dry-run 及全量测试通过：Windows 504 passed /
-16 skipped、WSL 519 passed / 1 skipped。v3 生产/常规测试行数均无净变化，资格代码净增
-108 行，没有增加依赖、缓存、CI、生产工具开关或思程保护边界改动；不宣称 macOS 真机验收。
+下表是同机顺序测量，单位 ms；两个 Actor 基线各取三次中位数，完成采纳是一次 Runtime 调用：
+
+| 平台 / 工具 | 原生 Actor | 暖共同 profile Actor | 已完成采纳 |
+| --- | ---: | ---: | ---: |
+| Windows / grep | 22.9 | 61.3 | 8.6 |
+| Windows / find | 20.9 | 21.6 | 2.8 |
+| WSL / grep | 15.2 | 60.6 | 13.2 |
+| WSL / find | 7.8 | 18.0 | 3.3 |
+
+首次 worker 准备另计 Windows 630 ms、WSL 617 ms，后续独立 Actor worker 约 336–581 ms。
+采纳前已支付投机计算成本；表中不能推导冷启动净收益，更不能用慢共同基线冒充原生加速。
+取消矩阵覆盖无后续 import 的无限循环及等待输入，晚到 resolve/reject 不交付旧调用；配额
+覆盖输出、管道、稀疏分配和累计输入。64 MiB WASM 上限不是整个进程 RSS 上界。
+
+复现前在独立目录显式安装 `wasi-sh@0.11.0 ripgrep@0.3.1 globby@16.2.4`（可用
+`npm install --prefix <独立目录> --ignore-scripts`），构建本仓后运行
+`node bench/portable-kernel.mjs <独立目录> --pi-tools`。WSL 的依赖应放在原生文件系统；
+本次从 `/mnt/c` 加载依赖的对照仅首次准备就约 2.18 s，不能混入原生存储测量。
+
+globby/Pi 是可信实现，客体不获得任意 JS、宿主文件句柄或网络接口。没有把
+[Node permission 的防误用机制](https://github.com/nodejs/node/blob/v24.x/doc/api/permissions.md)
+当作恶意代码沙箱。原生链接语义、全量配置矩阵、成本优化及生产共同 profile / TUI 接入仍待完成；
+本阶段不新增生产依赖或 CI，不修改思程保护边界，不宣称 macOS/ARM64 Runtime 真机验收。
+
+v4 两端完整 check/build/bench:check 和 Windows pack dry-run 通过；Windows 498 passed /
+17 skipped，WSL 514 passed / 1 skipped。生产源码、常规测试行数不变，find 复用同一组
+资格流程，不复制一套 Runtime 测试。Linux Bash 真路径重跑亦通过：冷/复用同父 1.85×、
+跨父 1.91×；另计运行中 Actor 4010 → 2817 ms（1.42×），采纳后未重执行。
 
 2026-09-08 将手工 gateway 采纳替换为真实 Runtime 后，发现 Actor 会无覆盖证明地等待不同
 查询的运行中候选：旧代码在固定 checkpoint 上等到 worker 的 5 秒 deadline 才 fallback。
