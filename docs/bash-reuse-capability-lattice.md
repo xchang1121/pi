@@ -570,3 +570,10 @@ Windows 与 WSL 的真实下载、替换及完整搜索资格均通过，默认 
 484/17 skipped 与 500/1 skipped，check/build/bench:check、Windows pack dry-run 通过。
 源码此步 +48 行、测试 +9 行、benchmark −7 行；当前源码 33,136，距本轮最终不增长目标尚需
 净减 40 行。工作进程生命周期与 TUI 接入继续进行，不把安装器当成生产投机路线已经启用。
+
+统一工具出口删除两层内部转发，由同一个不可变结算记录保留 Actor 原始成功值或失败，观察回调
+只能接收它；可恢复复用失败仍 fallback，poisoned 提交不再执行 Actor。四段重复测试合为包含
+同步/异步失败、falsy 命中和观察器修改尝试的故障矩阵。Windows 481 passed / 17 skipped、
+WSL 497 passed / 1 skipped，check/build/bench:check、pack dry-run、完整 grep/find 资格通过。
+Linux Bash 同父/跨父冷复用比约 1.97×/1.95×，另计运行中 Actor 4009 → 2651 ms（1.51×），
+未重复执行。此步源码 −23、测试 −41 行；思程保护路径无改动，生产搜索路线/TUI 仍待完成。
