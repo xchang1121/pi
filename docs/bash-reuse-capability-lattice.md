@@ -389,32 +389,36 @@ WSL 517 passed / 1 skipped，以及两端 check、build、bench:check 和 Window
 较早的 30,411 行绝对目标仍未达到。完整搜索、可移植共同 profile、原生 Windows/macOS 进程
 提供者仍需后续实现与资格验证，当前 goal 保持未完成；没有新增缓存层、配置开关或 CI。
 
-`portable-kernel.mjs --pi-tools` 进一步验证了共同配置下的完整 grep：原版 Pi 的搜索参数、
-输出格式化和上下文回读使用同一个内存文件系统，Actor 与投机共同固定虚拟时间、随机种子和
-环境。已完成分支经现有 gateway/事务验证后采纳，三个不同查询重新计算；宿主在搜索结束、
-Pi 回读前发生变化时，封存失败，不能发布候选。采纳前输入变化也会拒绝旧分支，Actor 只执行一次。
-这些断言在 Windows/WSL 的真实 Pi + rg WASM 路径通过，不是 mock 搜索结果。
+`portable-kernel.mjs --pi-tools` 使用原版 Pi grep 的参数、格式化和上下文回读，以及真实 rg
+WASM；Actor 与投机使用同一显式配置，不替换原生默认工具。父进程仍拥有证据、Runtime 与
+事务，独立子进程拥有工具生命周期。跨轮次命中、三个不同查询重算、运行中接管、过期及执行
+窗口变化拒绝均在 Windows/WSL 通过，Actor 与 producer 保持独立执行容量；不是 mock 搜索。
 
-这只证明显式共同配置的有限任务可以进入现有资源/事务边界，没有证明原生等价、完整取消或
-通用沙箱资格；未改生产依赖、原生 Actor、TUI 或思程保护边界。启动准备约需一秒，故不能隐藏
-这项成本，只展示暖命中。后续应完善同一个执行配置的工作进程通信、配额与输入访问集合，不再
-分别实现搜索输出投影。find 仍不以 `rg --files` 顶替 fd。
+2026-09-08 的 v3 配置将整包 IPC 改为按访问传输：同一子进程中的客体线程用同步邮箱等待
+异步输入，外层拥有唯一请求身份和退出边界。采用的是 [esbuild 的同步 worker 通信模式](https://github.com/evanw/esbuild/blob/main/lib/npm/node.ts)，
+不是让异步函数直接冒充 [wasi-sh 的同步文件系统接口](https://github.com/alganet/wasi-sh)。
+不开放 host 文件句柄或网络；目录条目证明不存在，未证明访问或预算失败不能被工具吞成成功。
+`ResourceReadView.stat()` 只从已保留内容提供大小，元数据视图不虚构文件长度；没有第二份捕获。
 
-随后将该实验重构为父进程持有证据/事务、worker 持有完整原版 Pi grep 与私有输入。IPC 只传
-字节和结构化请求，不传 host 文件句柄；完成、gateway 运行中 join、不同查询重算、过期拒绝
-和搜索期间变化拒绝在 Windows/WSL 均通过。完整 grep 在上下文回读前取消时，先确认 worker
-及 stdio 关闭，再以同一执行身份恢复；旧候选丢弃，Actor 只执行一次。无限循环 guest 从内部
-报告进入、随后不再调用 import，也能被父进程取消或按 deadline 终止，不靠 `setTimeout` 猜交错。
+搜索 fixture 含一个被忽略的 16 MiB 文件：每次约 66 个输入请求、1.18 MB 成功响应载荷，
+忽略内容没有传入客体；显式搜索大文件则被 8 MiB 配额拒绝。选择 `glob` 可以覆盖忽略规则，
+因此不在插件中重写忽略逻辑。注意：这里只完成按需传输，资源证据仍预先采集 `tree_content`；
+Runtime 验收前将该文件缩小。大工作区的按需捕获、完整 find 和生产配置接入仍未完成。
 
-同一资格任务的顺序测量：Windows 准备约 527 ms，共同 profile 暖 Actor 21.2 ms、完成采纳
-4.4 ms；WSL 准备约 664 ms，暖 Actor 16.4 ms、完成采纳 8.2 ms。暖 Actor 包含输入收集与
-IPC，原生对照分别约 23.6 / 15.3 ms；不同 profile 不计算成原生加速比，启动也不是免费成本。
-这一版本不再为读取版本号而导入 Pi 全部公共入口，但完整工具代码及格式化仍为原版。
+v3 末次顺序测量：Windows 暖 Actor 36.8 ms、完成采纳 14.6 ms、后续精确命中 5.7 ms；
+WSL 为 43.5 / 10.1 / 7.0 ms。每个 worker 准备另需约 540 / 697 ms。整包 IPC 旧样本为
+Windows 21.2 / 4.4 ms、WSL 16.4 / 8.2 ms；按需通信目前有额外开销，不宣称冷执行加速，
+也不把共同 profile 的采纳比值当作原生加速。减少捕获范围与通信成本是继续接入前的门槛。
 
-配额故障覆盖 stdout/管道写入和稀疏 store 分配，拒绝后没有部分结果，下一次调用的私有输入
-仍完整。它不证明任意 shell 变更、开放描述符快照或整个进程 RSS 已有严格上界，也不证明
-原生 find 等价性或生产可用性；不因此增加工具开关或新缓存。该 IPC 阶段未改生产代码、
-常规测试或思程保护边界；下一步仍是缩小完整搜索的输入证据集合并验证生产接入。
+取消矩阵覆盖实际进入后不再调用 import 的无限循环，以及等待输入的 guest：abort/deadline
+均先等进程及 stdio 关闭，晚到输入 resolve/reject 均不交付旧调用。配额覆盖输出、管道、
+稀疏分配和累计输入；缺少输入授权不会变成空搜索成功。线程内实测 WASM 内存增长上限仍为
+64 MiB，但 [Node 线程 heap 限额不包含外部分配](https://nodejs.org/api/worker_threads.html#new-workerfilename-options)，
+所以保留外部进程隔离；这不是整个 RSS 或任意 shell 的资源上界证明。
+
+两端 check/build/bench:check、Windows pack dry-run 及全量测试通过：Windows 504 passed /
+16 skipped、WSL 519 passed / 1 skipped。v3 生产/常规测试行数均无净变化，资格代码净增
+108 行，没有增加依赖、缓存、CI、生产工具开关或思程保护边界改动；不宣称 macOS 真机验收。
 
 2026-09-08 将手工 gateway 采纳替换为真实 Runtime 后，发现 Actor 会无覆盖证明地等待不同
 查询的运行中候选：旧代码在固定 checkpoint 上等到 worker 的 5 秒 deadline 才 fallback。
