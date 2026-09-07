@@ -428,9 +428,9 @@ Linux FIFO 在获取大小时即被拒绝，未请求内容且 worker 未超时�
 取消矩阵覆盖无后续 import 的无限循环及等待输入，晚到 resolve/reject 不交付旧调用；配额
 覆盖输出、管道、稀疏分配和累计输入。64 MiB WASM 上限不是整个进程 RSS 上界。
 
-当前复现先在本仓 `npm ci`、`npm run build`，再在独立目录显式安装 `ripgrep@0.3.1`
-（`npm install --prefix <独立目录> --ignore-scripts ripgrep@0.3.1`），运行
-`node bench/portable-kernel.mjs <独立目录> --pi-tools`。WSL 的依赖应放在原生文件系统；
+当前复现先在本仓 `npm ci`、`npm run build`，再 `npm run setup:search -- <模块文件路径>`，运行
+`node bench/portable-kernel.mjs <模块文件路径> --pi-tools`，无需在本仓或独立目录安装 ripgrep CLI。
+WSL 的依赖应放在原生文件系统；
 本次从 `/mnt/c` 加载依赖的对照仅首次准备就约 2.18 s，不能混入原生存储测量。
 
 globby/Pi 是可信实现，客体不获得任意 JS、宿主文件句柄或网络接口。没有把
@@ -561,3 +561,12 @@ check/build/bench:check 及 Windows pack dry-run 通过。源码此步 +179 行�
 147 行，常规测试不增长；当前源码 33,088、测试 14,744 行，相对 `65c8bfe` 源码仍净减 8 行。
 Linux Bash 整体/跨父子进程复用、输入改变 miss、运行中单次采纳回归通过。这不满足早先
 30,411 行绝对目标，也不是缺失的 macOS/ARM64 Runtime 验收。
+
+字节分发现使用显式 `setup:search`：下载有体积/时间上限的固定 npm 归档，先核对 SHA-512，
+仅从内存中读取指定数据模块，再核对解压 WASM 的 SHA-256。归档路径不落盘，不建立 CLI 链接。
+文件句柄以排他方式取得临时文件所有权，完整关闭后原子发布；下载和验证失败不会覆盖已有模块。
+Windows 与 WSL 的真实下载、替换及完整搜索资格均通过，默认 Actor/配置和思程保护路径未变。
+包边界原 fixture 合并 HTTP 失败、超限和摘要失败矩阵，测试数量不变；两端全量仍分别为
+484/17 skipped 与 500/1 skipped，check/build/bench:check、Windows pack dry-run 通过。
+源码此步 +48 行、测试 +9 行、benchmark −7 行；当前源码 33,136，距本轮最终不增长目标尚需
+净减 40 行。工作进程生命周期与 TUI 接入继续进行，不把安装器当成生产投机路线已经启用。
