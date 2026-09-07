@@ -242,6 +242,12 @@ TUI 层级配置。write/edit 沿用 Git 事务，Linux Bash 沿用现有证书/
 进程 world 改为单 session 所有权，删除输出字符串的盲目路径替换；资源分支也只以 token
 所有权决定是否仍可验证/提交。没有新增常驻缓存、虚拟机依赖或 CI。
 
+后续文件出口收敛为显式 `ToolInvocation.filesystem`：read/ls 使用封存资源，write/edit 使用
+私有工作区操作；二者执行同一组原版 Pi 工厂。工作区 world 不再调用任意传入的 host function，
+也不再改写工具参数、diff 或返回结果中的路径文本。Git/Overlay 分支与现有事务提交仍保留，
+这一步没有宣称消除了 write/edit 的 Git 准备成本；进一步取消这项依赖仍需证明权限、链接和
+文件身份语义。`resources` 操作绑定字段已由 `filesystem` 替换，嵌入宿主应同步更新。
+
 `PI_OPERATION_TOOLS` 是已接通的操作绑定，不是所有具有类似 effect 的工具集合。
 自定义宿主创建 Linux world 时必须显式传入 `tools`；受控资源 world 未传绑定时仍只观察。
 目录范围区分即时 `entries`、递归 `tree_entries` 与 `tree_content`，删除了自动猜测忽略文件
