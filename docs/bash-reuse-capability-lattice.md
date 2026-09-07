@@ -620,3 +620,7 @@ Bash 同父/跨父冷复用比约 1.87×/1.84×；运行中 Actor 4011 → 2758 
 摘要、超限和 Linux FIFO 在准备期拒绝。两端完整搜索和全量 480/17 skipped、496/1 skipped、
 check/build/bench:check、Windows pack dry-run 通过；源码 +75（基线 +98）、benchmark −14、
 常规测试不增长，思程未修改。默认插件尚未选择新 profile；下一步是 TUI 和惰性选择生命周期。
+
+配置覆盖的空值语义归 `applyOverlay`/`diffRecord` 所有，删除外层转发、克隆包装及手写深比较；
+TUI 使用相同的结构比较，不再比较 JSON 键顺序。继承、tombstone、恢复发布和菜单行为回归通过，
+两端全量及 check/build/bench:check 通过，源码 −40、测试行数不变；基线净增收敛到 58 行。
