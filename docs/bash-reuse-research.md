@@ -212,7 +212,8 @@ baseline; this prevents Git's directory-metadata approximation from becoming a p
 empty source directories remain outside the Git execution world's fidelity because Git cannot place
 them in a fresh worktree. Existing-directory metadata edits, symlinks, hard links, special inodes,
 renames that require identity preservation, and inode type changes still fail closed. Monitor/policy
-epoch v6 prevents certificates without the typed state from being reused.
+epoch v6 introduced that typed-state boundary. Current certificate epoch v7 retains it and additionally
+isolates locale-independent canonical identities; v6 history must be rewarmed, not accepted as v7 proof.
 
 An unprivileged kernel OverlayFS capability probe first established that a lighter copy-on-write
 driver was feasible. It was not promoted on that evidence alone. Linux's
