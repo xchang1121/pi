@@ -734,4 +734,14 @@ renameat/linkat/symlinkat 记录通过；临时探针已删除，没有为测试
 pack、完整 find/TUI、Linux process/in-flight/exec-boundary/artifacts/topology 通过。
 本次同父/跨父冷复用比约 1.59×/1.66×，Actor 到达后 4011→3129 ms（1.28×），不替代历史
 1.83× 的指标定义。验收副本核对后仅修正旧报告字段和 README；生产/测试/依赖/安装脚本一致。
-CLONE_FS 共享 cwd 的并发证据和完整搜索准入仍待继续，不据此结算整体 goal。
+后续关闭了 [CLONE_FS 共享 cwd](https://man7.org/linux/man-pages/man2/clone.2.html) 的反例：
+真实子进程切到 B 后，父进程读到 B，但旧 decoder 将普通 open 的依赖记在 A 且判为完整。
+进程选择、起始 cwd 和共享关系现由同一记录拥有；共享组发生成功 chdir/fchdir 后不跨 PID
+猜测顺序。独立 cwd、共享但不变仍可通过；目标 exec 之前已与被排除任务共享的边界保守拒绝，
+因为 [exec 不会解除这种共享](https://github.com/torvalds/linux/blob/master/fs/exec.c)。相对 chdir
+先按旧 cwd 记录路径再更新状态；epoch 升为 v19，旧证书失效。20 次真实 barrier 对照通过。
+合并原有根选择、syscall 重组和分类夹具后，源码 +5、测试 −3 行（相对本 goal 起点 −182/−1070）。
+Windows 475/16 skipped、WSL 490/1 skipped；check/build/bench:check、pack、find/TUI 和五组
+Linux Bash benchmark 通过。同父/跨父约 1.80×/1.84×，Actor 到达后 4012→2754 ms（1.46×）。
+临时探针已删除，未安装组件，依赖清单及思程保护路径未改。完整 grep 尚未准入，仓外此前被拒绝
+删除的旧实验残留也未计作清理完成；整体 goal 与最终代码预算仍未结算。
