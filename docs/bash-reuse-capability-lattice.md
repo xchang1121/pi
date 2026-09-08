@@ -1162,3 +1162,19 @@ WSL 522 passed / 1 skipped；142 个 source/test 文件哈希一致。相对 485
 WSL 523 passed / 1 skipped；142 个 source/test 文件哈希一致。按低负载要求串行验证，没有
 额外重复原生成本或压力基准；依赖、CI、ThinkThread 受保护路径不变。完整目标仍未结项，
 macOS/ARM64 和真实 ThinkThread Runtime 验收仍未具备，不能由本次结构回归替代。
+
+预测请求的准入等待与物理生产完成也分开归属。旧关闭矩阵已复现：初始预测、continuation 的
+请求在取消后已结算，但 producer 仍停在 finally 清理屏障，关闭却先返回。现在原 sourceTasks
+集合同时保留这两种生产回调返回的 Promise；超时或取消仍及时结束准入，完整关闭则等待
+实际退出和晚到失败，不新建生命周期所有者。忽略 AbortSignal、尚未返回的 producer 仍会
+阻止完整关闭；超时不是退出证明。原关闭矩阵扩充 disable/dispose、超时后的 terminal 关闭，
+验证清理恰好一次、晚到结果不执行、晚到拒绝被容纳，并保留终止轮次的共享结果。
+取消早于 producer 微任务时也不再调用生产者。生产 Host 的原短上下文夹具加入模型/选项准备
+屏障，复现了取消后仍发起一次模型调用；Drafter 现在在异步准备结束后检查本次请求的 signal。
+共享 batch 结构未变。短上下文断言改为等到实际请求结算，避免尚未启动就判通过；模型调用为
+mock，没有联网或把它宣称为真实 ThinkThread Runtime 资格。
+两端 check/build、各 151 项定向及 55 文件单 worker 全量通过：Windows 516 passed / 16 skipped、
+WSL 531 passed / 1 skipped。142 个 source/test 文件哈希一致；生产本步 +4，累计相对 485cdb2
+为 32,718（−116）；测试本步 +35，累计 14,737（+506），没有新增测试文件。完整测试按平台
+串行，未额外重复原生收益或压力基准；ThinkThread、依赖、CI 受保护路径不变。完整目标及
+未具备的 macOS/ARM64、真实 ThinkThread Runtime 验收仍未结项。
