@@ -7,7 +7,7 @@
 [有界生产资格](../bench/README.md#captured-search-production-qualification)。无新增依赖的
 Captured search 已接通 find/grep 与 TUI，但 grep 仅验收 Windows x64 rg 15.2.0 和 Linux x64
 rg 14.1.0 的显式 profile；它不是 Native Pi 默认语义，也不保证每次采纳有收益。
-投影归属阶段 `5e1d34d` 的 Windows/WSL 完整回归不替代既有原生成本测量，更不构成 macOS、
+下文各结构修复阶段的 Windows/WSL 完整回归不替代既有原生成本测量，更不构成 macOS、
 ARM64 或真实 ThinkThread Runtime 验收。下列无 Landlock 消费层仍是当前代码的实际限制：
 Actor 未命中尚未接入独立的进程证书生产者，不能把通用的 Observe 接口当作该能力已实现。
 
@@ -1146,3 +1146,19 @@ dispose 同步重入 release 时，旧记录尚未登记，导致同一资源清
 WSL 522 passed / 1 skipped；142 个 source/test 文件哈希一致。相对 485cdb2 生产仍为 32,738
 （−96），测试 14,630（+399）；无依赖、CI 或 ThinkThread 受保护路径修改，无新增原生成本或
 压力测量。完整目标保持未结项，未具备的 macOS/ARM64 与真实 Runtime 资格不由这些回归替代。
+
+计划物化现在先捕获 proposal/delta 头、删除集合、全部动作字段和依赖记录，再复制输入图。
+旧实现已复现：输入 getter 可把已校验 revision 改成 −1、改写动作身份和后续依赖，或更改
+本次 delta 的删除集合；Runtime 还会把已接受的 3 token 事后记为 99。回归合并进原身份/key
+绑定夹具，覆盖两种更新、输入只读取一次、原提供者可变与不透明反馈仍由提供者持有。
+原依赖夹具也证明，修改暴露记录会让等待 Actor 采纳的子任务提前可匹配；现有跨轮次 Runtime
+夹具的真实 preflight 回调同样复现了依赖改写。现在依赖条目与数组一并冻结，默认条件仅在
+捕获时规范化；读取直接使用条件，修订比较只排序数组副本，不再重建记录。等价的依赖顺序/
+默认条件更新仍保留原执行身份，子任务在父预测 miss 后的有效结果仍可跨轮次采纳。
+草稿接口从 PlanAction 派生且保留原字段集合；后台调度本来就读取计划节点，本步没有把它
+误判为缺失字段，也不新增草稿转发或生命周期所有者。未新增测试文件；生产本步 −24 行，
+累计相对 485cdb2 为 32,714（−120），测试本步 +72，累计 14,702（+471）。
+两端 check/build、各 162 项定向及 55 文件单 worker 全量通过：Windows 508 passed / 16 skipped、
+WSL 523 passed / 1 skipped；142 个 source/test 文件哈希一致。按低负载要求串行验证，没有
+额外重复原生成本或压力基准；依赖、CI、ThinkThread 受保护路径不变。完整目标仍未结项，
+macOS/ARM64 和真实 ThinkThread Runtime 验收仍未具备，不能由本次结构回归替代。
