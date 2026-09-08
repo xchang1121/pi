@@ -7,7 +7,7 @@
 [有界生产资格](../bench/README.md#captured-search-production-qualification)。无新增依赖的
 Captured search 已接通 find/grep 与 TUI，但 grep 仅验收 Windows x64 rg 15.2.0 和 Linux x64
 rg 14.1.0 的显式 profile；它不是 Native Pi 默认语义，也不保证每次采纳有收益。
-最新源码阶段 `5e1d34d` 的 Windows/WSL 完整回归不替代既有原生成本测量，更不构成 macOS、
+投影归属阶段 `5e1d34d` 的 Windows/WSL 完整回归不替代既有原生成本测量，更不构成 macOS、
 ARM64 或真实 ThinkThread Runtime 验收。下列无 Landlock 消费层仍是当前代码的实际限制：
 Actor 未命中尚未接入独立的进程证书生产者，不能把通用的 Observe 接口当作该能力已实现。
 
@@ -1108,3 +1108,15 @@ CI 和 ThinkThread 受保护路径不变；历史预算继续压缩，完整目�
 source/test 文件哈希一致；check/build、定向测试及各 55 文件单 worker 完整测试通过：Windows
 502 passed / 16 skipped、WSL 517 passed / 1 skipped。未重复压力或真实成本基准；依赖、CI、
 ThinkThread 受保护路径不变，macOS/ARM64 与真实 Runtime 仍未验收，完整目标不提前结项。
+
+候选注销现在使用插入时保存的精确/投影桶成员关系，不再调用提供者重新计算删除位置。旧实现
+已复现：partition 暂时返回空、抛错或改桶后，已删除候选仍从原桶出现；比较及兼容性回调也能
+让已注销的条目继续被选中。原成员 Map 现在同时保存该次注册及 recency，最终排序与准入前后
+检查同一注册；同对象删除再插入不会恢复旧注册的选择资格。回调清空或重建作用域后，插入从
+当前作用域登记，嵌套插入不再误报新建；重复插入同一结果保留原命中证据，不重置为冷条目。
+移除分离的作用域创建和投影增删函数，查询分区只计算一次并沿兼容性查询/插入复用；清理无
+提供者回调，没有新增索引或生命周期所有者。回归扩充原投影/精确/保留夹具，没有新增测试文件。
+两端 check/build、64 项定向测试及各 55 文件单 worker 全量通过：Windows 502 passed /
+16 skipped、WSL 517 passed / 1 skipped；142 个 source/test 文件哈希一致。生产本步 +12 行，
+相对 485cdb2 累计 32,731（−103）；测试本步 +65，累计 14,529（+298）。未重复压力或真实
+成本基准，ThinkThread、依赖和 CI 不变；完整目标及未具备的 macOS/ARM64 Runtime 验收仍未结项。
