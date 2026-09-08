@@ -683,7 +683,7 @@ bench:check 通过。测试净减 329 行，生产代码不变；当前源码 33
 
 删除 wasi-sh、globby、WASM 分发/校验/运行适配和安装报错；主仓与 WSL 验收副本均实际卸掉
 6 个独占依赖包。旧设置不做特殊迁移，也不初始化旧路线。Captured find 仅使用 Pi 已安装的
-glob/ignore，经公开 operations 和同一封存输入代理运行完整工具；匹配与 ignore 解析不自行重写。
+minimatch/ignore，经公开 operations 和同一封存输入代理运行完整工具；匹配与 ignore 解析不自行重写。
 Actor/producer 共享新的执行身份，原缓存/事务负责结果和输入重用，仍不声称与原生 fd 完全等价。
 grep 回到原生/可用统一环境，没有获准的本地跨平台提前执行路线；既有文件工具与 Linux Bash 保留。
 
@@ -694,3 +694,11 @@ Windows 4.97→1.71 ms、WSL 5.88→1.38 ms，不是原生 fd 或整任务加速
 冷复用比约 1.81×/1.83×，Actor 到达后的运行中采纳另计 4010→2808 ms，未重复执行。
 源码净减 135、测试净减 1 行，当前 32,955/14,271；思程保护路径无变化。旧绝对源码预算、
 macOS/ARM64 Runtime 资格和 metadata 零副作用边界仍未完成，不结算整体 goal。
+
+后续真机反例揭示 glob 的文件身份缓存会折叠 Windows 盘符和 Unicode（`é`/`é`、`①`/`1`）。
+已移除这一缓存及整套模拟 Node filesystem 适配；匹配器只遍历封存的 `/workspace` 名字空间，
+物理路径转换复用现有 containment 策略，输出仍交给原 Pi 格式化。执行身份升级为 v2，旧结果
+不可混用；没有新增依赖。原资格矩阵合并加入这些反例及 brace/相对路径匹配，测试行数不增长。
+Windows/WSL 全量仍为 478/16 skipped、493/1 skipped，check/build/bench:check、Windows pack、
+真实 find/TUI 及 Bash process/in-flight 均通过；同父/跨父冷复用比 1.87×/1.83×，Actor 运行中
+采纳另计 4010→2746 ms（1.46×）。源码再减 6 行，当前 32,949/14,271；思程保护路径无变化。
