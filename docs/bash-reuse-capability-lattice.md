@@ -848,3 +848,9 @@ WSL 496/1 skipped、两端 check 和五组 Linux Bash 验收通过；in-flight A
 已提交或 poisoned 的历史结算不因清理改写，避免重复 commit 被误当成可安全重新执行。原单一 abort
 测试改为四阶段×成功/失败交错矩阵，复现了旧实现提前 dispose 及关闭后返回 valid 的问题。
 Windows 481/16 skipped、WSL 496/1 skipped 和两端 check 通过；累计生产 −9、测试 −13 行。
+
+K(a) 绑定第 2 步：Actor 入站参数和解析后的执行元数据由本次调用持有；prepared 参数、计划与键
+共用一个不可变值实现，删除两份重复深冻结。原绑定矩阵加入异步改参、环境/argv/command 后改，
+验证 keyed、unkeyable、无 turn、绑定失败仍是同一执行器且恰好一次。Windows 481/16 skipped、
+WSL 496/1 skipped、两端 check 通过；累计生产 −4、测试 −6 行。执行函数闭包仍由 provider 的
+版本化契约负责，不能通过复制函数或比较文本推导权限或等价性。
