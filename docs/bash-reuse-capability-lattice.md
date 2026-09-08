@@ -1120,3 +1120,19 @@ ThinkThread 受保护路径不变，macOS/ARM64 与真实 Runtime 仍未验收�
 16 skipped、WSL 517 passed / 1 skipped；142 个 source/test 文件哈希一致。生产本步 +12 行，
 相对 485cdb2 累计 32,731（−103）；测试本步 +65，累计 14,529（+298）。未重复压力或真实
 成本基准，ThinkThread、依赖和 CI 不变；完整目标及未具备的 macOS/ARM64 Runtime 验收仍未结项。
+
+共享结果的单次图复制保留所有可枚举数据键，包括 Symbol 键，以及循环、共享引用和稀疏数组；
+不再先遍历校验再交给会丢 Symbol 键的 structuredClone。Symbol 值、Proxy、不透明原型、访问器
+和隐藏字段仍拒绝，且不会调用 getter 或冻结提供者对象；仅使用 Node 内建能力，没有新依赖。
+这不是放弃封存：WSL 的现有稳定读观察夹具接上生产 withPiProjectionCoverage 后，旧实现把
+本应复用的第二次读取交给 Actor，因为读覆盖元数据的 Symbol 键导致封存失败。现在封存、借出、
+重建及提交都保留该数据图；Windows 原有宿主观察限制不变，未修改 ThinkThread 受保护路径。
+
+输出投影复用同一归属函数，在二次验证/提交前复制提供者返回的视图；封存输入重建已经归属，
+不重复复制。旧端到端回归已复现：提供者在后验证时改写结果、前一 Actor 修改后污染下一读者，
+以及不透明投影被采纳。现在前两者仍给出独立的原生读结果，后者不提交并恰好一次 fallback。
+投影复制计入原投影耗时；既有关闭所有者也通过暂停投影屏障，先排空调用再关闭 world，无需新层。
+两端 check/build、各 102 项定向及 55 文件单 worker 全量通过：Windows 506 passed / 16 skipped、
+WSL 521 passed / 1 skipped。142 个 source/test 文件哈希一致；生产本步 +7，累计 32,738（−96），
+测试本步 +83，累计 14,612（+381）；未新增测试文件。未重复原生成本或压力扫描，既有 Bash/grep
+收益记录不冒充本次测量；依赖、CI 不变，完整目标及 macOS/ARM64、真实 Runtime 验收仍未结项。
