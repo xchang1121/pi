@@ -1178,3 +1178,20 @@ WSL 531 passed / 1 skipped。142 个 source/test 文件哈希一致；生产本�
 为 32,718（−116）；测试本步 +35，累计 14,737（+506），没有新增测试文件。完整测试按平台
 串行，未额外重复原生收益或压力基准；ThinkThread、依赖、CI 受保护路径不变。完整目标及
 未具备的 macOS/ARM64、真实 ThinkThread Runtime 验收仍未结项。
+
+continuation 的启动权限现在在排队完成后、领取 source slot 前重新核验。既有跨轮次夹具已
+复现三种旧实现失败：execution_succeeded 请求占位时排入 actor_adopted，随后目标决策到达、
+正常 observe delta 替换父动作，或 terminal 关闭开始；先前请求退出后，旧父回调仍会取得新
+slot 并启动。现在检查原计划动作身份与目标决策，关闭则在等待 producer 前撤销剩余计划和
+启动定时器。复用原计划、请求槽和 sourceTasks，不新增关闭标记或生命周期所有者；物理生产
+清理仍完整等待，terminal 对独立共享结果的保留不变。
+原跨轮次夹具同时保留正常延续，以及首个 continuation 返回空值后仍有效的第二触发重试。
+原提交错误夹具改为真实 EffectTransactionCoordinator 的屏障矩阵：terminal/dispose 在提交
+已占用时开始，Actor 仍得到一次结果、一次 adopted 结算和一次清理，不再启动后续预测；
+poisoned 提交错误仍向上传递，不能授权 fallback。关闭撤销的是计划启动权限，不是已占用
+的事务提交权。本次没有新增测试文件；生产本步 −2 行，测试 +51 行。
+两端 check/build、各 104 项定向及 55 文件单 worker 全量通过：Windows 522 passed / 16 skipped、
+WSL 537 passed / 1 skipped；142 个 source/test 文件哈希一致。累计相对 485cdb2 生产 32,716
+（−118），测试 14,788（+557）。依照低负载要求两端顺序验证，无额外原生成本或压力扫描；
+ThinkThread、依赖和 CI 受保护路径不变。完整目标仍未结项，既有 Bash/grep 成本记录不是本次
+重新测量，缺失的 macOS/ARM64 与真实 ThinkThread Runtime 验收也不能由结构回归替代。
