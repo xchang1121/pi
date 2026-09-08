@@ -753,3 +753,11 @@ Linux Bash benchmark 通过。同父/跨父约 1.80×/1.84×，Actor 到达后 4
 Windows 477/16 skipped、WSL 492/1 skipped，check/build/bench:check、pack、完整 find/TUI 及
 五组 Linux Bash 验收通过；同父/跨父冷复用比 1.89×/1.88×，Actor 到达后 4009→2516 ms（1.59×）。
 临时探针已删除，无新增依赖或思程改动；完整 grep、缺失平台资格和整体代码预算未结算。
+
+Runtime 仍曾在原版 Pi write 改变无关内容后丢弃完整 find 候选，真实任务复现了额外执行。
+现以同一后端校验契约拥有共享结果的新鲜度：无校验器、校验异常均不允许采纳；删除外部
+watch 订阅和路径重叠对封存结果的直接淘汰。未完成工作、checkpoint 后代和 Actor 窗口仍保守。
+原 read/ls/write 对照及 find/TUI 通过，无关写入命中、实际输入变化 miss；运行中重启、缺证据
+拒绝、事务失败并入原测试矩阵。Windows 482/16 skipped、WSL 497/1 skipped，全测及构建/打包、
+五组 Linux Bash 通过；同父/跨父冷复用比 1.93×/1.94×，Actor 到达后 4009→2555 ms（1.57×）。
+源码 −71、测试 −29 行，当前 32,843/14,231；不增加缓存或依赖，思程保护路径保持不变。
