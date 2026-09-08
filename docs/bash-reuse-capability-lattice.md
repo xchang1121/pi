@@ -638,3 +638,10 @@ TUI 现可明确选择 Portable search，Actor/producer 共用同一绑定；默
 grep 7.50 → 2.19 ms、find 8.23 → 1.13 ms，WSL 7.80 → 1.68 ms、5.26 → 0.99 ms；
 不是整体任务加速保证。Bash 同父/跨父冷复用比 1.88×/1.92×，另计运行中 Actor 4009 →
 2699 ms（1.49×），未重复执行。macOS 与 ARM64 思程 Runtime 资格仍缺实机，不计通过。
+
+投机源请求改用已有 `waitForCandidate` 管理等待竞争和清理，删除独立 deadline/取消状态机及
+两层 cause 转发；生产者取消和请求健康结算仍由源请求拥有。barrier/虚拟时钟替换四个重复场景，
+覆盖零等待、失败分类、过期及晚到成功/拒绝。源码 −30、测试 −32；当前 33,104 / 14,638，
+距本轮源码不增长目标仍差 8 行。两端全量 478/17 skipped、494/1 skipped，check/build/
+bench:check、pack dry-run、完整搜索和 TUI 资格通过；Linux 运行中单次采纳、exec-boundary、
+128 MiB artifact、32 MiB topology 回归通过。思程保护路径仍无改动，整体目标尚未结算。
