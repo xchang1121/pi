@@ -1010,3 +1010,20 @@ Windows 490 passed / 16 skipped、WSL 505 passed / 1 skipped，check 均通过�
 冷执行 2,991 ms、同父/跨父子进程命中 1,626/1,623 ms，变更输入重新执行；此夹具不声称整个命令
 缓存命中。Runtime in-flight 原始 Actor 4,010 ms、采纳 Actor 2,738 ms，第二次 Actor 恰好执行一次，
 PID 结果不进入持久历史。每个既有探针仅跑一轮，没有重复压力扫描或 ThinkThread 修改。
+
+受控搜索 v5 已接通生产 grep 和 TUI 的 Captured search：实际接受 Windows x64 rg 15.2.0 /
+Linux x64 rg 14.1.0。只读查找已有文件，固定字节后由拥有关闭等待的入口验证版本，不调用会先
+同步 spawn 的工具发现函数，不安装依赖。输入 materializer 从 bench 移入既有 Pi 调用所有者，
+bench 直接使用生产 profile；原 pool 排空后才删除私有引擎，单调用还等待选择/搜索进程和目录清理。
+两端各 46 项小语义案例通过；WSL 最终配置/编码/limit 六例补验通过。独立参考 worker 与取消探针
+才进入进程计数，不能据此声称统计了生产全部进程；结果上限与 abort 均证明关闭/借入清理先于结算。
+构建后的真实扩展回调两端均走通 find/grep 预测、采纳、TUI 应用、刷新及禁用，无模型网络调用。
+旧 portable 夹具改为先发起禁用、再释放暂停输入并等待禁用完成；其宿主观察断言改用 captured-only
+合同，而非把 Linux world 的一般观察能力当成该 profile 的权限。生产取消等待没有放宽。
+
+约 998 KB、三种查询各三次成本复查：Windows 9 次采纳，WSL 5 次采纳、4 次因收益不足恰好一次
+Actor fallback；Host Actor 中位数 Windows 20.1/26.9/25.3 ms、WSL 4.8/7.4/8.9 ms，采纳/回退混合
+探测中位数分别 7.2/6.9/6.2 和 5.8/7.2/6.5 ms。冷 profile 准备 166–276/14–25 ms、Producer
+约 473–482/275–290 ms 均单列，不算省时，不声称全任务或原生默认加速。常规全量复用上一个
+Git 提交同阶段的两端 55 文件结果；生产接入后相对 485cdb2 仍净减 2 行。没有改依赖、CI 或
+ThinkThread 受保护路径；macOS/ARM64 和真实 ThinkThread Runtime 仍未验收，完整目标未提前结项。
