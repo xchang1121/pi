@@ -745,3 +745,11 @@ Windows 475/16 skipped、WSL 490/1 skipped；check/build/bench:check、pack、fi
 Linux Bash benchmark 通过。同父/跨父约 1.80×/1.84×，Actor 到达后 4012→2754 ms（1.46×）。
 临时探针已删除，未安装组件，依赖清单及思程保护路径未改。完整 grep 尚未准入，仓外此前被拒绝
 删除的旧实验残留也未计作清理完成；整体 goal 与最终代码预算仍未结算。
+
+元数据证据现按消费字段封存，删除名字查询对文件大小的无关依赖；受控 find 身份升为 v3。
+旧实现真实跨轮次任务会重跑，新实现保留 16 MiB 文件增长后的候选；原生 Pi ls 对照中，文件
+增长至 64 MiB 后输出不变、验证读取 0 字节，替换为目录仍 miss。类型证据不能晋升为大小证据，
+内容读取预算和 Actor 窗口封存仍严格检查。合并既有资源矩阵，源码和测试均净零增长。
+Windows 477/16 skipped、WSL 492/1 skipped，check/build/bench:check、pack、完整 find/TUI 及
+五组 Linux Bash 验收通过；同父/跨父冷复用比 1.89×/1.88×，Actor 到达后 4009→2516 ms（1.59×）。
+临时探针已删除，无新增依赖或思程改动；完整 grep、缺失平台资格和整体代码预算未结算。
