@@ -667,3 +667,10 @@ bench:check、pack dry-run、完整搜索和 TUI 资格通过；Linux 运行中�
 Windows pack、完整搜索/TUI、Linux process/in-flight 通过；同父/跨父冷复用比 2.00×/2.07×，
 Actor 到达后 4010 → 2696 ms（1.49×）。Windows 首次全量的 Faux E2E 墙钟省时阈值失败、
 重跑通过，另行收敛该测试的时间假设；不计作文件证据回归已消除了所有测试不稳定性。
+
+Faux E2E 现使用正式 `host.execute`，删除手写 consume/fallback/actual 出口、轮询结算、未使用
+preview 设置和重复 schema 哈希；就绪、Actor 绑定、权威结算事件决定交错，不再用睡眠与墙钟
+省时阈值假定顺序。仍保留五类跨层流程，并覆盖候选执行失败后的单次 Actor 回退及实际输出。
+Windows 连续 100 次通过；Windows/WSL 全量仍为 478/16 skipped、493/1 skipped，check/build/
+bench:check 通过。测试净减 329 行，生产代码不变；当前源码 33,090、测试 14,272，相对本轮
+基线净减 6 / 1,058 行。思程保护路径无改动；这不是 metadata 零副作用或缺失平台 Runtime 资格证明。
