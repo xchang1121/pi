@@ -1048,3 +1048,10 @@ Windows 492 passed / 16 skipped、WSL 507 passed / 1 skipped。生产本步净�
 Producer 6,070.0 ms、采纳 2,749.8 ms、后一次 Actor 4,007.8 ms；单消费者采纳、Actor 恰好一次
 fallback、PID 不持久化均通过。这只是该路径的 Actor 到达收益，不是冷启动或全命令缓存命中。
 没有新增依赖、CI 或修改 ThinkThread 受保护路径；历史代码预算和完整跨平台验收仍未结项。
+
+事务借用在进入后端前登记：旧实现的验证/重建若在同步回调里发起关闭，清理会漏等尚未登记的
+Promise；既有屏障矩阵已复现提前释放。现在先登记 Promise 再调用后端，外部关闭和回调内关闭
+均等待验证、重建或提交完成，失败和关闭后重入的原有结算不变。生产不增行、不增加生命周期层。
+与同阶段 PatternAware 收敛共用一轮单 worker 全量：Windows 493 passed / 16 skipped、WSL
+508 passed / 1 skipped，各 55 文件；两端 check/build 与合计 111 项定向测试通过。未重复真实
+Bash、grep 成本或压力扫描，先前的资格结果不冒充本次新增验收。
