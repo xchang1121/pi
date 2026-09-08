@@ -710,6 +710,15 @@ Windows/WSL 全量仍为 478/16 skipped、493/1 skipped，check/build/bench:chec
 回归通过。源码 +5、常规测试不增长，当前 32,954/14,271；相对本轮基线源码仍净减 142 行。
 
 无新增依赖的 grep 尚未准入：[Pi 当前接口](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/tools/grep.ts)
-仍未提供搜索进程入口。两端已有 rg 的 stdin 实验表明，直接拼接 UTF-8/UTF-16 文件会丢失匹配，
-无末尾换行也会破坏文件边界；JS RegExp 则不接受 rg 的 `(?P<name>...)`，不是同一语法。
-不以这两种快捷替代宣称完整 grep；下一步需保留真实引擎和文件边界，并复用此输入工作所有权。
+仍未提供搜索进程入口。拼接 UTF-8/UTF-16 或无末尾换行文件不能保留边界，JS RegExp 也不接受
+rg 的 `(?P<name>...)`。只用已有 rg、私有逐文件输入和原 Pi 格式化的后续实验虽通过主要语义
+场景，但 Windows 夹具中原生 Actor 约 17.2 ms，受控 Actor 308.7 ms、命中 44.8 ms，净收益
+不成立。因此撤销未提交的进程适配和临时 benchmark，不新增设置、不用放大的 Actor 基线宣称加速。
+
+搜索组件准备失败现只意味着没有可绑定的执行器，安静保留原生 Actor；删除单独的 error 状态、
+安装/重新配置提示及重复 catch。已绑定调用的输入错误仍拒绝，不能中途切换语义。生命周期测试
+改验单次原生 fallback、刷新恢复和绑定后不偷换执行器；TUI 暂存/旧设置由原实机流程覆盖。
+本步源码 −2、测试 −5 行，Windows 478/16 skipped、WSL 493/1 skipped，check/build/bench:check、
+Windows pack、真实 find/TUI 通过。Bash process 首次因文件时钟未推进而安全拒绝，复跑通过；
+in-flight 另计 Actor 4009→2611 ms（1.54×），没有重复执行，不声称消除了时钟不稳定性。
+思程保护路径未改；主仓与 WSL 副本均无新增搜索依赖，仓外旧实验残留不属于运行时且未计作清理完成。
