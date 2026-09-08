@@ -1,5 +1,16 @@
 # Bash 复用的依赖降级设计
 
+## 当前阅读入口（2026-09-09）
+
+本文后半部保留按阶段排列的设计、撤销方案和资格记录；历史段落中的“尚未接入”不能作为当前
+功能状态。当前安装和 TUI 开关以 [README](../README-CN.md) 为准，搜索资格命令见
+[有界生产资格](../bench/README.md#captured-search-production-qualification)。无新增依赖的
+Captured search 已接通 find/grep 与 TUI，但 grep 仅验收 Windows x64 rg 15.2.0 和 Linux x64
+rg 14.1.0 的显式 profile；它不是 Native Pi 默认语义，也不保证每次采纳有收益。
+最新源码阶段 `5e1d34d` 的 Windows/WSL 完整回归不替代既有原生成本测量，更不构成 macOS、
+ARM64 或真实 ThinkThread Runtime 验收。下列无 Landlock 消费层仍是当前代码的实际限制：
+Actor 未命中尚未接入独立的进程证书生产者，不能把通用的 Observe 接口当作该能力已实现。
+
 ## 目的
 
 本文回答的不是“沙箱是否可用”这一道二元问题，而是：当某项 Linux 依赖缺失时，哪些 Bash
@@ -77,7 +88,7 @@ before-state 全部匹配，并且生产者保证可以被当前消费者接受�
 
 - [`completedReplayExecutor`](../src/linux-process-backend.ts) 只依赖存储、平台指纹、验证与提交，
   明确不解析 Sandlock 或 `strace` 二进制。
-- [`heldExecActorReplay`](../src/linux-process-backend.ts) 独立打开原生 exec 边界；未命中会继续真实
+- [`prepareActorReplay`](../src/linux-process-backend.ts) 独立打开原生 exec 边界；未命中会继续真实
   Actor 子进程，不需要 Fork 依赖。
 
 但是，新证书生产仍由同一个 `open()`/`resolveReady()` 入口承载。该入口把 Sandlock、
