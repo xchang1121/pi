@@ -157,6 +157,9 @@ before-state 全部匹配，并且生产者保证可以被当前消费者接受�
 追加边界：从 `ee97f0d` 起保留 PR #1 的思程实现，不改 SDK、控制协议、profile 安装和持久化
 恢复逻辑。下面第一步中的公共工厂归一已经完成，不据此继续改动思程文件；公共出口仍做接入回归。
 
+2026-09-08 新增约束：不为投机增加安装包、运行时或下载步骤。仅复用 Pi 已安装组件和系统已有
+能力；既有 Linux Bash 与思程 opt-in 接入不动。旧搜索设置直接恢复原生默认值，不保留安装报错。
+
 ### 统一什么、不统一什么
 
 保留 ExecutionWorldRouter、EffectTransaction、WorkspaceSandboxService、
@@ -401,6 +404,9 @@ WSL 517 passed / 1 skipped，以及两端 check、build、bench:check 和 Window
 
 ### 可移植搜索资格（2026-09-08，v4）
 
+本节保留被撤销方案的研究与测量记录，不是当前安装或使用说明。新增运行时、包和安装器已从
+插件移除；当前无新增依赖路线见文末及 README，不应按历史结果启用 grep 提前执行。
+
 `portable-kernel.mjs --pi-tools` 现在将完整 grep/find 放入同一组 Runtime 流程。grep 使用
 原版 Pi 的参数、格式化、上下文回读及真实 rg WASM；find 使用原版 Pi 公开的 `operations.glob`
 入口和 [globby](https://github.com/sindresorhus/globby) 的虚拟 FS / gitignore 支持，不自写忽略规则。
@@ -438,9 +444,7 @@ Linux FIFO 在获取大小时即被拒绝，未请求内容且 worker 未超时�
 取消矩阵覆盖无后续 import 的无限循环及等待输入，晚到 resolve/reject 不交付旧调用；配额
 覆盖输出、管道、稀疏分配和累计输入。64 MiB WASM 上限不是整个进程 RSS 上界。
 
-当前复现先在本仓 `npm ci`、`npm run build`，再 `npm run setup:search -- <模块文件路径>`，运行
-`node bench/portable-kernel.mjs <模块文件路径> --pi-tools`，无需在本仓或独立目录安装 ripgrep CLI。
-WSL 的依赖应放在原生文件系统；
+当时的复现依赖独立模块文件，现已撤销这一安装路线。WSL 的依赖应放在原生文件系统；
 本次从 `/mnt/c` 加载依赖的对照仅首次准备就约 2.18 s，不能混入原生存储测量。
 
 globby/Pi 是可信实现，客体不获得任意 JS、宿主文件句柄或网络接口。没有把
@@ -572,7 +576,7 @@ check/build/bench:check 及 Windows pack dry-run 通过。源码此步 +179 行�
 Linux Bash 整体/跨父子进程复用、输入改变 miss、运行中单次采纳回归通过。这不满足早先
 30,411 行绝对目标，也不是缺失的 macOS/ARM64 Runtime 验收。
 
-字节分发现使用显式 `setup:search`：下载有体积/时间上限的固定 npm 归档，先核对 SHA-512，
+当时的字节分发曾使用独立安装器（现已删除）：下载有体积/时间上限的固定 npm 归档，先核对 SHA-512，
 仅从内存中读取指定数据模块，再核对解压 WASM 的 SHA-256。归档路径不落盘，不建立 CLI 链接。
 文件句柄以排他方式取得临时文件所有权，完整关闭后原子发布；下载和验证失败不会覆盖已有模块。
 Windows 与 WSL 的真实下载、替换及完整搜索资格均通过，默认 Actor/配置和思程保护路径未变。
@@ -674,3 +678,19 @@ preview 设置和重复 schema 哈希；就绪、Actor 绑定、权威结算事�
 Windows 连续 100 次通过；Windows/WSL 全量仍为 478/16 skipped、493/1 skipped，check/build/
 bench:check 通过。测试净减 329 行，生产代码不变；当前源码 33,090、测试 14,272，相对本轮
 基线净减 6 / 1,058 行。思程保护路径无改动；这不是 metadata 零副作用或缺失平台 Runtime 资格证明。
+
+### 无新增依赖的当前路线（2026-09-08）
+
+删除 wasi-sh、globby、WASM 分发/校验/运行适配和安装报错；主仓与 WSL 验收副本均实际卸掉
+6 个独占依赖包。旧设置不做特殊迁移，也不初始化旧路线。Captured find 仅使用 Pi 已安装的
+glob/ignore，经公开 operations 和同一封存输入代理运行完整工具；匹配与 ignore 解析不自行重写。
+Actor/producer 共享新的执行身份，原缓存/事务负责结果和输入重用，仍不声称与原生 fd 完全等价。
+grep 回到原生/可用统一环境，没有获准的本地跨平台提前执行路线；既有文件工具与 Linux Bash 保留。
+
+两端全量为 Windows 478/16 skipped、WSL 493/1 skipped，check/build/bench:check、Windows pack
+通过。真机 find 保留完成/跨轮次/输入重算/运行中采纳、并发、变化/越界拒绝与关闭证明；FIFO
+断言移到实际读取接口，区分请求意图与已授予读取。小文件 TUI 任务的暖 Actor→命中分别约
+Windows 4.97→1.71 ms、WSL 5.88→1.38 ms，不是原生 fd 或整任务加速保证。Bash 同父/跨父
+冷复用比约 1.81×/1.83×，Actor 到达后的运行中采纳另计 4010→2808 ms，未重复执行。
+源码净减 135、测试净减 1 行，当前 32,955/14,271；思程保护路径无变化。旧绝对源码预算、
+macOS/ARM64 Runtime 资格和 metadata 零副作用边界仍未完成，不结算整体 goal。
