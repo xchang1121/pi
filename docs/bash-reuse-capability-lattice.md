@@ -1001,3 +1001,12 @@ Windows 9 次采纳，WSL 5 次采纳及 4 次收益不足的恰好一次 Actor 
 候选索引移除七个纯转发入口：本索引内查询、兼容插入、命中计数和裁剪直接使用原 store；
 跨索引迁移、共享/独占分离及分支释放仍归原注册表。两端既有候选索引、Runtime、提交拒绝
 45 项与 check 通过；测试未增长、未跑全量/高负载，生产净减 42 行，累计 −76 行。
+
+Git 私有仓库/索引参数由原进程执行函数一次绑定；沙箱与事务共享 regular blob 读取和模式解码，
+分别保留 64 MiB 基线文件限制和事务剩余预算。删除重复路径字段和 options 声明，没有增加转发层、
+缓存或依赖。生产净减 179 行，本提交相对 485cdb2 累计 −255 行（不含下一步 grep 接入）。
+Windows 沙箱/身份定向 20 passed / 4 skipped，WSL 24 passed；同阶段单 worker 全量均 55 文件通过，
+Windows 490 passed / 16 skipped、WSL 505 passed / 1 skipped，check 均通过。真实 WSL Bash 小夹具
+冷执行 2,991 ms、同父/跨父子进程命中 1,626/1,623 ms，变更输入重新执行；此夹具不声称整个命令
+缓存命中。Runtime in-flight 原始 Actor 4,010 ms、采纳 Actor 2,738 ms，第二次 Actor 恰好执行一次，
+PID 结果不进入持久历史。每个既有探针仅跑一轮，没有重复压力扫描或 ThinkThread 修改。
