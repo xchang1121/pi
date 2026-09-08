@@ -722,3 +722,16 @@ rg 的 `(?P<name>...)`。只用已有 rg、私有逐文件输入和原 Pi 格式
 Windows pack、真实 find/TUI 通过。Bash process 首次因文件时钟未推进而安全拒绝，复跑通过；
 in-flight 另计 Actor 4009→2611 ms（1.54×），没有重复执行，不声称消除了时钟不稳定性。
 思程保护路径未改；主仓与 WSL 副本均无新增搜索依赖，仓外旧实验残留不属于运行时且未计作清理完成。
+
+进一步的原生 rg/fd 实测仍被 statx、目录枚举、时间/随机源及部分可变宿主输入拒绝，不能仅把
+shell 描述改名为通用进程就开放完整搜索。审查同时复现了错误的 dirfd 依赖：旧 decoder 会把
+renameat/linkat 的两端和 symlinkat 的新路径都解析到 cwd，未知 dirfd 也会错误地当成 cwd。
+现在以 [内核路径参数 ABI](https://man7.org/linux/man-pages/man2/rename.2.html) 表统一拥有每个
+pathname/dirfd 对，兼容绝对路径和描述符形式的元数据调用；删除字符串位置猜测、重复名单和
+metadata 路径分支。证据 epoch 升为 v18，旧证书不能沿用。两项反例在旧实现失败，WSL 实际
+renameat/linkat/symlinkat 记录通过；临时探针已删除，没有为测试安装任何组件。
+源码 −43、测试 −3 行，Windows 477/16 skipped、WSL 492/1 skipped；check/build/bench:check、
+pack、完整 find/TUI、Linux process/in-flight/exec-boundary/artifacts/topology 通过。
+本次同父/跨父冷复用比约 1.59×/1.66×，Actor 到达后 4011→3129 ms（1.28×），不替代历史
+1.83× 的指标定义。验收副本核对后仅修正旧报告字段和 README；生产/测试/依赖/安装脚本一致。
+CLONE_FS 共享 cwd 的并发证据和完整搜索准入仍待继续，不据此结算整体 goal。
