@@ -843,3 +843,8 @@ Actor capture、seal 和预览；seal 跨越关闭边界时不再晋升结果。
 覆盖执行中/已封存/观察中/晋升失败/封存中的 disable 与 dispose。Windows 481/16 skipped、
 WSL 496/1 skipped、两端 check 和五组 Linux Bash 验收通过；in-flight Actor 4009→2600 ms（1.54×）。
 此步生产 +11、测试 −20；相对 `485cdb2` 累计生产 −10、测试 −20。事务内资源借用仍需下一步封闭。
+
+生命周期第 2 步：事务回收先拒绝新的校验/重算，再等待已经借用封存输入的重算、校验和提交完成。
+已提交或 poisoned 的历史结算不因清理改写，避免重复 commit 被误当成可安全重新执行。原单一 abort
+测试改为四阶段×成功/失败交错矩阵，复现了旧实现提前 dispose 及关闭后返回 valid 的问题。
+Windows 481/16 skipped、WSL 496/1 skipped 和两端 check 通过；累计生产 −9、测试 −13 行。
