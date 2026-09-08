@@ -1136,3 +1136,13 @@ ThinkThread 受保护路径不变，macOS/ARM64 与真实 Runtime 仍未验收�
 WSL 521 passed / 1 skipped。142 个 source/test 文件哈希一致；生产本步 +7，累计 32,738（−96），
 测试本步 +83，累计 14,612（+381）；未新增测试文件。未重复原生成本或压力扫描，既有 Bash/grep
 收益记录不冒充本次测量；依赖、CI 不变，完整目标及 macOS/ARM64、真实 Runtime 验收仍未结项。
+
+原 RuntimeLifecycleLane 的释放登记也提前到清理回调之前。直接探针及既有关闭夹具均已复现：
+dispose 同步重入 release 时，旧记录尚未登记，导致同一资源清理两次且返回不同 Promise。
+现在原 WeakMap 和工作集合先登记同一次释放，外部、重入及清理后的调用者均加入它，不新建
+生命周期所有者。成功/失败清理合并进原关闭矩阵，保留同步封门和 close 合并断言，并验证关闭
+回调自身结束后仍等待资源；清理错误仍不替换 Actor 结算。生产本步不增行、测试 +18 行。
+两端 check/build、各 77 项定向及 55 文件单 worker 全量通过：Windows 507 passed / 16 skipped、
+WSL 522 passed / 1 skipped；142 个 source/test 文件哈希一致。相对 485cdb2 生产仍为 32,738
+（−96），测试 14,630（+399）；无依赖、CI 或 ThinkThread 受保护路径修改，无新增原生成本或
+压力测量。完整目标保持未结项，未具备的 macOS/ARM64 与真实 Runtime 资格不由这些回归替代。
