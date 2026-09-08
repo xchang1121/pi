@@ -702,3 +702,14 @@ macOS/ARM64 Runtime 资格和 metadata 零副作用边界仍未完成，不结�
 Windows/WSL 全量仍为 478/16 skipped、493/1 skipped，check/build/bench:check、Windows pack、
 真实 find/TUI 及 Bash process/in-flight 均通过；同父/跨父冷复用比 1.87×/1.83×，Actor 运行中
 采纳另计 4010→2746 ms（1.46×）。源码再减 6 行，当前 32,949/14,271；思程保护路径无变化。
+
+原搜索取消只等待 guest 退出，委托给宿主的输入工作可能仍在运行；独立 Node 输入进程的反例
+在旧实现确定性失败。现在用拥有 signal/完成证明的输入记录替代 `inputPending` 布尔量，同一
+进程池取消并等待这项工作后才结算，不另建生命周期层。原取消矩阵保留晚到成功/失败，加入
+真实进程关闭证明；两端全量、check/build/bench:check、Windows pack 及完整 find/TUI/Bash
+回归通过。源码 +5、常规测试不增长，当前 32,954/14,271；相对本轮基线源码仍净减 142 行。
+
+无新增依赖的 grep 尚未准入：[Pi 当前接口](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/tools/grep.ts)
+仍未提供搜索进程入口。两端已有 rg 的 stdin 实验表明，直接拼接 UTF-8/UTF-16 文件会丢失匹配，
+无末尾换行也会破坏文件边界；JS RegExp 则不接受 rg 的 `(?P<name>...)`，不是同一语法。
+不以这两种快捷替代宣称完整 grep；下一步需保留真实引擎和文件边界，并复用此输入工作所有权。
