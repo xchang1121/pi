@@ -177,6 +177,16 @@ ProcessExecutionCoordinator 和现有 candidate / certificate / CAS 存储；不
 watcher 仅提供失效提示，不能把“没有事件”等同于“内容没有变化”。描述符身份、符号链接、
 特殊文件、目录负查询、访问权限及路径大小写都是证据的一部分。
 
+**采样边界（2026-09-08 实测）**：Windows 与 WSL 的文件读取、目录枚举均可能更新 atime，
+即使内容验证仍为 exact/valid。上述封存保证不是宿主 metadata/审计事件的零副作用保证，TUI
+路线详情也明确提示。共享文件捕获将准入 lstat、两次 fstat 和最终 lstat 约束为同一 regular-file
+身份；已知特殊文件不再打开，准入期间或末次 fstat 后的变更均拒绝。并发恶意替换成设备的
+open 副作用仍不是 Node 路径检查能隔离的。不能通过事后恢复 atime 掩盖这种边界，也不能
+把它写成已完成的全系统等价性。[Linux O_NOATIME](https://man7.org/linux/man-pages/man2/open.2.html)
+受权限和文件系统约束；[Windows SetFileTime](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-setfiletime)
+的逐句柄抑制需要额外访问权限，不能直接作为当前 Node 文件接口的跨平台保证。没有降低 Bash
+metadata 证书校验，也没有增加不合格 provider。
+
 复用输入和复用结果明确区分：同一内容可供另一个查询重新计算，不表示不同查询输出等价。
 read-range 投影仍保留；Bash-tail 文本投影因下述真实反例已撤回，不继续扩充语法规则库。
 
@@ -650,3 +660,10 @@ bench:check、pack dry-run、完整搜索和 TUI 资格通过；Linux 运行中�
 保留跨上下文、规范化别名、schema 拒绝、非权威样本、失败耗时和会话释放证明。此步源码 −12、
 测试 −48；当前 33,092 / 14,590，相对本轮基线源码 −4、测试 −740。Windows/WSL 全量
 477/17 skipped、493/1 skipped，check/build/bench:check 通过；早先绝对源码预算仍未达到。
+
+文件证据窗口修正的旧实现对照触发三项确定性失败，现有五组描述符场景合并保留短读、增长、
+缩短、替换，并覆盖准入/末次路径校验；特殊文件检查实际断言未打开描述符。源码 −2、测试 +11，
+未增加测试总数。两端全量最终为 478/16 skipped、493/1 skipped，check/build/bench:check、
+Windows pack、完整搜索/TUI、Linux process/in-flight 通过；同父/跨父冷复用比 2.00×/2.07×，
+Actor 到达后 4010 → 2696 ms（1.49×）。Windows 首次全量的 Faux E2E 墙钟省时阈值失败、
+重跑通过，另行收敛该测试的时间假设；不计作文件证据回归已消除了所有测试不稳定性。
