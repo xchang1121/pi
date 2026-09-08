@@ -645,3 +645,8 @@ grep 7.50 → 2.19 ms、find 8.23 → 1.13 ms，WSL 7.80 → 1.68 ms、5.26 → 
 距本轮源码不增长目标仍差 8 行。两端全量 478/17 skipped、494/1 skipped，check/build/
 bench:check、pack dry-run、完整搜索和 TUI 资格通过；Linux 运行中单次采纳、exec-boundary、
 128 MiB artifact、32 MiB topology 回归通过。思程保护路径仍无改动，整体目标尚未结算。
+
+会话重复动作直接由现有有界 LRU 拥有，不再通过三个方法转发 get/set/values。合并的资格矩阵
+保留跨上下文、规范化别名、schema 拒绝、非权威样本、失败耗时和会话释放证明。此步源码 −12、
+测试 −48；当前 33,092 / 14,590，相对本轮基线源码 −4、测试 −740。Windows/WSL 全量
+477/17 skipped、493/1 skipped，check/build/bench:check 通过；早先绝对源码预算仍未达到。
