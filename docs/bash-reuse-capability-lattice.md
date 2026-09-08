@@ -628,3 +628,13 @@ TUI 使用相同的结构比较，不再比较 JSON 键顺序。继承、tombsto
 统计类型现从实际初始化结构推导，移除重复字段清单和 TUI 的整套零值缓存；初始容量使用已加载
 配置而非固定默认值。原 TUI 流程验证 37 条配置从启动即正确显示，实时/重放统计对照继续通过。
 源码 −69、测试行数不变；两端全量及 check/build/bench:check 通过，基线源码净减 11 行。
+
+TUI 现可明确选择 Portable search，Actor/producer 共用同一绑定；默认原生 Pi 和思程保护路径
+不变。设置代际拥有准备、失败和进程池释放，关闭不初始化，缺模块拒绝调用，显式刷新可恢复。
+测试夹具改用真实 gateway，替换重复 fallback 状态机；源码 +49、测试 −22 行，当前源码
+33,134（基线 +38）、测试 14,670，最终不增长目标仍待收敛。Windows/WSL 全量 480/17 skipped、
+496/1 skipped，check/build/bench:check、pack dry-run 通过；真实扩展回调、TUI 暂存/应用、
+配置持久化和 grep/find 采纳均通过。小文件夹具的 warm Actor → ready hit 分别为 Windows
+grep 7.50 → 2.19 ms、find 8.23 → 1.13 ms，WSL 7.80 → 1.68 ms、5.26 → 0.99 ms；
+不是整体任务加速保证。Bash 同父/跨父冷复用比 1.88×/1.92×，另计运行中 Actor 4009 →
+2699 ms（1.49×），未重复执行。macOS 与 ARM64 思程 Runtime 资格仍缺实机，不计通过。
