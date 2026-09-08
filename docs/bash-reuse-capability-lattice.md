@@ -854,3 +854,9 @@ K(a) 绑定第 2 步：Actor 入站参数和解析后的执行元数据由本次
 验证 keyed、unkeyable、无 turn、绑定失败仍是同一执行器且恰好一次。Windows 481/16 skipped、
 WSL 496/1 skipped、两端 check 通过；累计生产 −4、测试 −6 行。执行函数闭包仍由 provider 的
 版本化契约负责，不能通过复制函数或比较文本推导权限或等价性。
+
+生命周期第 3 步：取消只结算逻辑候选，物理额度由执行与清理完成后的统一 finally 归还；删除
+独立 discard 和预览绕过准入的路径。实际 Actor 已持有的 reservation 决定 Actor 准入，可立即
+启动但必须记账；未到达的预览仍受投机额度约束。四类交错矩阵连续通过 100 次，两端 check/
+全量测试（Windows 480/16 skipped，WSL 495/1 skipped）及真实 Bash process/in-flight 通过。
+此步生产 +1、测试 −26；累计生产 −3、测试 −32 行。基准与重复测试并行的耗时不用于性能回归结论。
