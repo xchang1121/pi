@@ -1195,3 +1195,20 @@ WSL 537 passed / 1 skipped；142 个 source/test 文件哈希一致。累计相�
 （−118），测试 14,788（+557）。依照低负载要求两端顺序验证，无额外原生成本或压力扫描；
 ThinkThread、依赖和 CI 受保护路径不变。完整目标仍未结项，既有 Bash/grep 成本记录不是本次
 重新测量，缺失的 macOS/ARM64 与真实 ThinkThread Runtime 验收也不能由结构回归替代。
+
+批量准入与动作就绪不再共用一个最慢完成屏障。旧并发夹具扩充后复现：只返回一个多动作
+计划时，快动作会等待慢 K(a) 绑定；返回多个计划的数组或 observe 批次时，独立计划也被
+前一计划阻挡。原测试中另一独立请求完成后的全局调度掩盖了前一种情况。
+原 admitUpdate 扩为批量准入核心，预测、continuation 和观察更新直接进入同一实现；各计划
+同时登记在原 planAdmissionTails，只有相同计划继续串行。每个动作物化结束即调用既有调度，
+而批次和物化的 allSettled 仍等待所有已登记 Promise；空更新也保留原调度收敛。不新增队列、
+生命周期所有者或绕过 Router、权限与收益准入。计划身份与执行绑定的归属规则不变。
+原 Runtime 夹具覆盖独立请求、单计划、批次、同计划 proposal 修订及 observe delta；屏障
+证明慢绑定未完成时独立动作已执行、后续修订尚未开始绑定，解除后可采纳最新动作。原生产
+Host/ActorFork 集成夹具还暂停一个 sibling 的权限检查，确认另一动作先执行，暂停动作没有
+启动。此处 sidecar 仍为 mock，工具耗时是夹具模拟，不是新的原生成本或真实 Runtime 资格。
+两端 check/build、各 118 项定向及 55 文件单 worker 全量通过：Windows 526 passed / 16 skipped、
+WSL 541 passed / 1 skipped；142 个 source/test 文件哈希一致。生产本步 −9 行，累计相对
+485cdb2 为 32,707（−127）；测试本步 +12，累计 14,800（+569），没有新增测试文件。完整测试
+按平台串行，无额外压力或原生成本扫描；ThinkThread、依赖和 CI 不变。完整目标保持未结项，
+macOS/ARM64 与真实 ThinkThread Runtime 仍未验收，既有 Bash/grep 收益记录不冒充本次测量。
