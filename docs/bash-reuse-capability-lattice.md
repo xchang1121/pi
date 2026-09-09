@@ -12,7 +12,7 @@
 | 动作身份 | Pi preparation 只在 K(a) 前执行一次；语义、schema、参数、资源名称和执行身份不可后改；来源/调用编号/轮次不是等价条件 | [语义](../src/action-semantics.ts)、[工具绑定](../src/pi-tool-invocation.ts) |
 | 路由与权限 | 唯一 Router 选择统一环境、本地安全后备、Actor；所选隔离路线不进入 K(a)，相同键也不授予执行或重放权限 | [执行世界](../src/execution-world.ts)、[执行网关](../src/tool-execution-gateway.ts) |
 | 候选与调度 | 保存精确注册成员关系；动态资源版本属于产物证据；允许同一动作保留不同输入状态的结果 | [候选存储](../src/candidate-stores.ts)、[Runtime](../src/runtime-engine.ts) |
-| 输入与输出 | 可信文件操作只能访问已记账的受控输入；封存后不得新增输入。新查询只允许有覆盖证明的投影或封存输入重算 | [资源证据](../src/resource-version.ts)、[文件世界](../src/agent-execution-world.ts) |
+| 输入与输出 | 新参数在封存输入上求值，成功结果随同一候选有界保留；封存后不得新增输入，每次采纳仍验证新鲜度。默认不依赖工具输出投影 | [资源证据](../src/resource-version.ts)、[文件世界](../src/agent-execution-world.ts) |
 | 进程与产物 | 完整进程身份、动态依赖、生产者保证及有序输出/效果分别封存；重放前验证并持有整个 CAS 闭包 | [进程后端](../src/linux-process-backend.ts)、[证书](../src/provenance-certificate.ts)、[存储](../src/reuse-store.ts) |
 | 采纳与回退 | 再查权限、新鲜度、等价性、生产者保证和收益，然后提交；仅证明无效果的拒绝允许单次 fallback，poisoned 提交禁止重跑 | [事务](../src/effect-transaction.ts)、[调度](../src/scheduler.ts) |
 | 关闭与保留 | 逻辑取消不等于物理完成；所有者拒绝新准入并等待已执行、借用、封存和清理，之后才能回收工作区 | [生命周期](../src/runtime-lifecycle.ts)、[工作区](../src/workspace-sandbox.ts) |
