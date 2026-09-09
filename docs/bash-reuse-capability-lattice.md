@@ -1473,3 +1473,18 @@ source/test 文件哈希一致。生产本步 +9 行，累计相对 485cdb2 为 
 压测或重建未改动的生产产物；142 个 source/test 文件哈希一致。生产本步不变，累计相对
 485cdb2 为 32,640（−194），测试累计仍 +512 行；ThinkThread、依赖、CI 不变。
 完整目标与历史绝对预算仍未完成，macOS/ARM64 和真实 ThinkThread Runtime 仍未验收。
+
+嵌套进程原先在 transaction.begin 后、清理 try/finally 前分配 trace 目录；分配失败遗留
+active capture，使同一工作区后续命令被误判为重叠。分配现在进入原清理边界，失败等待
+abort，且只删除实际取得的目录；进程执行后的封存失败仍不重跑，K(a)、权限及资格规则不变。
+回归并入已有原生用例的第一次执行，不新增 fork 夹具或条目：注入一次 ENOSPC，旧代码
+实际 abort=0、下一事务 complete=false；修复后 abort=1、complete=true，原生子进程回退
+标记只输出一次。这里的 complete 仅指真实工作区事务，不宣称该命令已获得可回放证书。
+两端 check/build、6 文件定向通过（Windows 38 passed / 8 skipped，WSL 46 passed），
+55 文件单 worker 全量通过（Windows 529 passed / 16 skipped，WSL 544 passed / 1 skipped），
+仍为 545 项；142 个 source/test 文件哈希一致。生产本步行数不变，累计 32,640（−194），
+测试本步 +28，累计 14,771（+540）。平台顺序运行，无新增依赖、CI、ThinkThread 改动或压测。
+收紧完整输出时另发现：旧 barrier 脚本在本机报 shell 语法错误，末尾输出断言仍能通过；
+既有 Sandlock 的 ELF 探测会推进脚本 FD 读位置，需独立修正和原生验证。此用例当前不能
+证明完整并发语义；保留原断言不等于该缺口已解决。整体目标、历史预算及 macOS/ARM64、
+真实 ThinkThread Runtime 验收仍未完成。
