@@ -1484,7 +1484,23 @@ abort，且只删除实际取得的目录；进程执行后的封存失败仍不
 55 文件单 worker 全量通过（Windows 529 passed / 16 skipped，WSL 544 passed / 1 skipped），
 仍为 545 项；142 个 source/test 文件哈希一致。生产本步行数不变，累计 32,640（−194），
 测试本步 +28，累计 14,771（+540）。平台顺序运行，无新增依赖、CI、ThinkThread 改动或压测。
-收紧完整输出时另发现：旧 barrier 脚本在本机报 shell 语法错误，末尾输出断言仍能通过；
-既有 Sandlock 的 ELF 探测会推进脚本 FD 读位置，需独立修正和原生验证。此用例当前不能
-证明完整并发语义；保留原断言不等于该缺口已解决。整体目标、历史预算及 macOS/ARM64、
-真实 ThinkThread Runtime 验收仍未完成。
+本阶段另发现旧 barrier 脚本报 shell 语法错误但末尾断言仍通过；该验证缺口随后单独修复：
+短脚本直接执行输出前后两行，旧 Sandlock 只执行第 64 字节后的后半段且返回 0。
+固定 revision 的 ELF parser 会推进共享 FD；补丁现在复用既有 is_elf 分类，只对 ELF
+调用 parser，脚本 FD 不被消耗。独立原生构建恢复两行输出；exec-mount 的短脚本应退出 42，
+旧 binary 实际退出 0、新 binary 退出 42。安装器复用原 exec-mount 探测检验此语义，不增
+探测条目；Runtime 将短脚本检验并入既有上下文探测，实际拒绝旧 binary、接受新构建。
+生产者 epoch 升至 v20，使旧生产者证据冷失配；v7 证书格式不变，不清空缓存。
+原并发夹具隔离 noclobber 失败、等待两个 worker 的成功退出，精确比较包含管道结果的
+完整输出，并用会话取消限制失败夹具寿命；不再以末尾成功掩盖脚本错误。未新增用例或文件，
+测试本步 −1 行，累计 14,770（相对 485cdb2 为 +539）；生产本步 +12，累计 32,652（−182）。
+Rust 离线单 worker 构建仅使用已有源码和依赖缓存，未改研究源码或已安装 binary。
+各运行一次既有低负载基准：同/异父子进程命中把投机分支从 3.03s 降至 1.70/1.67s，
+但仍慢于 1.01s 的 Actor 直跑，不把它宣称为同步 Actor 收益；输入变化强制 miss，输出及
+文件效果一致。Runtime 整个 Bash 调用的 in-flight 样本在 3s lead 下把 Actor 4.01s 降至
+2.84s，第二次 Actor 恰好一次 fallback，PID-tainted 结果不持久化；这些不是全面性能保证。
+两端语法检查、check/build、9 文件定向通过（Windows 76 passed / 9 skipped，WSL 85 passed），
+55 文件单 worker 全量通过（Windows 529 passed / 16 skipped，WSL 544 passed / 1 skipped），
+仍为 545 项；142 个 source/test 文件哈希一致，ThinkThread、依赖和 CI 不变。WSL 验证
+显式选择本次独立构建；本机原安装未替换，旧 binary 不具备新生产者资格。整体目标、
+历史绝对预算及 macOS/ARM64、真实 ThinkThread Runtime 验收仍未完成。
