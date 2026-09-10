@@ -94,7 +94,11 @@ npm run bench:thinkthread-tools
 
 基线中的原生 read/grep/find/ls 仅在 Actor 授权后执行，不代表可以提前运行宿主函数。首选路线选择失败就是资格失败，不能用原生通过替代。准备、producer、已完成采纳是分开的单样本；poisoned 采纳保留所属夹具，不继续写工作区。
 
-普通测试复用的是本地 wire runner，不是真实 Runtime。Profile 内 Bash 仍须另行通过原生进程/in-flight 资格；冲突、取消恢复和隐式依赖闭包也是独立验收项。本机 x86-64 环境没有可用的公开 ThinkThread Runtime，不宣称 ARM64/helper 或真实 Profile 已验收。
+本机 WSL2 x86_64 已从 alpha4 RPM `0.1.0-19` 解包布局运行真实 Pi 0.84.1/Node 24.20.0：`read/ls/edit` 采纳通过；新文件 `write` 失败，故整条命令仍返回失败。独立原生 Node 复现显示：私有分支对不存在路径的异步 `realpath` 返回 `EACCES`，Actor 返回 `ENOENT`；不将权限错误改写成不存在来绕过保护。Host 拒绝该候选后 Actor 成功写入一次。
+
+七项实机生命周期检查覆盖共享 BASE、过期读取、写入冲突、连续 fs snapshot 采纳、错误候选回退、进程取消及关闭排空，请求/快照归零；宿主在同次启动中确认取消的父子进程退出。另有五场景各两对、共 20 个 Host 任务，按固定 3 s/30 ms Actor 到达时序比较开关并计入回收，均未获净加速；未知耗时的在途样本约为关闭 32 ms、开启 2.23 s。构造时序不代表自然任务。
+
+真实 TUI 的开关须 Apply 才生效；该 Profile 的 held-exec 返回 `EACCES`，Bash 提前执行不可用，文件后备与 Actor 保留。注册后备不授予嵌套 tracing/handoff 权限；wire 测试和 fs snapshot 检查不授予 Host Checkpoint/restore、ARM64 或完整进程闭包资格。
 
 ## 录制与模型消融
 

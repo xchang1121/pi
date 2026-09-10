@@ -28,9 +28,9 @@
 | 原生 Actor 只读观察 | 路径绑定窗口无法证明，保持关闭 | 仅对具备完整稳定窗口证据的绑定开放 | 未据本机测试授予资格 |
 | 受控 find/grep 与 TUI | 现有 rg 15.2.0 的显式共同 profile 已验证 | 现有 rg 14.1.0 的显式共同 profile 已验证 | 未资格化，不自动启用 |
 | 原生 Bash 整体/子进程/in-flight | 不宣称原生 Windows 进程证书能力；WSL 是独立环境 | 按下表逐项探测和准入 | 需要真实 provider/helper 证明 |
-| ThinkThread 可选接入 | 不虚构 Runtime | SDK/wire 接入回归保留；本机无真实 Runtime | 真实 Runtime 与 helper 配合未验收 |
+| ThinkThread 可选接入 | 原生 Windows 不支持；使用 WSL2 | alpha4 x86_64 部分实机资格，见下文 | Runtime 与 helper 配合未验收 |
 
-Windows/WSL 和本地 wire runner 不授予 macOS、ARM64 或真实 ThinkThread Runtime 资格。无安全路线时由 Actor 正常执行。
+平台与用例分别验收；本地 wire runner 不能替代真实 Runtime，WSL 结果不外推 macOS/ARM64。无安全路线时由 Actor 正常执行。
 
 资源读取和目录枚举可能更新宿主 atime。描述符身份、路径包含、链接链和特殊文件检查保护输入语义，不提供宿主 metadata/审计事件零副作用保证，也不是恶意并发换成设备文件的内核隔离。不得事后恢复时间戳来掩盖这一边界。
 
@@ -125,8 +125,7 @@ OverlayFS 必须通过固定 binary、FUSE、copy-up、whiteout、opaque、匿�
 
 ## 当前证据与剩余工作
 
-- 2026-09-10 两端 check/test/build/bench:check 通过，561 项：Windows 545 通过/16 跳过，WSL 560 通过/1 跳过。WSL 首次 sidecar 超时原因未明；保留失败日志，同源码单项、整文件及全量复跑通过。
-- `ActorAction` 合并候选选择、准入与结算，生产减少 122 行/3,136 字节。每端 432 组合法流程与旧版一致，8 次真实 Agent 对照通过，未证明新增稳定加速，付费 API 为零。
+- 2026-09-10 两端 check/test/build/bench:check 通过，561 项：Windows 545 通过/16 跳过，WSL 560 通过/1 跳过。WSL 首次 sidecar 超时原因未明，同源码单项、整文件及全量复跑通过。思程阶段未改生产代码，按摘要沿用上述结果，未付费调用模型。
 - 固定 LF 口径含空行：`src` 32,380 行，随包脚本 269 行；较 `8c559d1` 生产仍多 4,447 字节、test 多 13,436 字节。较 `485cdb2` 生产多 24,604 字节；30,411 行预算仍差 1,969 行。
-- `2f49367` 的缓存实验有 12/12 配对优于旧版和关闭；历史条件与复现见[验证说明](../bench/README.md#已保存的历史测量)。保留未知 Actor 耗时探索；零窗口及自然应用尚无稳定收益证明。
-- 独立 Actor 进程观察、进程默认 ACL、减量、macOS/ARM64、真实 ThinkThread Runtime 仍待验收。
+- ThinkThread alpha4 x86_64 的 read/ls/edit 采纳、七项生命周期及真实 TUI 通过；新文件 write 的 realpath 错误仍失败并回退 Actor 一次，小文件未获加速。边界见[实机资格](../bench/README.md#thinkthread-真实-runtime-资格)。
+- 独立 Actor 进程观察、进程默认 ACL、减量、macOS/ARM64、思程新文件 write/嵌套 Bash/Host 恢复及自然净加速仍待验收。
