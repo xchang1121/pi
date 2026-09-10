@@ -96,7 +96,7 @@ npm run bench:thinkthread-tools
 
 七项实机检查覆盖共享 BASE、过期读取、写入冲突、连续快照采纳、错误回退、取消和关闭排空，请求/快照归零。生产 runner 直接加载已验收 Pi 0.84.1 的原版工具模块；六个工具与公共入口输出及效果一致，其他版本拒绝隔离执行。首次共享采纳只验新一次，直接 commit 与后续消费者仍各自验新。
 
-相对 `93ce3a5`，63 个真实 Agent 任务仅替换子进程 runner：PNG 的 1.2 s 窗口下，关闭/父实现/当前均值为 1300/1725/1253 ms，当前 3/3 优于两组；3 s 窗口没有一致父版本收益。30 ms 冷窗口仍为 126/1690/1059 ms，晚到编辑、失配、资源变化和小文本开启也仍亏损。计时含 Host/Agent、流、工具进程加载、验证、回退及回收，外层导入、夹具和 oracle 除外；模型流固定构造，API 为零，不能代表自然任务收益。原生 Windows/WSL 各 18 次冷 runner 对照仅证明子进程降耗，不能替代普通 Host 净收益。
+本轮相对 `cb26dbf` 的 72 个 Agent 任务保持正确输出与回收，逐次核对隔离子进程的模块哈希。PNG 的 1.2 s 窗口下，关闭/父实现/当前为 1265/1251/1259 ms；30 ms 冷窗口为 93/981/982 ms，不能据此声称本轮提速。大编辑超过 512 KiB 输出上限，候选被拒绝后每个工具回到 Actor 一次。
 
 TUI 修改须 Apply；开放 helper 读取后，嵌套 ptrace 仍报 `EPERM`，Bash 提前执行不可用，Actor 回退正确。文件路线、wire 和快照检查不授予嵌套 tracing/handoff、Host Checkpoint/restore、ARM64 或完整进程闭包资格。
 
@@ -139,7 +139,7 @@ API key 只从环境读取，不写入产物或交给基准 shell 子进程。�
 
 `actualEndToEndMs` 从工具/Host 初始化前计至终态结算、Host 与工作区回收完成；`setupMs`、`agentPromptMs`、`teardownMs` 构成这一总时长。数据集下载、checkout 和最终补丁检查在计时外。Drafter 根请求直接接收 Actor 即将提交的完整上下文，不自行重建首轮消息。
 
-共用流式参数跟踪的对照使用约 468 KB 编辑参数、256 字符分片及 3000/30 ms 模型窗口：Windows、WSL、ThinkThread 各 36 个真实 Agent 任务，共 180 次工具调用。逐片扫描后，开启投机的长窗口编辑完整均值分别从 4248.71/3592.08/3522.12 ms 降到 3400.94/3110.57/3060.68 ms，三端各 3/3 改善；关闭投机也受益，短参数没有一致收益。计时含 Host/Agent、执行、回退及关闭，不含外层启动、夹具和 oracle；模型流为构造、API 为零。思程大编辑约 978 KB 输出超过现有 512 KiB runner 上限，候选拒绝后各工具回退一次，不能记为采纳。三端当前开启仍慢于关闭，此证据只证明移除共用开销有效。
+本轮共 216 个真实 Agent 任务：Windows 54、WSL 90、ThinkThread 72；每任务用新进程完整切换四个公共模块，保留冷窗口与拒绝样本。身份修复未显示一致父版本提速，普通文件小任务开启仍亏损。Bash 长窗口与运行中接续仍各 3/3 优于关闭投机，晚/冷窗口亏损。计时包含 Host/Agent、流、工具加载、验证、回退和回收；外层导入、夹具、oracle 与删除另记完整子进程时长。504 次模型流均为构造，API 为零，不代表自然任务收益。
 
 加速比为 `serializedCounterfactualMs / actualEndToEndMs`；分子等于 `actualEndToEndMs + hiddenLatencyMs`，也等于 `nonToolMs + authoritativeToolMs`。本次采纳候选计入权威工具时间，未采用预测和旧缓存不计入；重叠可包含 Actor 自身并行，`executionAheadMs` 仅表示执行领先。
 

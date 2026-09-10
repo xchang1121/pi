@@ -9,7 +9,7 @@
 | 边界 | 当前职责与不可放宽的条件 | 主要实现 |
 | --- | --- | --- |
 | 预测与 Actor | Drafter、Actor probe、PatternAware 只产生来源中立动作；入站数据在异步排队和提供者回调前归属于本次调用 | [计划](../src/plan-runtime.ts)、[宿主接入](../src/agent-integration.ts) |
-| 动作身份 | Pi preparation 只在 K(a) 前执行一次；语义、schema、参数、资源名称和执行身份不可后改；来源/调用编号/轮次不是等价条件 | [语义](../src/action-semantics.ts)、[工具绑定](../src/pi-tool-invocation.ts) |
+| 动作身份 | 参数准备一次；语义、schema、参数、资源名称与执行身份不可后改。仅自有的无损纯数据树可携带身份；来源/调用编号/轮次不是等价条件 | [语义](../src/action-semantics.ts)、[封存](../src/stable-json.ts) |
 | 路由与权限 | 唯一 Router 选择统一环境、本地安全后备、Actor；所选隔离路线不进入 K(a)，相同键也不授予执行或重放权限 | [执行世界](../src/execution-world.ts)、[执行网关](../src/tool-execution-gateway.ts) |
 | 候选与调度 | 保存精确注册成员关系；动态资源版本属于产物证据；允许同一动作保留不同输入状态的结果 | [候选存储](../src/candidate-stores.ts)、[Runtime](../src/runtime-engine.ts) |
 | 输入与输出 | 完整流式意图可提前转换封存数据；让出事件处理后正式调用已到达便跳过。结果沿用候选预算；采纳仅等待相同动作及执行器，仍授权、验证和提交 | [Runtime](../src/runtime-engine.ts)、[文件世界](../src/agent-execution-world.ts) |
@@ -125,7 +125,7 @@ OverlayFS 必须通过固定 binary、FUSE、copy-up、whiteout、opaque、匿�
 
 ## 当前证据与剩余工作
 
-- 2026-09-10 当前源码两端 check/test/build/bench:check 通过：Windows 545 通过/16 跳过，WSL 560 通过/1 跳过，共 561 项；模型请求为零。
-- 固定 LF 含空行：`src` 32,422 行，脚本 269 行；较 `8c559d1` 生产仍多 6,648 字节、test 多 19,607 字节。较 `485cdb2` 生产多 26,805 字节；30,411 行预算仍差 2,011 行。
-- ThinkThread alpha4 七项生命周期通过，新文件 write 仍失败。63 个 Agent 任务证明窄工具入口可扩大 PNG 的有效执行窗口，冷窗口仍亏损；共用流处理的三端降耗与大编辑输出上限见[实机资格](../bench/README.md#thinkthread-真实-runtime-资格)及[计时边界](../bench/README.md#计时与验收规则)。TUI 仍为历史证据。
+- 2026-09-10 两端 check/test/build/bench:check 通过：Windows 546 通过/16 跳过，WSL 561 通过/1 跳过，共 562 项；API 为零。
+- 固定 LF 含空行：`src` 32,439 行，脚本 269 行；较 `8c559d1` 生产多 7,871 字节、test 多 26,787 字节。较 `485cdb2` 生产多 28,028 字节；30,411 行预算仍差 2,028 行。
+- 两端各 30 组身份探针的错误采纳从 12 次降为零，纯数据精确命中保留。216 个 Agent 任务、两个 Linux 进程资格脚本及 ThinkThread 七项生命周期通过；成本边界见[实机资格](../bench/README.md#thinkthread-真实-runtime-资格)与[计时规则](../bench/README.md#计时与验收规则)。TUI 仍为历史证据。
 - 独立 Actor 进程观察、进程默认 ACL、减量、macOS/ARM64、思程新文件 write/嵌套 Bash/Host 恢复及自然净加速仍待验收。
