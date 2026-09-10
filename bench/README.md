@@ -94,9 +94,7 @@ npm run bench:thinkthread-tools
 
 本机 WSL2 x86_64 使用 alpha4 RPM `0.1.0-19` 解包布局、Pi 0.84.1/Node 24.20.0：`read/ls/edit` 采纳通过；新文件 `write` 令整条命令失败。原生 Node 对照确认，不存在路径的异步 `realpath` 在私有分支报 `EACCES`，Actor 报 `ENOENT`。保留权限错误，Host 拒绝候选后 Actor 成功写入一次。
 
-默认 Linux 根快照可对合格普通文件复用 SDK 不可变输入，仍重绑原版 Pi 操作、核对当前访问权限与祖先路径；目录、超限输入、父 checkpoint 和自定义执行器保留 fs.run。当前 19 项边界、七项真实 ACL 和 22 项原版输出/图像设置对照通过；图像取消探针确认原版 Worker 实际退出后执行与关闭才结算。共享分支排空已准入验证/提交，请求与快照归零；此前 48 项绑定、七项生命周期对照保留各自原有范围。
-
-当前 108 个 ThinkThread Agent 任务输出、上下文与回收正确。纯 Actor/父/当前的冷图像为 90/1,036/219 ms，冷编辑为 63/1,236/1,139 ms；当前仍分别增加 129/1,076 ms。33 次 SDK run 核对实际生产 argv，39 次 snapshotPread 属于新输入路径。两种路线共同保留 1 MiB 请求、512 KiB 响应及完整图像设置；超限回到 Actor 一次。输入路线取消等待原操作与 Worker，不承诺 fs.run 的 120 秒进程硬限时。
+SDK 在首次准备或指纹检查时加载；缺失 SDK 时注册成功，自检报告不可用，真实 Actor 仍完成一次原生调用。根普通文件使用封存输入与原版 Pi 绑定；其余输入保留 `fs.run`，两者共用请求/响应预算。既有权限、祖先绑定和图像 Worker 回收资格对应 `10bec82`；本次读取与编辑的首次准备、采纳、效果及请求/快照回收另经真实 Runtime 对照。
 
 TUI 修改须 Apply；开放 helper 读取后，嵌套 ptrace 仍报 `EPERM`，Bash 提前执行不可用，Actor 回退正确。文件路线、wire 和快照检查不授予嵌套 tracing/handoff、Host Checkpoint/restore、ARM64 或完整进程闭包资格。
 
@@ -139,11 +137,11 @@ API key 只从环境读取，不写入产物或交给基准 shell 子进程。�
 
 `actualEndToEndMs` 从工具/Host 初始化前计至终态结算、Host 与工作区回收完成；`setupMs`、`agentPromptMs`、`teardownMs` 构成这一总时长。数据集下载、checkout 和最终补丁检查在计时外。Drafter 根请求直接接收 Actor 即将提交的完整上下文，不自行重建首轮消息。
 
-当前 180 个任务（Windows 36、WSL 36、ThinkThread 108）比较纯 Agent+原版工具、关闭投机的 Host、开启投机的父/当前版本。24 个模块按版本在原 URL 加载一次；216 次工具调用、396 次 Actor 流、78 次 Drafter 回调全部保留。提示词、工具顺序、schema、调用 ID、参数分片、输出与后续上下文按实际事件核对一致，仅归一化夹具路径与时间戳。三轮旋转，全部条件保留；构造流、API 为零，不作统计显著性声明。
+本次 154 个真实 Agent 任务（Windows 30、WSL 30、ThinkThread 94）核对 308 次 Actor 流、62 次 Drafter 回调及完整工具输出、后续上下文与效果；另有三端 36 项入口资格检查。控制组分别为纯 Agent+原版工具，以及关闭/开启投机的父版 `10bec82` 与当前 Host。提示词、schema、调用 ID 和参数分片须一致，仅归一化夹具路径与时间戳。
 
-此前称“独立 Actor”的 off-current 实际保留关闭的 Host；控制输入未完全匹配的初测也原样保留，纯 Actor 差值以匹配对照为准。上述 D 不计共享导入、Runtime 客户端准备、夹具、oracle、摘要与删除；四组在 D 内创建原版工具并共同观察流，纯 Actor 不构造 Host/World/协调器。另做三环境各 24 个独立进程任务，只加载各组所需模块，纯 Actor 加载零个投机模块。计时从 execFile 到真实退出，含导入、任务、回收与共同摘要；夹具与 oracle 提前创建，不清 OS 缓存，不等于 Pi TUI 启动或自然模型任务。
+独立进程计时从 `execFile` 至真实退出，包含所需导入、首次 SDK 初始化、任务、回收与共同摘要；纯 Actor 加载零个投机模块。SDK 状态检查在父进程中执行，避免观察器强制加载 SDK。夹具、oracle、状态与效果检查均在计时外。三轮旋转保留负收益与波动；构造流、API 为零，不等于自然模型、Pi TUI 或冷 OS 缓存性能。
 
-独立进程文本/图像任务中，ThinkThread 父版本 2,006/2,153 ms，当前 1,278/1,364 ms，纯 Actor 909/946 ms；当前仍多 369/418 ms。Windows/WSL 图像进程仍多约 31/24 ms；WSL 文本均值受首轮波动影响，不能据此宣称收益。当前 WSL 空历史短 Bash 为纯 Actor/关闭 Host/父/当前 40/46/50/49 ms。此前 Bash 长窗口/接续/晚窗口/冷回退 S/D 1.369/1.433/1.105/1.000×及晚窗口额外 754 ms 的结果本阶段未重跑。
+ThinkThread 30 ms 流下，关闭投机的文本/图像进程减少 218/233 ms；开启后的冷编辑由 2,279 降至 1,178 ms，仍比纯 Actor 多 223 ms。此时首次读取/编辑回退原生 Actor；3 秒流下仍正常采纳，文本/图像/编辑进程较父版减少 210/213/235 ms，仍比纯 Actor 多 104/19/133 ms。SDK 首次初始化成本仍存在，不能把延后加载当作消除成本。其他进程复用与历史 S/D 证据沿用原有范围。
 
 主加速比为同次运行的 `serializedCounterfactualMs / actualEndToEndMs`，分子为 `actualEndToEndMs + hiddenLatencyMs = nonToolMs + authoritativeToolMs`。完整开销保留，无重叠为 1×；纯 Actor 耗时不能代入分子，但必须另查开启系统增加的成本，1×不表示低开销。重叠按任务事件中的 Actor 区间与去重权威计算重建，未采用预测和旧缓存不计入，不能一般性地累加 `executionAheadMs`。多轮分别求和分子、分母，再相除。
 
