@@ -90,15 +90,15 @@ Overlay 探针描述宿主非特权能力，不是生产路线切换许可。生
 npm run bench:thinkthread-tools
 ```
 
-命令在创建夹具前必须取得真实 SDK `selfView` 与 `fs.stat`；仅设置环境变量不算 Runtime。每个获准 stock 路线比较 Actor 基线、原生 fallback，以及经过生产 Gateway 的真实 `fs.run`、validate、commit：同 cwd/path 的序列化输出、全部文件内容/模式与采纳前工作区不变均须相等。
+创建夹具前通过 SDK `selfView/fs.stat` 确认 Runtime，环境变量不足为证。对照 Actor、原生 fallback 和生产 Gateway 的 `fs.run/validate/commit`：同 cwd/path 的完整输出、文件内容/模式须相同，采纳前工作区不变。原生工具仅在 Actor 授权后运行，不能替代失败的首选路线；准备、执行、采纳分别计单样本，poisoned 夹具保留且不再写入。
 
-基线中的原生 read/grep/find/ls 仅在 Actor 授权后执行，不代表可以提前运行宿主函数。首选路线选择失败就是资格失败，不能用原生通过替代。准备、producer、已完成采纳是分开的单样本；poisoned 采纳保留所属夹具，不继续写工作区。
+本机 WSL2 x86_64 使用 alpha4 RPM `0.1.0-19` 解包布局、Pi 0.84.1/Node 24.20.0：`read/ls/edit` 采纳通过；新文件 `write` 令整条命令失败。原生 Node 对照确认，不存在路径的异步 `realpath` 在私有分支报 `EACCES`，Actor 报 `ENOENT`。保留权限错误，Host 拒绝候选后 Actor 成功写入一次。
 
-本机 WSL2 x86_64 已从 alpha4 RPM `0.1.0-19` 解包布局运行真实 Pi 0.84.1/Node 24.20.0：`read/ls/edit` 采纳通过；新文件 `write` 失败，故整条命令仍返回失败。独立原生 Node 复现显示：私有分支对不存在路径的异步 `realpath` 返回 `EACCES`，Actor 返回 `ENOENT`；不将权限错误改写成不存在来绕过保护。Host 拒绝该候选后 Actor 成功写入一次。
+七项实机检查覆盖共享 BASE、过期读取、写入冲突、连续快照采纳、错误回退、取消和关闭排空，请求/快照归零。移除错误封装的模型库加载后，六对 runner 执行均值从 2.02 s 降到 1.53 s；完整 Host 的在途场景从 2.07 s 降到 1.60 s，三对均改善，但关闭投机仅 32 ms。六场景开关/旧版/当前共 54 个任务中，小文本仍无净收益；准备充分的候选未显示一致改善。
 
-七项实机生命周期检查覆盖共享 BASE、过期读取、写入冲突、连续 fs snapshot 采纳、错误候选回退、进程取消及关闭排空，请求/快照归零；宿主在同次启动中确认取消的父子进程退出。另有五场景各两对、共 20 个 Host 任务，按固定 3 s/30 ms Actor 到达时序比较开关并计入回收，均未获净加速；未知耗时的在途样本约为关闭 32 ms、开启 2.23 s。构造时序不代表自然任务。
+另用 Pi 自带 PNG 做 18 个完整任务，当前开启/关闭均值为 3072/3096 ms，六对均略快；旧版同样有收益，不归因于加载优化。均采用固定 3 s/30 ms 模型时序，计入 Host 初始化和回收，不代表自然任务。异步关闭终态记录虽改善独立 SDK 测量，完整任务未呈现一致收益，故未保留。
 
-真实 TUI 的开关须 Apply 才生效；该 Profile 的 held-exec 返回 `EACCES`，Bash 提前执行不可用，文件后备与 Actor 保留。注册后备不授予嵌套 tracing/handoff 权限；wire 测试和 fs snapshot 检查不授予 Host Checkpoint/restore、ARM64 或完整进程闭包资格。
+TUI 修改须 Apply；开放 helper 读取后，嵌套 ptrace 仍报 `EPERM`，Bash 提前执行不可用，Actor 回退正确。文件路线、wire 和快照检查不授予嵌套 tracing/handoff、Host Checkpoint/restore、ARM64 或完整进程闭包资格。
 
 ## 录制与模型消融
 

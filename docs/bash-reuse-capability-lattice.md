@@ -125,7 +125,7 @@ OverlayFS 必须通过固定 binary、FUSE、copy-up、whiteout、opaque、匿�
 
 ## 当前证据与剩余工作
 
-- 2026-09-10 两端 check/test/build/bench:check 通过，561 项：Windows 545 通过/16 跳过，WSL 560 通过/1 跳过。WSL 首次 sidecar 超时原因未明，同源码单项、整文件及全量复跑通过。思程阶段未改生产代码，按摘要沿用上述结果，未付费调用模型。
-- 固定 LF 口径含空行：`src` 32,380 行，随包脚本 269 行；较 `8c559d1` 生产仍多 4,447 字节、test 多 13,436 字节。较 `485cdb2` 生产多 24,604 字节；30,411 行预算仍差 1,969 行。
-- ThinkThread alpha4 x86_64 的 read/ls/edit 采纳、七项生命周期及真实 TUI 通过；新文件 write 的 realpath 错误仍失败并回退 Actor 一次，小文件未获加速。边界见[实机资格](../bench/README.md#thinkthread-真实-runtime-资格)。
+- 2026-09-10 当前源码两端 check/test/build/bench:check 全量通过：Windows 545 通过/16 跳过，WSL 560 通过/1 跳过，共 561 项；未付费调用模型。早前 WSL sidecar 超时原因未明，本次未复现。
+- 固定 LF 含空行：`src` 32,379 行，脚本 269 行；较 `8c559d1` 生产仍多 4,432 字节、test 多 14,033 字节。较 `485cdb2` 生产多 24,589 字节；30,411 行预算仍差 1,968 行。
+- ThinkThread alpha4 x86_64 的文件采纳、七项生命周期及历史 TUI 检查通过；新文件 write 仍失败并回退一次。去除无关模块加载缩短在途等待，小文本仍无净收益，PNG 仅有限样本略快。见[实机资格](../bench/README.md#thinkthread-真实-runtime-资格)。
 - 独立 Actor 进程观察、进程默认 ACL、减量、macOS/ARM64、思程新文件 write/嵌套 Bash/Host 恢复及自然净加速仍待验收。
