@@ -94,9 +94,9 @@ npm run bench:thinkthread-tools
 
 本机 WSL2 x86_64 使用 alpha4 RPM `0.1.0-19` 解包布局、Pi 0.84.1/Node 24.20.0：`read/ls/edit` 采纳通过；新文件 `write` 令整条命令失败。原生 Node 对照确认，不存在路径的异步 `realpath` 在私有分支报 `EACCES`，Actor 报 `ENOENT`。保留权限错误，Host 拒绝候选后 Actor 成功写入一次。
 
-七项实机检查覆盖共享 BASE、过期读取、写入冲突、连续快照采纳、错误回退、取消和关闭排空，请求/快照归零。生产 runner 直接加载已验收 Pi 0.84.1 的原版工具模块；六个工具与公共入口输出及效果一致，其他版本拒绝隔离执行。首次共享采纳只验新一次，直接 commit 与后续消费者仍各自验新。
+七项实机检查覆盖共享 BASE、过期读取、写入冲突、连续采纳、错误回退、取消和关闭排空，请求/快照归零。runner 校验 Pi 0.84.1 文件绑定并传入图像设置。三种环境各用小图和超阈值图、四组设置前后共 48 例；Runtime 的大图为构造夹具。修正后图像与模型提示符合 Actor，未知绑定拒绝该后端。首次共享采纳只验新一次，后续仍各自验新。
 
-本阶段 108 个 Agent 任务输出与回收正确，使用原生产 runner 并核对摘要。冷编辑的独立 Actor/父实现/当前为 74/1,146/1,160 ms，PNG 冷窗口为 100/1,043/1,064 ms；执行开销仍未解决。大编辑超出 512 KiB 输出预算时，每个工具回到 Actor 一次。
+本阶段 108 个 Agent 任务输出与回收正确。父/当前分别直接执行对应生产 runner，路径及四个依赖摘要逐次核对。冷编辑的 Actor/父/当前为 76/1,168/1,242 ms，PNG 冷窗口为 102/1,120/1,091 ms；开销仍未解决。大编辑超出 512 KiB 输出预算时，每个工具回到 Actor 一次。
 
 TUI 修改须 Apply；开放 helper 读取后，嵌套 ptrace 仍报 `EPERM`，Bash 提前执行不可用，Actor 回退正确。文件路线、wire 和快照检查不授予嵌套 tracing/handoff、Host Checkpoint/restore、ARM64 或完整进程闭包资格。
 
@@ -139,7 +139,7 @@ API key 只从环境读取，不写入产物或交给基准 shell 子进程。�
 
 `actualEndToEndMs` 从工具/Host 初始化前计至终态结算、Host 与工作区回收完成；`setupMs`、`agentPromptMs`、`teardownMs` 构成这一总时长。数据集下载、checkout 和最终补丁检查在计时外。Drafter 根请求直接接收 Actor 即将提交的完整上下文，不自行重建首轮消息。
 
-当前 369 个任务（Windows 90、WSL 171、ThinkThread 108）保留完整事件和独立 Actor 对照；864 次 Actor 模型流、144 次 Drafter 回调均构造，API 为零。输入视图释放现等待已开始的读取：两端八个描述符对照证明修正，barrier 不作计时。本次冷编辑的 Actor/父实现/当前在 Windows 为 90/124/127 ms、WSL 为 79/95/95 ms。Bash 长窗口/接续/晚窗口/冷回退为 1.381/1.434/1.105/1.000×，晚窗口比 Actor 多 765 ms。所有预定行保留；导入、夹具、oracle 和删除另计完整子进程时长。
+当前 369 个任务（Windows 90、WSL 171、ThinkThread 108）保留完整事件与独立 Actor 对照；864 次 Actor 流、144 次 Drafter 回调均构造，API 为零。18 个相关模块在每个新进程原 URL 按版本加载一次。本次冷编辑的 Actor/父/当前在 Windows 为 87/131/123 ms、WSL 为 78/97/98 ms。Bash 长窗口/接续/晚窗口/冷回退为 1.384/1.430/1.105/1.000×；晚窗口仍比 Actor 多 726 ms。全部预定行保留，导入、夹具、oracle 和删除另计完整子进程时长。
 
 主加速比为同次运行的 `serializedCounterfactualMs / actualEndToEndMs`，分子为 `actualEndToEndMs + hiddenLatencyMs = nonToolMs + authoritativeToolMs`。完整开销保留，无重叠为 1×；独立 Actor 耗时不能代入分子，但必须另查开启系统增加的成本，1×不表示低开销。重叠按任务事件中的 Actor 区间与去重权威计算重建，未采用预测和旧缓存不计入，不能一般性地累加 `executionAheadMs`。多轮分别求和分子、分母，再相除。
 
