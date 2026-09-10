@@ -139,6 +139,8 @@ API key 只从环境读取，不写入产物或交给基准 shell 子进程。�
 
 `actualEndToEndMs` 从工具/Host 初始化前计至终态结算、Host 与工作区回收完成；`setupMs`、`agentPromptMs`、`teardownMs` 构成这一总时长。数据集下载、checkout 和最终补丁检查在计时外。Drafter 根请求直接接收 Actor 即将提交的完整上下文，不自行重建首轮消息。
 
+共用流式参数跟踪的对照使用约 468 KB 编辑参数、256 字符分片及 3000/30 ms 模型窗口：Windows、WSL、ThinkThread 各 36 个真实 Agent 任务，共 180 次工具调用。逐片扫描后，开启投机的长窗口编辑完整均值分别从 4248.71/3592.08/3522.12 ms 降到 3400.94/3110.57/3060.68 ms，三端各 3/3 改善；关闭投机也受益，短参数没有一致收益。计时含 Host/Agent、执行、回退及关闭，不含外层启动、夹具和 oracle；模型流为构造、API 为零。思程大编辑约 978 KB 输出超过现有 512 KiB runner 上限，候选拒绝后各工具回退一次，不能记为采纳。三端当前开启仍慢于关闭，此证据只证明移除共用开销有效。
+
 加速比为 `serializedCounterfactualMs / actualEndToEndMs`；分子等于 `actualEndToEndMs + hiddenLatencyMs`，也等于 `nonToolMs + authoritativeToolMs`。本次采纳候选计入权威工具时间，未采用预测和旧缓存不计入；重叠可包含 Actor 自身并行，`executionAheadMs` 仅表示执行领先。
 
 1. 固定任务、初态、模型、候选数和超时，独立测量开/关投机，计入失败、争用与清理。
