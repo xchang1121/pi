@@ -12,7 +12,7 @@
 | 动作身份 | 参数准备一次；语义、schema、参数、资源名称与执行身份不可后改。仅自有的无损纯数据树可携带身份；来源/调用编号/轮次不是等价条件 | [语义](../src/action-semantics.ts)、[封存](../src/stable-json.ts) |
 | 路由与权限 | 唯一 Router 选择统一环境、本地安全后备、Actor；所选隔离路线不进入 K(a)，相同键也不授予执行或重放权限 | [执行世界](../src/execution-world.ts)、[执行网关](../src/tool-execution-gateway.ts) |
 | 候选与调度 | 保存精确注册成员关系；动态资源版本属于产物证据；允许同一动作保留不同输入状态的结果 | [候选存储](../src/candidate-stores.ts)、[Runtime](../src/runtime-engine.ts) |
-| 输入与输出 | 完整流式意图可提前转换封存数据；让出事件处理后正式调用已到达便跳过。结果沿用候选预算；采纳仅等待相同动作及执行器，仍授权、验证和提交 | [Runtime](../src/runtime-engine.ts)、[文件世界](../src/agent-execution-world.ts) |
+| 输入与输出 | 新建预览候选或转换封存结果前让出一次事件处理，正式调用已到达则跳过准备。既有候选可提升或接续；结果沿用原预算，采纳仍授权、验新和提交 | [Runtime](../src/runtime-engine.ts)、[文件世界](../src/agent-execution-world.ts) |
 | 进程与产物 | 完整进程身份、动态依赖、生产者保证及有序输出/效果分别封存；重放前验证并持有整个 CAS 闭包 | [进程后端](../src/linux-process-backend.ts)、[证书](../src/provenance-certificate.ts)、[存储](../src/reuse-store.ts) |
 | 采纳与回退 | 再查权限、新鲜度、等价性、生产者保证和收益，然后提交；仅证明无效果的拒绝允许单次 fallback，poisoned 提交禁止重跑 | [事务](../src/effect-transaction.ts)、[调度](../src/scheduler.ts) |
 | 关闭与保留 | 逻辑取消不等于物理完成；所有者拒绝新准入并等待已执行、借用、封存和清理，之后才能回收工作区 | [生命周期](../src/runtime-lifecycle.ts)、[工作区](../src/workspace-sandbox.ts) |
@@ -126,6 +126,6 @@ OverlayFS 必须通过固定 binary、FUSE、copy-up、whiteout、opaque、匿�
 ## 当前证据与剩余工作
 
 - 2026-09-10 两端 check/test/build/bench:check 通过：Windows 546 通过/16 跳过，WSL 561 通过/1 跳过，共 562 项；API 为零。
-- 固定 LF 含空行：`src` 32,439 行，脚本 269 行；较 `8c559d1` 生产多 7,871 字节、test 多 26,787 字节。较 `485cdb2` 生产多 28,028 字节；30,411 行预算仍差 2,028 行。
-- 两端各 30 组身份探针的错误采纳从 12 次降为零，纯数据精确命中保留。216 个 Agent 任务、两个 Linux 进程资格脚本及 ThinkThread 七项生命周期通过；成本边界见[实机资格](../bench/README.md#thinkthread-真实-runtime-资格)与[计时规则](../bench/README.md#计时与验收规则)。TUI 仍为历史证据。
+- 固定 LF 含空行：`src` 32,435 行，脚本 269 行；较 `8c559d1` 生产多 7,665 字节、test 多 28,242 字节。较 `485cdb2` 生产多 27,822 字节；30,411 行预算仍差 2,024 行。
+- 318 个 Agent 任务、两个 Linux 进程资格脚本及 ThinkThread 七项生命周期通过；逐项核对完整结果、后续 Actor 上下文、单次回退和回收。成本边界见[实机资格](../bench/README.md#thinkthread-真实-runtime-资格)与[计时规则](../bench/README.md#计时与验收规则)。TUI 仍为历史证据。
 - 独立 Actor 进程观察、进程默认 ACL、减量、macOS/ARM64、思程新文件 write/嵌套 Bash/Host 恢复及自然净加速仍待验收。
