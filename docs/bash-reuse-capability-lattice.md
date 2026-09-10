@@ -126,6 +126,6 @@ OverlayFS 必须通过固定 binary、FUSE、copy-up、whiteout、opaque、匿�
 ## 当前证据与剩余工作
 
 - 2026-09-10 当前源码两端 check/test/build/bench:check 通过：Windows 545 通过/16 跳过，WSL 560 通过/1 跳过，共 561 项；模型请求为零。
-- 固定 LF 含空行：`src` 32,419 行，脚本 269 行；较 `8c559d1` 生产仍多 6,426 字节、test 多 19,173 字节。较 `485cdb2` 生产多 26,583 字节；30,411 行预算仍差 2,008 行。
-- ThinkThread alpha4 文件采纳及七项生命周期通过，TUI 为历史证据；新文件 write 仍失败。合并只读验证的 PNG 六组快于父提交和关闭。共用流跟踪消除大参数重复解析，三端各 36 个 Agent 任务验证降耗；小文本无一致改善，思程超输出预算编辑走一次回退，开启仍慢于关闭。见[实机资格](../bench/README.md#thinkthread-真实-runtime-资格)及[计时边界](../bench/README.md#计时与验收规则)。
+- 固定 LF 含空行：`src` 32,422 行，脚本 269 行；较 `8c559d1` 生产仍多 6,648 字节、test 多 19,607 字节。较 `485cdb2` 生产多 26,805 字节；30,411 行预算仍差 2,011 行。
+- ThinkThread alpha4 七项生命周期通过，新文件 write 仍失败。63 个 Agent 任务证明窄工具入口可扩大 PNG 的有效执行窗口，冷窗口仍亏损；共用流处理的三端降耗与大编辑输出上限见[实机资格](../bench/README.md#thinkthread-真实-runtime-资格)及[计时边界](../bench/README.md#计时与验收规则)。TUI 仍为历史证据。
 - 独立 Actor 进程观察、进程默认 ACL、减量、macOS/ARM64、思程新文件 write/嵌套 Bash/Host 恢复及自然净加速仍待验收。
