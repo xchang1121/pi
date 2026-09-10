@@ -126,6 +126,6 @@ OverlayFS 必须通过固定 binary、FUSE、copy-up、whiteout、opaque、匿�
 ## 当前证据与剩余工作
 
 - 2026-09-11 两端 check/test/build/bench:check 通过：Windows 547 通过/16 跳过，WSL 562 通过/1 跳过，共 563 项；API 为零。
-- 固定 LF 含空行：`src` 32,497 行，脚本 269 行；较 `8c559d1` 生产 +11,057 字节、test +36,693 字节。较 `485cdb2` 生产 +31,214 字节；30,411 行预算仍差 2,086 行。
-- 369 个 Agent 任务、两个 Linux 进程资格脚本及 ThinkThread 七项生命周期通过；结果、后续 Actor 上下文、单次回退和回收均核对。三种环境的 48 个前后对照验证 runner 的实际图像缩放与模型提示符合绑定。晚 Bash 和 ThinkThread 冷执行仍有明显开销。S/D 与独立 Actor 成本见[实机资格](../bench/README.md#thinkthread-真实-runtime-资格)和[计时规则](../bench/README.md#计时与验收规则)。TUI 仍为历史证据。
+- 固定 LF 含空行：`src` 32,515 行，脚本 269 行；较 `8c559d1` 生产 +12,040 字节、test +40,388 字节。较 `485cdb2` 生产 +32,197 字节；30,411 行预算仍差 2,104 行。
+- 180 个输入匹配的 Agent 对照及三个 Linux 资格脚本通过；另保留 180 个控制输入有差异的初测和 18 个外部探针，不混作纯 Actor 对照。当前核对整体/子进程/运行中复用、单次回退、上下文和回收；四个 Runtime 已移除。ThinkThread 绑定的 48 例、七项生命周期与 TUI 沿用此前证据，本阶段未重跑。S/D 与纯 Actor 额外成本见[计时规则](../bench/README.md#计时与验收规则)。
 - 独立 Actor 进程观察、进程默认 ACL、减量、macOS/ARM64、思程新文件 write/嵌套 Bash/Host 恢复及自然净加速仍待验收。

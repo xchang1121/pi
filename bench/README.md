@@ -139,9 +139,13 @@ API key 只从环境读取，不写入产物或交给基准 shell 子进程。�
 
 `actualEndToEndMs` 从工具/Host 初始化前计至终态结算、Host 与工作区回收完成；`setupMs`、`agentPromptMs`、`teardownMs` 构成这一总时长。数据集下载、checkout 和最终补丁检查在计时外。Drafter 根请求直接接收 Actor 即将提交的完整上下文，不自行重建首轮消息。
 
-当前 369 个任务（Windows 90、WSL 171、ThinkThread 108）保留完整事件与独立 Actor 对照；864 次 Actor 流、144 次 Drafter 回调均构造，API 为零。18 个相关模块在每个新进程原 URL 按版本加载一次。本次冷编辑的 Actor/父/当前在 Windows 为 87/131/123 ms、WSL 为 78/97/98 ms。Bash 长窗口/接续/晚窗口/冷回退为 1.384/1.430/1.105/1.000×；晚窗口仍比 Actor 多 726 ms。全部预定行保留，导入、夹具、oracle 和删除另计完整子进程时长。
+当前 180 个任务（Windows 36、WSL 120、ThinkThread 24）比较纯 Agent+原版工具、关闭投机但保留 Host、开启投机的父/当前版本。24 个模块按版本在新进程原 URL 加载一次。216 次工具调用、396 次 Actor 流、60 次 Drafter 回调保留；模型流构造，API 为零。提示词、工具顺序、schema、调用 ID、参数分片和后续上下文按实际事件核对一致，仅归一化夹具路径与时间戳。三轮旋转，所有条件保留；不作统计显著性声明。
 
-主加速比为同次运行的 `serializedCounterfactualMs / actualEndToEndMs`，分子为 `actualEndToEndMs + hiddenLatencyMs = nonToolMs + authoritativeToolMs`。完整开销保留，无重叠为 1×；独立 Actor 耗时不能代入分子，但必须另查开启系统增加的成本，1×不表示低开销。重叠按任务事件中的 Actor 区间与去重权威计算重建，未采用预测和旧缓存不计入，不能一般性地累加 `executionAheadMs`。多轮分别求和分子、分母，再相除。
+此前称“独立 Actor”的 off-current 实际保留关闭的 Host。另有 180 个控制输入未完全匹配的初测原样保留，纯 Actor 差值以修正对照为准。纯 Actor 的 D 不构造 Host/World/协调器，四组均在 D 内创建原版工具；共同的流观察也占用计时。共享导入、Runtime 客户端准备、夹具、oracle、摘要计算与删除另计完整子进程时长，尚非独立模块冷启动资格。
+
+WSL 空历史短 Bash 的纯 Actor/关闭 Host/父/当前为 39/44/63/50 ms。Bash 长窗口/接续/晚窗口/冷回退 S/D 为 1.369/1.433/1.105/1.000×；晚窗口仍比纯 Actor 多 754 ms。Linux 延后重放准备不构成 Windows 或 ThinkThread 加速证据。
+
+主加速比为同次运行的 `serializedCounterfactualMs / actualEndToEndMs`，分子为 `actualEndToEndMs + hiddenLatencyMs = nonToolMs + authoritativeToolMs`。完整开销保留，无重叠为 1×；纯 Actor 耗时不能代入分子，但必须另查开启系统增加的成本，1×不表示低开销。重叠按任务事件中的 Actor 区间与去重权威计算重建，未采用预测和旧缓存不计入，不能一般性地累加 `executionAheadMs`。多轮分别求和分子、分母，再相除。
 
 1. 固定任务、初态、模型、候选数和超时，独立测量开/关投机，计入失败、争用与清理。
 2. 要求 `git diff --check` 通过并保留完成信息，比较完整时长、命中、重叠、工具工作量与模型成本。
