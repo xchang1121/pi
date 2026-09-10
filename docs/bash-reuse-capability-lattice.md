@@ -126,6 +126,6 @@ OverlayFS 必须通过固定 binary、FUSE、copy-up、whiteout、opaque、匿�
 ## 当前证据与剩余工作
 
 - 2026-09-10 两端 check/test/build/bench:check 通过：Windows 546 通过/16 跳过，WSL 561 通过/1 跳过，共 562 项；API 为零。
-- 固定 LF 含空行：`src` 32,435 行，脚本 269 行；较 `8c559d1` 生产多 7,665 字节、test 多 28,242 字节。较 `485cdb2` 生产多 27,822 字节；30,411 行预算仍差 2,024 行。
-- 318 个 Agent 任务、两个 Linux 进程资格脚本及 ThinkThread 七项生命周期通过；逐项核对完整结果、后续 Actor 上下文、单次回退和回收。成本边界见[实机资格](../bench/README.md#thinkthread-真实-runtime-资格)与[计时规则](../bench/README.md#计时与验收规则)。TUI 仍为历史证据。
+- 固定 LF 含空行：`src` 32,455 行，脚本 269 行；较 `8c559d1` 生产多 8,706 字节、test 多 30,189 字节。较 `485cdb2` 生产多 28,863 字节；30,411 行预算仍差 2,044 行。
+- 369 个 Agent 任务、两个 Linux 进程资格脚本及 ThinkThread 七项生命周期通过；核对完整结果、后续 Actor 上下文、单次回退和回收。同次 S/D 与独立 Actor 额外耗时并列；跳过请求不再预热，普通冷启动及晚 Bash 仍有明显成本。见[实机资格](../bench/README.md#thinkthread-真实-runtime-资格)与[计时规则](../bench/README.md#计时与验收规则)。TUI 仍为历史证据。
 - 独立 Actor 进程观察、进程默认 ACL、减量、macOS/ARM64、思程新文件 write/嵌套 Bash/Host 恢复及自然净加速仍待验收。

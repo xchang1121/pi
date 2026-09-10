@@ -96,7 +96,7 @@ npm run bench:thinkthread-tools
 
 七项实机检查覆盖共享 BASE、过期读取、写入冲突、连续快照采纳、错误回退、取消和关闭排空，请求/快照归零。生产 runner 直接加载已验收 Pi 0.84.1 的原版工具模块；六个工具与公共入口输出及效果一致，其他版本拒绝隔离执行。首次共享采纳只验新一次，直接 commit 与后续消费者仍各自验新。
 
-相对 `ee1f5c2` 的 99 个 Agent 任务保持正确输出与回收，逐次核对 runner 摘要。独立壁钟对照中，预测关闭的冷编辑平均 94→92 ms；预测开启的长窗口大编辑 3088→3106 ms，三轮均更慢。PNG 冷窗口的关闭/父/当前为 100/1088/1070 ms。这些路径成本对照不等于下述加速比。大编辑超出 512 KiB 输出预算时，每个工具回到 Actor 一次。
+当前 108 个 Agent 任务保持正确输出与回收，逐次核对 runner 摘要。上下文跳过请求的冷编辑，独立 Actor/父实现/当前为 78/92/95 ms；预热虽已省去，壁钟未改善。预测开启的冷编辑为 75/1219/1219 ms，PNG 冷窗口为 95/1064/1063 ms，额外成本仍高。这些对照不等于下述加速比。大编辑超出 512 KiB 输出预算时，每个工具回到 Actor 一次。
 
 TUI 修改须 Apply；开放 helper 读取后，嵌套 ptrace 仍报 `EPERM`，Bash 提前执行不可用，Actor 回退正确。文件路线、wire 和快照检查不授予嵌套 tracing/handoff、Host Checkpoint/restore、ARM64 或完整进程闭包资格。
 
@@ -139,9 +139,9 @@ API key 只从环境读取，不写入产物或交给基准 shell 子进程。�
 
 `actualEndToEndMs` 从工具/Host 初始化前计至终态结算、Host 与工作区回收完成；`setupMs`、`agentPromptMs`、`teardownMs` 构成这一总时长。数据集下载、checkout 和最终补丁检查在计时外。Drafter 根请求直接接收 Actor 即将提交的完整上下文，不自行重建首轮消息。
 
-原 318 个 Agent 任务（Windows 81、WSL 138、ThinkThread 99）记录的是独立路径耗时对照；735 次模型流均构造，API 为零。66 个单工具 Bash 任务按保存的权威执行与 Actor 到达时序重算，当前长窗口/接续/晚窗口/冷回退为 1.376/1.429/1.104/1.000×；另外 24 个任务补收 Runtime 完整计时事件，核对重算关系。短 Bash 的 620→65 ms 是准备成本下降，没有重叠时仍为 1×。其余文件任务缺少完整任务时间线，不补造加速比。全部原始耗时保留；外层导入、夹具、oracle 和删除另记子进程时长。
+当前 369 个 Agent 任务（Windows 90、WSL 171、ThinkThread 108）包含开启组的完整 Runtime 任务事件与独立原生 Actor 对照；864 次 Actor 模型流、144 次 Drafter 回调均构造，API 为零。Bash 长窗口/接续/晚窗口/冷回退为 1.390/1.429/1.103/1.000×，但晚窗口仍比 Actor 多约 785 ms。上下文跳过的冷编辑在 Windows/WSL 为 373→93/156→93 ms，短 Bash 为 599→64 ms，均仍比 Actor 慢且无重叠，故为 1×。此前另收 75 个完整事件任务验证多工具计时，不为旧文件数据补造时间线。所有预定行保留；导入、夹具、oracle 和删除另计完整子进程时长。
 
-主加速比为同次运行的 `serializedCounterfactualMs / actualEndToEndMs`，分子为 `actualEndToEndMs + hiddenLatencyMs = nonToolMs + authoritativeToolMs`。完整开销保留，无重叠为 1×；独立关闭投机的耗时不能代入分子。重叠按任务事件中的 Actor 区间与去重权威计算重建，未采用预测和旧缓存不计入，不能一般性地累加 `executionAheadMs`。多轮先分别求和分子、分母，再相除。
+主加速比为同次运行的 `serializedCounterfactualMs / actualEndToEndMs`，分子为 `actualEndToEndMs + hiddenLatencyMs = nonToolMs + authoritativeToolMs`。完整开销保留，无重叠为 1×；独立 Actor 耗时不能代入分子，但必须另查开启系统增加的成本，1×不表示低开销。重叠按任务事件中的 Actor 区间与去重权威计算重建，未采用预测和旧缓存不计入，不能一般性地累加 `executionAheadMs`。多轮分别求和分子、分母，再相除。
 
 1. 固定任务、初态、模型、候选数和超时，独立测量开/关投机，计入失败、争用与清理。
 2. 要求 `git diff --check` 通过并保留完成信息，比较完整时长、命中、重叠、工具工作量与模型成本。
