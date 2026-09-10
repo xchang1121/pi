@@ -96,7 +96,7 @@ npm run bench:thinkthread-tools
 
 七项实机检查覆盖共享 BASE、过期读取、写入冲突、连续快照采纳、错误回退、取消和关闭排空，请求/快照归零。生产 runner 直接加载已验收 Pi 0.84.1 的原版工具模块；六个工具与公共入口输出及效果一致，其他版本拒绝隔离执行。首次共享采纳只验新一次，直接 commit 与后续消费者仍各自验新。
 
-本阶段 108 个 Agent 任务保持输出与回收正确，直接运行未修改的生产 runner，矩阵前后核对摘要。冷编辑的独立 Actor/父实现/当前为 76/1,175/1,189 ms，PNG 冷窗口为 96/1,073/1,056 ms，主要执行开销仍未解决。大编辑超出 512 KiB 输出预算时，每个工具回到 Actor 一次。
+本阶段 108 个 Agent 任务输出与回收正确，使用原生产 runner 并核对摘要。冷编辑的独立 Actor/父实现/当前为 74/1,146/1,160 ms，PNG 冷窗口为 100/1,043/1,064 ms；执行开销仍未解决。大编辑超出 512 KiB 输出预算时，每个工具回到 Actor 一次。
 
 TUI 修改须 Apply；开放 helper 读取后，嵌套 ptrace 仍报 `EPERM`，Bash 提前执行不可用，Actor 回退正确。文件路线、wire 和快照检查不授予嵌套 tracing/handoff、Host Checkpoint/restore、ARM64 或完整进程闭包资格。
 
@@ -139,7 +139,7 @@ API key 只从环境读取，不写入产物或交给基准 shell 子进程。�
 
 `actualEndToEndMs` 从工具/Host 初始化前计至终态结算、Host 与工作区回收完成；`setupMs`、`agentPromptMs`、`teardownMs` 构成这一总时长。数据集下载、checkout 和最终补丁检查在计时外。Drafter 根请求直接接收 Actor 即将提交的完整上下文，不自行重建首轮消息。
 
-当前 369 个 Agent 任务（Windows 90、WSL 171、ThinkThread 108）包含完整任务事件与独立原生 Actor 对照；864 次 Actor 模型流、144 次 Drafter 回调均构造，API 为零。取消贯穿模型返回及 Git 准备阶段后，预测冷编辑的 Actor/父实现/当前在 Windows 为 82/399/125 ms、WSL 为 75/171/94 ms。Bash 长窗口/接续/晚窗口/冷回退为 1.388/1.435/1.105/1.000×，晚窗口仍比 Actor 多 728 ms。所有预定行保留；导入、夹具、oracle 和删除另计完整子进程时长。
+当前 369 个任务（Windows 90、WSL 171、ThinkThread 108）保留完整事件和独立 Actor 对照；864 次 Actor 模型流、144 次 Drafter 回调均构造，API 为零。输入视图释放现等待已开始的读取：两端八个描述符对照证明修正，barrier 不作计时。本次冷编辑的 Actor/父实现/当前在 Windows 为 90/124/127 ms、WSL 为 79/95/95 ms。Bash 长窗口/接续/晚窗口/冷回退为 1.381/1.434/1.105/1.000×，晚窗口比 Actor 多 765 ms。所有预定行保留；导入、夹具、oracle 和删除另计完整子进程时长。
 
 主加速比为同次运行的 `serializedCounterfactualMs / actualEndToEndMs`，分子为 `actualEndToEndMs + hiddenLatencyMs = nonToolMs + authoritativeToolMs`。完整开销保留，无重叠为 1×；独立 Actor 耗时不能代入分子，但必须另查开启系统增加的成本，1×不表示低开销。重叠按任务事件中的 Actor 区间与去重权威计算重建，未采用预测和旧缓存不计入，不能一般性地累加 `executionAheadMs`。多轮分别求和分子、分母，再相除。
 
@@ -147,7 +147,7 @@ API key 只从环境读取，不写入产物或交给基准 shell 子进程。�
 2. 要求 `git diff --check` 通过并保留完成信息，比较完整时长、命中、重叠、工具工作量与模型成本。
 3. 延迟比较要求 `patchCandidate=true`：低于轮次上限、无超时/Agent 错误、补丁非空且干净，并与 gold patch 文件有交集。
 4. `patchCandidate` 只是筛选，不是正确性结论；仍须由数据集工具链/容器执行 `FAIL_TO_PASS`、`PASS_TO_PASS`。
-5. 只有重复测量改善时延、且正确性和资源没有退化时，才支持保留实现；必须保留负收益边界。
+5. 性能收益须重复验证，且结果、权限和回收不退化；安全修正单独说明必要性，负收益行仍保留。
 
 套件串行运行，失败即停止，结果汇入 `suite-result.json`。加速比使用串行总时长之和除以端到端时长之和，标明分子来自本次轨迹；95% bootstrap 按任务聚类，不拆散同任务重复，p95 使用最近秩。独立对照可另用 `pairedLatencyStatistics` 汇总。
 
