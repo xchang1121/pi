@@ -94,9 +94,9 @@ npm run bench:thinkthread-tools
 
 本机 WSL2 x86_64 使用 alpha4 RPM `0.1.0-19` 解包布局、Pi 0.84.1/Node 24.20.0：`read/ls/edit` 采纳通过；新文件 `write` 令整条命令失败。原生 Node 对照确认，不存在路径的异步 `realpath` 在私有分支报 `EACCES`，Actor 报 `ENOENT`。保留权限错误，Host 拒绝候选后 Actor 成功写入一次。
 
-七项实机检查覆盖共享 BASE、过期读取、写入冲突、连续采纳、错误回退、取消和关闭排空，请求/快照归零。runner 校验 Pi 0.84.1 文件绑定并传入图像设置。三种环境各用小图和超阈值图、四组设置前后共 48 例；Runtime 的大图为构造夹具。修正后图像与模型提示符合 Actor，未知绑定拒绝该后端。首次共享采纳只验新一次，后续仍各自验新。
+默认 Linux 根快照可对合格普通文件复用 SDK 不可变输入，仍重绑原版 Pi 操作、核对当前访问权限与祖先路径；目录、超限输入、父 checkpoint 和自定义执行器保留 fs.run。当前 19 项边界、七项真实 ACL 和 22 项原版输出/图像设置对照通过；图像取消探针确认原版 Worker 实际退出后执行与关闭才结算。共享分支排空已准入验证/提交，请求与快照归零；此前 48 项绑定、七项生命周期对照保留各自原有范围。
 
-本阶段 108 个 Agent 任务输出与回收正确。父/当前分别直接执行对应生产 runner，路径及四个依赖摘要逐次核对。冷编辑的 Actor/父/当前为 76/1,168/1,242 ms，PNG 冷窗口为 102/1,120/1,091 ms；开销仍未解决。大编辑超出 512 KiB 输出预算时，每个工具回到 Actor 一次。
+当前 108 个 ThinkThread Agent 任务输出、上下文与回收正确。纯 Actor/父/当前的冷图像为 90/1,036/219 ms，冷编辑为 63/1,236/1,139 ms；当前仍分别增加 129/1,076 ms。33 次 SDK run 核对实际生产 argv，39 次 snapshotPread 属于新输入路径。两种路线共同保留 1 MiB 请求、512 KiB 响应及完整图像设置；超限回到 Actor 一次。输入路线取消等待原操作与 Worker，不承诺 fs.run 的 120 秒进程硬限时。
 
 TUI 修改须 Apply；开放 helper 读取后，嵌套 ptrace 仍报 `EPERM`，Bash 提前执行不可用，Actor 回退正确。文件路线、wire 和快照检查不授予嵌套 tracing/handoff、Host Checkpoint/restore、ARM64 或完整进程闭包资格。
 
@@ -139,11 +139,11 @@ API key 只从环境读取，不写入产物或交给基准 shell 子进程。�
 
 `actualEndToEndMs` 从工具/Host 初始化前计至终态结算、Host 与工作区回收完成；`setupMs`、`agentPromptMs`、`teardownMs` 构成这一总时长。数据集下载、checkout 和最终补丁检查在计时外。Drafter 根请求直接接收 Actor 即将提交的完整上下文，不自行重建首轮消息。
 
-当前 180 个任务（Windows 36、WSL 120、ThinkThread 24）比较纯 Agent+原版工具、关闭投机但保留 Host、开启投机的父/当前版本。24 个模块按版本在新进程原 URL 加载一次。216 次工具调用、396 次 Actor 流、60 次 Drafter 回调保留；模型流构造，API 为零。提示词、工具顺序、schema、调用 ID、参数分片和后续上下文按实际事件核对一致，仅归一化夹具路径与时间戳。三轮旋转，所有条件保留；不作统计显著性声明。
+当前 180 个任务（Windows 36、WSL 36、ThinkThread 108）比较纯 Agent+原版工具、关闭投机的 Host、开启投机的父/当前版本。24 个模块按版本在原 URL 加载一次；216 次工具调用、396 次 Actor 流、78 次 Drafter 回调全部保留。提示词、工具顺序、schema、调用 ID、参数分片、输出与后续上下文按实际事件核对一致，仅归一化夹具路径与时间戳。三轮旋转，全部条件保留；构造流、API 为零，不作统计显著性声明。
 
-此前称“独立 Actor”的 off-current 实际保留关闭的 Host。另有 180 个控制输入未完全匹配的初测原样保留，纯 Actor 差值以修正对照为准。纯 Actor 的 D 不构造 Host/World/协调器，四组均在 D 内创建原版工具；共同的流观察也占用计时。共享导入、Runtime 客户端准备、夹具、oracle、摘要计算与删除另计完整子进程时长，尚非独立模块冷启动资格。
+此前称“独立 Actor”的 off-current 实际保留关闭的 Host；控制输入未完全匹配的初测也原样保留，纯 Actor 差值以匹配对照为准。上述 D 不计共享导入、Runtime 客户端准备、夹具、oracle、摘要与删除；四组在 D 内创建原版工具并共同观察流，纯 Actor 不构造 Host/World/协调器。另做三环境各 24 个独立进程任务，只加载各组所需模块，纯 Actor 加载零个投机模块。计时从 execFile 到真实退出，含导入、任务、回收与共同摘要；夹具与 oracle 提前创建，不清 OS 缓存，不等于 Pi TUI 启动或自然模型任务。
 
-WSL 空历史短 Bash 的纯 Actor/关闭 Host/父/当前为 39/44/63/50 ms。Bash 长窗口/接续/晚窗口/冷回退 S/D 为 1.369/1.433/1.105/1.000×；晚窗口仍比纯 Actor 多 754 ms。Linux 延后重放准备不构成 Windows 或 ThinkThread 加速证据。
+独立进程文本/图像任务中，ThinkThread 父版本 2,006/2,153 ms，当前 1,278/1,364 ms，纯 Actor 909/946 ms；当前仍多 369/418 ms。Windows/WSL 图像进程仍多约 31/24 ms；WSL 文本均值受首轮波动影响，不能据此宣称收益。当前 WSL 空历史短 Bash 为纯 Actor/关闭 Host/父/当前 40/46/50/49 ms。此前 Bash 长窗口/接续/晚窗口/冷回退 S/D 1.369/1.433/1.105/1.000×及晚窗口额外 754 ms 的结果本阶段未重跑。
 
 主加速比为同次运行的 `serializedCounterfactualMs / actualEndToEndMs`，分子为 `actualEndToEndMs + hiddenLatencyMs = nonToolMs + authoritativeToolMs`。完整开销保留，无重叠为 1×；纯 Actor 耗时不能代入分子，但必须另查开启系统增加的成本，1×不表示低开销。重叠按任务事件中的 Actor 区间与去重权威计算重建，未采用预测和旧缓存不计入，不能一般性地累加 `executionAheadMs`。多轮分别求和分子、分母，再相除。
 
