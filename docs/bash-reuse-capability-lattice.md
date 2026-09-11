@@ -11,7 +11,7 @@
 | 预测与 Actor | Drafter、Actor probe、PatternAware 只产生来源中立动作；入站数据在异步排队和提供者回调前归属于本次调用 | [计划](../src/plan-runtime.ts)、[宿主接入](../src/agent-integration.ts) |
 | 动作身份 | 参数准备一次；语义、schema、参数、资源名称与执行身份不可后改。仅自有的无损纯数据树可携带身份；来源/调用编号/轮次不是等价条件 | [语义](../src/action-semantics.ts)、[封存](../src/stable-json.ts) |
 | 路由与权限 | 唯一 Router 选择统一环境、本地安全后备、Actor；所选隔离路线不进入 K(a)，相同键也不授予执行或重放权限 | [执行世界](../src/execution-world.ts)、[执行网关](../src/tool-execution-gateway.ts) |
-| 候选与调度 | ID 单一登记，验新后重查当前代；当前需求决定排序和启动，无主的未启动工作退役，共享结果可保留。启动与采纳共用收益判定 | [候选存储](../src/candidate-stores.ts)、[Runtime](../src/runtime-engine.ts) |
+| 候选与调度 | ID 单一登记，验新后重查当前代；当前需求决定排序和启动，无主的未启动工作退役，共享结果可保留。收益反馈属于 Actor 决策及有界样本窗口，原生替代成本包含捕获/封存等待 | [候选存储](../src/candidate-stores.ts)、[Runtime](../src/runtime-engine.ts) |
 | 输入与输出 | 新建预览候选或转换封存结果前让出一次事件处理，正式调用已到达则跳过准备。既有候选可提升或接续；结果沿用原预算，采纳仍授权、验新和提交 | [Runtime](../src/runtime-engine.ts)、[文件世界](../src/agent-execution-world.ts) |
 | 进程与产物 | 完整进程身份、动态依赖、生产者保证及有序输出/效果分别封存；重放前验证并持有整个 CAS 闭包 | [进程后端](../src/linux-process-backend.ts)、[证书](../src/provenance-certificate.ts)、[存储](../src/reuse-store.ts) |
 | 采纳与回退 | 只认领当前登记，再查权限、新鲜度、等价性、生产者保证和收益；仅证明无效果的拒绝允许单次 fallback，poisoned 提交禁止重跑 | [事务](../src/effect-transaction.ts)、[调度](../src/scheduler.ts) |
@@ -125,7 +125,7 @@ OverlayFS 必须通过固定 binary、FUSE、copy-up、whiteout、opaque、匿�
 
 ## 当前证据与剩余工作
 
-- 2026-09-11 check/test/build/bench:check 通过：Windows 592 通过/17 跳过，WSL 608 通过/1 跳过，共 609 项；ThinkThread Runtime 127 项相关测试通过，API 为零。
-- LF 含空行：生产 32,513 行，较 `8c559d1` 多 12,075 字节、test 多 70,444；较 `485cdb2` 少 590 行但多 32,232 字节，减量未达标。
-- 三端各 48 个真实 Agent 构造流任务通过；较父版 `105d335` 均值 3 降/6 升，范围 -0.5% 至 1.1%。较纯 Actor，固定图片 -63.3% 至 -31.9%，变化图片 -44.2% 至 -4.6%，文本多 81–194 ms；负值表示更快，不能外推自然净加速，见[计时规则](../bench/README.md#计时与验收规则)。
+- 2026-09-11 check/test/build/bench:check 通过：Windows 594 通过/17 跳过，WSL 610 通过/1 跳过，共 611 项；ThinkThread Runtime 151 项相关测试通过，API 为零。
+- LF 含空行：生产 32,536 行，较 `8c559d1` 多 13,308 字节、test 多 73,433 字节；较 `485cdb2` 少 567 行但多 33,465 字节，减量未达标。
+- 三端各 48 个真实 Agent 构造流任务通过；较父版 `b138358` 均值 6 降/3 升，范围 -2.1% 至 4.0%。较纯 Actor，固定图片 -62.2% 至 -31.8%，变化图片 -45.0% 至 -4.3%，深路径文本（16 次读取）差 53–322 ms；负值表示更快，不能外推自然净加速，见[计时规则](../bench/README.md#计时与验收规则)。
 - 独立 Actor 进程观察、进程默认 ACL、减量、macOS/ARM64 和自然净加速未验收。思程写入的权限/文件身份偏差、新文件 write、嵌套 Bash 及 Host 恢复问题保留复现，尚未修复。
