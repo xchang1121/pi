@@ -11,10 +11,10 @@
 | 预测与 Actor | Drafter、Actor probe、PatternAware 只产生来源中立动作；入站数据在异步排队和提供者回调前归属于本次调用 | [计划](../src/plan-runtime.ts)、[宿主接入](../src/agent-integration.ts) |
 | 动作身份 | 参数准备一次；语义、schema、参数、资源名称与执行身份不可后改。仅自有的无损纯数据树可携带身份；来源/调用编号/轮次不是等价条件 | [语义](../src/action-semantics.ts)、[封存](../src/stable-json.ts) |
 | 路由与权限 | 唯一 Router 选择统一环境、本地安全后备、Actor；所选隔离路线不进入 K(a)，相同键也不授予执行或重放权限 | [执行世界](../src/execution-world.ts)、[执行网关](../src/tool-execution-gateway.ts) |
-| 候选与调度 | 保存精确注册成员关系；动态资源版本属于产物证据；允许同一动作保留不同输入状态的结果 | [候选存储](../src/candidate-stores.ts)、[Runtime](../src/runtime-engine.ts) |
+| 候选与调度 | 预测与预览同步认领唯一登记，封存不迁移身份；验新后重查当前代，启动沿用采纳收益判定。K(a) 匹配复用，各输入版本与独立副作用保留各自所有权 | [候选存储](../src/candidate-stores.ts)、[Runtime](../src/runtime-engine.ts) |
 | 输入与输出 | 新建预览候选或转换封存结果前让出一次事件处理，正式调用已到达则跳过准备。既有候选可提升或接续；结果沿用原预算，采纳仍授权、验新和提交 | [Runtime](../src/runtime-engine.ts)、[文件世界](../src/agent-execution-world.ts) |
 | 进程与产物 | 完整进程身份、动态依赖、生产者保证及有序输出/效果分别封存；重放前验证并持有整个 CAS 闭包 | [进程后端](../src/linux-process-backend.ts)、[证书](../src/provenance-certificate.ts)、[存储](../src/reuse-store.ts) |
-| 采纳与回退 | 再查权限、新鲜度、等价性、生产者保证和收益，然后提交；仅证明无效果的拒绝允许单次 fallback，poisoned 提交禁止重跑 | [事务](../src/effect-transaction.ts)、[调度](../src/scheduler.ts) |
+| 采纳与回退 | 只认领当前登记，再查权限、新鲜度、等价性、生产者保证和收益；仅证明无效果的拒绝允许单次 fallback，poisoned 提交禁止重跑 | [事务](../src/effect-transaction.ts)、[调度](../src/scheduler.ts) |
 | 关闭与保留 | 逻辑取消不等于物理完成；所有者拒绝新准入并等待已执行、借用、封存和清理，之后才能回收工作区 | [生命周期](../src/runtime-lifecycle.ts)、[工作区](../src/workspace-sandbox.ts) |
 
 不得增加第二套 Router、事务、沙箱、进程协调器或缓存/CAS，也不以工具名、Bash 文本相似度、纯转发层或未经证明的宿主观察绕过上述边界。
@@ -34,7 +34,7 @@
 
 资源读取和目录枚举可能更新宿主 atime。描述符身份、路径包含、链接链和特殊文件检查保护输入语义，不提供宿主 metadata/审计事件零副作用保证，也不是恶意并发换成设备文件的内核隔离。不得事后恢复时间戳来掩盖这一边界。
 
-Windows 的目录/junction A→B→A 可能保留 inode 与时间戳，因此仅内容相等不能认证 Actor 未读到中间状态。watcher 只能否定不稳定窗口，不以没有事件代替精确输入证明。
+watcher 只能否定不稳定窗口。Actor 写入后，未完成工作和 checkpoint 后代保守失效；封存共享结果依靠精确验新，事件不能代替证明。Windows 目录/junction A→B→A 可保留 inode 与时间戳，因此关闭原生 Actor 观察。
 
 ## 受控搜索
 
