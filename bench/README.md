@@ -137,13 +137,11 @@ API key 只从环境读取，不写入产物或交给基准 shell 子进程。�
 
 `actualEndToEndMs` 从工具/Host 初始化前计至终态结算、Host 与工作区回收完成；`setupMs`、`agentPromptMs`、`teardownMs` 构成这一总时长。数据集下载、checkout 和最终补丁检查在计时外。Drafter 根请求直接接收 Actor 即将提交的完整上下文，不自行重建首轮消息。
 
-本次 154 个真实 Agent 任务（Windows 30、WSL 30、ThinkThread 94）核对 308 次 Actor 流、62 次 Drafter 回调及完整工具输出、后续上下文与效果；另有三端 36 项入口资格检查。控制组分别为纯 Agent+原版工具，以及关闭/开启投机的父版 `10bec82` 与当前 Host。提示词、schema、调用 ID 和参数分片须一致，仅归一化夹具路径与时间戳。
+独立 Agent 对照使用纯 Actor+原版工具、关闭的当前 Host，以及开启的父版和当前 Host。提示词、schema、调用 ID、参数分片、完整输出与后续上下文须一致，仅归一化夹具路径与时间戳。父版提交、执行次数及逐轮结果随报告保存，[当前证据](../docs/bash-reuse-capability-lattice.md#当前证据与剩余工作)不沿用旧提交的样本量或收益。
 
-独立进程计时从 `execFile` 至真实退出，包含所需导入、首次 SDK 初始化、任务、回收与共同摘要；纯 Actor 加载零个投机模块。SDK 状态检查在父进程中执行，避免观察器强制加载 SDK。夹具、oracle、状态与效果检查均在计时外。三轮旋转保留负收益与波动；构造流、API 为零，不等于自然模型、Pi TUI 或冷 OS 缓存性能。
+独立进程从 `execFile` 计至真实退出，包含导入、首次 SDK 初始化、任务、回收与共同摘要；纯 Actor 不加载投机模块。夹具、oracle 和对称的 SDK 状态检查在父进程计时外执行。顺序提前平衡，保留全部负收益、原生回退与波动。构造流、API 为零，不等于自然模型、Pi TUI 或冷 OS 缓存性能。
 
-ThinkThread 30 ms 流下，关闭投机的文本/图像进程减少 218/233 ms；开启后的冷编辑由 2,279 降至 1,178 ms，仍比纯 Actor 多 223 ms。此时首次读取/编辑回退原生 Actor；3 秒流下仍正常采纳，文本/图像/编辑进程较父版减少 210/213/235 ms，仍比纯 Actor 多 104/19/133 ms。SDK 首次初始化成本仍存在，不能把延后加载当作消除成本。其他进程复用与历史 S/D 证据沿用原有范围。
-
-主加速比为同次运行的 `serializedCounterfactualMs / actualEndToEndMs`，分子为 `actualEndToEndMs + hiddenLatencyMs = nonToolMs + authoritativeToolMs`。完整开销保留，无重叠为 1×；纯 Actor 耗时不能代入分子，但必须另查开启系统增加的成本，1×不表示低开销。重叠按任务事件中的 Actor 区间与去重权威计算重建，未采用预测和旧缓存不计入，不能一般性地累加 `executionAheadMs`。多轮分别求和分子、分母，再相除。
+主加速比为同次运行的 `serializedCounterfactualMs / actualEndToEndMs`，分子为 `actualEndToEndMs + hiddenLatencyMs = nonToolMs + authoritativeToolMs`。完整开销保留，无重叠为 1×；纯 Actor 耗时不能代入分子，1×不表示低开销。重叠按 Actor 区间与实际权威计算重建：原生结果转缓存、预览及多次采纳共用计算身份，只计一次；独立计算即使端点相同仍分别计数，查询转换与重算另计。未采用预测和旧任务缓存不计入，不能一般性地累加 `executionAheadMs`。多轮分别求和分子、分母，再相除。
 
 1. 固定任务、初态、模型、候选数和超时，独立测量开/关投机，计入失败、争用与清理。
 2. 要求 `git diff --check` 通过并保留完成信息，比较完整时长、命中、重叠、工具工作量与模型成本。
