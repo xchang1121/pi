@@ -11,7 +11,7 @@
 | 预测与 Actor | Drafter、Actor probe、PatternAware 只产生来源中立动作；入站数据在异步排队和提供者回调前归属于本次调用 | [计划](../src/plan-runtime.ts)、[宿主接入](../src/agent-integration.ts) |
 | 动作身份 | 参数准备一次；语义、schema、参数、资源名称与执行身份不可后改。仅自有的无损纯数据树可携带身份；来源/调用编号/轮次不是等价条件 | [语义](../src/action-semantics.ts)、[封存](../src/stable-json.ts) |
 | 路由与权限 | 唯一 Router 选择统一环境、本地安全后备、Actor；所选隔离路线不进入 K(a)，相同键也不授予执行或重放权限 | [执行世界](../src/execution-world.ts)、[执行网关](../src/tool-execution-gateway.ts) |
-| 候选与调度 | 预测与预览同步认领唯一登记，封存不迁移身份；验新后重查当前代，启动沿用采纳收益判定。K(a) 匹配复用，各输入版本与独立副作用保留各自所有权 | [候选存储](../src/candidate-stores.ts)、[Runtime](../src/runtime-engine.ts) |
+| 候选与调度 | ID 单一登记，验新后重查当前代；当前需求决定排序和启动，无主的未启动工作退役，共享结果可保留。启动与采纳共用收益判定 | [候选存储](../src/candidate-stores.ts)、[Runtime](../src/runtime-engine.ts) |
 | 输入与输出 | 新建预览候选或转换封存结果前让出一次事件处理，正式调用已到达则跳过准备。既有候选可提升或接续；结果沿用原预算，采纳仍授权、验新和提交 | [Runtime](../src/runtime-engine.ts)、[文件世界](../src/agent-execution-world.ts) |
 | 进程与产物 | 完整进程身份、动态依赖、生产者保证及有序输出/效果分别封存；重放前验证并持有整个 CAS 闭包 | [进程后端](../src/linux-process-backend.ts)、[证书](../src/provenance-certificate.ts)、[存储](../src/reuse-store.ts) |
 | 采纳与回退 | 只认领当前登记，再查权限、新鲜度、等价性、生产者保证和收益；仅证明无效果的拒绝允许单次 fallback，poisoned 提交禁止重跑 | [事务](../src/effect-transaction.ts)、[调度](../src/scheduler.ts) |
