@@ -15,7 +15,7 @@
 | 输入与输出 | 新建预览候选或转换封存结果前让出一次事件处理，正式调用已到达则跳过准备。既有候选可提升或接续；结果沿用原预算，采纳仍授权、验新和提交 | [Runtime](../src/runtime-engine.ts)、[文件世界](../src/agent-execution-world.ts) |
 | 进程与产物 | 完整进程身份、动态依赖、生产者保证及有序输出/效果分别封存；重放前验证并持有整个 CAS 闭包 | [进程后端](../src/linux-process-backend.ts)、[证书](../src/provenance-certificate.ts)、[存储](../src/reuse-store.ts) |
 | 采纳与回退 | 只认领当前登记，再查权限、新鲜度、等价性、生产者保证和收益；仅证明无效果的拒绝允许单次 fallback，poisoned 提交禁止重跑 | [事务](../src/effect-transaction.ts)、[调度](../src/scheduler.ts) |
-| 关闭与保留 | 逻辑取消不等于物理完成；所有者拒绝新准入并等待已执行、借用、封存和清理，之后才能回收工作区 | [生命周期](../src/runtime-lifecycle.ts)、[工作区](../src/workspace-sandbox.ts) |
+| 关闭与保留 | 会话持有轮次，替换与关闭串行；停止准入后排空执行、借用、封存和清理，再回收工作区 | [生命周期](../src/runtime-lifecycle.ts)、[工作区](../src/workspace-sandbox.ts) |
 
 不得增加第二套 Router、事务、沙箱、进程协调器或缓存/CAS，也不以工具名、Bash 文本相似度、纯转发层或未经证明的宿主观察绕过上述边界。
 
@@ -125,7 +125,7 @@ OverlayFS 必须通过固定 binary、FUSE、copy-up、whiteout、opaque、匿�
 
 ## 当前证据与剩余工作
 
-- 2026-09-11 两端 check/test/build/bench:check 通过：Windows 587 通过/17 跳过，WSL 603 通过/1 跳过，共 604 项；ThinkThread Runtime 151 项相关测试通过；API 为零。
-- LF 含空行：`src` 32,269 行，脚本 269 行。较 `8c559d1` 生产 +12,801 字节、test +66,625；较 `485cdb2` 生产少 565 行但多 32,958 字节，减量未达标。
-- 三端各 48 个真实 Agent 构造流任务通过，计算计数与独立统计一致。较父版 `2a7c8f5` 均值 3 降/6 升，范围 −1.6% 至 +9.1%；ThinkThread 首个固定图片样本多一次原生读取，完整保留。较纯 Actor，固定图片快 32.0%–62.7%，变化图片快 5.0%–43.7%，文本多 80–164 ms；不能证明零开销或自然净加速，见[计时规则](../bench/README.md#计时与验收规则)。
+- 2026-09-11 check/test/build/bench:check 通过：Windows 592 通过/17 跳过，WSL 608 通过/1 跳过，共 609 项；ThinkThread Runtime 127 项相关测试通过，API 为零。
+- LF 含空行：生产 32,513 行，较 `8c559d1` 多 12,075 字节、test 多 70,444；较 `485cdb2` 少 590 行但多 32,232 字节，减量未达标。
+- 三端各 48 个真实 Agent 构造流任务通过；较父版 `105d335` 均值 3 降/6 升，范围 -0.5% 至 1.1%。较纯 Actor，固定图片 -63.3% 至 -31.9%，变化图片 -44.2% 至 -4.6%，文本多 81–194 ms；负值表示更快，不能外推自然净加速，见[计时规则](../bench/README.md#计时与验收规则)。
 - 独立 Actor 进程观察、进程默认 ACL、减量、macOS/ARM64 和自然净加速未验收。思程写入的权限/文件身份偏差、新文件 write、嵌套 Bash 及 Host 恢复问题保留复现，尚未修复。
