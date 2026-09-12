@@ -14,11 +14,23 @@ node bench/adoption-latency.mjs . /absolute/output/ready.json 20 ready read,ls,w
 node bench/adoption-latency.mjs . /absolute/output/running.json 3 running read,ls,write,edit,find,grep
 ```
 
-每次新建 Host，核对同路径原生输出、文件内容和权限，禁止提前写入；采纳与回退分别检查执行次数。`running` 在 Actor 加入后释放受控生产者，单列剩余执行与完成后的交付时间；它验证运行中复用，不代表自然任务加速。Native search 当前回退也照实报告。Bash、ThinkThread 和自然模型端到端任务需要各自的实机验证。
+每次新建 Host，核对同路径原生输出、文件内容与 POSIX mode，禁止提前写入；采纳与回退分别检查执行次数。`running` 在 Actor 加入后释放受控生产者，单列剩余执行与完成后的交付时间；它验证运行中复用，不代表自然任务加速。报告分别保留命中、回退时长和拒绝原因，不能把正确回退当成测试失败，也不能把所有调用的 p50 当作命中 p50。
 
-`--profile` 临时插桩分段调用，`--fs-profile` 进一步统计 I/O；嵌套时长不能相加，性能结论使用不插桩的运行。可用 `--resource-baseline=/absolute/old/resource-version.js` 和 `--workspace-baseline=/absolute/old/workspace-sandbox.js` 在加载时替换已构建的旧模块作相邻对照，不修改生产源码。结果文件必须不存在。
+Linux/WSL 使用真实进程后端；既有 helper 可通过 `PI_SPEC_SANDLOCK`、`PI_SPEC_HELD_EXEC` 指定，不自动安装。`bash-child` 的父命令不同，共同调用编译后的 CPU/文件效果夹具，Actor 经过真正 held-exec 边界消费子进程。默认并发额度 2 允许接入运行中工作；`--concurrency=1` 验证抢占后的单次回退。子进程就绪时间取自 handoff 完成，不能使用稍后结束的整个父分支时间。
+
+```sh
+node bench/adoption-latency.mjs . /absolute/output/bash.json 15 ready bash,bash-child --backend=linux-process
+node bench/adoption-latency.mjs . /absolute/output/child-running.json 3 running bash-child --backend=linux-process
+node bench/adoption-latency.mjs . /absolute/output/child-preemption.json 2 running bash-child --backend=linux-process --concurrency=1
+```
+
+ThinkThread 要在真实 Profile 的 `THINKTHREAD_FS` 根目录运行并通过控制连接检查，使用 `--backend=thinkthread` 和 `read,ls,write,edit,native-find,native-grep,bash`；输出路径也须由 Profile 允许写入。使用生产默认封存输入/runner 路线。write 的 EACCES 回退、edit 的既有权限/身份缺口和不支持的进程路线照实报告；内容/mode 比较不能授予完整写入资格。
+
+`--profile` 临时插桩分段调用，`--fs-profile` 进一步统计 I/O；嵌套时长不能相加，性能结论使用不插桩的运行。`--resource-baseline`、`--workspace-baseline`、`--handoff-baseline` 接受对应旧构建模块的绝对路径，用于同一驱动下的相邻对照。结果文件必须不存在。
 
 2026-09-12 的各 20 次相邻对照中，Windows x64 新文件 write 的完整采纳 p50 为 3.89 → 3.33 ms，captured grep 为 4.96 → 3.74 ms；WSL x64 grep 为 4.43 → 4.06 ms。一次 grep 诊断的 lstat/realpath 调用由 151/100 降到 117/66，新文件 truncate 由一次降到零。其他小文件工具没有一致的净改善；这些数值不是自然应用端到端加速声明。
+
+同日 WSL 子进程 ready 15 次命中 p50 为 16.07 ms，原生重算 96.72 ms；旧模块相邻对照的 11 次命中 p50 为 16.84 ms，随后一次文件系统时钟证明失败并正确回退，未完成等量时延对照。因此只确认同轮已完成/加入后完成的结果省去一次持久历史查询，不声称稳定的整体提速。两版都出现时钟证明失败，失败不隐去。ThinkThread 两个 ready read 样本为 20–34 ms、ls 为 15–29 ms，原生均不足 1 ms；仍有明显采纳开销。
 
 ## 受控搜索资格
 
