@@ -106,6 +106,8 @@ npm run bench:linux-topology -- --mode reuse --output /absolute/output/topology-
 | `linux-artifacts` | 三个父命令的 128 MiB 文件效果重放均命中，摘要一致；开始效果前验证完整产物闭包 | 单独记录校验产物数量与字节 |
 | `linux-topology` | 子进程创建两个目录和 32 MiB 确定性产物；三个父 Bash 恢复精确目录/文件状态，外层验证并提交 | direct 是收益对照，保留重放更慢的短任务 |
 
+2026-09-12 复核发现，同轮交接逐条调用规划器，让上述八历史状态基准在原版脚本也因重复捕获而失败。改为批量选择后，八个候选共用一次当前路径集捕获，验证读取从 285,632,152 降到 35,704,019 字节；完整输出及产物一致。并发整支/子进程消费发生在验证期间时，失去认领权的结果被拒绝，剩余候选重新验证。此处确认读取量改善，不作独立端到端提速声明。
+
 拓扑基准的 `--rounds N` 范围为 0–4096、默认 96；两侧使用同值扫描交叉点。旧报告驱动的 `linux-admission` 分析入口已移除；收益决策由 `test/scheduler.test.ts` 验证，实际加入/回退使用前述完整 Host 采纳基准。
 
 进程与拓扑基准支持 `--workspace-driver git` / `overlayfs`，用于同机器 A/B；`--source-files N` 扫描目录规模。auto 只有在 binary、FUSE、copy-up、whiteout、opaque 目录、匿名事务时钟、跨视图时间顺序、可见性及卸载均通过，且精确基线至少 256 项时选择 OverlayFS。小树保留 Git；驱动导致的不支持结果会污染证据。`routePreparationMs` 与 fork/hit 分开报告。
