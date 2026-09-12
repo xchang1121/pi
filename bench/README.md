@@ -158,6 +158,8 @@ Drafter 的一个响应可提供一批工具预测；整批结果按响应顺序
 
 持续错误预测的完整任务对照中，现有收益门将 Drafter 请求从 15 降到 6、跳过 9 批；单次时长 8.194 → 8.339 s，不据此声称提速。正预测对照保持 15 次请求，未知 Actor 成本没有被伪造为零。Linux process 的同一只读流程单次关闭/开启为 7.436/7.796 s，子进程命中为零；文件命中不能计为 Bash 复用。原始自然模型运行在 14 轮上限结束且 native grep 截断次序导致严格重放失败，保留作准确率诊断，不纳入完成任务的性能比较。
 
+后续 21 次决策、27 次调用的 mock 增加 write/edit、逐步文件状态检查和跨父命令 C 子进程。审计确认调度器曾把未知服务耗时当作 1 ms，并推导虚构 Actor 周期；已改为保留未知值，Windows/WSL 各 191 项相关回归通过。这是调度修复，尚无该长任务的提速证据：1500/80 ms 模型时序下，合格工作区和 PATH 中的 C 子进程仍因约 3 s 的生产链超过约 2.1 s 领先而回退。早期只读夹具的 node_modules 链接越出工作区，不能用来证明 Linux 提前执行已具备资格。
+
 模型套件选择 [Claw-SWE-Bench Lite](https://huggingface.co/datasets/TokenRhythm/Claw-SWE-Bench) 的真实问题，只取得选定 base commit；每次创建新的 detached 工作区，不把 gold patch 给 Agent。
 
 先在环境中提供 `DEEPSEEK_API_KEY`，再显式运行需要模型/网络的阶段：
