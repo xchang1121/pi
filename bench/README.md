@@ -32,6 +32,16 @@ ThinkThread 要在真实 Profile 的 `THINKTHREAD_FS` 根目录运行并通过�
 
 同日 WSL 子进程 ready 15 次命中 p50 为 16.07 ms，原生重算 96.72 ms；旧模块相邻对照的 11 次命中 p50 为 16.84 ms，随后一次文件系统时钟证明失败并正确回退，未完成等量时延对照。因此只确认同轮已完成/加入后完成的结果省去一次持久历史查询，不声称稳定的整体提速。两版都出现时钟证明失败，失败不隐去。ThinkThread 两个 ready read 样本为 20–34 ms、ls 为 15–29 ms，原生均不足 1 ms；仍有明显采纳开销。
 
+## PatternAware 历史与绑定
+
+```sh
+node bench/pattern-latency.mjs . /absolute/output/pattern.json /absolute/old-pattern-aware.js
+```
+
+旧模块须来自同一依赖版本的构建；省略时只测当前版本。默认比较搜索结果宽度 0、96、512 的三组历史，每组五轮交替顺序，逐项核对预测前沿和最终学习状态。可追加真实 `PatternAwareEventInput[]` JSON 路径，重放该历史，仍不发 API。计时包含学习、预测、快照和结算，单列 observe/predict；它是组件对照。
+
+2026-09-12 Windows 的独立运行中，96/512 项结果的预测中位数分别为 10.58 → 10.10 / 36.17 → 34.63 ms；包含学习的总时间为 112.16 → 108.79 / 292.10 → 296.51 ms。后缀共享与批次起点减少分配，但总时间没有一致改善，不能据此声明自然任务端到端提速。Windows/WSL 的 74 项相关回归均通过。
+
 ## 受控搜索资格
 
 先完成 `npm run build`，再按需要选择低负载命令：
