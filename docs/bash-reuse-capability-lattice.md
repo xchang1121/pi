@@ -125,7 +125,7 @@ OverlayFS 必须通过固定 binary、FUSE、copy-up、whiteout、opaque、匿�
 
 ## 当前证据与剩余工作
 
-- 2026-09-12 check/test/build/bench:check 通过：Windows 605 通过/17 跳过，WSL 621/1，共 622 项；真实 ThinkThread 相关测试 215/3。三端工作区提交反例从错误改写旁路文件改为按提交时快照写入。
-- 三端各 48 个真实 Agent 构造流任务、四轮完整进程计时：较父版 `4a61413` 均值 3 降/6 升，范围 -0.5–5.4%；较纯 Actor，小编辑 15.9–26.3%，大编辑 0.5–4.1%，写入 2.3–3.2%。负值更快，见[计时规则](../bench/README.md#计时与验收规则)。
-- 相对 `8c559d1` 的生产/测试减量及 `485cdb2` 生产上限仍未满足。构造流与提交队列控制分开统计，API 为零，不构成自然净加速验收。
-- 独立 Actor 进程观察、进程默认 ACL、macOS/ARM64 未验收。思程权限/文件身份偏差、新文件 write、嵌套 Bash 及 Host 恢复问题保留复现，尚未修复。
+- `d15123e`：Windows 完整回归 608 通过/17 跳过，共 625 项；WSL 文件证据、工作区与 Host 相关回归 83 通过。check/build 通过。文件采纳的入口、样本范围和对照见[基准说明](../bench/README.md#文件工具采纳延迟)，小幅波动不外推为所有工具都更快。
+- `b85fca0`：官方 Drafter Flash 的 off/minimal/low/medium/high/xhigh/max 共 14 次真实请求，覆盖首轮和工具续轮；Actor Pro 另 1 次请求。逐请求严格重放通过。参数兼容探针不等于预测准确率或自然任务净加速。
+- 历史构造流、队列控制和完整进程计时不替代当前自然任务验收。每次变更单独核对 `src`、`test` 的净行数和字节，优先删除重复工作与状态；不删安全检查或有效回归来满足减量。
+- 独立 Actor 进程观察、进程默认 ACL、macOS/ARM64 未验收。ThinkThread alpha4 的私有分支缺失路径异步 realpath 返回 EACCES；snapshot apply 不保持原生 ACL、硬链接、打开描述符和等内容写入语义。按用户要求暂缓其修复，保留复现；普通内容相等不能授予完整写入资格，嵌套 Bash 仍受 ptrace 限制。
