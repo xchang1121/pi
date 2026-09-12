@@ -134,7 +134,7 @@ prevents certificates from the older, weaker effect model from crossing this bou
 
 On the qualified 128 MiB Pi Bash fixture, content-free structural snapshots plus transaction-delta
 sealing reduced complete-hit median latency by 17.5% and cold latency by 11.5%. The raw reports and
-method are in `bench/results/wsl2-transaction-delta-2026-09-01.md`.
+method are in [historical measurements](https://github.com/xchang1121/pi-speculative-action/blob/4c7dbb2/bench/results/wsl2-transaction-delta-2026-09-01.md).
 
 ## Nested workspace-transaction frontier
 
@@ -186,7 +186,7 @@ retained frontier uses Git only as immutable baseline content, never as the per-
 On the qualified real Pi Bash fixture, the fenced frontier reduced cold complete latency by 7.4% and
 the nested miss backend by 13.5%; lazy initialization also made complete hits 1.0% faster. Raw
 measurements and the discarded-experiment result are in
-`bench/results/wsl2-workspace-frontier-2026-09-01.md`.
+[historical measurements](https://github.com/xchang1121/pi-speculative-action/blob/4c7dbb2/bench/results/wsl2-workspace-frontier-2026-09-01.md).
 
 ## Typed directory topology and replay profitability
 
@@ -226,7 +226,7 @@ Real-machine profitability is workload-dependent. Five interleaved stock Pi Bash
 deterministic 32 MiB/96-round transform reduced median-of-medians from 2686.65 ms direct to 936.26 ms
 replayed (65.1%, 2.87x), with 15/15 hits and zero taints. A shorter 384.56 ms task regressed to
 937.24 ms under replay, while a roughly one-second task was within noise. Those negative points are
-preserved in `bench/results/wsl2-topology-reuse-2026-09-01.md`; they require a cost-aware admission
+preserved in [historical measurements](https://github.com/xchang1121/pi-speculative-action/blob/4c7dbb2/bench/results/wsl2-topology-reuse-2026-09-01.md); they require a cost-aware admission
 policy based on measured execution distributions and estimated validation/artifact/commit cost rather
 than unconditional adoption of every valid certificate.
 
@@ -275,7 +275,7 @@ back, while 48- and 96-round candidates join. A ready 40-round result is still p
 824 ms private execution has already been hidden. The fresh 48-round result disagrees materially with
 the earlier noise-boundary run, so both are preserved rather than turning the workload parameter into
 a fixed threshold. Full raw evidence and the negative results are in
-`bench/results/wsl2-cost-aware-admission-2026-09-01.md`.
+[historical measurements](https://github.com/xchang1121/pi-speculative-action/blob/4c7dbb2/bench/results/wsl2-cost-aware-admission-2026-09-01.md).
 
 The next high-leverage cost reduction is deferred output materialization, not a weaker admission
 gate. Bazel's
@@ -354,7 +354,7 @@ that result. Three independent real Pi Bash processes per driver produced nine h
 large-tree size: median total hit time improved 9.47% at 500 source files and 13.21% at 1,000, while
 publication warm-up improved 24.53% and 31.29%. The small `auto` workload stayed on Git and still
 obtained a 2.45x cold-to-hit speedup from Bash reuse. Main, boundary, production-selector, and rejected
-measurements are preserved in `bench/results/wsl2-overlayfs-workspace-driver-2026-09-01.md`.
+measurements are preserved in [historical measurements](https://github.com/xchang1121/pi-speculative-action/blob/4c7dbb2/bench/results/wsl2-overlayfs-workspace-driver-2026-09-01.md).
 
 ## Partial execution reuse
 

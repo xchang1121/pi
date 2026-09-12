@@ -96,10 +96,6 @@ npm run bench:linux-pathset -- --output /absolute/output/pathset.json
 npm run bench:linux-artifacts -- --output /absolute/output/artifacts.json
 npm run bench:linux-topology -- --mode direct --output /absolute/output/topology-direct.json
 npm run bench:linux-topology -- --mode reuse --output /absolute/output/topology-reuse.json
-npm run bench:linux-admission -- \
-  --direct /absolute/output/topology-direct.json \
-  --reuse /absolute/output/topology-reuse.json \
-  --expect join --expect-ready join --output /absolute/output/admission.json
 ```
 
 | 命令 | 必须证明的事实 | 成本边界 |
@@ -107,9 +103,8 @@ npm run bench:linux-admission -- \
 | `linux-pathset` | 一个 32 MiB 输入的八个历史状态都可参与查询，相同路径集只捕获一次当前依赖 | 不按历史证书重复哈希大输入 |
 | `linux-artifacts` | 三个父命令的 128 MiB 文件效果重放均命中，摘要一致；开始效果前验证完整产物闭包 | 单独记录校验产物数量与字节 |
 | `linux-topology` | 子进程创建两个目录和 32 MiB 确定性产物；三个父 Bash 恢复精确目录/文件状态，外层验证并提交 | direct 是收益对照，保留重放更慢的短任务 |
-| `linux-admission` | 使用生产调度器的 Actor、投机执行和采纳分布决定加入或 fallback | 不新造 Bash 专属时长阈值 |
 
-拓扑基准的 `--rounds N` 范围为 0–4096、默认 96；两侧使用同值扫描交叉点。准入分析的 `--elapsed-ms N` 表示候选已执行部分时间，显式预期决策不一致时验证失败。
+拓扑基准的 `--rounds N` 范围为 0–4096、默认 96；两侧使用同值扫描交叉点。旧报告驱动的 `linux-admission` 分析入口已移除；收益决策由 `test/scheduler.test.ts` 验证，实际加入/回退使用前述完整 Host 采纳基准。
 
 进程与拓扑基准支持 `--workspace-driver git` / `overlayfs`，用于同机器 A/B；`--source-files N` 扫描目录规模。auto 只有在 binary、FUSE、copy-up、whiteout、opaque 目录、匿名事务时钟、跨视图时间顺序、可见性及卸载均通过，且精确基线至少 256 项时选择 OverlayFS。小树保留 Git；驱动导致的不支持结果会污染证据。`routePreparationMs` 与 fork/hit 分开报告。
 
@@ -125,10 +120,10 @@ Overlay 探针描述宿主非特权能力，不是生产路线切换许可。生
 使用已安装真实 Agent POSIX SDK、已构建的源码 checkout 和运行中的 `tt pi-speculative-action` Profile。在 `THINKTHREAD_FS` 根目录通过 Pi 的 Bash 工具运行：
 
 ```sh
-npm run bench:thinkthread-tools
+node bench/adoption-latency.mjs . /allowed/output/thinkthread.json 3 ready read,ls,write,edit,native-find,native-grep,bash --backend=thinkthread
 ```
 
-创建夹具前通过 SDK `selfView/fs.stat` 确认 Runtime，环境变量不足为证。对照 Actor、原生 fallback 和生产 Gateway 的 `fs.run/validate/commit`：同 cwd/path 的完整输出、文件内容/模式须相同，采纳前工作区不变。原生工具仅在 Actor 授权后运行，不能替代失败的首选路线；准备、执行、采纳分别计单样本，poisoned 夹具保留且不再写入。
+创建夹具前通过 SDK `selfView/fs.stat` 确认 Runtime，环境变量不足为证。统一使用完整 Host 和生产默认执行路线；显式覆写 runner 的旧入口已移除。本地 wire runner 的六工具语义对照保留在 `test/thinkthread-tool-runner.test.ts`，不是 Runtime 通过证明。当前采纳测量与权限/身份限制见本文开头。
 
 本机 WSL2 x86_64 使用 alpha4 RPM `0.1.0-19` 解包布局、Pi 0.84.1/Node 24.20.0：`read/ls/edit` 采纳通过；新文件 `write` 令整条命令失败。原生 Node 对照确认，不存在路径的异步 `realpath` 在私有分支报 `EACCES`，Actor 报 `ENOENT`。保留权限错误，Host 拒绝候选后 Actor 成功写入一次。
 
@@ -193,13 +188,6 @@ API key 只从环境读取，不写入产物或交给基准 shell 子进程。�
 
 汇总命中率为总命中/总 Actor 动作。未通过 `patchCandidate` 的运行保留失败原因，但不纳入汇总延迟和命中率，仍不能据此代替官方正确性评分。
 
-## 已保存的历史测量
+## 历史测量
 
-以下报告保留其各自提交、机器与初始条件，不能直接冒充当前源码的完整资格或性能保证：
-
-- [结构重构](./results/wsl2-structural-refactor-96b2778-2026-09-01.md)
-- [依赖消融](./results/wsl2-dependency-ablation-2419f16-2026-09-03.md)
-- [原生 exec 边界](./results/wsl2-exec-boundary-47b2ce6-2026-09-03.md)
-- [已完成/运行中子进程转换](./results/wsl2-held-child-conversion-6b7579d-2026-09-03.md)
-- [能力、in-flight 与存储驱动消融](./results/wsl2-capability-ablation-c0d4c96-2026-09-03.md)
-- [多历史路径集](./results/wsl2-pathset-2026-09-01.md)、[产物闭包](./results/wsl2-artifacts-2026-09-01.md)、[工作区前沿](./results/wsl2-workspace-frontier-2026-09-01.md)
+重复阶段报告已移出当前目录；必要的边界和经验归入[能力说明](../docs/bash-reuse-capability-lattice.md)与[研究记录](../docs/bash-reuse-research.md)。保留 PR #1 的[发布说明](./results/release-qualification-2026-09-03.md)。其余原始历史报告仍可在[固定提交的 Git 历史](https://github.com/xchang1121/pi-speculative-action/tree/4c7dbb2/bench/results)查阅，不能当作当前源码的完整资格或性能保证。
