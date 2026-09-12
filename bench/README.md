@@ -133,6 +133,8 @@ Overlay 探针描述宿主非特权能力，不是生产路线切换许可。生
 
 随后整理 exec 分支、Actor 计时和等待助手，生成的 1,735 字节 C 程序及 17 个命令字面量与 `fa914a4` 完全一致；completed/running、同轮一次性消费、跨轮拒绝、描述符、逻辑 cwd 和元数据检查均保留。一次原生运行在“completed child did not remain ephemeral”计数断言失败，原日志没有详细计数，原因未确定。只补充错误计数信息后，两次当前版和一次 `fa914a4` 复核通过，running join 基准也通过；未改变等待预算、领先时间或证明条件。这次未复现失败仍属保留结果，不据重跑宣称不存在间歇问题。
 
+后续确定性屏障审计发现独立的捕获生命周期缺陷：在 `6e743a5` 中，trace 读取或事务封存一侧抛错，另一侧仍被阻塞时 trace 目录已开始清理。两种顺序均复现；修复保留并行捕获与首个错误，失败后排空双方再清理和返回已执行输出。回归核对单次执行、目录回收、禁止发布与采纳，Windows 42 项通过、10 项平台跳过，匹配 helper 的 WSL 52 项通过。这解释了一条捕获失败路径，尚不能认定是上述偶发计数断言的根因。
+
 ## ThinkThread 真实 Runtime 资格
 
 使用已安装真实 Agent POSIX SDK、已构建的源码 checkout 和运行中的 `tt pi-speculative-action` Profile。在 `THINKTHREAD_FS` 根目录通过 Pi 的 Bash 工具运行：
