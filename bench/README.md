@@ -4,6 +4,22 @@
 
 私有录制、预注册材料和每次运行的原始 JSON 保留在仓库外；仓库只保留可复现脚本及经过审阅的结果摘要。
 
+## 文件工具采纳延迟
+
+`adoption-latency.mjs` 从完整 `Host.execute` 入口计到 Actor 结果返回，分别报告准备时间、原生调用和 fallback；不把内部 `hitLatencyMs` 当成完整交付时间。使用真实 read/ls/write/edit 和共同绑定的 captured find/grep，确定性模型只提供已知动作，API 请求数为零。
+
+```sh
+npm run build
+node bench/adoption-latency.mjs . /absolute/output/ready.json 20 ready read,ls,write,edit,find,grep,native-find,native-grep
+node bench/adoption-latency.mjs . /absolute/output/running.json 3 running read,ls,write,edit,find,grep
+```
+
+每次新建 Host，核对同路径原生输出、文件内容和权限，禁止提前写入；采纳与回退分别检查执行次数。`running` 在 Actor 加入后释放受控生产者，单列剩余执行与完成后的交付时间；它验证运行中复用，不代表自然任务加速。Native search 当前回退也照实报告。Bash、ThinkThread 和自然模型端到端任务需要各自的实机验证。
+
+`--profile` 临时插桩分段调用，`--fs-profile` 进一步统计 I/O；嵌套时长不能相加，性能结论使用不插桩的运行。可用 `--resource-baseline=/absolute/old/resource-version.js` 和 `--workspace-baseline=/absolute/old/workspace-sandbox.js` 在加载时替换已构建的旧模块作相邻对照，不修改生产源码。结果文件必须不存在。
+
+2026-09-12 的各 20 次相邻对照中，Windows x64 新文件 write 的完整采纳 p50 为 3.89 → 3.33 ms，captured grep 为 4.96 → 3.74 ms；WSL x64 grep 为 4.43 → 4.06 ms。一次 grep 诊断的 lstat/realpath 调用由 151/100 降到 117/66，新文件 truncate 由一次降到零。其他小文件工具没有一致的净改善；这些数值不是自然应用端到端加速声明。
+
 ## 受控搜索资格
 
 先完成 `npm run build`，再按需要选择低负载命令：
